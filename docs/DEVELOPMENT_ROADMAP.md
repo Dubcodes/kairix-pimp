@@ -6,7 +6,7 @@ Implemented and automated-test covered: domain types, date selection/fallback, f
 
 Implemented and tested with generated media: FFprobe metadata extraction and FFmpeg thumbnail generation for H.264 and H.265/HEVC fixtures.
 
-UI implemented: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection, batch action affordances, Light status, and the two required date mode names. The displayed media is clearly development fixture data. Native filesystem/drag-drop wiring is not complete.
+UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection, Light status, and the two required date mode names. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation. The displayed media and its mutations are clearly development fixture state. Native filesystem/drag-drop wiring and real catalogue persistence are not complete.
 
 Scaffolded: Tauri 2 application and minimal capability policy. Native build is unverified due to missing Rust/MSVC tools.
 
@@ -15,7 +15,7 @@ Scaffolded: Tauri 2 application and minimal capability policy. Native build is u
 - Native folder picker/drop events and recursive directory ingest preserving camera structures
 - Durable resumable job journal, pause/cancel, throughput and per-file progress
 - Media fixtures for H.264/H.265 probe and thumbnail regression tests
-- SQLite/FTS disposable projection, saved compound filters, pagination/virtualization
+- SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Contact sheets, preview player, custom thumbnails, folder rename/move journal
 - Evidence-scored and reversible DJI camera/audio pairing
 

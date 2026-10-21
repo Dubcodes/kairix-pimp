@@ -422,6 +422,18 @@ article.selected {
   padding: 3px 6px;
   margin-right: 4px;
 }
+.projects {
+  min-height: 17px;
+  margin-top: 7px;
+  display: flex;
+  gap: 4px;
+  overflow: hidden;
+}
+.projects span {
+  color: #8fae95;
+  font-size: 8px;
+  white-space: nowrap;
+}
 article footer {
   display: flex;
   justify-content: space-between;
@@ -436,31 +448,199 @@ article footer span {
 }
 .batch {
   position: fixed;
-  bottom: 24px;
-  left: 50%;
-  transform: translateX(-35%);
+  z-index: 10;
+  bottom: 20px;
+  left: 253px;
+  right: 28px;
   background: #e8f0ea;
   color: #182019;
-  padding: 8px 10px 8px 17px;
-  border-radius: 10px;
-  display: flex;
-  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  display: grid;
+  grid-template-columns: auto minmax(230px, 1fr) minmax(250px, 1fr) auto;
+  gap: 12px;
   align-items: center;
   box-shadow: 0 12px 40px #0008;
 }
-.batch strong {
-  font-size: 11px;
-  margin-right: 8px;
+.batch-heading {
+  min-width: 92px;
 }
-.batch button {
+.batch-heading strong,
+.batch-heading span {
+  display: block;
+}
+.batch-heading strong {
+  font-size: 11px;
+}
+.batch-heading span {
+  color: #657168;
+  font-size: 8px;
+  margin-top: 2px;
+}
+.batch-combo {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 7px;
+  align-items: center;
+}
+.batch-clear {
   border: 1px solid #c2ccc4;
   background: #f8fbf9;
   color: #253029;
   padding: 7px 10px;
   border-radius: 6px;
-  display: flex;
-  gap: 6px;
   font-size: 10px;
+  white-space: nowrap;
+}
+.combo-field {
+  min-width: 0;
+  position: relative;
+}
+.combo-label {
+  display: block;
+  color: #4b5850;
+  font-size: 8px;
+  font-weight: 700;
+  margin: 0 0 3px 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.combo-control {
+  min-height: 35px;
+  border: 1px solid #bbc6bd;
+  background: #f8fbf9;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px;
+  color: #5a675f;
+  cursor: text;
+  overflow: hidden;
+}
+.combo-control:focus-within {
+  border-color: #667d22;
+  box-shadow: 0 0 0 2px #aeca4f55;
+}
+.combo-field[data-disabled] .combo-control {
+  background: #e4e9e5;
+  color: #929b95;
+  cursor: not-allowed;
+}
+.combo-input {
+  min-width: 75px;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #182019;
+  font-size: 10px;
+  padding: 3px 0;
+}
+.combo-input::placeholder {
+  color: #77827b;
+}
+.combo-single-value {
+  color: #263029;
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combo-chip {
+  max-width: 125px;
+  border: 1px solid #c4d09a;
+  background: #edf5d0;
+  color: #36401d;
+  border-radius: 12px;
+  padding: 2px 3px 2px 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combo-chip button,
+.combo-clear,
+.combo-disclosure {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 2px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.combo-clear {
+  border-right: 1px solid #d5ddd7;
+  padding-right: 6px;
+}
+.combo-spinner {
+  width: 15px;
+  animation: combo-spin 0.9s linear infinite;
+}
+.combo-popover {
+  z-index: 1000;
+  max-height: min(280px, var(--popover-available-height));
+  overflow-y: auto;
+  border: 1px solid #3a453e;
+  background: #111613;
+  color: #e9efeb;
+  border-radius: 8px;
+  padding: 5px;
+  box-shadow: 0 16px 45px #000a;
+  outline: none;
+}
+.combo-option {
+  min-height: 36px;
+  border-radius: 5px;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.combo-option[data-active-item] {
+  background: #263125;
+  color: #eaf4c4;
+}
+.combo-option[aria-selected='true'] {
+  color: #d6f85f;
+}
+.combo-option strong,
+.combo-option small {
+  display: block;
+}
+.combo-option small {
+  color: #7f8b82;
+  margin-top: 2px;
+  font-size: 9px;
+}
+.combo-create {
+  border-top: 1px solid #29312c;
+  color: #d6f85f;
+  margin-top: 3px;
+}
+.combo-empty,
+.combo-limit {
+  margin: 0;
+  padding: 12px 9px;
+  color: #87928a;
+  font-size: 10px;
+}
+.combo-limit {
+  border-top: 1px solid #29312c;
+  padding: 8px 9px 5px;
+}
+@keyframes combo-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .ingest {
   display: grid;

@@ -18,7 +18,9 @@ Full-edition AI processing is planned and is not implemented in this milestone.
 
 This repository contains the first vertical-slice foundation. The portable TypeScript core and Node filesystem adapter implement and test checksum-verified single-file ingest, collision/duplicate handling, catalogue event replay, tags, project assignments, project manifests, settings separation, safe paths, FFprobe, and thumbnail generation. The React application shell presents the primary navigation, library, batch selection, search, and the two exact date-mode choices.
 
-The Tauri 2 shell is scaffolded but has **not** been compiled in this environment because Rust and a Windows C++ build toolchain are not installed. Folder drag/drop wiring, native path selection, Premiere, AI, and archive cleanup are not claimed as complete.
+The library fixture now uses one shared accessible searchable selector for batch tags and many-to-many project assignment. It supports keyboard/mouse use, stable IDs, explicit tag creation, and portal-based popovers, but changes remain in demo memory and are not persisted to the real catalogue.
+
+The Tauri 2 shell is scaffolded but has **not** been compiled in this environment because Rust and a Windows C++ build toolchain are not installed. Folder drag/drop wiring, native path selection, real UI persistence, Premiere, AI, and archive cleanup are not claimed as complete.
 
 Windows is the first release target. The core and adapter boundaries are designed for future Linux and macOS support, but neither platform is currently verified.
 
@@ -61,7 +63,7 @@ npm run tauri dev
 - Synchronization-aware, recoverable cleanup with explicit authorization
 - Windows Light and Full installers, followed by Linux and macOS validation
 
-See [the development roadmap](docs/DEVELOPMENT_ROADMAP.md) for milestone boundaries.
+See the [project brief](docs/PROJECT_BRIEF.md), [development roadmap](docs/DEVELOPMENT_ROADMAP.md), and [testing strategy](docs/TESTING.md) for scope and evidence boundaries.
 
 ## Known limitations
 
@@ -81,8 +83,8 @@ No software license has been selected yet. Public availability does not grant pe
 - `packages/core`: platform-neutral catalogue, dates, search, and AI contracts
 - `packages/node-adapter`: verified filesystem operations and FFmpeg integration
 - `src-tauri`: minimal Tauri 2 shell and capability boundary
-- `docs`: product, architecture, data, Syncthing, research, and roadmap
+- `docs`: project brief, product/architecture/data rules, decision log, testing strategy, Syncthing design, research, roadmap, and future task template
 
 ## Development preview
 
-![Kairix PIMP library development fixture](docs/pimp-library.png)
+![Kairix PIMP searchable project assignment development fixture](docs/pimp-searchable-combos.png)

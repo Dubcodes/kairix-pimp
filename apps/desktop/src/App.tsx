@@ -12,7 +12,8 @@ import {
   UploadCloud,
   UsersRound,
 } from 'lucide-react';
-import { demoMedia } from './demo';
+import { SearchableComboBox } from './components/SearchableComboBox';
+import { demoMedia, demoProjects, demoTags } from './demo';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
 const icons = {
@@ -29,13 +30,22 @@ export function App() {
   const [query, setQuery] = useState('');
   const [folder, setFolder] = useState('All media');
   const [selected, setSelected] = useState<string[]>(['1', '2']);
+  const [batchTagIds, setBatchTagIds] = useState<string[]>([]);
+  const [batchProjectIds, setBatchProjectIds] = useState<string[]>([]);
   const [dateMode, setDateMode] = useState<'today' | 'original'>('original');
   const filtered = useMemo(
     () =>
       media.filter(
         (item) =>
           (folder === 'All media' || item.folder === folder) &&
-          [item.name, item.folder, item.project, ...item.tags]
+          [
+            item.name,
+            item.folder,
+            ...item.tags,
+            ...item.projectIds.map(
+              (id) => demoProjects.find((project) => project.id === id)?.name,
+            ),
+          ]
             .join(' ')
             .toLowerCase()
             .includes(query.toLowerCase()),
@@ -43,28 +53,46 @@ export function App() {
     [folder, media, query],
   );
 
-  const addTag = () => {
-    const tag = window.prompt('Tag selected media');
-    if (!tag?.trim()) return;
+  const applyBatchTags = (tagIds: string[]) => {
+    const addedTagIds = tagIds.filter((id) => !batchTagIds.includes(id));
+    setBatchTagIds(tagIds);
+    if (!addedTagIds.length) return;
     setMedia((items) =>
       items.map((item) =>
-        selected.includes(item.id) && !item.tags.includes(tag.trim())
-          ? { ...item, tags: [...item.tags, tag.trim()] }
+        selected.includes(item.id)
+          ? {
+              ...item,
+              tags: [...new Set([...item.tags, ...addedTagIds])],
+            }
           : item,
       ),
     );
   };
 
-  const assignProject = () => {
-    const project = window.prompt('Assign selected media to project');
-    if (!project?.trim()) return;
+  const applyBatchProjects = (projectIds: string[]) => {
+    const addedProjectIds = projectIds.filter(
+      (id) => !batchProjectIds.includes(id),
+    );
+    setBatchProjectIds(projectIds);
+    if (!addedProjectIds.length) return;
     setMedia((items) =>
       items.map((item) =>
         selected.includes(item.id)
-          ? { ...item, project: project.trim() }
+          ? {
+              ...item,
+              projectIds: [
+                ...new Set([...item.projectIds, ...addedProjectIds]),
+              ],
+            }
           : item,
       ),
     );
+  };
+
+  const clearSelection = () => {
+    setSelected([]);
+    setBatchTagIds([]);
+    setBatchProjectIds([]);
   };
 
   return (
@@ -203,6 +231,15 @@ export function App() {
                             <em key={tag}>{tag}</em>
                           ))}
                         </div>
+                        <div className="projects">
+                          {item.projectIds.map((projectId) => (
+                            <span key={projectId}>
+                              {demoProjects.find(
+                                (project) => project.id === projectId,
+                              )?.name ?? projectId}
+                            </span>
+                          ))}
+                        </div>
                         <footer>
                           <span>
                             <Clock3 size={12} />
@@ -218,14 +255,39 @@ export function App() {
             </section>
             {selected.length > 0 && (
               <div className="batch">
-                <strong>{selected.length} selected</strong>
-                <button onClick={addTag}>
-                  <Tag size={15} /> Add tags
+                <div className="batch-heading">
+                  <strong>{selected.length} selected</strong>
+                  <span>Demo fixture changes only</span>
+                </div>
+                <div className="batch-combo">
+                  <Tag aria-hidden="true" size={15} />
+                  <SearchableComboBox
+                    label="Add tags"
+                    mode="multiple"
+                    options={demoTags.map((tag) => ({ id: tag, label: tag }))}
+                    selectedIds={batchTagIds}
+                    onSelectionChange={applyBatchTags}
+                    placeholder="Search tags…"
+                    onCreate={(label) => ({ id: label, label })}
+                  />
+                </div>
+                <div className="batch-combo">
+                  <UsersRound aria-hidden="true" size={15} />
+                  <SearchableComboBox
+                    label="Assign projects"
+                    mode="multiple"
+                    options={demoProjects.map((project) => ({
+                      id: project.id,
+                      label: project.name,
+                    }))}
+                    selectedIds={batchProjectIds}
+                    onSelectionChange={applyBatchProjects}
+                    placeholder="Search projects…"
+                  />
+                </div>
+                <button className="batch-clear" onClick={clearSelection}>
+                  Clear media selection
                 </button>
-                <button onClick={assignProject}>
-                  <UsersRound size={15} /> Assign project
-                </button>
-                <button onClick={() => setSelected([])}>Clear</button>
               </div>
             )}
           </>

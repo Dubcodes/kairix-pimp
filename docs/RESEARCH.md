@@ -29,6 +29,10 @@ whisper.cpp exposes segment and experimental token timestamps in a compact C/C++
 
 Tauri 2 capability files can restrict window/webview permissions. PIMP should expose purpose-built commands rather than broad filesystem access. FFprobe JSON is the technical metadata interchange and FFmpeg generates thumbnails/previews as cancellable background jobs using explicit argument arrays.
 
+## Accessible selection controls
+
+Ariakit, Downshift, and React Aria were evaluated as maintained headless foundations. Ariakit was selected for the shared searchable selector because its combobox primitives cover WAI-ARIA semantics, single/multiple selection, keyboard/focus behavior, disclosure, and portal/edge-aware popover positioning while leaving filtering and visual design to PIMP. Downshift provides strong selection hooks but would require a separate positioning/portal layer here; React Aria offers a broader component ecosystem than this focused milestone needs. PIMP caps each rendered filtered result set at 100 and asks the user to narrow it, avoiding unbounded DOM lists without prematurely adding a virtualization dependency.
+
 ## Sources
 
 - [Hedge OffShoot verification](https://docs.hedge.video/offshoot/features/verification)
@@ -45,5 +49,8 @@ Tauri 2 capability files can restrict window/webview permissions. PIMP should ex
 - [PlumePack overview](https://www.autokroma.com/PlumePack/)
 - [Tauri 2](https://v2.tauri.app/)
 - [FFmpeg documentation](https://ffmpeg.org/documentation.html)
+- [Ariakit Combobox](https://ariakit.org/components/combobox)
+- [Ariakit ComboboxProvider reference](https://ariakit.org/reference/combobox-provider)
+- [Downshift multiple selection](https://www.downshift-js.com/use-multiple-selection/)
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper)

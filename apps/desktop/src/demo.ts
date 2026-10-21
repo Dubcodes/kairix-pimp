@@ -1,3 +1,22 @@
+export const demoProjects = [
+  { id: 'project-simple-vlog-055', name: 'Simple Vlog 055' },
+  { id: 'project-simple-vlog-056', name: 'Simple Vlog 056' },
+  { id: 'project-halloween-special', name: 'Halloween Special' },
+  { id: 'project-workshop-stories', name: 'Workshop Stories' },
+];
+
+export const demoTags = [
+  'B-roll',
+  'Detail',
+  'Go Kart',
+  'Onboard',
+  'Power tools',
+  'Prep',
+  'Repairs',
+  'Track',
+  'Workshop',
+];
+
 export const demoMedia = [
   {
     id: '1',
@@ -7,7 +26,7 @@ export const demoMedia = [
     duration: '08:42',
     size: '3.8 GB',
     tags: ['Go Kart', 'Repairs'],
-    project: 'Simple Vlog 055',
+    projectIds: ['project-simple-vlog-055'],
     hue: 32,
   },
   {
@@ -18,7 +37,7 @@ export const demoMedia = [
     duration: '03:16',
     size: '1.4 GB',
     tags: ['Workshop', 'Detail'],
-    project: 'Simple Vlog 055',
+    projectIds: ['project-simple-vlog-055'],
     hue: 196,
   },
   {
@@ -29,7 +48,7 @@ export const demoMedia = [
     duration: '12:07',
     size: '7.1 GB',
     tags: ['Track', 'Onboard'],
-    project: 'Simple Vlog 056',
+    projectIds: ['project-simple-vlog-056'],
     hue: 345,
   },
   {
@@ -40,7 +59,7 @@ export const demoMedia = [
     duration: '05:29',
     size: '2.6 GB',
     tags: ['Power tools', 'Workshop'],
-    project: 'Halloween Special',
+    projectIds: ['project-halloween-special'],
     hue: 263,
   },
   {
@@ -51,7 +70,7 @@ export const demoMedia = [
     duration: '02:51',
     size: '1.1 GB',
     tags: ['B-roll'],
-    project: 'Unassigned',
+    projectIds: [],
     hue: 148,
   },
   {
@@ -62,7 +81,7 @@ export const demoMedia = [
     duration: '06:12',
     size: '2.9 GB',
     tags: ['Go Kart', 'Prep'],
-    project: 'Simple Vlog 056',
+    projectIds: ['project-simple-vlog-056'],
     hue: 12,
   },
 ];
