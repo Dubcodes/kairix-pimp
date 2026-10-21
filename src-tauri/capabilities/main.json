@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Minimal shell permissions; filesystem work is exposed only through validated application commands.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
