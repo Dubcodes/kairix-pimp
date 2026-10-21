@@ -287,9 +287,13 @@ describe('FFmpeg integration', () => {
 });
 
 describe('path safety', () => {
-  it.each(['../escape', '..\\escape', 'C:\\outside'])(
-    'rejects out-of-root path %s',
-    (candidate) =>
-      expect(() => resolveWithin('C:\\master', candidate)).toThrow(),
+  it.each([
+    '../escape',
+    '..\\escape',
+    'C:\\outside',
+    '/outside',
+    '\\\\server\\share',
+  ])('rejects out-of-root path %s', (candidate) =>
+    expect(() => resolveWithin(path.resolve('master'), candidate)).toThrow(),
   );
 });

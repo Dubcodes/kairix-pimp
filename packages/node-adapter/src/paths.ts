@@ -4,14 +4,20 @@ import path from 'node:path';
 export function assertSafeRelativePath(relativePath: string): string {
   if (
     !relativePath ||
-    path.isAbsolute(relativePath) ||
+    path.win32.isAbsolute(relativePath) ||
+    path.posix.isAbsolute(relativePath) ||
     relativePath.includes('\0')
   )
     throw new Error('Path must be a safe relative path');
-  const normalized = path.normalize(relativePath);
-  if (normalized === '..' || normalized.startsWith(`..${path.sep}`))
+  const segments = relativePath.split(/[\\/]+/);
+  if (segments.some((segment) => segment === '..'))
     throw new Error('Path escapes the configured root');
-  return normalized;
+  const safeSegments = segments.filter(
+    (segment) => segment.length > 0 && segment !== '.',
+  );
+  if (safeSegments.length === 0)
+    throw new Error('Path must be a safe relative path');
+  return path.join(...safeSegments);
 }
 
 export function resolveWithin(root: string, relativePath: string): string {
