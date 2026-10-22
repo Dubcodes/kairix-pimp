@@ -4,23 +4,21 @@
 
 ```text
 Master Bin/
-  media/YYYY-MM-DD/...
+  YYYY-MM-DD/...
   .pimp/
     catalogue.json
-    settings.json
+    shared-settings.json
     events/<device-id>.jsonl
-    previews/<media-id>/...
-    ai/<media-id>/<processor-version>.json
 Working Project/
   .pimp-project.json
   existing Premiere, music, graphics, image and asset directories
 ```
 
-`catalogue.json` identifies the format; state is derived from immutable JSON Lines events. A device appends only to its own file. A local SQLite database is a disposable projection and is never synchronized.
+`catalogue.json` is the current native read model. The host also appends audit records only to its device-partitioned JSON Lines file. Cross-device replay of those files into the snapshot is not implemented yet, so this milestone must not be represented as fully Syncthing-conflict-safe. Device settings, absolute project-path mappings and the bounded thumbnail cache live in the operating-system application-data location (or another explicitly configured device-local cache), not in portable metadata. A future local SQLite database remains a disposable projection and must never be synchronized.
 
 ## Identities and records
 
-- Media ID: currently `sha256:<full-file-sha256>`. A later alias/resource layer can distinguish two intentional identical copies without changing content identity.
+- Media ID: UUID for the catalogue item; full-file SHA-256 is stored separately for integrity and duplicate detection. This permits future location records and intentional identical copies.
 - Folder and project IDs: UUIDs, independent of names and paths.
 - Paths: normalized relative paths rooted at Master Bin or a project.
 - Date: ISO 8601 value plus `embedded`, `filesystem`, or `unknown` provenance; timezone retained when available.
@@ -35,3 +33,5 @@ Future schema migrations are pure, version-to-version transforms. Unknown newer 
 ## Project manifest
 
 `.pimp-project.json` embeds project identity and portable media references (ID, Master Bin relative path, checksum, tags). Its working directory is `.`. Updating the manifest uses atomic replacement and does not recreate or delete asset directories.
+
+The manifest writer creates the stable project record without restructuring or deleting existing project content. Additive media assignments update both the catalogue and each affected manifest with portable media references; absolute project paths remain device-local.

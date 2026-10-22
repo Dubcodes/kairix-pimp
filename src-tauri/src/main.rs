@@ -1,1 +1,3 @@
-fn main() { kairix_pimp_lib::run(); }
+fn main() {
+    kairix_pimp_lib::run();
+}

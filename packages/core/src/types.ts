@@ -7,6 +7,12 @@ export interface DeviceSettings {
   deviceId: string;
   masterBinPath: string;
   workingProjectsPath: string;
+  catalogueInMasterBin?: boolean;
+  sharedCataloguePath?: string;
+  thumbnailCachePath?: string;
+  thumbnailCacheLimitBytes?: number;
+  initializedCataloguePath?: string;
+  projectPaths?: Record<string, string>;
 }
 
 export interface SharedSettings {
@@ -37,6 +43,11 @@ export interface MediaItem {
   tags: string[];
   projectIds: string[];
   technical: TechnicalMetadata;
+  notes?: string;
+  thumbnailPath?: string;
+  attachedAudioId?: string;
+  available?: boolean;
+  needsReview?: boolean;
   missing?: boolean;
 }
 

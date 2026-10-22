@@ -29,6 +29,10 @@ key.pem
 Thumbs.db
 coverage/
 .test-tmp/
+.tools/
+.cargo-home/
+.rustup-home/
+.test-fixtures/
 *.tsbuildinfo
 src-tauri/gen/
 

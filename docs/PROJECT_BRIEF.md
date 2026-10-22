@@ -30,10 +30,10 @@ AI processing is optional, local, modular, cancellable, and unable to block ordi
 
 ## Current implementation — October 2026
 
-Implemented and automated-test covered today: portable TypeScript domain records, event replay and conflict surfacing, date selection, combined catalogue search, safe-path checks, Node-based atomic settings/catalogue/project manifests, checksum-verified single-file ingest, collision/duplicate/cancellation behavior, FFprobe metadata, FFmpeg thumbnails, and a React development UI.
+Implemented now: the tested portable core and Node reference adapter plus a compiled Tauri host for device/shared settings, restricted file and folder selection, native drops, recursive verified ingest, progress/cancellation, collision reporting and explicit incoming-copy rename, persisted catalogue records, project manifests, stable-file discovery, FFprobe metadata and FFmpeg thumbnails. The real Library supports folder browsing, combined search, multi-selection, additive tags and multiple project assignments.
 
-The UI uses synthetic fixture data. It provides the application shell, library search/folders/cards, multi-selection, shared accessible searchable tag/project controls, many-to-many fixture project assignment, and the required ingest date choices. These fixture mutations are not persisted to the real catalogue.
+Normal operation contains no synthetic catalogue entries. New devices show setup and empty-library guidance. A 30-second reconciliation scan plus manual Rescan discovers stable media copied directly into Master Bin and marks it for review; notification-based watching and durable restart recovery are still planned.
 
-Scaffolded but not verified here: the Tauri 2 shell and capability file. Native filesystem commands, folder drop/pickers, durable jobs, and real UI-to-catalogue persistence remain incomplete.
+Native compilation, unsigned MSI/NSIS packaging and an ingest/restart acceptance pass are verified on Windows. Release signing and upgrades, cross-device event replay into the snapshot, folder notes, preview-frame selection and bounded-cache eviction remain incomplete.
 
-Planned, not functional: Premiere integration, Full-edition AI processing, verified consolidation/archive, destructive cleanup, installers, and Linux/macOS releases. See the [roadmap](DEVELOPMENT_ROADMAP.md) and [testing strategy](TESTING.md) for the exact boundaries.
+Planned, not functional: Premiere integration, Full-edition AI processing, verified consolidation/archive, destructive cleanup, signed release delivery, and Linux/macOS releases. See the [roadmap](DEVELOPMENT_ROADMAP.md) and [testing strategy](TESTING.md) for the exact boundaries.

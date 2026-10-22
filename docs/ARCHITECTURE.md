@@ -2,7 +2,7 @@
 
 ## Current status and boundaries
 
-PIMP uses a Tauri 2 desktop shell, a React/TypeScript frontend, portable TypeScript domain logic, and narrow native adapters. The Node adapter is the automated-test reference for filesystem behavior. The Rust/Tauri host is scaffolded but its commands and a native Windows build are not complete; the current UI runs against synthetic in-memory fixture state.
+PIMP uses a Tauri 2 desktop shell, a React/TypeScript frontend, portable TypeScript domain logic, and narrow native adapters. The Node adapter remains the detailed automated-test reference for filesystem behavior. The compiled Rust/Tauri host exposes only settings, catalogue, ingest, metadata, project, rescan and known-media path operations; normal UI state comes from the persisted catalogue rather than fixtures.
 
 Tauri was selected over Electron for a smaller runtime distribution and explicit capability boundaries. React supports composable accessible UI. Rust is reserved for trusted host operations and durable orchestration; FFmpeg remains an external child process invoked with explicit argument arrays.
 
@@ -47,6 +47,8 @@ The implemented single-file reference transaction:
 
 Recursive ingest needs a durable journal. Long work must execute outside the render thread with stable job IDs, item/progress events, cancellation, bounded concurrency, retries, and restart recovery. Event handlers must be idempotent because reconnect/replay can redeliver state.
 
+The current host implements stable job IDs, byte/file progress, cancellation and partial-file cleanup, but the durable journal and restart recovery remain pending. FFprobe and thumbnail enrichment run after successful ingest and cannot invalidate a verified copy. External discovery uses a conservative stable-file scan every 30 seconds and an explicit Rescan command; a native notification watcher is still pending.
+
 ## Metadata, search, and Syncthing
 
 The synchronized Master Bin contains portable relative paths, stable IDs, a small catalogue descriptor, and device-partitioned append-only event logs. Devices never write another device's stream. Deterministic replay deduplicates event IDs and retains ambiguous concurrent updates for resolution.
@@ -73,6 +75,8 @@ Full-edition analysis runs behind an optional process-isolated `AiProcessor` con
 ## Premiere and archive boundaries
 
 A future UXP extension uses documented active-project, import, folder/bin, and media-path APIs. PIMP reconciles Premiere's observed contents with its manifest and never edits `.prproj` internals. The extension and desktop app communicate through a versioned, authenticated local boundary still to be designed and tested.
+
+Until that extension exists, the default editing workflow references footage directly from Master Bin. Working Project folders and their existing Premiere saves/assets are not restructured, and users continue to use Premiere's normal desktop/laptop drive-path relinking.
 
 Finalization builds a dependency inventory, copies or derives an archive, verifies integrity, and validates that the Premiere project resolves independently of the Master Bin. Complete-source mode precedes consolidation/transcode. Derived media gets a new checksum plus derivation/time-range provenance rather than pretending to match the source hash. Cleanup eligibility is a separate stage that considers every active project, Syncthing state, explicit authorization, and recoverable quarantine.
 

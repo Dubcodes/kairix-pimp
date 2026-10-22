@@ -1,20 +1,18 @@
 # Development roadmap
 
-## Milestone 1 — foundation (current)
+## Milestone 1 — foundation (complete)
 
 Implemented and automated-test covered: domain types, date selection/fallback, folder metadata suggestions, deterministic event replay/deduplication, conflict surfacing, combined text search, path traversal rejection, atomic settings/manifests, safe file ingest, SHA-256 verification, collisions, duplicates, cancellation cleanup, malformed-event reporting, and project manifest preservation.
 
 Implemented and tested with generated media: FFprobe metadata extraction and FFmpeg thumbnail generation for H.264 and H.265/HEVC fixtures.
 
-UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection, Light status, and the two required date mode names. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation. The displayed media and its mutations are clearly development fixture state. Native filesystem/drag-drop wiring and real catalogue persistence are not complete.
+UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection, Light status, and the two required date mode names. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation.
 
-Scaffolded: Tauri 2 application and minimal capability policy. Native build is unverified due to missing Rust/MSVC tools.
+## Milestone 2 — production ingest and advanced library (in progress)
 
-## Milestone 2 — production ingest and advanced library
-
-- Native folder picker/drop events and recursive directory ingest preserving camera structures
+- Implemented: native picker/drop, recursive inventory, verified copies, persisted real Library, per-ingest date overrides, explicit collision rename, projects, manual/periodic discovery, metadata/thumbnails and conservative same-stem MP4/WAV pairing
 - Durable resumable job journal, pause/cancel, throughput and per-file progress
-- Media fixtures for H.264/H.265 probe and thumbnail regression tests
+- Native notification watcher, event-log replay into the cross-device projection, bounded thumbnail eviction, alternate thumbnail frames, folder notes and richer conflict workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Contact sheets, preview player, custom thumbnails, folder rename/move journal
 - Evidence-scored and reversible DJI camera/audio pairing

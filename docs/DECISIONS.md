@@ -91,3 +91,27 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Decision:** Build one Kairix-styled `SearchableComboBox` on Ariakit, supporting single/multiple selection and explicit creation.
 - **Rationale:** Ariakit provides maintained WAI-ARIA behavior, keyboard/focus handling, and portal/edge-aware positioning without imposing a UI framework. Kairix retains filtering and data semantics.
 - **Consequences:** `@ariakit/react` is a production dependency; UI tests cover the shared contract. Rendering is capped at 100 filtered options, so users narrow very large lists by typing; true windowed virtualization can be added if measured data sizes require it.
+
+## ADR-010 — Direct Master Bin editing workflow
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Projects reference footage directly from Master Bin by default. PIMP leaves existing project directories intact and relies on Premiere's normal user-managed drive-path relinking between computers until a tested UXP extension exists.
+
+## ADR-011 — Temporary ingest-date overrides
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Today, Yesterday and Choose date are request-scoped overrides. They do not become a third persistent organization mode or modify the remembered two-mode preference.
+
+## ADR-012 — Configurable catalogue with migration lock
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Shared metadata may live under `Master Bin/.pimp` or at an explicit shared path. Once initialized, the native host rejects location changes until a verified migration workflow exists rather than silently abandoning data.
+
+## ADR-013 — Discovery and future location-aware records
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** The initial host performs stable-file reconciliation periodically and on demand without moving external copies. A notification watcher, multiple physical locations, independent availability/verification state, offline Cathy records, system theme and optional grid/list layout remain compatible future extensions rather than claims of current implementation.

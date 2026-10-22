@@ -15,7 +15,8 @@ body {
     radial-gradient(circle at 75% -20%, #1c2821 0, transparent 36%), #090c0b;
 }
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 .app-shell {
@@ -115,6 +116,15 @@ input {
   justify-content: space-between;
   font-size: 10px;
   color: #667068;
+}
+.storage > small {
+  display: block;
+  color: #56625a;
+  font-size: 9px;
+  margin-top: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .edition {
   margin: 3px 8px 0;
@@ -333,6 +343,28 @@ article.selected {
     hsl(calc(var(--hue) + 35) 30% 8%)
   );
   overflow: hidden;
+}
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.thumb.unavailable {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+.thumb .file-kind {
+  inset: 0;
+  right: auto;
+  bottom: auto;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-size: 15px;
+  color: #8d9a91;
 }
 .thumb:before,
 .thumb:after {
@@ -684,6 +716,195 @@ article footer span {
 .pending {
   margin-top: 14px;
   color: #78857b;
+  font-size: 10px;
+}
+.notice {
+  margin: 12px 29px 0;
+  border: 1px solid #49603f;
+  background: #172018;
+  color: #caddbd;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  justify-content: space-between;
+  gap: 15px;
+  white-space: pre-wrap;
+  font-size: 11px;
+}
+.notice.error {
+  border-color: #75443f;
+  background: #251514;
+  color: #f0b5ad;
+}
+.notice button,
+.link {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.empty {
+  margin: 28px;
+  padding: 35px;
+  border: 1px solid #28302b;
+  border-radius: 12px;
+  background: #111613;
+  color: #78837b;
+  text-align: center;
+}
+.empty h2 {
+  color: #e3ebe5;
+}
+.empty p {
+  line-height: 1.6;
+}
+.settings-form {
+  max-width: 780px;
+  margin: 30px;
+  padding: 28px;
+  border: 1px solid #28302b;
+  border-radius: 12px;
+  background: #111613;
+  display: grid;
+  gap: 17px;
+}
+.settings-form h2,
+.settings-form p {
+  margin: 0;
+}
+.settings-form p,
+.settings-form > small {
+  color: #7d8a80;
+  line-height: 1.5;
+}
+.settings-form > label {
+  display: grid;
+  gap: 7px;
+  color: #aab5ad;
+  font-size: 11px;
+  font-weight: 700;
+}
+.settings-form input,
+.mode input[type='date'] {
+  min-width: 0;
+  border: 1px solid #39433c;
+  border-radius: 7px;
+  background: #0b0f0d;
+  color: #edf2ee;
+  padding: 10px;
+}
+.path-field {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+.path-field button,
+.mode > button:not(.primary) {
+  border: 1px solid #39433c;
+  border-radius: 7px;
+  background: #1a211d;
+  color: #d4ded7;
+  padding: 8px 12px;
+}
+.settings-form fieldset {
+  border: 1px solid #303a33;
+  border-radius: 8px;
+  color: #aab5ad;
+  display: flex;
+  gap: 20px;
+  font-size: 11px;
+}
+.check-field {
+  display: flex !important;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+.primary {
+  justify-self: start;
+  border: 0;
+  border-radius: 7px;
+  background: #d6f85f;
+  color: #17200f;
+  padding: 11px 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.button-row {
+  display: flex;
+  gap: 9px;
+}
+.source-list {
+  width: min(620px, 85%);
+  margin-top: 18px;
+  border: 1px solid #303a33;
+  border-radius: 8px;
+  padding: 12px;
+  text-align: left;
+  display: grid;
+  gap: 5px;
+}
+.source-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drop progress {
+  width: min(620px, 85%);
+  margin-top: 15px;
+  accent-color: #d6f85f;
+}
+.mode > p {
+  color: #77837a;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.mode > .primary {
+  width: 100%;
+  margin-top: 18px;
+}
+.conflict-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #75443f;
+  border-radius: 8px;
+  color: #e7b6af;
+}
+.conflict-list > small {
+  color: #ad827c;
+  line-height: 1.4;
+}
+.conflict-list label {
+  display: grid;
+  gap: 4px;
+  font-size: 9px;
+  overflow: hidden;
+}
+.project-list {
+  display: grid;
+  gap: 8px;
+}
+.project-list > div {
+  border: 1px solid #303a33;
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 15px;
+}
+.project-list small {
+  color: #6f7c73;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-list span {
+  color: #96a59a;
   font-size: 10px;
 }
 .mode {
