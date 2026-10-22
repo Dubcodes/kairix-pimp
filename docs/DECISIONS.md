@@ -115,3 +115,73 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Date:** 2026-10-22
 - **Status:** Accepted
 - **Decision:** The initial host performs stable-file reconciliation periodically and on demand without moving external copies. A notification watcher, multiple physical locations, independent availability/verification state, offline Cathy records, system theme and optional grid/list layout remain compatible future extensions rather than claims of current implementation.
+
+## ADR-014 — Schema-2 causal event authority
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Per-device schema-2 JSONL streams are the sole authoritative catalogue metadata. Envelopes carry event/device IDs, monotonic device sequence, observed sequence vector and typed payload. Tags and project memberships use causal add/remove events; concurrent scalar writes are retained as conflicts. Wall-clock time is informational only.
+- **Consequences:** The native projection is rebuilt from events. `catalogue.json` becomes a retained legacy input after idempotent migration. Conflict resolution UI and eventual compaction remain separate work.
+
+## ADR-015 — Migration without destructive conversion
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Existing snapshots become deterministic bootstrap events while their original bytes and a recovery backup remain intact. V1 TypeScript and Rust envelopes are adapted during replay; newer unsupported records are reported and untouched.
+- **Consequences:** Migration can be restarted safely and preserves IDs and final snapshot metadata. Damaged snapshots stop migration instead of creating an empty library.
+
+## ADR-016 — Private same-filesystem ingest staging
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Native ingest stages in a device-owned hidden sibling of Master Bin, never inside the synchronized tree. A small local journal identifies owned incomplete work. Verified files are promoted using an OS no-replace operation.
+- **Consequences:** A Master Bin whose parent cannot host private staging fails closed. Journals recover abandoned staging but do not yet resume byte ranges.
+
+## ADR-017 — Conservative evidence-based discovery
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** External files require repeated unchanged observations spanning at least 15 seconds before hashing and registration. Existing paths are not permanently skipped; changed evidence triggers revalidation and review.
+- **Consequences:** Discovery intentionally has latency and still cannot prove an external producer has closed a file. A watcher or Syncthing completion signal may strengthen this later.
+
+## ADR-018 — Portable thumbnail references and generated manifests
+
+- **Date:** 2026-10-22
+- **Status:** Accepted
+- **Decision:** Catalogue thumbnail values are cache-relative filenames resolved beneath the configured local cache. Project manifests are portable generated projections; incompatible existing identities are rejected rather than overwritten.
+- **Consequences:** Absolute legacy thumbnail paths are reduced to safe cache references. Cache-budget eviction and field-level project conflict UX remain deferred.
+
+## ADR-019 — DCM naming and configurable date presentation
+
+- **Date:** 2026-10-23
+- **Status:** Accepted
+- **Decision:** Use **DCM Master Bin** as the product term and default root-folder name. Retain the two organization modes, default a future date-format preference to `yyyyMMdd`, and never rename existing date folders when that preference changes.
+- **Consequences:** Date formatting is presentation/configuration work, not a migration of existing media paths.
+
+## ADR-020 — Durable ingest intent metadata
+
+- **Date:** 2026-10-23
+- **Status:** Accepted
+- **Decision:** Future ingest jobs may carry tags, project assignments, descriptions and favourites. Queued/incomplete intent is persisted independently and survives retry; it becomes catalogue metadata only after verified promotion. Do not impose a rigid tag-count cap.
+- **Consequences:** The persistent job schema needs versioned intent fields and must not expose an incomplete item as committed media.
+
+## ADR-021 — Direct Premiere layout and explicit project collection
+
+- **Date:** 2026-10-23
+- **Status:** Accepted
+- **Decision:** Premiere edits directly from DCM Master Bin, with dated bins and an optional virtual Audio grouping. A collected `.prproj` inside DCM Content becomes the authoritative editing project for the existing stable project ID only after an explicit verified collection workflow; file presence alone does not imply collection.
+- **Consequences:** Collection needs a state event, identity validation, dependency verification and rollback-safe archive construction.
+
+## ADR-022 — Verification-gated, recoverable cleanup
+
+- **Date:** 2026-10-23
+- **Status:** Accepted
+- **Decision:** Cleanup automation is future, opt-in and disabled by default. Eligibility requires successful finalization verification, per-file protection and cross-project reference checks. Removal first uses recoverable quarantine; Syncthing replicas do not count as backups.
+- **Consequences:** No deletion behavior is added in the reliability milestone. Later purge requires separate authorization and retention policy.
+
+## ADR-023 — Searchable completed-project records and persistent jobs
+
+- **Date:** 2026-10-23
+- **Status:** Accepted
+- **Decision:** Keep completed projects as lightweight searchable catalogue records and give each portable local archive its stable project identity and media manifest. Public-link and YouTube metadata remain deferred. Long-running work will use a persistent startup-resumed job manager.
+- **Consequences:** Project history remains usable when archive media is offline; job persistence must distinguish intent, progress, committed effects and retryable enrichment.

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import {
   SCHEMA_VERSION,
   type MediaItem,
@@ -19,6 +19,22 @@ export async function writeProjectManifest(
   );
   await mkdir(directory, { recursive: true });
   const target = path.join(directory, '.pimp-project.json');
+  try {
+    const existing = JSON.parse(await readFile(target, 'utf8')) as {
+      schemaVersion?: number;
+      id?: string;
+      project?: { id?: string };
+    };
+    if (
+      (existing.schemaVersion ?? 1) > SCHEMA_VERSION ||
+      (existing.id ?? existing.project?.id) !== project.id
+    )
+      throw new Error(
+        'Existing .pimp-project.json is incompatible and was not overwritten',
+      );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   await atomicWrite(
     target,
     JSON.stringify(

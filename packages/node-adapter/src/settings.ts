@@ -1,10 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import {
-  SCHEMA_VERSION,
-  type DeviceSettings,
-  type SharedSettings,
-} from '@kairix-pimp/core';
+import type { DeviceSettings, SharedSettings } from '@kairix-pimp/core';
 import { atomicWrite } from './atomic.js';
 
 export async function saveDeviceSettings(
@@ -34,7 +30,7 @@ export async function saveSharedSettings(
   masterBin: string,
   settings: SharedSettings,
 ): Promise<void> {
-  if (settings.schemaVersion !== SCHEMA_VERSION)
+  if (settings.schemaVersion !== 1)
     throw new Error('Unsupported shared settings schema');
   await atomicWrite(
     path.join(masterBin, '.pimp', 'settings.json'),
@@ -49,7 +45,7 @@ export async function loadSharedSettings(
     const parsed = JSON.parse(
       await readFile(path.join(masterBin, '.pimp', 'settings.json'), 'utf8'),
     ) as SharedSettings;
-    if (parsed.schemaVersion !== SCHEMA_VERSION)
+    if (parsed.schemaVersion !== 1)
       throw new Error('Unsupported shared settings schema');
     return parsed;
   } catch (error) {

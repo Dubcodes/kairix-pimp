@@ -37,7 +37,7 @@ Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 
 - Treat original media as immutable. Never delete, truncate, rewrite, or rename a source file.
 - Never silently overwrite an existing destination. Detect collisions and report ambiguity.
-- Destination writes use a sibling temporary file, independent source/destination checksums, and atomic promotion.
+- Destination writes stage in an application-owned same-filesystem directory outside the synchronized Master Bin, recheck source consistency, independently verify staged bytes, and use atomic no-overwrite promotion.
 - Reject paths outside configured roots after canonical resolution; string-prefix checks are insufficient.
 - Make operations idempotent and interruption-safe where practical. Tests use synthetic media and repository-local or OS-provided disposable fixture directories only.
 - Do not add source deletion or destructive cleanup without a separately reviewed design, explicit authorization, archive-independence verification, and recoverable quarantine.

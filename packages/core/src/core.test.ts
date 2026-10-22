@@ -26,11 +26,12 @@ const envelope = (
   deviceId = 'a',
   occurredAt = '2026-10-18T00:00:00Z',
 ): EventEnvelope => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   eventId: id,
   deviceId,
   sequence: 1,
   occurredAt,
+  observed: {},
   event,
 });
 
@@ -65,35 +66,137 @@ describe('catalogue reducer', () => {
       envelope({ type: 'media.registered', media }),
       envelope(
         {
-          type: 'media.tags-set',
+          type: 'media.tags.added',
           mediaId: 'm1',
-          tags: ['Workshop', 'Workshop'],
+          values: ['Workshop', 'Workshop'],
         },
         'e2',
       ),
       envelope(
-        { type: 'media.projects-set', mediaId: 'm1', projectIds: ['p2', 'p1'] },
+        { type: 'media.projects.added', mediaId: 'm1', values: ['p2', 'p1'] },
         'e3',
       ),
     ]);
     expect(state.media.m1.tags).toEqual(['Workshop']);
     expect(state.media.m1.projectIds).toEqual(['p1', 'p2']);
   });
-  it('surfaces simultaneous independent edits instead of silently overwriting', () => {
+  it('merges simultaneous independent set additions', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),
       envelope(
-        { type: 'media.tags-set', mediaId: 'm1', tags: ['A'] },
+        { type: 'media.tags.added', mediaId: 'm1', values: ['A'] },
         'e2',
         'device-a',
       ),
       envelope(
-        { type: 'media.tags-set', mediaId: 'm1', tags: ['B'] },
+        { type: 'media.tags.added', mediaId: 'm1', values: ['B'] },
         'e3',
         'device-b',
       ),
     ]);
+    expect(state.media.m1.tags).toEqual(['A', 'B']);
+    expect(state.conflicts).toHaveLength(0);
+  });
+  it('retains concurrent scalar values as a conflict despite clock skew', () => {
+    const registered = envelope({ type: 'media.registered', media });
+    const first = envelope(
+      { type: 'media.notes.set', mediaId: 'm1', value: 'Desktop note' },
+      'e2',
+      'desktop',
+      '2030-01-01T00:00:00Z',
+    );
+    const second = envelope(
+      { type: 'media.notes.set', mediaId: 'm1', value: 'Laptop note' },
+      'e3',
+      'laptop',
+      '2020-01-01T00:00:00Z',
+    );
+    const state = rebuildCatalogue([second, registered, first]);
     expect(state.conflicts).toHaveLength(1);
+    expect(state.conflicts[0].values).toEqual(['Desktop note', 'Laptop note']);
+  });
+  it('only removes set additions observed by the removing device', () => {
+    const registered = envelope({ type: 'media.registered', media });
+    const desktopAdd = envelope(
+      { type: 'media.tags.added', mediaId: 'm1', values: ['Track'] },
+      'e2',
+      'desktop',
+    );
+    const laptopAdd = envelope(
+      { type: 'media.tags.added', mediaId: 'm1', values: ['Night'] },
+      'e3',
+      'laptop',
+    );
+    const remove = {
+      ...envelope(
+        {
+          type: 'media.tags.removed',
+          mediaId: 'm1',
+          values: ['Track', 'Night'],
+        },
+        'e4',
+        'desktop',
+      ),
+      sequence: 2,
+      observed: { desktop: 1 },
+    };
+    expect(
+      rebuildCatalogue([laptopAdd, remove, registered, desktopAdd]).media.m1
+        .tags,
+    ).toEqual(['Night']);
+  });
+  it('replays enrichment and changed-file evidence from the canonical contract', () => {
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media }),
+      envelope(
+        {
+          type: 'media.enriched',
+          mediaId: 'm1',
+          technical: { sizeBytes: 2, width: 1920, height: 1080 },
+          thumbnailRef: 'm1.jpg',
+        },
+        'e2',
+      ),
+      envelope(
+        {
+          type: 'media.evidence-observed',
+          mediaId: 'm1',
+          observedSize: 3,
+          observedModifiedMillis: 42,
+          needsReview: true,
+        },
+        'e3',
+      ),
+    ]);
+    expect(state.media.m1).toMatchObject({
+      technical: { sizeBytes: 2, width: 1920, height: 1080 },
+      thumbnailPath: 'm1.jpg',
+      observedSize: 3,
+      observedModifiedMillis: 42,
+      needsReview: true,
+    });
+  });
+  it('surfaces concurrent project record changes', () => {
+    const project = {
+      id: 'p1',
+      name: 'One',
+      workingDirectory: 'one',
+      mediaIds: ['m1'],
+      createdAt: '2026-10-18T00:00:00Z',
+    };
+    const state = rebuildCatalogue([
+      envelope({ type: 'project.upserted', project }, 'p-a', 'desktop'),
+      envelope(
+        {
+          type: 'project.upserted',
+          project: { ...project, name: 'Two' },
+        },
+        'p-b',
+        'laptop',
+      ),
+    ]);
+    expect(state.conflicts).toHaveLength(1);
+    expect(state.conflicts[0].field).toBe('project');
   });
   it('searches filename, folder tags and projects', () => {
     const state = rebuildCatalogue([
@@ -124,7 +227,7 @@ describe('catalogue reducer', () => {
         'e3',
       ),
       envelope(
-        { type: 'media.projects-set', mediaId: 'm1', projectIds: ['p1'] },
+        { type: 'media.projects.added', mediaId: 'm1', values: ['p1'] },
         'e4',
       ),
     ]);

@@ -31,7 +31,7 @@ The frontend never receives broad arbitrary-filesystem permission. A host comman
 - `apps/desktop`: presentation and local interaction state. `SearchableComboBox` is the shared stable-ID selector for growing lists; Ariakit supplies ARIA/keyboard/focus/popover primitives while PIMP supplies filtering, result caps, explicit creation, and styling.
 - `packages/core`: platform-neutral identities, catalogue events/projection, search, date rules, and optional AI contracts. It cannot import browser, Node, Tauri, OS, or model dependencies.
 - `packages/node-adapter`: tested reference filesystem/process implementation for atomic records, safe ingest, manifests, FFprobe, and thumbnails.
-- `src-tauri`: planned production trust boundary for purpose-built commands, capability enforcement, OS integration, and durable job control.
+- `src-tauri`: production trust boundary for purpose-built commands, event replay/migration, capability enforcement, safe ingest/discovery, OS integration, and minimal durable operation records.
 - future adapters/workers: local SQLite/FTS projection, Syncthing read-only status, optional Full AI workers, and Premiere UXP extension.
 
 ## Ingest and background jobs
@@ -41,17 +41,20 @@ The implemented single-file reference transaction:
 1. Snapshot source metadata and select capture date with provenance.
 2. Resolve a destination under `media/YYYY-MM-DD` and enforce its canonical root.
 3. Recognize an identical hash as a duplicate; reject different content at an existing path.
-4. Hash the source, stream to a unique sibling `.pimp-part-*` file, independently hash it, compare, then atomically rename.
-5. Append `media.registered` only after successful promotion.
-6. Probe and preview as separately retryable work; their failure does not invalidate the verified ingest.
+4. Record the operation in a device-local journal and stream to an application-owned staging sibling outside the synchronized Master Bin.
+5. Recheck source evidence and hash, independently hash staged bytes, then atomically create the destination name without replacement.
+6. Append and flush `media.registered` only after successful promotion. A persistence failure leaves a verified orphan that conservative discovery can recover; it never rolls back by deleting the media.
+7. Probe and preview as separately retryable work; their failure does not invalidate the verified ingest.
 
-Recursive ingest needs a durable journal. Long work must execute outside the render thread with stable job IDs, item/progress events, cancellation, bounded concurrency, retries, and restart recovery. Event handlers must be idempotent because reconnect/replay can redeliver state.
+Long work executes outside the render thread with stable job IDs, progress events and cancellation. A minimal journal identifies abandoned PIMP-owned staging files after restart. Byte-offset resume and retry scheduling remain future work. Event handlers are idempotent because reconnect/replay can redeliver state.
 
-The current host implements stable job IDs, byte/file progress, cancellation and partial-file cleanup, but the durable journal and restart recovery remain pending. FFprobe and thumbnail enrichment run after successful ingest and cannot invalidate a verified copy. External discovery uses a conservative stable-file scan every 30 seconds and an explicit Rescan command; a native notification watcher is still pending.
+The target job architecture persists versioned intent, progress and retry state for ingest, enrichment, consolidation and cleanup, then resumes eligible work at startup. Ingest intent will include initial tags, projects, description and favourite state without making incomplete media visible in the committed catalogue.
+
+FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. A native notification watcher remains pending.
 
 ## Metadata, search, and Syncthing
 
-The synchronized Master Bin contains portable relative paths, stable IDs, a small catalogue descriptor, and device-partitioned append-only event logs. Devices never write another device's stream. Deterministic replay deduplicates event IDs and retains ambiguous concurrent updates for resolution.
+The synchronized Master Bin contains portable relative paths, stable IDs and device-partitioned append-only schema-2 event logs. Devices never write another device's stream. Deterministic replay deduplicates event IDs, uses causal vectors for set additions/removals and retains ambiguous concurrent scalar updates for resolution. The legacy snapshot is retained for recovery but is no longer operational state.
 
 ```text
 device A events ─┐
@@ -64,7 +67,7 @@ SQLite/FTS is a disposable device-local search projection, never a synchronized 
 
 ## Identity and project architecture
 
-Content hashes currently provide stable media identity; folder and project IDs are independent of names and paths. Portable records use `/`-separated relative paths. Device settings map Master Bin and Working Projects roots locally.
+Stable media IDs are independent of content hashes, names and paths; SHA-256 remains integrity and duplicate evidence. Folder and project IDs are likewise path-independent. Portable records use `/`-separated relative paths. Device settings map Master Bin and Working Projects roots locally.
 
 Media contains `projectIds[]`, so assignments are many-to-many. Each working directory owns an atomically updated `.pimp-project.json` manifest containing portable media identities, paths, checksums, and relevant metadata without recreating or deleting existing assets. See [DATA_MODEL.md](DATA_MODEL.md).
 
@@ -78,7 +81,11 @@ A future UXP extension uses documented active-project, import, folder/bin, and m
 
 Until that extension exists, the default editing workflow references footage directly from Master Bin. Working Project folders and their existing Premiere saves/assets are not restructured, and users continue to use Premiere's normal desktop/laptop drive-path relinking.
 
+The established product layout calls that source root **DCM Master Bin**. Dated folders become Premiere bins and an optional virtual Audio grouping may expose paired audio without moving it. A future explicit collection workflow writes a verified portable archive under DCM Content; only its successful state transition makes the collected `.prproj` authoritative for the stable project ID.
+
 Finalization builds a dependency inventory, copies or derives an archive, verifies integrity, and validates that the Premiere project resolves independently of the Master Bin. Complete-source mode precedes consolidation/transcode. Derived media gets a new checksum plus derivation/time-range provenance rather than pretending to match the source hash. Cleanup eligibility is a separate stage that considers every active project, Syncthing state, explicit authorization, and recoverable quarantine.
+
+Completed projects retain lightweight searchable catalogue records even when archive media is offline. Future cleanup automation remains disabled by default, honors per-file protection, treats Syncthing peers as replicas rather than backups, and cannot bypass verification or recoverable quarantine.
 
 ## Errors and recovery
 

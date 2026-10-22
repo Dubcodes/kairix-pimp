@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1 as const;
+export const SCHEMA_VERSION = 2 as const;
 
 export type DateOrganization = 'today' | 'original-file-dates';
 export type MetadataOrigin = 'manual' | 'technical' | 'ai-suggestion';
@@ -16,7 +16,7 @@ export interface DeviceSettings {
 }
 
 export interface SharedSettings {
-  schemaVersion: typeof SCHEMA_VERSION;
+  schemaVersion: number;
   ingestDateOrganization: DateOrganization;
   updatedAt: string;
   updatedBy: string;
@@ -29,6 +29,7 @@ export interface TechnicalMetadata {
   codec?: string;
   frameRate?: number;
   sizeBytes: number;
+  hasAudio?: boolean;
 }
 
 export interface MediaItem {
@@ -40,6 +41,7 @@ export interface MediaItem {
   captureDateProvenance: 'embedded' | 'filesystem' | 'unknown';
   captureTimezone?: string;
   ingestDate: string;
+  fileType?: string;
   tags: string[];
   projectIds: string[];
   technical: TechnicalMetadata;
@@ -48,6 +50,8 @@ export interface MediaItem {
   attachedAudioId?: string;
   available?: boolean;
   needsReview?: boolean;
+  observedSize?: number;
+  observedModifiedMillis?: number;
   missing?: boolean;
 }
 
@@ -65,12 +69,30 @@ export interface ProjectRecord {
   workingDirectory: string;
   mediaIds: string[];
   createdAt: string;
+  notes?: string;
+  tags?: string[];
 }
 
 export type CatalogueEvent =
   | { type: 'media.registered'; media: MediaItem }
-  | { type: 'media.tags-set'; mediaId: string; tags: string[] }
-  | { type: 'media.projects-set'; mediaId: string; projectIds: string[] }
+  | { type: 'media.tags.added'; mediaId: string; values: string[] }
+  | { type: 'media.tags.removed'; mediaId: string; values: string[] }
+  | { type: 'media.projects.added'; mediaId: string; values: string[] }
+  | { type: 'media.projects.removed'; mediaId: string; values: string[] }
+  | { type: 'media.notes.set'; mediaId: string; value: string }
+  | {
+      type: 'media.enriched';
+      mediaId: string;
+      technical: TechnicalMetadata;
+      thumbnailRef?: string;
+    }
+  | {
+      type: 'media.evidence-observed';
+      mediaId: string;
+      observedSize: number;
+      observedModifiedMillis?: number;
+      needsReview: boolean;
+    }
   | { type: 'folder.upserted'; folder: FolderRecord }
   | { type: 'folder.moved'; folderId: string; relativePath: string }
   | { type: 'project.upserted'; project: ProjectRecord };
@@ -81,14 +103,22 @@ export interface EventEnvelope {
   deviceId: string;
   sequence: number;
   occurredAt: string;
+  observed: Record<string, number>;
   event: CatalogueEvent;
+}
+
+export interface MetadataConflict {
+  entityId: string;
+  field: string;
+  eventIds: string[];
+  values: unknown[];
 }
 
 export interface CatalogueState {
   media: Record<string, MediaItem>;
   folders: Record<string, FolderRecord>;
   projects: Record<string, ProjectRecord>;
-  conflicts: EventEnvelope[];
+  conflicts: MetadataConflict[];
   appliedEventIds: string[];
 }
 

@@ -6,19 +6,24 @@
 Master Bin/
   YYYY-MM-DD/...
   .pimp/
-    catalogue.json
-    shared-settings.json
     events/<device-id>.jsonl
+    migration-v2.json
+    catalogue.json                       # legacy, retained read-only
+    catalogue.pre-events-v1.backup.json # migration recovery copy
 Working Project/
   .pimp-project.json
   existing Premiere, music, graphics, image and asset directories
 ```
 
-`catalogue.json` is the current native read model. The host also appends audit records only to its device-partitioned JSON Lines file. Cross-device replay of those files into the snapshot is not implemented yet, so this milestone must not be represented as fully Syncthing-conflict-safe. Device settings, absolute project-path mappings and the bounded thumbnail cache live in the operating-system application-data location (or another explicitly configured device-local cache), not in portable metadata. A future local SQLite database remains a disposable projection and must never be synchronized.
+Schema-2 files under `events/` are authoritative. Each device appends and flushes complete newline-delimited envelopes only to its own stream. The native catalogue is rebuilt from those streams; `catalogue.json` is never updated after its idempotent migration and is not authoritative. Syncthing conflict-copy event files are reported and quarantined from automatic replay.
+
+Device settings, absolute project-path mappings, discovery observations, ingest journals and the thumbnail cache are device-local. Ingest staging is a hidden sibling of Master Bin on the same filesystem rather than a child of the synchronized tree. A future SQLite/FTS database remains a disposable local projection and must never be synchronized.
+
+The remembered ingest date mode is a device preference, not shared production metadata. Legacy `shared-settings.json` is retained but no longer overwritten; this removes its former last-writer-wins role without discarding it.
 
 ## Identities and records
 
-- Media ID: UUID for the catalogue item; full-file SHA-256 is stored separately for integrity and duplicate detection. This permits future location records and intentional identical copies.
+- Media ID: stable UUID for the catalogue item; full-file SHA-256 is stored separately for integrity and duplicate detection. Migration preserves existing IDs.
 - Folder and project IDs: UUIDs, independent of names and paths.
 - Paths: normalized relative paths rooted at Master Bin or a project.
 - Date: ISO 8601 value plus `embedded`, `filesystem`, or `unknown` provenance; timezone retained when available.
@@ -26,12 +31,14 @@ Working Project/
 
 ## Events and conflicts
 
-Event envelopes contain schema version, globally unique event ID, device ID, per-device sequence, timestamp, and payload. Replay deduplicates event IDs. Deterministic ordering makes projection repeatable, but equal-time edits from different devices to the same replace-style field are retained as conflicts for user resolution.
+Every canonical envelope contains schema version `2`, a globally unique event ID, device ID, monotonically increasing per-device sequence, informational wall-clock timestamp, observed per-device sequence vector, and a typed `event` payload. Replay deduplicates event IDs and uses sequence/observed causality rather than clocks.
 
-Future schema migrations are pure, version-to-version transforms. Unknown newer schema versions are quarantined from projection and reported. Malformed lines are reported with filename and line rather than discarded silently.
+Tags and project assignments use add/remove events. A removal affects only additions causally observed by the removing device, so an unrelated concurrent addition survives. Replace-style values such as notes retain concurrent values in `conflicts`; the projection chooses a deterministic display value without destroying either event.
+
+Malformed lines, truncated streams, non-monotonic sequences, owner/filename mismatches and unsupported newer schemas are reported with source locations. Valid records from the same log remain usable. Original logs are never rewritten. Compatible v1 TypeScript and Rust envelopes are read through adapters; the final legacy snapshot is converted to deterministic bootstrap events, with the source snapshot and backup retained.
 
 ## Project manifest
 
-`.pimp-project.json` embeds project identity and portable media references (ID, Master Bin relative path, checksum, tags). Its working directory is `.`. Updating the manifest uses atomic replacement and does not recreate or delete asset directories.
+`.pimp-project.json` is a portable generated projection containing project identity and media references (ID, Master Bin relative path, checksum, tags). Its working directory is `.`. Authoritative project identity, metadata and assignments live in events, so a delayed manifest cannot erase newer edits.
 
-The manifest writer creates the stable project record without restructuring or deleting existing project content. Additive media assignments update both the catalogue and each affected manifest with portable media references; absolute project paths remain device-local.
+The writer recognizes a compatible existing manifest and imports its stable identity. An incompatible or differently identified manifest is rejected without modification. Updates use recoverable atomic replacement and never restructure or delete Premiere files, autosaves or asset directories.

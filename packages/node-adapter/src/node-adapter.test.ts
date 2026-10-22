@@ -177,6 +177,47 @@ describe('metadata durability', () => {
     expect(loaded.state.media.x).toBeDefined();
     expect(loaded.malformed).toHaveLength(1);
   });
+  it('adapts legacy events while quarantining newer schemas and conflict copies', async () => {
+    const { master } = await fixture();
+    await loadCatalogue(master);
+    const events = path.join(master, '.pimp', 'events');
+    await writeFile(
+      path.join(events, 'legacy-device.jsonl'),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        eventId: 'legacy-media',
+        deviceId: 'legacy-device',
+        type: 'media.registered',
+        payload: {
+          id: 'legacy-id',
+          relativePath: '20261022/legacy.mp4',
+          originalFilename: 'legacy.mp4',
+          sha256: 'legacy-hash',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-22T00:00:00Z',
+          tags: ['Imported'],
+          projectIds: [],
+          technical: { sizeBytes: 1 },
+        },
+      })}\n${JSON.stringify({
+        schemaVersion: 99,
+        eventId: 'future',
+        deviceId: 'legacy-device',
+        sequence: 2,
+        event: { type: 'future.event' },
+      })}\n`,
+    );
+    await writeFile(
+      path.join(events, 'legacy-device.sync-conflict-copy.jsonl'),
+      '{"untrusted":true}\n',
+    );
+    const loaded = await loadCatalogue(master);
+    expect(loaded.state.media['legacy-id'].tags).toEqual(['Imported']);
+    expect(loaded.unsupported).toEqual(['legacy-device.jsonl:2']);
+    expect(loaded.conflictCopies).toEqual([
+      'legacy-device.sync-conflict-copy.jsonl',
+    ]);
+  });
   it('keeps device paths local and shared preference portable', async () => {
     const { root, master } = await fixture();
     const local = {
@@ -224,6 +265,28 @@ describe('metadata durability', () => {
       JSON.parse(await readFile(manifest, 'utf8')).project.workingDirectory,
     ).toBe('.');
     expect(await readFile(existing, 'utf8')).toBe('asset');
+  });
+  it('refuses to overwrite an incompatible project identity', async () => {
+    const { projects } = await fixture();
+    const directory = path.join(projects, 'vlog');
+    await mkdir(directory, { recursive: true });
+    const manifest = path.join(directory, '.pimp-project.json');
+    const original = JSON.stringify({ schemaVersion: 1, id: 'existing' });
+    await writeFile(manifest, original);
+    await expect(
+      writeProjectManifest(
+        projects,
+        {
+          id: 'different',
+          name: 'Vlog',
+          workingDirectory: 'vlog',
+          mediaIds: [],
+          createdAt: new Date().toISOString(),
+        },
+        [],
+      ),
+    ).rejects.toThrow('was not overwritten');
+    expect(await readFile(manifest, 'utf8')).toBe(original);
   });
   it('preserves folder identity through a move event', async () => {
     const { master } = await fixture();

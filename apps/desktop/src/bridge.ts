@@ -41,6 +41,8 @@ export interface MediaItem {
   attachedAudioId?: string;
   available: boolean;
   needsReview: boolean;
+  observedSize?: number;
+  observedModifiedMillis?: number;
 }
 export interface ProjectRecord {
   id: string;
@@ -55,6 +57,18 @@ export interface Catalogue {
   media: MediaItem[];
   projects: ProjectRecord[];
   updatedAt: string;
+  conflicts?: Array<{
+    entityId: string;
+    field: string;
+    eventIds: string[];
+    values: unknown[];
+  }>;
+  issues?: Array<{ code: string; source: string; detail: string }>;
+}
+export interface RescanResult {
+  registered: number;
+  changed: number;
+  pending: number;
 }
 export interface IngestProgress {
   jobId: string;
@@ -142,7 +156,7 @@ export const desktopBridge = {
   }) => invoke<Catalogue>('update_media', { update }),
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
-  rescan: () => invoke<number>('rescan'),
+  rescan: () => invoke<RescanResult>('rescan'),
   enrichMedia: () => invoke<number>('enrich_media'),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),

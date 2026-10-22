@@ -16,11 +16,15 @@ Full-edition AI processing is planned and is not implemented in this milestone.
 
 ## Milestone status
 
-The Windows vertical slice now connects the React interface to a restricted Tauri 2 host. It persists device settings, shared settings, a catalogue snapshot and per-device audit events; accepts native file/folder pickers and drops; recursively ingests supported camera media; independently SHA-256 verifies temporary copies before atomic promotion; and reports progress, duplicates, unsupported inputs and actionable filename conflicts.
+The Windows vertical slice now connects the React interface to a restricted Tauri 2 host. Versioned per-device append-only event streams are authoritative; the Library is rebuilt by deterministic, deduplicating replay and no synchronized mutable database is operational state. The host accepts native file/folder pickers and drops, recursively ingests supported camera media, independently verifies staged copies and promotes them without overwrite, and reports progress, duplicates, unsupported inputs and actionable filename conflicts.
 
-The Library displays genuine persisted records, folders, availability, technical metadata and FFmpeg thumbnails. Search, additive bulk tags, many-to-many project assignment, MP4/WAV pairing, manual rescan and a 30-second stable-file reconciliation fallback survive restarts. New installs show setup guidance and an empty library instead of synthetic media. Fixtures remain available only to tests/reference code.
+The Library displays genuine persisted records, availability, technical metadata and FFmpeg thumbnails. Search, convergent additive tags, many-to-many project assignment, folder-aware MP4/WAV pairing, manual rescan and conservative multi-observation reconciliation survive restarts. Concurrent scalar edits are retained as visible conflicts. New installs show setup guidance and an empty library instead of synthetic media.
 
-The native host, web frontend, unsigned MSI and NSIS installers build on Windows, and the packaged application has completed a native ingest/restart acceptance pass. Installer signing and upgrades, a durable restartable ingest journal, notification-based filesystem watcher, safe catalogue-location migration, folder notes, preview-frame selection and Premiere integration remain incomplete.
+Legacy `catalogue.json`, v1 TypeScript events, v1 Rust events and compatible project manifests have explicit compatibility paths. Migration preserves the original snapshot plus a recoverable backup and is idempotent. Ingest uses a device-owned same-filesystem staging directory outside Master Bin, durable minimal operation records, source-change detection and atomic no-overwrite promotion.
+
+Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
+
+The native host, web frontend, unsigned MSI and NSIS installers build on Windows. Installer signing and upgrades, a notification-based filesystem watcher, safe catalogue-location relocation, folder notes, preview-frame selection and Premiere integration remain incomplete.
 
 Windows is the first release target. The core and adapter boundaries are designed for future Linux and macOS support, but neither platform is currently verified.
 
@@ -55,7 +59,7 @@ npm run tauri dev
 
 ## Planned work
 
-- Durable restartable ingest jobs and a notification-based watcher
+- Resumable ingest retries and a notification-based watcher
 - Virtualized browsing, saved compound filters, contact sheets, and previews
 - A tested Adobe Premiere UXP extension and import reconciliation
 - Optional, offline local media intelligence in PIMP Full
@@ -67,9 +71,12 @@ See the [project brief](docs/PROJECT_BRIEF.md), [development roadmap](docs/DEVEL
 
 ## Known limitations
 
-- Cross-device event replay into the native catalogue snapshot is not yet wired.
-- Automatic discovery currently polls every 30 seconds and offers manual Rescan; a native watcher is not yet wired.
+- Event replay and convergence are simulated in automated tests, but actual multi-device Syncthing conflict behavior still needs an external two-device acceptance pass.
+- Automatic discovery polls every 30 seconds and requires multiple observations over at least 15 seconds; a native watcher and positive transfer-completion signal are not yet wired.
 - Catalogue relocation is deliberately locked after initialization until safe migration is implemented.
+- The minimal ingest journal safely recovers abandoned staging files but does not yet resume an interrupted copy from its prior byte offset.
+- Metadata conflicts are reported as a count; field-level conflict resolution UI remains planned.
+- Thumbnail cache references are portable and root-validated, but configured-budget eviction remains deferred.
 - No Premiere integration, AI processing, project consolidation, or cleanup is functional yet.
 - Unsigned MSI and NSIS bundles build and the packaged native workflow is verified; release signing and upgrade behavior remain unverified.
 

@@ -1,0 +1,1433 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+use uuid::Uuid;
+
+use crate::write_json;
+
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TechnicalMetadata {
+    pub size_bytes: u64,
+    pub duration_seconds: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub codec: Option<String>,
+    pub frame_rate: Option<f64>,
+    pub has_audio: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaItem {
+    pub id: String,
+    pub relative_path: String,
+    pub original_filename: String,
+    pub sha256: String,
+    pub capture_date: Option<String>,
+    pub capture_date_provenance: String,
+    pub ingest_date: String,
+    #[serde(default)]
+    pub file_type: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub technical: TechnicalMetadata,
+    /// A cache-relative filename, never an absolute filesystem path.
+    #[serde(default, alias = "thumbnailRef")]
+    pub thumbnail_path: Option<String>,
+    #[serde(default)]
+    pub attached_audio_id: Option<String>,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub needs_review: bool,
+    #[serde(default)]
+    pub observed_size: Option<u64>,
+    #[serde(default)]
+    pub observed_modified_millis: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub working_directory: String,
+    #[serde(default)]
+    pub media_ids: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRecord {
+    pub id: String,
+    pub relative_path: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataConflict {
+    pub entity_id: String,
+    pub field: String,
+    pub event_ids: Vec<String>,
+    pub values: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueIssue {
+    pub code: String,
+    pub source: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Catalogue {
+    #[serde(default)]
+    pub media: Vec<MediaItem>,
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
+    #[serde(default)]
+    pub folders: Vec<FolderRecord>,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub conflicts: Vec<MetadataConflict>,
+    #[serde(default)]
+    pub issues: Vec<CatalogueIssue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum CatalogueEvent {
+    #[serde(rename = "media.registered")]
+    MediaRegistered { media: MediaItem },
+    #[serde(rename = "media.tags.added")]
+    MediaTagsAdded {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        values: Vec<String>,
+    },
+    #[serde(rename = "media.tags.removed")]
+    MediaTagsRemoved {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        values: Vec<String>,
+    },
+    #[serde(rename = "media.projects.added")]
+    MediaProjectsAdded {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        values: Vec<String>,
+    },
+    #[serde(rename = "media.projects.removed")]
+    MediaProjectsRemoved {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        values: Vec<String>,
+    },
+    #[serde(rename = "media.notes.set")]
+    MediaNotesSet {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        value: String,
+    },
+    #[serde(rename = "media.enriched")]
+    MediaEnriched {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        technical: TechnicalMetadata,
+        #[serde(rename = "thumbnailRef")]
+        thumbnail_ref: Option<String>,
+    },
+    #[serde(rename = "media.evidence-observed")]
+    MediaEvidenceObserved {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        #[serde(rename = "observedSize")]
+        observed_size: u64,
+        #[serde(rename = "observedModifiedMillis")]
+        observed_modified_millis: Option<u64>,
+        #[serde(rename = "needsReview")]
+        needs_review: bool,
+    },
+    #[serde(rename = "folder.upserted")]
+    FolderUpserted { folder: FolderRecord },
+    #[serde(rename = "folder.moved")]
+    FolderMoved {
+        #[serde(rename = "folderId")]
+        folder_id: String,
+        #[serde(rename = "relativePath")]
+        relative_path: String,
+    },
+    #[serde(rename = "project.upserted")]
+    ProjectUpserted { project: ProjectRecord },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventEnvelope {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub device_id: String,
+    pub sequence: u64,
+    pub occurred_at: String,
+    #[serde(default)]
+    pub observed: BTreeMap<String, u64>,
+    pub event: CatalogueEvent,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EventRead {
+    pub events: Vec<EventEnvelope>,
+    pub vector: BTreeMap<String, u64>,
+    pub issues: Vec<CatalogueIssue>,
+}
+
+fn normalized(values: &[String]) -> Vec<String> {
+    let mut out: Vec<_> = values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    out.sort_by_key(|value| value.to_lowercase());
+    out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    out
+}
+
+fn event_dir(root: &Path) -> PathBuf {
+    root.join("events")
+}
+
+fn issue(code: &str, source: impl Into<String>, detail: impl Into<String>) -> CatalogueIssue {
+    CatalogueIssue {
+        code: code.into(),
+        source: source.into(),
+        detail: detail.into(),
+    }
+}
+
+fn parse_legacy(value: &Value, line_number: u64) -> Result<EventEnvelope, String> {
+    let device_id = value
+        .get("deviceId")
+        .and_then(Value::as_str)
+        .unwrap_or("legacy")
+        .to_string();
+    let sequence = value
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .unwrap_or(line_number);
+    let event_id = value
+        .get("eventId")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| format!("legacy-{device_id}-{sequence}"));
+    let occurred_at = value
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .unwrap_or("1970-01-01T00:00:00Z")
+        .to_string();
+    let raw_event = value.get("event");
+    let event_type = raw_event
+        .and_then(|event| event.get("type"))
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .ok_or("legacy event type is missing")?;
+    let body = raw_event.unwrap_or_else(|| value.get("payload").unwrap_or(value));
+    let event = match event_type {
+        "media.registered" | "media.discovered" => CatalogueEvent::MediaRegistered {
+            media: serde_json::from_value(
+                body.get("media").cloned().unwrap_or_else(|| body.clone()),
+            )
+            .map_err(|error| error.to_string())?,
+        },
+        "media.tags-set" => CatalogueEvent::MediaTagsAdded {
+            media_id: body["mediaId"].as_str().unwrap_or_default().into(),
+            values: serde_json::from_value(body["tags"].clone()).unwrap_or_default(),
+        },
+        "media.projects-set" => CatalogueEvent::MediaProjectsAdded {
+            media_id: body["mediaId"].as_str().unwrap_or_default().into(),
+            values: serde_json::from_value(body["projectIds"].clone()).unwrap_or_default(),
+        },
+        "project.upserted" => CatalogueEvent::ProjectUpserted {
+            project: serde_json::from_value(
+                body.get("project").cloned().unwrap_or_else(|| body.clone()),
+            )
+            .map_err(|error| error.to_string())?,
+        },
+        "folder.upserted" => CatalogueEvent::FolderUpserted {
+            folder: serde_json::from_value(
+                body.get("folder").cloned().unwrap_or_else(|| body.clone()),
+            )
+            .map_err(|error| error.to_string())?,
+        },
+        "folder.moved" => CatalogueEvent::FolderMoved {
+            folder_id: body["folderId"].as_str().unwrap_or_default().into(),
+            relative_path: body["relativePath"].as_str().unwrap_or_default().into(),
+        },
+        // The v1 Rust host wrote the whole final item. Registering it preserves
+        // legacy-only logs; the snapshot migration below preserves its final state.
+        "media.updated" => CatalogueEvent::MediaRegistered {
+            media: serde_json::from_value(body.clone()).map_err(|error| error.to_string())?,
+        },
+        other => return Err(format!("unsupported legacy event type {other}")),
+    };
+    let mut observed = BTreeMap::new();
+    observed.insert(device_id.clone(), sequence.saturating_sub(1));
+    Ok(EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id,
+        device_id,
+        sequence,
+        occurred_at,
+        observed,
+        event,
+    })
+}
+
+pub fn read_events(root: &Path) -> Result<EventRead, String> {
+    fs::create_dir_all(event_dir(root)).map_err(|error| error.to_string())?;
+    let mut result = EventRead::default();
+    let mut entries: Vec<_> = fs::read_dir(event_dir(root))
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let filename = entry.file_name().to_string_lossy().to_string();
+        let lower = filename.to_ascii_lowercase();
+        if lower.contains(".sync-conflict-") {
+            result.issues.push(issue(
+                "syncthing-conflict-copy",
+                filename,
+                "Conflict copies are quarantined from authoritative replay",
+            ));
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
+        if !content.is_empty() && !content.ends_with('\n') {
+            result.issues.push(issue(
+                "truncated-stream",
+                filename.clone(),
+                "Event stream does not end at a committed newline boundary",
+            ));
+        }
+        let expected_device = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let mut last_sequence = 0u64;
+        for (index, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let location = format!("{filename}:{}", index + 1);
+            let value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(error) => {
+                    result
+                        .issues
+                        .push(issue("malformed-event", location, error.to_string()));
+                    continue;
+                }
+            };
+            let version = value
+                .get("schemaVersion")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as u32;
+            if version > EVENT_SCHEMA_VERSION {
+                result.issues.push(issue(
+                    "unsupported-schema",
+                    location,
+                    format!("schema {version} is newer than {EVENT_SCHEMA_VERSION}"),
+                ));
+                continue;
+            }
+            let envelope = if version == EVENT_SCHEMA_VERSION {
+                match serde_json::from_value::<EventEnvelope>(value) {
+                    Ok(envelope)
+                        if !envelope.event_id.is_empty()
+                            && !envelope.device_id.is_empty()
+                            && envelope.sequence > 0 =>
+                    {
+                        envelope
+                    }
+                    Ok(_) => {
+                        result.issues.push(issue(
+                            "invalid-envelope",
+                            location,
+                            "event ID, device ID and positive sequence are required",
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        result
+                            .issues
+                            .push(issue("invalid-envelope", location, error.to_string()));
+                        continue;
+                    }
+                }
+            } else {
+                match parse_legacy(&value, (index + 1) as u64) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        result.issues.push(issue("legacy-event", location, error));
+                        continue;
+                    }
+                }
+            };
+            if version == EVENT_SCHEMA_VERSION && envelope.device_id != expected_device {
+                result.issues.push(issue(
+                    "stream-owner-mismatch",
+                    location,
+                    format!(
+                        "event belongs to {} but is stored in {filename}",
+                        envelope.device_id
+                    ),
+                ));
+                continue;
+            }
+            if envelope.sequence <= last_sequence {
+                result.issues.push(issue(
+                    "non-monotonic-sequence",
+                    location,
+                    format!(
+                        "sequence {} does not follow {}",
+                        envelope.sequence, last_sequence
+                    ),
+                ));
+                continue;
+            }
+            last_sequence = envelope.sequence;
+            result
+                .vector
+                .entry(envelope.device_id.clone())
+                .and_modify(|sequence| *sequence = (*sequence).max(envelope.sequence))
+                .or_insert(envelope.sequence);
+            result.events.push(envelope);
+        }
+    }
+    Ok(result)
+}
+
+fn happens_before(a: &EventEnvelope, b: &EventEnvelope) -> bool {
+    (a.device_id == b.device_id && a.sequence < b.sequence)
+        || b.observed.get(&a.device_id).copied().unwrap_or(0) >= a.sequence
+}
+
+fn event_order(a: &EventEnvelope, b: &EventEnvelope) -> std::cmp::Ordering {
+    if a.device_id == b.device_id {
+        return a
+            .sequence
+            .cmp(&b.sequence)
+            .then_with(|| a.event_id.cmp(&b.event_id));
+    }
+    if a.observed.get(&b.device_id).copied().unwrap_or(0) >= b.sequence {
+        return std::cmp::Ordering::Greater;
+    }
+    if b.observed.get(&a.device_id).copied().unwrap_or(0) >= a.sequence {
+        return std::cmp::Ordering::Less;
+    }
+    a.device_id
+        .cmp(&b.device_id)
+        .then_with(|| a.sequence.cmp(&b.sequence))
+        .then_with(|| a.event_id.cmp(&b.event_id))
+}
+
+#[derive(Clone)]
+struct Addition {
+    value: String,
+    envelope: EventEnvelope,
+}
+
+fn add_conflict(catalogue: &mut Catalogue, conflict: MetadataConflict) {
+    if !catalogue.conflicts.iter().any(|candidate| {
+        candidate.entity_id == conflict.entity_id
+            && candidate.field == conflict.field
+            && candidate.event_ids == conflict.event_ids
+    }) {
+        catalogue.conflicts.push(conflict);
+    }
+}
+
+pub fn rebuild(mut read: EventRead) -> Catalogue {
+    read.events.sort_by(event_order);
+    // A registration establishes the entity identity. Replaying registrations
+    // first also lets partially synchronized streams retain dependent edits
+    // until the corresponding registration arrives, independent of filenames
+    // or delivery order.
+    read.events.sort_by_key(|envelope| {
+        (
+            !matches!(envelope.event, CatalogueEvent::MediaRegistered { .. }),
+            !envelope.event_id.starts_with("legacy-"),
+        )
+    });
+    let mut catalogue = Catalogue::default();
+    let mut seen = HashSet::new();
+    let mut media = HashMap::<String, MediaItem>::new();
+    let mut projects = HashMap::<String, ProjectRecord>::new();
+    let mut folders = HashMap::<String, FolderRecord>::new();
+    let mut additions = HashMap::<String, HashMap<String, Addition>>::new();
+    let mut scalar_versions = HashMap::<String, (EventEnvelope, Value)>::new();
+
+    for envelope in read.events {
+        if !seen.insert(envelope.event_id.clone()) {
+            continue;
+        }
+        match &envelope.event {
+            CatalogueEvent::MediaRegistered { media: item } => {
+                if let Some(existing) = media.get(&item.id) {
+                    if existing.sha256 != item.sha256
+                        || existing.relative_path != item.relative_path
+                    {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: item.id.clone(),
+                                field: "registration".into(),
+                                event_ids: vec![envelope.event_id.clone()],
+                                values: vec![
+                                    serde_json::to_value(existing).unwrap(),
+                                    serde_json::to_value(item).unwrap(),
+                                ],
+                            },
+                        );
+                    }
+                    continue;
+                }
+                let mut item = item.clone();
+                if item
+                    .thumbnail_path
+                    .as_deref()
+                    .is_some_and(|value| Path::new(value).is_absolute())
+                {
+                    item.thumbnail_path = Some(format!("{}.jpg", item.id));
+                }
+                let original_tags = std::mem::take(&mut item.tags);
+                let original_projects = std::mem::take(&mut item.project_ids);
+                for (field, values) in [("tags", original_tags), ("projectIds", original_projects)]
+                {
+                    let set = additions.entry(format!("{}:{field}", item.id)).or_default();
+                    for value in normalized(&values) {
+                        set.insert(
+                            format!("{}:{value}", envelope.event_id),
+                            Addition {
+                                value,
+                                envelope: envelope.clone(),
+                            },
+                        );
+                    }
+                }
+                media.insert(item.id.clone(), item);
+            }
+            CatalogueEvent::MediaTagsAdded { media_id, values }
+            | CatalogueEvent::MediaProjectsAdded { media_id, values } => {
+                if !media.contains_key(media_id) {
+                    add_conflict(
+                        &mut catalogue,
+                        MetadataConflict {
+                            entity_id: media_id.clone(),
+                            field: "missing-media".into(),
+                            event_ids: vec![envelope.event_id.clone()],
+                            values: vec![serde_json::to_value(&envelope.event).unwrap()],
+                        },
+                    );
+                    continue;
+                }
+                let field = if matches!(envelope.event, CatalogueEvent::MediaTagsAdded { .. }) {
+                    "tags"
+                } else {
+                    "projectIds"
+                };
+                let set = additions.entry(format!("{media_id}:{field}")).or_default();
+                for value in normalized(values) {
+                    set.insert(
+                        format!("{}:{value}", envelope.event_id),
+                        Addition {
+                            value,
+                            envelope: envelope.clone(),
+                        },
+                    );
+                }
+            }
+            CatalogueEvent::MediaTagsRemoved { media_id, values }
+            | CatalogueEvent::MediaProjectsRemoved { media_id, values } => {
+                let field = if matches!(envelope.event, CatalogueEvent::MediaTagsRemoved { .. }) {
+                    "tags"
+                } else {
+                    "projectIds"
+                };
+                let removed: HashSet<_> = normalized(values).into_iter().collect();
+                if let Some(set) = additions.get_mut(&format!("{media_id}:{field}")) {
+                    set.retain(|_, addition| {
+                        !removed.contains(&addition.value)
+                            || !happens_before(&addition.envelope, &envelope)
+                    });
+                }
+            }
+            CatalogueEvent::MediaNotesSet { media_id, value } => {
+                let Some(item) = media.get_mut(media_id) else {
+                    continue;
+                };
+                let key = format!("{media_id}:notes");
+                if let Some((previous, previous_value)) = scalar_versions.get(&key) {
+                    if !happens_before(previous, &envelope) {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: media_id.clone(),
+                                field: "notes".into(),
+                                event_ids: vec![
+                                    previous.event_id.clone(),
+                                    envelope.event_id.clone(),
+                                ],
+                                values: vec![previous_value.clone(), Value::String(value.clone())],
+                            },
+                        );
+                        let prior_key = format!(
+                            "{}:{:020}:{}",
+                            previous.device_id, previous.sequence, previous.event_id
+                        );
+                        let next_key = format!(
+                            "{}:{:020}:{}",
+                            envelope.device_id, envelope.sequence, envelope.event_id
+                        );
+                        if next_key > prior_key {
+                            item.notes = value.clone();
+                        }
+                    } else {
+                        item.notes = value.clone();
+                    }
+                } else {
+                    item.notes = value.clone();
+                }
+                scalar_versions.insert(key, (envelope.clone(), Value::String(value.clone())));
+            }
+            CatalogueEvent::MediaEnriched {
+                media_id,
+                technical,
+                thumbnail_ref,
+            } => {
+                if let Some(item) = media.get_mut(media_id) {
+                    item.technical = technical.clone();
+                    item.thumbnail_path = thumbnail_ref
+                        .as_ref()
+                        .filter(|value| safe_cache_reference(value))
+                        .cloned();
+                }
+            }
+            CatalogueEvent::MediaEvidenceObserved {
+                media_id,
+                observed_size,
+                observed_modified_millis,
+                needs_review,
+            } => {
+                if let Some(item) = media.get_mut(media_id) {
+                    item.observed_size = Some(*observed_size);
+                    item.observed_modified_millis = *observed_modified_millis;
+                    item.needs_review = *needs_review;
+                }
+            }
+            CatalogueEvent::FolderUpserted { folder } => {
+                let key = format!("{}:folder", folder.id);
+                let value = serde_json::to_value(folder).unwrap();
+                if let Some((previous, previous_value)) = scalar_versions.get(&key) {
+                    if !happens_before(previous, &envelope) && previous_value != &value {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: folder.id.clone(),
+                                field: "folder".into(),
+                                event_ids: vec![
+                                    previous.event_id.clone(),
+                                    envelope.event_id.clone(),
+                                ],
+                                values: vec![previous_value.clone(), value.clone()],
+                            },
+                        );
+                    }
+                }
+                let mut folder = folder.clone();
+                folder.tags = normalized(&folder.tags);
+                folders.insert(folder.id.clone(), folder);
+                scalar_versions.insert(key, (envelope.clone(), value));
+            }
+            CatalogueEvent::FolderMoved {
+                folder_id,
+                relative_path,
+            } => {
+                let Some(folder) = folders.get_mut(folder_id) else {
+                    add_conflict(
+                        &mut catalogue,
+                        MetadataConflict {
+                            entity_id: folder_id.clone(),
+                            field: "missing-folder".into(),
+                            event_ids: vec![envelope.event_id.clone()],
+                            values: vec![Value::String(relative_path.clone())],
+                        },
+                    );
+                    continue;
+                };
+                let key = format!("{folder_id}:folder-path");
+                if let Some((previous, previous_value)) = scalar_versions.get(&key) {
+                    if !happens_before(previous, &envelope) {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: folder_id.clone(),
+                                field: "relativePath".into(),
+                                event_ids: vec![
+                                    previous.event_id.clone(),
+                                    envelope.event_id.clone(),
+                                ],
+                                values: vec![
+                                    previous_value.clone(),
+                                    Value::String(relative_path.clone()),
+                                ],
+                            },
+                        );
+                    }
+                }
+                folder.relative_path = relative_path.clone();
+                scalar_versions.insert(
+                    key,
+                    (envelope.clone(), Value::String(relative_path.clone())),
+                );
+            }
+            CatalogueEvent::ProjectUpserted { project } => {
+                let key = format!("{}:project", project.id);
+                if let Some((previous, previous_value)) = scalar_versions.get(&key) {
+                    if !happens_before(previous, &envelope)
+                        && previous_value != &serde_json::to_value(project).unwrap()
+                    {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: project.id.clone(),
+                                field: "project".into(),
+                                event_ids: vec![
+                                    previous.event_id.clone(),
+                                    envelope.event_id.clone(),
+                                ],
+                                values: vec![
+                                    previous_value.clone(),
+                                    serde_json::to_value(project).unwrap(),
+                                ],
+                            },
+                        );
+                    }
+                }
+                projects.insert(project.id.clone(), project.clone());
+                scalar_versions.insert(
+                    key,
+                    (envelope.clone(), serde_json::to_value(project).unwrap()),
+                );
+            }
+        }
+    }
+
+    for item in media.values_mut() {
+        item.tags = normalized(
+            &additions
+                .get(&format!("{}:tags", item.id))
+                .map(|set| {
+                    set.values()
+                        .map(|addition| addition.value.clone())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default(),
+        );
+        item.project_ids = normalized(
+            &additions
+                .get(&format!("{}:projectIds", item.id))
+                .map(|set| {
+                    set.values()
+                        .map(|addition| addition.value.clone())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default(),
+        );
+    }
+    for project in projects.values_mut() {
+        project.media_ids = media
+            .values()
+            .filter(|item| item.project_ids.contains(&project.id))
+            .map(|item| item.id.clone())
+            .collect();
+        project.media_ids.sort();
+    }
+    catalogue.media = media.into_values().collect();
+    catalogue
+        .media
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    catalogue.projects = projects.into_values().collect();
+    catalogue.projects.sort_by(|a, b| a.name.cmp(&b.name));
+    catalogue.folders = folders.into_values().collect();
+    catalogue
+        .folders
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    catalogue.issues.extend(read.issues);
+    catalogue.updated_at = Utc::now().to_rfc3339();
+    pair_audio(&mut catalogue);
+    catalogue
+}
+
+pub fn load(root: &Path) -> Result<Catalogue, String> {
+    Ok(rebuild(read_events(root)?))
+}
+
+pub fn append(root: &Path, device_id: &str, events: Vec<CatalogueEvent>) -> Result<(), String> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let read = read_events(root)?;
+    let mut vector = read.vector;
+    let mut sequence = vector.get(device_id).copied().unwrap_or(0);
+    let directory = event_dir(root);
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("{device_id}.jsonl"));
+    if path.exists() {
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            return Err(format!(
+                "Refusing to append to truncated event stream {}",
+                path.display()
+            ));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    for event in events {
+        sequence += 1;
+        vector.insert(device_id.to_string(), sequence - 1);
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            event_id: Uuid::new_v4().to_string(),
+            device_id: device_id.into(),
+            sequence,
+            occurred_at: Utc::now().to_rfc3339(),
+            observed: vector.clone(),
+            event,
+        };
+        writeln!(file, "{}", serde_json::to_string(&envelope).unwrap())
+            .map_err(|error| error.to_string())?;
+        vector.insert(device_id.to_string(), sequence);
+    }
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+pub fn safe_cache_reference(value: &str) -> bool {
+    !value.is_empty()
+        && !Path::new(value).is_absolute()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+        && value.ends_with(".jpg")
+}
+
+pub fn pair_audio(catalogue: &mut Catalogue) {
+    let mut audios = HashMap::<(String, String), Vec<String>>::new();
+    for item in catalogue
+        .media
+        .iter()
+        .filter(|item| item.file_type == "wav")
+    {
+        let path = Path::new(&item.relative_path);
+        let directory = path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        audios
+            .entry((directory, stem))
+            .or_default()
+            .push(item.id.clone());
+    }
+    for item in catalogue
+        .media
+        .iter_mut()
+        .filter(|item| matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v"))
+    {
+        let path = Path::new(&item.relative_path);
+        let key = (
+            path.parent()
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase(),
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+        );
+        item.attached_audio_id = audios
+            .get(&key)
+            .filter(|matches| matches.len() == 1)
+            .map(|matches| matches[0].clone());
+    }
+}
+
+pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let marker = root.join("migration-v2.json");
+    if marker.exists() {
+        return Ok(());
+    }
+    let legacy_path = root.join("catalogue.json");
+    if !legacy_path.exists() {
+        write_json(
+            &marker,
+            &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"none"}),
+        )?;
+        return Ok(());
+    }
+    let bytes = fs::read(&legacy_path).map_err(|error| error.to_string())?;
+    let legacy_value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Legacy catalogue migration stopped: {error}"))?;
+    let recognizable = legacy_value.get("media").is_some()
+        || legacy_value.get("projects").is_some()
+        || legacy_value.get("format").and_then(Value::as_str) == Some("pimp-event-log");
+    if !recognizable {
+        return Err("Legacy catalogue migration stopped: unrecognized catalogue structure".into());
+    }
+    let legacy: Catalogue = serde_json::from_value(legacy_value)
+        .map_err(|error| format!("Legacy catalogue migration stopped: {error}"))?;
+    let backup = root.join("catalogue.pre-events-v1.backup.json");
+    if !backup.exists() {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    } else if fs::read(&backup).map_err(|error| error.to_string())? != bytes {
+        return Err(
+            "Existing migration backup differs from catalogue.json; refusing to continue".into(),
+        );
+    }
+    let migration_device = format!("migration-{device_id}");
+    let migration_path = event_dir(root).join(format!("{migration_device}.jsonl"));
+    if !migration_path.exists() {
+        fs::create_dir_all(event_dir(root)).map_err(|error| error.to_string())?;
+        let mut content = String::new();
+        let mut sequence = 0u64;
+        let mut push = |event: CatalogueEvent, identity: String| {
+            sequence += 1;
+            let mut observed = BTreeMap::new();
+            observed.insert(migration_device.clone(), sequence - 1);
+            let envelope = EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                event_id: format!("legacy-{identity}"),
+                device_id: migration_device.clone(),
+                sequence,
+                occurred_at: "1970-01-01T00:00:00Z".into(),
+                observed,
+                event,
+            };
+            content.push_str(&serde_json::to_string(&envelope).unwrap());
+            content.push('\n');
+        };
+        for media in legacy.media {
+            let identity = format!("media-{}", media.id);
+            push(CatalogueEvent::MediaRegistered { media }, identity);
+        }
+        for project in legacy.projects {
+            let identity = format!("project-{}", project.id);
+            push(CatalogueEvent::ProjectUpserted { project }, identity);
+        }
+        for folder in legacy.folders {
+            let identity = format!("folder-{}", folder.id);
+            push(CatalogueEvent::FolderUpserted { folder }, identity);
+        }
+        let temporary = root.join(format!(".migration-{}.tmp", Uuid::new_v4()));
+        fs::write(&temporary, content).map_err(|error| error.to_string())?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        fs::rename(&temporary, &migration_path).map_err(|error| error.to_string())?;
+    }
+    write_json(
+        &marker,
+        &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"catalogue.json","backup":"catalogue.pre-events-v1.backup.json"}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary(name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".test-tmp")
+            .join(format!("pimp-catalogue-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn item(id: &str, path: &str, kind: &str) -> MediaItem {
+        MediaItem {
+            id: id.into(),
+            relative_path: path.into(),
+            original_filename: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            sha256: format!("hash-{id}"),
+            capture_date: None,
+            capture_date_provenance: "unknown".into(),
+            ingest_date: "2026-10-22T00:00:00Z".into(),
+            file_type: kind.into(),
+            tags: vec![],
+            project_ids: vec![],
+            notes: String::new(),
+            technical: TechnicalMetadata {
+                size_bytes: 1,
+                ..Default::default()
+            },
+            thumbnail_path: None,
+            attached_audio_id: None,
+            available: true,
+            needs_review: false,
+            observed_size: Some(1),
+            observed_modified_millis: Some(1),
+        }
+    }
+
+    fn envelope(device: &str, sequence: u64, event: CatalogueEvent) -> EventEnvelope {
+        EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            event_id: format!("{device}-{sequence}"),
+            device_id: device.into(),
+            sequence,
+            occurred_at: "2026-10-22T00:00:00Z".into(),
+            observed: BTreeMap::from([(device.into(), sequence.saturating_sub(1))]),
+            event,
+        }
+    }
+
+    #[test]
+    fn independently_added_tags_converge_in_any_delivery_order() {
+        let registered = envelope(
+            "seed",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "2026-10-22/a.mp4", "mp4"),
+            },
+        );
+        let desktop = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaTagsAdded {
+                media_id: "m".into(),
+                values: vec!["Track".into()],
+            },
+        );
+        let laptop = envelope(
+            "laptop",
+            1,
+            CatalogueEvent::MediaTagsAdded {
+                media_id: "m".into(),
+                values: vec!["Night".into()],
+            },
+        );
+        let first = rebuild(EventRead {
+            events: vec![desktop.clone(), registered.clone(), laptop.clone()],
+            ..Default::default()
+        });
+        let second = rebuild(EventRead {
+            events: vec![laptop, desktop, registered],
+            ..Default::default()
+        });
+        assert_eq!(first.media[0].tags, vec!["Night", "Track"]);
+        assert_eq!(first.media[0].tags, second.media[0].tags);
+    }
+
+    #[test]
+    fn disk_level_device_stream_merge_converges_for_media_tags_and_projects() {
+        let desktop_root = temporary("desktop-stream");
+        let laptop_root = temporary("laptop-stream");
+        let first_merge = temporary("merge-first");
+        let second_merge = temporary("merge-second");
+        let seed = envelope(
+            "seed",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "2026-10-22/a.mp4", "mp4"),
+            },
+        );
+        for root in [&desktop_root, &laptop_root] {
+            fs::create_dir_all(event_dir(root)).unwrap();
+            fs::write(
+                event_dir(root).join("seed.jsonl"),
+                format!("{}\n", serde_json::to_string(&seed).unwrap()),
+            )
+            .unwrap();
+        }
+        append(
+            &desktop_root,
+            "desktop",
+            vec![
+                CatalogueEvent::MediaTagsAdded {
+                    media_id: "m".into(),
+                    values: vec!["Track".into()],
+                },
+                CatalogueEvent::MediaProjectsAdded {
+                    media_id: "m".into(),
+                    values: vec!["project-a".into()],
+                },
+            ],
+        )
+        .unwrap();
+        append(
+            &laptop_root,
+            "laptop",
+            vec![
+                CatalogueEvent::MediaRegistered {
+                    media: item("m2", "2026-10-23/b.mp4", "mp4"),
+                },
+                CatalogueEvent::MediaTagsAdded {
+                    media_id: "m".into(),
+                    values: vec!["Night".into()],
+                },
+                CatalogueEvent::MediaProjectsAdded {
+                    media_id: "m".into(),
+                    values: vec!["project-b".into()],
+                },
+            ],
+        )
+        .unwrap();
+        for root in [&first_merge, &second_merge] {
+            fs::create_dir_all(event_dir(root)).unwrap();
+        }
+        for (root, files) in [
+            (
+                &first_merge,
+                ["seed.jsonl", "desktop.jsonl", "laptop.jsonl"],
+            ),
+            (
+                &second_merge,
+                ["laptop.jsonl", "desktop.jsonl", "seed.jsonl"],
+            ),
+        ] {
+            for file in files {
+                let source_root = if file == "laptop.jsonl" {
+                    &laptop_root
+                } else {
+                    &desktop_root
+                };
+                fs::copy(
+                    event_dir(source_root).join(file),
+                    event_dir(root).join(file),
+                )
+                .unwrap();
+            }
+        }
+        let first = load(&first_merge).unwrap();
+        let second = load(&second_merge).unwrap();
+        assert_eq!(first.media, second.media);
+        assert_eq!(first.conflicts, second.conflicts);
+        assert_eq!(first.media.len(), 2);
+        let merged = first.media.iter().find(|media| media.id == "m").unwrap();
+        assert_eq!(merged.tags, vec!["Night", "Track"]);
+        assert_eq!(merged.project_ids, vec!["project-a", "project-b"]);
+        for root in [desktop_root, laptop_root, first_merge, second_merge] {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_delivery_is_idempotent() {
+        let event = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "a.mp4", "mp4"),
+            },
+        );
+        let catalogue = rebuild(EventRead {
+            events: vec![event.clone(), event],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.media.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_notes_are_retained_as_conflict_despite_clock_order() {
+        let registered = envelope(
+            "seed",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "a.mp4", "mp4"),
+            },
+        );
+        let mut desktop = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaNotesSet {
+                media_id: "m".into(),
+                value: "desktop".into(),
+            },
+        );
+        desktop.occurred_at = "2030-01-01T00:00:00Z".into();
+        let mut laptop = envelope(
+            "laptop",
+            1,
+            CatalogueEvent::MediaNotesSet {
+                media_id: "m".into(),
+                value: "laptop".into(),
+            },
+        );
+        laptop.occurred_at = "2020-01-01T00:00:00Z".into();
+        let catalogue = rebuild(EventRead {
+            events: vec![laptop, registered, desktop],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.conflicts.len(), 1);
+        assert_eq!(catalogue.conflicts[0].values.len(), 2);
+    }
+
+    #[test]
+    fn pairing_requires_same_directory_and_unambiguous_audio() {
+        let mut catalogue = Catalogue {
+            media: vec![
+                item("v1", "2026-10-21/DJI_0001.mp4", "mp4"),
+                item("a1", "2026-10-21/DJI_0001.wav", "wav"),
+                item("v2", "2026-10-22/DJI_0001.mp4", "mp4"),
+                item("a2", "2026-10-22/DJI_0001.wav", "wav"),
+            ],
+            ..Default::default()
+        };
+        pair_audio(&mut catalogue);
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "v1")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("a1")
+        );
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "v2")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("a2")
+        );
+        catalogue
+            .media
+            .push(item("a3", "2026-10-22/DJI_0001.wav", "wav"));
+        pair_audio(&mut catalogue);
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "v2")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+    }
+
+    #[test]
+    fn cache_references_reject_traversal_and_absolute_paths() {
+        assert!(safe_cache_reference("item.jpg"));
+        assert!(!safe_cache_reference("../item.jpg"));
+        assert!(!safe_cache_reference("C:\\cache\\item.jpg"));
+        assert!(!safe_cache_reference("folder/item.jpg"));
+    }
+
+    #[test]
+    fn malformed_and_newer_records_do_not_hide_valid_events() {
+        let root = temporary("validation");
+        let events = event_dir(&root);
+        fs::create_dir_all(&events).unwrap();
+        let valid = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "a.mp4", "mp4"),
+            },
+        );
+        let newer = serde_json::json!({
+            "schemaVersion": 99,
+            "eventId": "future",
+            "deviceId": "desktop",
+            "sequence": 2,
+            "occurredAt": "2026-10-22T00:00:00Z",
+            "observed": {},
+            "event": {"type": "future.event"}
+        });
+        fs::write(
+            events.join("desktop.jsonl"),
+            format!(
+                "{}\n{{bad json}}\n{}\n",
+                serde_json::to_string(&valid).unwrap(),
+                newer
+            ),
+        )
+        .unwrap();
+        fs::write(events.join("desktop.sync-conflict-1.jsonl"), "ignored\n").unwrap();
+        let catalogue = load(&root).unwrap();
+        assert_eq!(catalogue.media.len(), 1);
+        assert!(catalogue
+            .issues
+            .iter()
+            .any(|issue| issue.code == "malformed-event"));
+        assert!(catalogue
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unsupported-schema"));
+        assert!(catalogue
+            .issues
+            .iter()
+            .any(|issue| issue.code == "syncthing-conflict-copy"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_preserves_legacy_ids_and_is_idempotent() {
+        let root = temporary("migration");
+        let legacy = Catalogue {
+            media: vec![item("legacy-media", "2026-10-22/clip.mp4", "mp4")],
+            projects: vec![ProjectRecord {
+                id: "legacy-project".into(),
+                name: "Project".into(),
+                working_directory: ".".into(),
+                media_ids: vec!["legacy-media".into()],
+                notes: "note".into(),
+                tags: vec!["tag".into()],
+                created_at: "2026-10-22T00:00:00Z".into(),
+            }],
+            folders: vec![FolderRecord {
+                id: "legacy-folder".into(),
+                relative_path: "2026-10-22".into(),
+                display_name: "Day".into(),
+                tags: vec!["Track".into()],
+                notes: Some("note".into()),
+            }],
+            ..Default::default()
+        };
+        fs::write(
+            root.join("catalogue.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        migrate_legacy_snapshot(&root, "device-a").unwrap();
+        let first = fs::read(event_dir(&root).join("migration-device-a.jsonl")).unwrap();
+        migrate_legacy_snapshot(&root, "device-a").unwrap();
+        assert_eq!(
+            first,
+            fs::read(event_dir(&root).join("migration-device-a.jsonl")).unwrap()
+        );
+        let rebuilt = load(&root).unwrap();
+        assert_eq!(rebuilt.media[0].id, "legacy-media");
+        assert_eq!(rebuilt.projects[0].id, "legacy-project");
+        assert_eq!(rebuilt.folders[0].id, "legacy-folder");
+        assert!(root.join("catalogue.pre-events-v1.backup.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_recovers_when_interrupted_after_writing_events() {
+        let root = temporary("migration-restart");
+        let original = serde_json::to_vec_pretty(&Catalogue {
+            media: vec![item("legacy-media", "2026-10-22/clip.mp4", "mp4")],
+            ..Default::default()
+        })
+        .unwrap();
+        fs::write(root.join("catalogue.json"), &original).unwrap();
+        migrate_legacy_snapshot(&root, "desktop").unwrap();
+        let events = fs::read(event_dir(&root).join("migration-desktop.jsonl")).unwrap();
+        fs::remove_file(root.join("migration-v2.json")).unwrap();
+        migrate_legacy_snapshot(&root, "desktop").unwrap();
+        assert_eq!(
+            fs::read(event_dir(&root).join("migration-desktop.jsonl")).unwrap(),
+            events
+        );
+        assert_eq!(
+            fs::read(root.join("catalogue.pre-events-v1.backup.json")).unwrap(),
+            original
+        );
+        assert_eq!(load(&root).unwrap().media[0].id, "legacy-media");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn append_refuses_a_truncated_owned_stream() {
+        let root = temporary("truncated");
+        fs::create_dir_all(event_dir(&root)).unwrap();
+        fs::write(event_dir(&root).join("desktop.jsonl"), "{\"partial\":true}").unwrap();
+        let error = append(
+            &root,
+            "desktop",
+            vec![CatalogueEvent::MediaRegistered {
+                media: item("m", "a.mp4", "mp4"),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.contains("truncated"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn damaged_legacy_snapshot_stops_without_creating_migration_state() {
+        let root = temporary("damaged-migration");
+        fs::write(root.join("catalogue.json"), br#"{"unexpected":true}"#).unwrap();
+        assert!(migrate_legacy_snapshot(&root, "desktop").is_err());
+        assert!(!root.join("migration-v2.json").exists());
+        assert!(!root.join("catalogue.pre-events-v1.backup.json").exists());
+        assert_eq!(
+            fs::read(root.join("catalogue.json")).unwrap(),
+            br#"{"unexpected":true}"#
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

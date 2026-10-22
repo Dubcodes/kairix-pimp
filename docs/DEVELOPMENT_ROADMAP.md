@@ -11,15 +11,21 @@ UI implemented and component-test covered: application shell, primary navigation
 ## Milestone 2 — production ingest and advanced library (in progress)
 
 - Implemented: native picker/drop, recursive inventory, verified copies, persisted real Library, per-ingest date overrides, explicit collision rename, projects, manual/periodic discovery, metadata/thumbnails and conservative same-stem MP4/WAV pairing
-- Durable resumable job journal, pause/cancel, throughput and per-file progress
-- Native notification watcher, event-log replay into the cross-device projection, bounded thumbnail eviction, alternate thumbnail frames, folder notes and richer conflict workflow
+- Implemented reliability foundation: canonical causal event replay, duplicate/malformed/newer-record handling, legacy migration/backup, multi-device convergence tests, external staging, minimal recovery journal, no-overwrite promotion, source-change checks, conservative discovery, folder-aware pairing, portable thumbnails and manifest identity protection
+- Resumable byte-range ingest retries, pause, throughput history and richer job inspection
+- Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Contact sheets, preview player, custom thumbnails, folder rename/move journal
 - Evidence-scored and reversible DJI camera/audio pairing
+- Configurable date/time folder naming (default `yyyyMMdd`, including separators and 12-/24-hour patterns) without renaming existing folders
+- Ingest-time tags, project assignments, descriptions and favourites persisted with queued/retryable jobs
+- Rich library interaction: keyboard/multi-select batch actions, favourites, saved filters, previews and explicit review/conflict flows
 
 ## Milestone 3 — Premiere extension
 
 Build and test a UXP extension against a supported Premiere version. Use active project access, `Project.importFiles`, transactional bin creation via `FolderItem`, and `ClipProjectItem.getMediaFilePath` to reconcile actual imports. Never edit `.prproj` internals.
+
+Keep direct DCM Master Bin references, dated bins and an optional virtual Audio grouping. Project collection is an explicit verified transition: the collected `.prproj` in DCM Content becomes authoritative for the existing stable project ID only after dependency checks; presence alone never changes state.
 
 ## Milestone 4 — Full AI
 
@@ -29,9 +35,17 @@ Add a separately packaged worker protocol, queue, resource governor, cache, and 
 
 Inventory dependencies, support complete-source archives first, integrate Premiere Project Manager and/or PlumePack through supported interfaces, verify the output project, then add opt-in transcode/trim modes with handles and provenance. Transcodes receive new hashes linked by derivation records.
 
+Retain lightweight completed-project records in catalogue search and a portable project-local archive carrying stable project identity and its media manifest. Public sharing links and YouTube metadata remain deferred.
+
 ## Milestone 6 — safe cleanup
 
 Unused-footage review, cross-project protection, synchronization preflight, recoverable quarantine, multi-step explicit authorization, and delayed purge. No direct deletion from source cards.
+
+Automation is opt-in and disabled by default. Per-file protection and successful finalization verification gate eligibility; Syncthing replicas are not treated as backups.
+
+## Cross-cutting — persistent background work
+
+Replace the minimal ingest recovery journal with a versioned background job manager for ingest, enrichment, consolidation and cleanup. Persist intent and checkpoints, distinguish incomplete from committed records, and resume safely at startup.
 
 ## Milestone 7 — packaging and additional platforms
 

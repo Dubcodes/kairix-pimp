@@ -60,13 +60,15 @@ describe('native application integration', () => {
   });
 
   it('runs an explicit manual rescan from the real library', async () => {
-    mocks.rescan.mockResolvedValue(2);
+    mocks.rescan.mockResolvedValue({ registered: 2, changed: 0, pending: 1 });
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: /Rescan/ }));
     expect(mocks.rescan).toHaveBeenCalledOnce();
     expect(
-      await screen.findByText('2 stable external files discovered.'),
+      await screen.findByText(
+        '2 external files registered; 0 changed and 1 still awaiting stability.',
+      ),
     ).toBeVisible();
   });
 

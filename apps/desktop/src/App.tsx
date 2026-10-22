@@ -106,8 +106,8 @@ export function App() {
     const timer = window.setInterval(() => {
       void desktopBridge
         .rescan()
-        .then(async (count) => {
-          if (count > 0) {
+        .then(async (result) => {
+          if (result.registered > 0 || result.changed > 0) {
             setCatalogue(await desktopBridge.loadCatalogue());
             void desktopBridge.enrichMedia().then(async () => {
               setCatalogue(await desktopBridge.loadCatalogue());
@@ -271,10 +271,10 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      const count = await desktopBridge.rescan();
+      const result = await desktopBridge.rescan();
       await refresh();
       setMessage(
-        `${count} stable external file${count === 1 ? '' : 's'} discovered.`,
+        `${result.registered} external file${result.registered === 1 ? '' : 's'} registered; ${result.changed} changed and ${result.pending} still awaiting stability.`,
       );
       void desktopBridge
         .enrichMedia()
@@ -377,6 +377,16 @@ export function App() {
             >
               Dismiss
             </button>
+          </section>
+        )}
+        {((catalogue.conflicts?.length ?? 0) > 0 ||
+          (catalogue.issues?.length ?? 0) > 0) && (
+          <section className="notice error" role="status">
+            <span>
+              Metadata needs attention: {catalogue.conflicts?.length ?? 0}{' '}
+              concurrent conflict(s), {catalogue.issues?.length ?? 0} stream
+              issue(s). Authoritative event files were left unchanged.
+            </span>
           </section>
         )}
         {!native ? (

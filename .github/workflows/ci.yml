@@ -44,3 +44,24 @@ jobs:
 
       - name: Audit dependencies
         run: npm audit --audit-level=high
+
+  native-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Test native host
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Check native host
+        run: cargo check --manifest-path src-tauri/Cargo.toml

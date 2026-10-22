@@ -1,4 +1,11 @@
+mod catalogue;
+mod discovery;
+mod fs_safe;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use catalogue::{
+    Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
+};
 use chrono::{DateTime, Duration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,62 +64,6 @@ impl Default for DeviceSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TechnicalMetadata {
-    size_bytes: u64,
-    duration_seconds: Option<f64>,
-    width: Option<u32>,
-    height: Option<u32>,
-    codec: Option<String>,
-    frame_rate: Option<f64>,
-    has_audio: Option<bool>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaItem {
-    id: String,
-    relative_path: String,
-    original_filename: String,
-    sha256: String,
-    capture_date: Option<String>,
-    capture_date_provenance: String,
-    ingest_date: String,
-    file_type: String,
-    tags: Vec<String>,
-    project_ids: Vec<String>,
-    notes: String,
-    technical: TechnicalMetadata,
-    thumbnail_path: Option<String>,
-    attached_audio_id: Option<String>,
-    available: bool,
-    needs_review: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProjectRecord {
-    id: String,
-    name: String,
-    working_directory: String,
-    media_ids: Vec<String>,
-    notes: String,
-    tags: Vec<String>,
-    created_at: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Catalogue {
-    #[serde(default)]
-    media: Vec<MediaItem>,
-    #[serde(default)]
-    projects: Vec<ProjectRecord>,
-    #[serde(default)]
-    updated_at: String,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IngestRequest {
@@ -154,6 +105,14 @@ struct IngestConflict {
     reason: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RescanResult {
+    registered: usize,
+    changed: usize,
+    pending: usize,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaUpdate {
@@ -172,7 +131,21 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
-        return Ok(T::default());
+        let backup = path.with_file_name(format!(
+            "{}.backup",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if backup.is_file() {
+            fs::copy(&backup, path).map_err(|error| {
+                format!(
+                    "Cannot recover {} from {}: {error}",
+                    path.display(),
+                    backup.display()
+                )
+            })?;
+        } else {
+            return Ok(T::default());
+        }
     }
     let data = fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     serde_json::from_slice(&data).map_err(|e| format!("Invalid {}: {e}", path.display()))
@@ -195,21 +168,41 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         file.write_all(&bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
     }
-    if !path.exists() {
-        return fs::rename(&temp, path).map_err(|e| e.to_string());
+    if path.exists() {
+        let backup = path.with_file_name(format!(
+            "{}.backup",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        fs::copy(path, &backup)
+            .map_err(|error| format!("Cannot create recoverable metadata backup: {error}"))?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("Cannot flush metadata backup: {error}"))?;
+        let retired = path.with_file_name(format!(
+            "{}.retired",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if retired.exists() {
+            fs::remove_file(&retired).map_err(|error| error.to_string())?;
+        }
+        fs::rename(path, &retired)
+            .map_err(|error| format!("Cannot prepare metadata replacement: {error}"))?;
+        if let Err(error) = fs::rename(&temp, path) {
+            let _ = fs::rename(&retired, path);
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Could not promote metadata update: {error}"));
+        }
+        fs::remove_file(retired).map_err(|error| error.to_string())?;
+        return Ok(());
     }
-    let backup = parent.join(format!(
-        ".{}.{}.backup",
-        path.file_name().unwrap().to_string_lossy(),
-        Uuid::new_v4()
-    ));
-    fs::rename(path, &backup).map_err(|e| e.to_string())?;
     if let Err(error) = fs::rename(&temp, path) {
-        let _ = fs::rename(&backup, path);
         let _ = fs::remove_file(&temp);
         return Err(format!("Could not promote metadata update: {error}"));
     }
-    fs::remove_file(backup).map_err(|e| e.to_string())
+    Ok(())
 }
 fn load_settings_file(app: &AppHandle) -> Result<DeviceSettings, String> {
     read_json(&settings_path(app)?)
@@ -226,33 +219,13 @@ fn catalogue_dir(settings: &DeviceSettings) -> Result<PathBuf, String> {
         Ok(PathBuf::from(&settings.shared_catalogue_path))
     }
 }
-fn catalogue_path(settings: &DeviceSettings) -> Result<PathBuf, String> {
-    Ok(catalogue_dir(settings)?.join("catalogue.json"))
-}
 fn load_catalogue_file(settings: &DeviceSettings) -> Result<Catalogue, String> {
-    read_json(&catalogue_path(settings)?)
+    let root = catalogue_dir(settings)?;
+    catalogue::migrate_legacy_snapshot(&root, &settings.device_id)?;
+    catalogue::load(&root)
 }
-fn save_catalogue_file(settings: &DeviceSettings, catalogue: &mut Catalogue) -> Result<(), String> {
-    catalogue.updated_at = Utc::now().to_rfc3339();
-    write_json(&catalogue_path(settings)?, catalogue)
-}
-fn append_event(
-    settings: &DeviceSettings,
-    event_type: &str,
-    payload: &serde_json::Value,
-) -> Result<(), String> {
-    let path = catalogue_dir(settings)?
-        .join("events")
-        .join(format!("{}.jsonl", settings.device_id));
-    fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-    let envelope = serde_json::json!({"schemaVersion":1,"eventId":Uuid::new_v4(),"deviceId":settings.device_id,"occurredAt":Utc::now().to_rfc3339(),"type":event_type,"payload":payload});
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    writeln!(file, "{}", envelope).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())
+fn append_events(settings: &DeviceSettings, events: Vec<CatalogueEvent>) -> Result<(), String> {
+    catalogue::append(&catalogue_dir(settings)?, &settings.device_id, events)
 }
 
 #[tauri::command]
@@ -261,7 +234,11 @@ fn load_settings(app: AppHandle) -> Result<DeviceSettings, String> {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceSettings, String> {
+fn save_settings(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    mut settings: DeviceSettings,
+) -> Result<DeviceSettings, String> {
     if settings.master_bin_path.trim().is_empty()
         || settings.working_projects_path.trim().is_empty()
     {
@@ -275,9 +252,7 @@ fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceS
     let current = load_settings_file(&app)?;
     if !current.initialized_catalogue_path.is_empty()
         && current.initialized_catalogue_path != next_catalogue
-        && Path::new(&current.initialized_catalogue_path)
-            .join("catalogue.json")
-            .exists()
+        && Path::new(&current.initialized_catalogue_path).exists()
     {
         return Err("Catalogue migration is not implemented. Keep the initialized catalogue location, or move it manually with PIMP closed before changing this setting.".into());
     }
@@ -297,24 +272,30 @@ fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceS
     if settings.device_id.is_empty() {
         settings.device_id = current.device_id;
     }
+    let _guard = state.catalogue_write.lock().unwrap();
+    let root = catalogue_dir(&settings)?;
+    catalogue::migrate_legacy_snapshot(&root, &settings.device_id)?;
     write_json(&settings_path(&app)?, &settings)?;
-    if !catalogue_path(&settings)?.exists() {
-        save_catalogue_file(&settings, &mut Catalogue::default())?;
-    }
-    write_json(
-        &catalogue_dir(&settings)?.join("shared-settings.json"),
-        &serde_json::json!({"schemaVersion":1,"ingestDateOrganization":settings.ingest_date_organization,"updatedAt":Utc::now().to_rfc3339(),"updatedBy":settings.device_id}),
-    )?;
     Ok(settings)
 }
 
 #[tauri::command]
 fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
     let settings = load_settings_file(&app)?;
+    let recovered = recover_staging(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let mut catalogue = load_catalogue_file(&settings)?;
+    if recovered > 0 {
+        catalogue.issues.push(CatalogueIssue {
+            code: "ingest-recovery".into(),
+            source: "device-local staging".into(),
+            detail: format!("Recovered {recovered} interrupted staging operation(s)"),
+        });
+    }
     let master = PathBuf::from(&settings.master_bin_path);
     for item in &mut catalogue.media {
-        item.available = master.join(&item.relative_path).is_file();
+        item.available = fs_safe::resolve_existing(&master, &item.relative_path)
+            .map(|path| path.is_file())
+            .unwrap_or(false);
     }
     for project in &mut catalogue.projects {
         if let Some(path) = settings.project_paths.get(&project.id) {
@@ -342,6 +323,10 @@ fn ignored(path: &Path) -> bool {
     name.starts_with(".syncthing.")
         || name.ends_with(".tmp")
         || name.ends_with(".part")
+        || name.ends_with(".partial")
+        || name.ends_with(".crdownload")
+        || name.contains(".pimp-part-")
+        || name.contains(".sync-conflict-")
         || path.components().any(|c| c.as_os_str() == ".pimp")
 }
 fn source_files(sources: &[String], unsupported: &mut Vec<String>) -> Vec<PathBuf> {
@@ -423,9 +408,67 @@ fn destination_date(
         },
     )
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestJournal {
+    job_id: String,
+    source_path: String,
+    destination_path: String,
+    staged_name: String,
+    status: String,
+    detail: Option<String>,
+}
+
+fn recover_staging(master: &Path, device_id: &str) -> Result<usize, String> {
+    let root = fs_safe::staging_root(master, device_id)?;
+    let jobs = root.join("jobs");
+    fs::create_dir_all(&jobs).map_err(|error| error.to_string())?;
+    let mut recovered = 0;
+    for entry in fs::read_dir(&jobs).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let journal: IngestJournal = match read_json(&entry.path()) {
+            Ok(journal) => journal,
+            Err(error) => {
+                return Err(format!(
+                    "Invalid ingest recovery record {}; staging was left untouched: {error}",
+                    entry.path().display()
+                ))
+            }
+        };
+        if Path::new(&journal.staged_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(journal.staged_name.as_str())
+        {
+            return Err(format!(
+                "Unsafe staging filename in {}; staging was left untouched",
+                entry.path().display()
+            ));
+        }
+        let staged = root.join("files").join(&journal.staged_name);
+        if staged.is_file() {
+            fs::remove_file(&staged).map_err(|error| error.to_string())?;
+        }
+        fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        let backup = entry
+            .path()
+            .with_file_name(format!("{}.backup", entry.file_name().to_string_lossy()));
+        if backup.is_file() {
+            fs::remove_file(backup).map_err(|error| error.to_string())?;
+        }
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
 fn copy_verified(
     app: &AppHandle,
     state: &NativeState,
+    settings: &DeviceSettings,
     job_id: &str,
     source: &Path,
     destination: &Path,
@@ -434,58 +477,105 @@ fn copy_verified(
     file_index: usize,
     file_total: usize,
 ) -> Result<String, String> {
-    let source_hash = sha256(source)?;
-    let temp_dir = destination.parent().unwrap().join(".pimp-incoming");
-    fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-    let temp = temp_dir.join(format!("{}.part", Uuid::new_v4()));
-    let mut input = File::open(source).map_err(|e| e.to_string())?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|e| e.to_string())?;
-    let mut copied = 0u64;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        if state.cancelled_jobs.lock().unwrap().contains(job_id) {
-            drop(output);
+    let before = fs_safe::snapshot(source)?;
+    let staging = fs_safe::staging_root(Path::new(&settings.master_bin_path), &settings.device_id)?;
+    let staged_name = format!("{}.part", Uuid::new_v4());
+    let temp = staging.join("files").join(&staged_name);
+    let journal_path = staging
+        .join("jobs")
+        .join(format!("{}.json", Uuid::new_v4()));
+    fs::create_dir_all(journal_path.parent().unwrap()).map_err(|error| error.to_string())?;
+    let mut journal = IngestJournal {
+        job_id: job_id.into(),
+        source_path: source.to_string_lossy().to_string(),
+        destination_path: destination.to_string_lossy().to_string(),
+        staged_name,
+        status: "copying".into(),
+        detail: None,
+    };
+    write_json(&journal_path, &journal)?;
+    let operation: Result<String, String> = (|| {
+        let mut input =
+            File::open(source).map_err(|error| format!("Cannot read source: {error}"))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| format!("Cannot create staging file: {error}"))?;
+        let mut copied = 0u64;
+        let mut source_hash = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            if state.cancelled_jobs.lock().unwrap().contains(job_id) {
+                return Err("__cancelled__".into());
+            }
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| format!("Interrupted source read: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            source_hash.update(&buffer[..read]);
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| format!("Interrupted staging write: {error}"))?;
+            copied += read as u64;
+            let _ = app.emit(
+                "ingest-progress",
+                IngestProgress {
+                    job_id: job_id.into(),
+                    phase: "copying".into(),
+                    current_file: source.to_string_lossy().to_string(),
+                    files_complete: file_index,
+                    files_total: file_total,
+                    bytes_complete: base_bytes + copied,
+                    bytes_total: total_bytes,
+                },
+            );
+        }
+        output.sync_all().map_err(|error| error.to_string())?;
+        drop(output);
+        let copied_source_hash = format!("{:x}", source_hash.finalize());
+        let after = fs_safe::snapshot(source)?;
+        if before != after || copied != before.length {
+            return Err("Source changed during transfer; staged copy was rejected".into());
+        }
+        let post_copy_source_hash = sha256(source)?;
+        if post_copy_source_hash != copied_source_hash {
+            return Err("Source content changed during transfer; staged copy was rejected".into());
+        }
+        if sha256(&temp)? != copied_source_hash {
+            return Err("Independent SHA-256 verification failed".into());
+        }
+        journal.status = "verified".into();
+        write_json(&journal_path, &journal)?;
+        fs_safe::promote_no_overwrite(&temp, destination)?;
+        Ok(copied_source_hash)
+    })();
+    match operation {
+        Ok(hash) => {
+            let _ = fs::remove_file(&journal_path);
+            let _ = fs::remove_file(journal_path.with_file_name(format!(
+                "{}.backup",
+                journal_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )));
+            Ok(hash)
+        }
+        Err(error) => {
             let _ = fs::remove_file(&temp);
-            return Err("__cancelled__".into());
+            journal.status = "failed".into();
+            journal.detail = Some(error.clone());
+            let _ = write_json(&journal_path, &journal);
+            if error == "__destination_exists__" {
+                Err("__race__".into())
+            } else {
+                Err(error)
+            }
         }
-        let read = input.read(&mut buffer).map_err(|e| e.to_string())?;
-        if read == 0 {
-            break;
-        }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|e| e.to_string())?;
-        copied += read as u64;
-        let _ = app.emit(
-            "ingest-progress",
-            IngestProgress {
-                job_id: job_id.into(),
-                phase: "copying".into(),
-                current_file: source.to_string_lossy().to_string(),
-                files_complete: file_index,
-                files_total: file_total,
-                bytes_complete: base_bytes + copied,
-                bytes_total: total_bytes,
-            },
-        );
     }
-    output.sync_all().map_err(|e| e.to_string())?;
-    drop(output);
-    if sha256(&temp)? != source_hash {
-        let _ = fs::remove_file(&temp);
-        return Err("Independent SHA-256 verification failed".into());
-    }
-    fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
-    if destination.exists() {
-        let _ = fs::remove_file(&temp);
-        return Err("__race__".into());
-    }
-    fs::rename(&temp, destination).map_err(|e| format!("Cannot promote verified copy: {e}"))?;
-    Ok(source_hash)
 }
 fn new_media(
     source: &Path,
@@ -521,6 +611,12 @@ fn new_media(
         attached_audio_id: None,
         available: true,
         needs_review,
+        observed_size: Some(metadata.len()),
+        observed_modified_millis: metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64),
     })
 }
 
@@ -541,7 +637,18 @@ async fn start_ingest(
     let mut completed_bytes = 0u64;
     state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
     let _guard = state.catalogue_write.lock().unwrap();
-    let mut catalogue = load_catalogue_file(&settings)?;
+    let recovered = recover_staging(&master, &settings.device_id)?;
+    if recovered > 0 {
+        result.failures.push(format!(
+            "Recovered {recovered} interrupted staging operation(s) before ingest"
+        ));
+    }
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut known_paths: HashSet<String> = catalogue
+        .media
+        .iter()
+        .map(|item| item.relative_path.clone())
+        .collect();
     for (index, source) in files.iter().enumerate() {
         if state
             .cancelled_jobs
@@ -576,22 +683,99 @@ async fn start_ingest(
             ));
             continue;
         }
-        let destination = master.join(&date_folder).join(&filename);
-        let relative = destination
-            .strip_prefix(&master)
-            .map_err(|_| "Destination escaped Master Bin")?
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative = format!("{date_folder}/{filename}").replace('\\', "/");
+        let destination = match fs_safe::resolve_for_create(&master, &relative) {
+            Ok(path) => path,
+            Err(error) => {
+                result
+                    .failures
+                    .push(format!("{}: {error}", source.display()));
+                continue;
+            }
+        };
         if destination.exists() {
-            match(sha256(source),sha256(&destination)){(Ok(a),Ok(b))if a==b=>{result.duplicates.push(source.to_string_lossy().to_string());if !catalogue.media.iter().any(|m|m.relative_path==relative){let item=new_media(&destination,relative,b,capture,provenance,false)?;catalogue.media.push(item.clone());result.imported.push(item)}},_=>result.conflicts.push(IngestConflict{source_path:source.to_string_lossy().to_string(),destination_path:destination.to_string_lossy().to_string(),reason:"A different file already uses this destination name. Skip it, choose another date, or explicitly rename the incoming copy.".into()})}
+            match (sha256(source), sha256(&destination)) {
+                (Ok(a), Ok(b)) if a == b => {
+                    result.duplicates.push(source.to_string_lossy().to_string());
+                    if !known_paths.contains(&relative) {
+                        let item = new_media(
+                            &destination,
+                            relative,
+                            b,
+                            capture,
+                            provenance,
+                            false,
+                        )?;
+                        append_events(
+                            &settings,
+                            vec![CatalogueEvent::MediaRegistered {
+                                media: item.clone(),
+                            }],
+                        )?;
+                        known_paths.insert(item.relative_path.clone());
+                        result.imported.push(item);
+                    }
+                }
+                _ => result.conflicts.push(IngestConflict {
+                    source_path: source.to_string_lossy().to_string(),
+                    destination_path: destination.to_string_lossy().to_string(),
+                    reason: "A different file already uses this destination name. Skip it, choose another date, or explicitly rename the incoming copy.".into(),
+                }),
+            }
             completed_bytes += source_size;
             continue;
         }
-        match copy_verified(&app,&state,&request.job_id,source,&destination,completed_bytes,total_bytes,index,files.len()){Ok(hash)=>{let item=new_media(&destination,relative,hash,capture,provenance,false)?;append_event(&settings,"media.registered",&serde_json::to_value(&item).unwrap())?;catalogue.media.push(item.clone());result.imported.push(item)},Err(error)if error=="__cancelled__"=>{result.cancelled=true;break},Err(error)if error=="__race__"=>result.conflicts.push(IngestConflict{source_path:source.to_string_lossy().to_string(),destination_path:destination.to_string_lossy().to_string(),reason:"Another operation created the destination while copying; the verified temporary copy was discarded.".into()}),Err(error)=>result.failures.push(format!("{}: {error}",source.display()))}
+        match copy_verified(
+            &app,
+            &state,
+            &settings,
+            &request.job_id,
+            source,
+            &destination,
+            completed_bytes,
+            total_bytes,
+            index,
+            files.len(),
+        ) {
+            Ok(hash) => {
+                let item = new_media(
+                    &destination,
+                    relative,
+                    hash,
+                    capture,
+                    provenance,
+                    false,
+                )?;
+                if let Err(error) = append_events(
+                    &settings,
+                    vec![CatalogueEvent::MediaRegistered {
+                        media: item.clone(),
+                    }],
+                ) {
+                    result.failures.push(format!(
+                        "{} was safely copied but catalogue persistence failed: {error}. Rescan can recover it.",
+                        destination.display()
+                    ));
+                } else {
+                    known_paths.insert(item.relative_path.clone());
+                    result.imported.push(item);
+                }
+            }
+            Err(error) if error == "__cancelled__" => {
+                result.cancelled = true;
+                break;
+            }
+            Err(error) if error == "__race__" => result.conflicts.push(IngestConflict {
+                source_path: source.to_string_lossy().to_string(),
+                destination_path: destination.to_string_lossy().to_string(),
+                reason: "Another operation created the destination while copying; the verified staged copy was discarded without replacing it.".into(),
+            }),
+            Err(error) => result
+                .failures
+                .push(format!("{}: {error}", source.display())),
+        }
         completed_bytes += source_size;
     }
-    pair_audio(&mut catalogue);
-    save_catalogue_file(&settings, &mut catalogue)?;
     state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
     let _ = app.emit("catalogue-changed", ());
     Ok(result)
@@ -616,6 +800,20 @@ fn write_project_manifest(
     project: &ProjectRecord,
     media: &[MediaItem],
 ) -> Result<(), String> {
+    let manifest_path = directory.join(".pimp-project.json");
+    if manifest_path.exists() {
+        let value: serde_json::Value = read_json(&manifest_path)?;
+        let existing_id = value
+            .get("id")
+            .or_else(|| value.get("project").and_then(|project| project.get("id")))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Existing .pimp-project.json has no compatible project identity")?;
+        if existing_id != project.id {
+            return Err(format!(
+                "Existing .pimp-project.json belongs to project {existing_id}; it was not overwritten"
+            ));
+        }
+    }
     let references: Vec<_> = media
         .iter()
         .filter(|item| item.project_ids.contains(&project.id))
@@ -629,9 +827,9 @@ fn write_project_manifest(
         })
         .collect();
     write_json(
-        &directory.join(".pimp-project.json"),
+        &manifest_path,
         &serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "id": project.id,
             "name": project.name,
             "workingDirectory": ".",
@@ -651,47 +849,93 @@ async fn update_media(
 ) -> Result<Catalogue, String> {
     let settings = load_settings_file(&app)?;
     let _guard = state.catalogue_write.lock().unwrap();
-    let mut catalogue = load_catalogue_file(&settings)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut events = Vec::new();
     for item in catalogue
         .media
-        .iter_mut()
-        .filter(|m| update.media_ids.contains(&m.id))
+        .iter()
+        .filter(|item| update.media_ids.contains(&item.id))
     {
         if let Some(tags) = &update.tags {
-            item.tags = normalized(tags)
+            let desired = normalized(tags);
+            events.push(CatalogueEvent::MediaTagsAdded {
+                media_id: item.id.clone(),
+                values: desired
+                    .iter()
+                    .filter(|value| !item.tags.contains(value))
+                    .cloned()
+                    .collect(),
+            });
+            events.push(CatalogueEvent::MediaTagsRemoved {
+                media_id: item.id.clone(),
+                values: item
+                    .tags
+                    .iter()
+                    .filter(|value| !desired.contains(value))
+                    .cloned()
+                    .collect(),
+            });
         }
         if let Some(projects) = &update.project_ids {
-            item.project_ids = normalized(projects)
+            let desired = normalized(projects);
+            events.push(CatalogueEvent::MediaProjectsAdded {
+                media_id: item.id.clone(),
+                values: desired
+                    .iter()
+                    .filter(|value| !item.project_ids.contains(value))
+                    .cloned()
+                    .collect(),
+            });
+            events.push(CatalogueEvent::MediaProjectsRemoved {
+                media_id: item.id.clone(),
+                values: item
+                    .project_ids
+                    .iter()
+                    .filter(|value| !desired.contains(value))
+                    .cloned()
+                    .collect(),
+            });
         }
         if let Some(tags) = &update.add_tags {
-            item.tags = normalized(&[item.tags.clone(), tags.clone()].concat())
+            events.push(CatalogueEvent::MediaTagsAdded {
+                media_id: item.id.clone(),
+                values: normalized(tags),
+            });
         }
         if let Some(projects) = &update.add_project_ids {
-            item.project_ids = normalized(&[item.project_ids.clone(), projects.clone()].concat())
+            events.push(CatalogueEvent::MediaProjectsAdded {
+                media_id: item.id.clone(),
+                values: normalized(projects),
+            });
         }
         if let Some(notes) = &update.notes {
-            item.notes = notes.clone()
+            events.push(CatalogueEvent::MediaNotesSet {
+                media_id: item.id.clone(),
+                value: notes.clone(),
+            });
         }
-        item.needs_review = false;
-        append_event(
-            &settings,
-            "media.updated",
-            &serde_json::to_value(&item).unwrap(),
-        )?;
+        events.push(CatalogueEvent::MediaEvidenceObserved {
+            media_id: item.id.clone(),
+            observed_size: item.observed_size.unwrap_or(item.technical.size_bytes),
+            observed_modified_millis: item.observed_modified_millis,
+            needs_review: false,
+        });
     }
-    let media = &catalogue.media;
-    for project in &mut catalogue.projects {
-        project.media_ids = media
-            .iter()
-            .filter(|item| item.project_ids.contains(&project.id))
-            .map(|item| item.id.clone())
-            .collect();
+    events.retain(|event| match event {
+        CatalogueEvent::MediaTagsAdded { values, .. }
+        | CatalogueEvent::MediaTagsRemoved { values, .. }
+        | CatalogueEvent::MediaProjectsAdded { values, .. }
+        | CatalogueEvent::MediaProjectsRemoved { values, .. } => !values.is_empty(),
+        _ => true,
+    });
+    append_events(&settings, events)?;
+    let next = load_catalogue_file(&settings)?;
+    for project in &next.projects {
         if let Some(path) = settings.project_paths.get(&project.id) {
-            write_project_manifest(Path::new(path), project, media)?;
+            write_project_manifest(Path::new(path), project, &next.media)?;
         }
     }
-    save_catalogue_file(&settings, &mut catalogue)?;
-    Ok(catalogue)
+    Ok(next)
 }
 #[tauri::command]
 fn create_project(
@@ -706,72 +950,81 @@ fn create_project(
     let mut settings = load_settings_file(&app)?;
     let directory = PathBuf::from(&working_directory);
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    let project = ProjectRecord {
-        id: Uuid::new_v4().to_string(),
-        name: name.trim().into(),
-        working_directory: ".".into(),
-        media_ids: vec![],
-        notes: String::new(),
-        tags: vec![],
-        created_at: Utc::now().to_rfc3339(),
+    let manifest_path = directory.join(".pimp-project.json");
+    let project = if manifest_path.exists() {
+        let value: serde_json::Value = read_json(&manifest_path)?;
+        let project_value = value.get("project").unwrap_or(&value);
+        let id = project_value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Existing .pimp-project.json is incompatible and was not overwritten")?;
+        ProjectRecord {
+            id: id.into(),
+            name: project_value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(name.trim())
+                .into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: project_value
+                .get("notes")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            tags: serde_json::from_value(project_value.get("tags").cloned().unwrap_or_default())
+                .unwrap_or_default(),
+            created_at: project_value
+                .get("createdAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("1970-01-01T00:00:00Z")
+                .into(),
+        }
+    } else {
+        ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.trim().into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: Utc::now().to_rfc3339(),
+        }
     };
-    write_project_manifest(&directory, &project, &[])?;
     settings
         .project_paths
         .insert(project.id.clone(), working_directory);
-    write_json(&settings_path(&app)?, &settings)?;
     let _guard = state.catalogue_write.lock().unwrap();
-    let mut catalogue = load_catalogue_file(&settings)?;
-    catalogue.projects.push(project.clone());
-    append_event(
+    append_events(
         &settings,
-        "project.upserted",
-        &serde_json::to_value(&project).unwrap(),
+        vec![CatalogueEvent::ProjectUpserted {
+            project: project.clone(),
+        }],
     )?;
-    save_catalogue_file(&settings, &mut catalogue)?;
+    write_json(&settings_path(&app)?, &settings)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    write_project_manifest(&directory, &project, &catalogue.media)?;
     Ok(project)
 }
-fn pair_audio(catalogue: &mut Catalogue) {
-    let audios: HashMap<String, String> = catalogue
-        .media
-        .iter()
-        .filter(|m| m.file_type == "wav")
-        .map(|m| {
-            (
-                Path::new(&m.original_filename)
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_ascii_lowercase(),
-                m.id.clone(),
-            )
-        })
-        .collect();
-    for media in catalogue
-        .media
-        .iter_mut()
-        .filter(|m| matches!(m.file_type.as_str(), "mp4" | "mov" | "m4v"))
-    {
-        let stem = Path::new(&media.original_filename)
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_ascii_lowercase();
-        media.attached_audio_id = audios.get(&stem).cloned();
-    }
-}
 #[tauri::command]
-async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, String> {
+async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanResult, String> {
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
     let _guard = state.catalogue_write.lock().unwrap();
-    let mut catalogue = load_catalogue_file(&settings)?;
-    let known: HashSet<_> = catalogue
+    let catalogue = load_catalogue_file(&settings)?;
+    let known: HashMap<_, _> = catalogue
         .media
         .iter()
-        .map(|m| m.relative_path.clone())
+        .map(|item| (item.relative_path.clone(), item.clone()))
         .collect();
-    let mut added = 0;
+    let discovery_path = settings_path(&app)?
+        .parent()
+        .unwrap()
+        .join("discovery-observations.json");
+    let mut observations = discovery::load(&discovery_path)?;
+    let now = Utc::now().timestamp();
+    let mut events = Vec::new();
+    let mut result = RescanResult::default();
     for entry in WalkDir::new(&master)
         .follow_links(false)
         .into_iter()
@@ -786,29 +1039,45 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, 
             .map_err(|_| "Path escaped Master Bin")?
             .to_string_lossy()
             .replace('\\', "/");
-        if known.contains(&relative) {
-            continue;
+        let snapshot = match fs_safe::snapshot(path) {
+            Ok(snapshot) => snapshot,
+            Err(_) => continue,
+        };
+        if let Some(item) = known.get(&relative) {
+            if item.observed_size == Some(snapshot.length)
+                && item.observed_modified_millis
+                    == snapshot.modified_millis.map(|value| value as u64)
+            {
+                observations.verified(&relative);
+                continue;
+            }
         }
-        let before = path.metadata().map_err(|e| e.to_string())?;
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let after = path.metadata().map_err(|e| e.to_string())?;
-        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        if discovery::Decision::Wait == observations.observe(&relative, &snapshot, now) {
+            result.pending += 1;
             continue;
         }
         let hash = sha256(path)?;
-        let (_, capture, provenance) = destination_date(&settings, path, &None);
-        let item = new_media(path, relative, hash, capture, provenance, true)?;
-        append_event(
-            &settings,
-            "media.discovered",
-            &serde_json::to_value(&item).unwrap(),
-        )?;
-        catalogue.media.push(item);
-        added += 1
+        if let Some(item) = known.get(&relative) {
+            events.push(CatalogueEvent::MediaEvidenceObserved {
+                media_id: item.id.clone(),
+                observed_size: snapshot.length,
+                observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
+                needs_review: hash != item.sha256,
+            });
+            if hash != item.sha256 {
+                result.changed += 1;
+            }
+        } else {
+            let (_, capture, provenance) = destination_date(&settings, path, &None);
+            let item = new_media(path, relative.clone(), hash, capture, provenance, true)?;
+            events.push(CatalogueEvent::MediaRegistered { media: item });
+            result.registered += 1;
+        }
+        observations.verified(&relative);
     }
-    pair_audio(&mut catalogue);
-    save_catalogue_file(&settings, &mut catalogue)?;
-    Ok(added)
+    append_events(&settings, events)?;
+    discovery::save(&discovery_path, &observations)?;
+    Ok(result)
 }
 #[tauri::command]
 async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, String> {
@@ -817,69 +1086,83 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
     let cache = PathBuf::from(&settings.thumbnail_cache_path);
     fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let _guard = state.catalogue_write.lock().unwrap();
-    let mut catalogue = load_catalogue_file(&settings)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut events = Vec::new();
     let mut changed = 0;
-    for item in &mut catalogue.media {
-        let source = master.join(&item.relative_path);
-        if !source.is_file() {
-            item.available = false;
+    for item in &catalogue.media {
+        let source = match fs_safe::resolve_existing(&master, &item.relative_path) {
+            Ok(path) if path.is_file() => path,
+            _ => continue,
+        };
+        let thumbnail_ref = format!("{}.jpg", item.id);
+        if !catalogue::safe_cache_reference(&thumbnail_ref) {
             continue;
         }
-        if let Ok(output) = Command::new("ffprobe")
-            .args([
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-show_format",
-            ])
-            .arg(&source)
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    let streams = value["streams"].as_array().cloned().unwrap_or_default();
-                    let video = streams
-                        .iter()
-                        .find(|stream| stream["codec_type"] == "video");
-                    item.technical.has_audio =
-                        Some(streams.iter().any(|stream| stream["codec_type"] == "audio"));
-                    item.technical.duration_seconds = value["format"]["duration"]
-                        .as_str()
-                        .and_then(|value| value.parse().ok());
-                    if let Some(video) = video {
-                        item.technical.width = video["width"].as_u64().map(|value| value as u32);
-                        item.technical.height = video["height"].as_u64().map(|value| value as u32);
-                        item.technical.codec = video["codec_name"].as_str().map(String::from);
-                        item.technical.frame_rate =
-                            video["avg_frame_rate"].as_str().and_then(|rate| {
-                                let mut parts = rate.split('/');
-                                let numerator: f64 = parts.next()?.parse().ok()?;
-                                let denominator: f64 = parts.next()?.parse().ok()?;
-                                (denominator != 0.0).then_some(numerator / denominator)
-                            });
+        let thumbnail = cache.join(&thumbnail_ref);
+        let needs_probe = item.technical.codec.is_none()
+            && matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v");
+        let needs_thumbnail =
+            matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v") && !thumbnail.is_file();
+        if !needs_probe && !needs_thumbnail {
+            continue;
+        }
+        let mut technical = item.technical.clone();
+        if needs_probe {
+            if let Ok(output) = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-show_format",
+                ])
+                .arg(&source)
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        let streams = value["streams"].as_array().cloned().unwrap_or_default();
+                        let video = streams
+                            .iter()
+                            .find(|stream| stream["codec_type"] == "video");
+                        technical.has_audio =
+                            Some(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+                        technical.duration_seconds = value["format"]["duration"]
+                            .as_str()
+                            .and_then(|value| value.parse().ok());
+                        if let Some(video) = video {
+                            technical.width = video["width"].as_u64().map(|value| value as u32);
+                            technical.height = video["height"].as_u64().map(|value| value as u32);
+                            technical.codec = video["codec_name"].as_str().map(String::from);
+                            technical.frame_rate =
+                                video["avg_frame_rate"].as_str().and_then(|rate| {
+                                    let mut parts = rate.split('/');
+                                    let numerator: f64 = parts.next()?.parse().ok()?;
+                                    let denominator: f64 = parts.next()?.parse().ok()?;
+                                    (denominator != 0.0).then_some(numerator / denominator)
+                                });
+                        }
                     }
                 }
             }
         }
-        if matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v") {
-            let thumbnail = cache.join(format!("{}.jpg", item.id));
-            if !thumbnail.exists() {
-                let _ = Command::new("ffmpeg")
-                    .args(["-y", "-ss", "0.1", "-i"])
-                    .arg(&source)
-                    .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
-                    .arg(&thumbnail)
-                    .output();
-            }
-            if thumbnail.is_file() {
-                item.thumbnail_path = Some(thumbnail.to_string_lossy().to_string());
-            }
+        if needs_thumbnail {
+            let _ = Command::new("ffmpeg")
+                .args(["-y", "-ss", "0.1", "-i"])
+                .arg(&source)
+                .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
+                .arg(&thumbnail)
+                .output();
         }
+        events.push(CatalogueEvent::MediaEnriched {
+            media_id: item.id.clone(),
+            technical,
+            thumbnail_ref: thumbnail.is_file().then_some(thumbnail_ref),
+        });
         changed += 1;
     }
-    save_catalogue_file(&settings, &mut catalogue)?;
+    append_events(&settings, events)?;
     Ok(changed)
 }
 #[tauri::command]
@@ -891,10 +1174,11 @@ fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String
         .iter()
         .find(|m| m.id == media_id)
         .ok_or("Unknown media item")?;
-    Ok(PathBuf::from(settings.master_bin_path)
-        .join(&item.relative_path)
-        .to_string_lossy()
-        .to_string())
+    Ok(
+        fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?
+            .to_string_lossy()
+            .to_string(),
+    )
 }
 
 #[tauri::command]
@@ -906,10 +1190,27 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
         .iter()
         .find(|item| item.id == media_id)
         .ok_or("Unknown media item")?;
-    let Some(path) = &item.thumbnail_path else {
+    let Some(reference) = &item.thumbnail_path else {
         return Ok(None);
     };
-    let path = PathBuf::from(path);
+    if !catalogue::safe_cache_reference(reference) || reference != &format!("{}.jpg", item.id) {
+        return Err("Catalogue contains an unsafe thumbnail reference".into());
+    }
+    let cache = PathBuf::from(&settings.thumbnail_cache_path);
+    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+    let cache = cache
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
+    let path = cache.join(reference);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve thumbnail: {error}"))?;
+    if !path.starts_with(&cache) {
+        return Err("Thumbnail resolved outside the configured cache".into());
+    }
     let metadata = path.metadata().map_err(|e| e.to_string())?;
     if metadata.len() > 10 * 1024 * 1024 {
         return Err("Thumbnail exceeds the 10 MB safety limit".into());
@@ -947,6 +1248,15 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn temporary(name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".test-tmp")
+            .join(format!("pimp-native-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn accepts_only_initial_media_extensions() {
         assert!(supported(Path::new("clip.MP4")));
@@ -969,5 +1279,84 @@ mod tests {
             normalized(&[existing, added].concat()),
             vec!["Night", "Race", "Workshop"]
         );
+    }
+
+    #[test]
+    fn metadata_write_retains_a_recoverable_previous_version() {
+        let root = temporary("metadata");
+        let path = root.join("state.json");
+        write_json(&path, &serde_json::json!({"version":1})).unwrap();
+        write_json(&path, &serde_json::json!({"version":2})).unwrap();
+        assert_eq!(read_json::<serde_json::Value>(&path).unwrap()["version"], 2);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_json::<serde_json::Value>(&path).unwrap()["version"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_recovery_journal_fails_closed_without_deleting_staging() {
+        let root = temporary("bad-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("keep.part");
+        let journal = staging.join("jobs").join("bad.json");
+        fs::write(&staged, b"incomplete").unwrap();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(&journal, b"{not-json}").unwrap();
+        assert!(recover_staging(&master, "device-a").is_err());
+        assert_eq!(fs::read(&staged).unwrap(), b"incomplete");
+        assert!(journal.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_removes_only_the_file_named_by_a_valid_journal() {
+        let root = temporary("owned-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let owned = staging.join("files").join("owned.part");
+        let unrelated = staging.join("files").join("unrelated.part");
+        fs::write(&owned, b"owned").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+        let journal_path = staging.join("jobs").join("owned.json");
+        write_json(
+            &journal_path,
+            &IngestJournal {
+                job_id: "job".into(),
+                source_path: "source".into(),
+                destination_path: "destination".into(),
+                staged_name: "owned.part".into(),
+                status: "copying".into(),
+                detail: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(recover_staging(&master, "device-a").unwrap(), 1);
+        assert!(!owned.exists());
+        assert!(!journal_path.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incompatible_project_manifest_is_never_overwritten() {
+        let root = temporary("manifest");
+        let path = root.join(".pimp-project.json");
+        let original = br#"{"schemaVersion":1,"id":"existing","name":"Existing"}"#;
+        fs::write(&path, original).unwrap();
+        let project = ProjectRecord {
+            id: "incoming".into(),
+            name: "Incoming".into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-22T00:00:00Z".into(),
+        };
+        assert!(write_project_manifest(&root, &project, &[]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
     }
 }
