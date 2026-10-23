@@ -1263,7 +1263,7 @@ pub fn migrate_legacy_snapshot(root: &Path, _device_id: &str) -> Result<(), Stri
         fs::create_dir_all(event_dir(root)).map_err(|error| error.to_string())?;
         let content = migration_content(&legacy);
         let temporary = root.join(format!(".migration-{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, content).map_err(|error| error.to_string())?;
+        fs::write(&temporary, &content).map_err(|error| error.to_string())?;
         OpenOptions::new()
             .read(true)
             .write(true)
