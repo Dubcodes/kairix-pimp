@@ -53,6 +53,14 @@ export interface MediaItem {
   observedSize?: number;
   observedModifiedMillis?: number;
   missing?: boolean;
+  integrityByDevice?: Record<string, IntegrityEvidence>;
+}
+
+export interface IntegrityEvidence {
+  observedSize: number;
+  observedModifiedMillis?: number;
+  observedSha256?: string;
+  needsReview: boolean;
 }
 
 export interface FolderRecord {
@@ -94,6 +102,7 @@ export type CatalogueEvent =
       mediaId: string;
       observedSize: number;
       observedModifiedMillis?: number;
+      observedSha256?: string;
       needsReview: boolean;
     }
   | { type: 'folder.upserted'; folder: FolderRecord }

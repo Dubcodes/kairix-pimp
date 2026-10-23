@@ -302,6 +302,38 @@ describe('catalogue reducer', () => {
     expect(state.media.m1.tags).toEqual(['Track']);
     expect(state.media.m1.notes).toBe('Keep warning');
   });
+  it('retains integrity evidence independently for each device', () => {
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media }),
+      envelope(
+        {
+          type: 'media.evidence-observed',
+          mediaId: 'm1',
+          observedSize: 3,
+          observedSha256: 'changed',
+          needsReview: true,
+        },
+        'desktop-evidence',
+        'desktop',
+      ),
+      envelope(
+        {
+          type: 'media.evidence-observed',
+          mediaId: 'm1',
+          observedSize: 2,
+          observedSha256: 'abc',
+          needsReview: false,
+        },
+        'laptop-evidence',
+        'laptop',
+      ),
+    ]);
+    expect(state.media.m1.integrityByDevice?.desktop.needsReview).toBe(true);
+    expect(state.media.m1.integrityByDevice?.laptop).toMatchObject({
+      observedSha256: 'abc',
+      needsReview: false,
+    });
+  });
   it('surfaces concurrent project record changes', () => {
     const project = {
       id: 'p1',

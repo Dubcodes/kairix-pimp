@@ -187,6 +187,13 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
       item.observedSize = event.observedSize;
       item.observedModifiedMillis = event.observedModifiedMillis;
       item.needsReview = event.needsReview;
+      item.integrityByDevice ??= {};
+      item.integrityByDevice[envelope.deviceId] = {
+        observedSize: event.observedSize,
+        observedModifiedMillis: event.observedModifiedMillis,
+        observedSha256: event.observedSha256,
+        needsReview: event.needsReview,
+      };
     } else if (event.type === 'folder.upserted') {
       const key = `${event.folder.id}:folder`;
       const previous = fieldVersions.get(key);

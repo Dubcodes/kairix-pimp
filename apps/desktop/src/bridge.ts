@@ -157,6 +157,8 @@ export const desktopBridge = {
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
   rescan: () => invoke<RescanResult>('rescan'),
+  verifyMediaIntegrity: (mediaId: string) =>
+    invoke<boolean>('verify_media_integrity', { mediaId }),
   enrichMedia: () => invoke<number>('enrich_media'),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),

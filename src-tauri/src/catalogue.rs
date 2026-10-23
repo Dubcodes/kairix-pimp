@@ -25,6 +25,15 @@ pub struct TechnicalMetadata {
     pub has_audio: Option<bool>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrityEvidence {
+    pub observed_size: u64,
+    pub observed_modified_millis: Option<u64>,
+    pub observed_sha256: Option<String>,
+    pub needs_review: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaItem {
@@ -58,6 +67,8 @@ pub struct MediaItem {
     pub observed_size: Option<u64>,
     #[serde(default)]
     pub observed_modified_millis: Option<u64>,
+    #[serde(default)]
+    pub integrity_by_device: BTreeMap<String, IntegrityEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -186,6 +197,8 @@ pub enum CatalogueEvent {
         observed_size: u64,
         #[serde(rename = "observedModifiedMillis")]
         observed_modified_millis: Option<u64>,
+        #[serde(default, rename = "observedSha256")]
+        observed_sha256: Option<String>,
         #[serde(rename = "needsReview")]
         needs_review: bool,
     },
@@ -854,12 +867,22 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 media_id,
                 observed_size,
                 observed_modified_millis,
+                observed_sha256,
                 needs_review,
             } => {
                 if let Some(item) = media.get_mut(media_id) {
                     item.observed_size = Some(*observed_size);
                     item.observed_modified_millis = *observed_modified_millis;
                     item.needs_review = *needs_review;
+                    item.integrity_by_device.insert(
+                        envelope.device_id.clone(),
+                        IntegrityEvidence {
+                            observed_size: *observed_size,
+                            observed_modified_millis: *observed_modified_millis,
+                            observed_sha256: observed_sha256.clone(),
+                            needs_review: *needs_review,
+                        },
+                    );
                 }
             }
             CatalogueEvent::FolderUpserted { folder } => {
@@ -1011,6 +1034,15 @@ pub fn load(root: &Path) -> Result<Catalogue, String> {
 }
 
 pub fn append(root: &Path, device_id: &str, events: Vec<CatalogueEvent>) -> Result<(), String> {
+    if device_id.is_empty()
+        || Path::new(device_id)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(device_id)
+        || device_id.to_ascii_lowercase().contains(".sync-conflict-")
+    {
+        return Err("Device identity is unsafe for an owned event stream".into());
+    }
     if events.is_empty() {
         return Ok(());
     }
@@ -1263,6 +1295,7 @@ mod tests {
             needs_review: false,
             observed_size: Some(1),
             observed_modified_millis: Some(1),
+            integrity_by_device: Default::default(),
         }
     }
 
@@ -1566,6 +1599,50 @@ mod tests {
         assert!(catalogue.media[0].needs_review);
         assert_eq!(catalogue.media[0].tags, vec!["Track"]);
         assert_eq!(catalogue.media[0].notes, "Keep warning");
+    }
+
+    #[test]
+    fn integrity_evidence_is_retained_independently_per_device() {
+        let registered = envelope(
+            "seed",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "clip.mp4", "mp4"),
+            },
+        );
+        let changed = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaEvidenceObserved {
+                media_id: "m".into(),
+                observed_size: 2,
+                observed_modified_millis: Some(20),
+                observed_sha256: Some("changed".into()),
+                needs_review: true,
+            },
+        );
+        let verified = envelope(
+            "laptop",
+            1,
+            CatalogueEvent::MediaEvidenceObserved {
+                media_id: "m".into(),
+                observed_size: 1,
+                observed_modified_millis: Some(10),
+                observed_sha256: Some("hash-m".into()),
+                needs_review: false,
+            },
+        );
+        let catalogue = rebuild(EventRead {
+            events: vec![verified, changed, registered],
+            ..Default::default()
+        });
+        let evidence = &catalogue.media[0].integrity_by_device;
+        assert!(evidence["desktop"].needs_review);
+        assert!(!evidence["laptop"].needs_review);
+        assert_eq!(
+            evidence["laptop"].observed_sha256.as_deref(),
+            Some("hash-m")
+        );
     }
 
     #[test]

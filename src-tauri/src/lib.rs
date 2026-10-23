@@ -231,6 +231,18 @@ fn load_settings(app: AppHandle) -> Result<DeviceSettings, String> {
     load_settings_file(&app)
 }
 
+fn preserve_device_identity(current: &str, requested: &str) -> Result<String, String> {
+    if !current.is_empty() {
+        if requested.is_empty() || requested == current {
+            return Ok(current.to_string());
+        }
+        return Err("Device identity is immutable after initialization".into());
+    }
+    Uuid::parse_str(requested)
+        .map(|value| value.to_string())
+        .map_err(|_| "Device identity must be a UUID generated for this device".into())
+}
+
 #[tauri::command]
 fn save_settings(
     app: AppHandle,
@@ -248,6 +260,7 @@ fn save_settings(
         .map_err(|e| format!("Cannot create Working Projects directory: {e}"))?;
     let next_catalogue = catalogue_dir(&settings)?.to_string_lossy().to_string();
     let current = load_settings_file(&app)?;
+    settings.device_id = preserve_device_identity(&current.device_id, &settings.device_id)?;
     if !current.initialized_catalogue_path.is_empty()
         && current.initialized_catalogue_path != next_catalogue
         && Path::new(&current.initialized_catalogue_path).exists()
@@ -267,9 +280,6 @@ fn save_settings(
     fs::create_dir_all(&settings.thumbnail_cache_path)
         .map_err(|e| format!("Cannot create thumbnail cache: {e}"))?;
     settings.initialized_catalogue_path = next_catalogue;
-    if settings.device_id.is_empty() {
-        settings.device_id = current.device_id;
-    }
     let _guard = state.catalogue_write.lock().unwrap();
     let root = catalogue_dir(&settings)?;
     catalogue::migrate_legacy_snapshot(&root, &settings.device_id)?;
@@ -286,6 +296,11 @@ fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
         item.available = fs_safe::resolve_existing(&master, &item.relative_path)
             .map(|path| path.is_file())
             .unwrap_or(false);
+        if let Some(evidence) = item.integrity_by_device.get(&settings.device_id) {
+            item.observed_size = Some(evidence.observed_size);
+            item.observed_modified_millis = evidence.observed_modified_millis;
+            item.needs_review = evidence.needs_review;
+        }
     }
     for project in &mut catalogue.projects {
         if let Some(path) = settings.project_paths.get(&project.id) {
@@ -410,6 +425,25 @@ struct IngestJournal {
     detail: Option<String>,
 }
 
+struct VerifiedCopy {
+    hash: String,
+    journal_path: PathBuf,
+}
+
+fn remove_journal(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    let backup = path.with_file_name(format!(
+        "{}.backup",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if backup.is_file() {
+        fs::remove_file(backup).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn recover_staging(master: &Path, device_id: &str) -> Result<usize, String> {
     let root = fs_safe::staging_root(master, device_id)?;
     let jobs = root.join("jobs");
@@ -439,17 +473,37 @@ fn recover_staging(master: &Path, device_id: &str) -> Result<usize, String> {
                 entry.path().display()
             ));
         }
+        if !matches!(
+            journal.status.as_str(),
+            "copying" | "verified" | "committed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            return Err(format!(
+                "Unknown ingest lifecycle state in {}; staging was left untouched",
+                entry.path().display()
+            ));
+        }
         let staged = root.join("files").join(&journal.staged_name);
+        let destination = PathBuf::from(&journal.destination_path);
+        if destination.exists() {
+            let master = master
+                .canonicalize()
+                .map_err(|error| format!("Cannot resolve Master Bin during recovery: {error}"))?;
+            let destination = destination
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            if !destination.starts_with(&master) {
+                return Err(format!(
+                    "Unsafe recovery destination in {}; staging was left untouched",
+                    entry.path().display()
+                ));
+            }
+        }
         if staged.is_file() {
             fs::remove_file(&staged).map_err(|error| error.to_string())?;
         }
-        fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
-        let backup = entry
-            .path()
-            .with_file_name(format!("{}.backup", entry.file_name().to_string_lossy()));
-        if backup.is_file() {
-            fs::remove_file(backup).map_err(|error| error.to_string())?;
-        }
+        // A committed journal owns only its staging artifact. The promoted
+        // destination is durable user media and is reconciled by Rescan.
+        remove_journal(&entry.path())?;
         recovered += 1;
     }
     Ok(recovered)
@@ -466,7 +520,7 @@ fn copy_verified(
     total_bytes: u64,
     file_index: usize,
     file_total: usize,
-) -> Result<String, String> {
+) -> Result<VerifiedCopy, String> {
     let before = fs_safe::snapshot(source)?;
     let staging = fs_safe::staging_root(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let staged_name = format!("{}.part", Uuid::new_v4());
@@ -540,23 +594,19 @@ fn copy_verified(
         journal.status = "verified".into();
         write_json(&journal_path, &journal)?;
         fs_safe::promote_no_overwrite(&temp, destination)?;
+        journal.status = "committed".into();
+        write_json(&journal_path, &journal)?;
         Ok(copied_source_hash)
     })();
     match operation {
-        Ok(hash) => {
-            let _ = fs::remove_file(&journal_path);
-            let _ = fs::remove_file(journal_path.with_file_name(format!(
-                "{}.backup",
-                journal_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            )));
-            Ok(hash)
-        }
+        Ok(hash) => Ok(VerifiedCopy { hash, journal_path }),
         Err(error) => {
             let _ = fs::remove_file(&temp);
-            journal.status = "failed".into();
+            journal.status = if error == "__cancelled__" {
+                "cancelled".into()
+            } else {
+                "failed".into()
+            };
             journal.detail = Some(error.clone());
             let _ = write_json(&journal_path, &journal);
             if error == "__destination_exists__" {
@@ -607,6 +657,7 @@ fn new_media(
             .ok()
             .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|value| value.as_millis() as u64),
+        integrity_by_device: Default::default(),
     })
 }
 
@@ -727,11 +778,11 @@ async fn start_ingest(
             index,
             files.len(),
         ) {
-            Ok(hash) => {
+            Ok(copy) => {
                 let item = new_media(
                     &destination,
                     relative,
-                    hash,
+                    copy.hash,
                     capture,
                     provenance,
                     false,
@@ -747,6 +798,7 @@ async fn start_ingest(
                         destination.display()
                     ));
                 } else {
+                    remove_journal(&copy.journal_path)?;
                     known_paths.insert(item.relative_path.clone());
                     result.imported.push(item);
                 }
@@ -1028,10 +1080,12 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
             Err(_) => continue,
         };
         if let Some(item) = known.get(&relative) {
-            if item.observed_size == Some(snapshot.length)
-                && item.observed_modified_millis
-                    == snapshot.modified_millis.map(|value| value as u64)
-            {
+            let evidence = item.integrity_by_device.get(&settings.device_id);
+            if evidence.is_some_and(|evidence| {
+                evidence.observed_size == snapshot.length
+                    && evidence.observed_modified_millis
+                        == snapshot.modified_millis.map(|value| value as u64)
+            }) {
                 observations.verified(&relative);
                 continue;
             }
@@ -1046,6 +1100,7 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
                 media_id: item.id.clone(),
                 observed_size: snapshot.length,
                 observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
+                observed_sha256: Some(hash.clone()),
                 needs_review: hash != item.sha256,
             });
             if hash != item.sha256 {
@@ -1062,6 +1117,39 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
     append_events(&settings, events)?;
     discovery::save(&discovery_path, &observations)?;
     Ok(result)
+}
+
+#[tauri::command]
+fn verify_media_integrity(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    media_id: String,
+) -> Result<bool, String> {
+    let settings = load_settings_file(&app)?;
+    let _guard = state.catalogue_write.lock().unwrap();
+    let catalogue = load_catalogue_file(&settings)?;
+    let item = catalogue
+        .media
+        .iter()
+        .find(|item| item.id == media_id)
+        .ok_or("Unknown media item")?;
+    let path =
+        fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?;
+    let snapshot = fs_safe::snapshot(&path)?;
+    let observed_sha256 = sha256(&path)?;
+    let matches = observed_sha256 == item.sha256;
+    append_events(
+        &settings,
+        vec![CatalogueEvent::MediaEvidenceObserved {
+            media_id,
+            observed_size: snapshot.length,
+            observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
+            observed_sha256: Some(observed_sha256),
+            needs_review: !matches,
+        }],
+    )?;
+    let _ = app.emit("catalogue-changed", ());
+    Ok(matches)
 }
 #[tauri::command]
 async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, String> {
@@ -1220,6 +1308,7 @@ pub fn run() {
             update_media,
             create_project,
             rescan,
+            verify_media_integrity,
             enrich_media,
             resolve_media_path,
             load_thumbnail
@@ -1263,6 +1352,14 @@ mod tests {
             normalized(&[existing, added].concat()),
             vec!["Night", "Race", "Workshop"]
         );
+    }
+
+    #[test]
+    fn device_identity_cannot_be_replaced_after_initialization() {
+        let identity = Uuid::new_v4().to_string();
+        assert_eq!(preserve_device_identity(&identity, "").unwrap(), identity);
+        assert!(preserve_device_identity(&identity, &Uuid::new_v4().to_string()).is_err());
+        assert!(preserve_device_identity("", "desktop").is_err());
     }
 
     #[test]
@@ -1337,6 +1434,37 @@ mod tests {
         assert!(!owned.exists());
         assert!(!journal_path.exists());
         assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_never_deletes_a_promoted_destination() {
+        let root = temporary("committed-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let destination = master.join("2026-10-23").join("clip.mp4");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"verified-media").unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("already-promoted.part");
+        fs::write(&staged, b"stale-stage").unwrap();
+        let journal_path = staging.join("jobs").join("committed.json");
+        write_json(
+            &journal_path,
+            &IngestJournal {
+                job_id: "job".into(),
+                source_path: "source".into(),
+                destination_path: destination.to_string_lossy().into(),
+                staged_name: "already-promoted.part".into(),
+                status: "committed".into(),
+                detail: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(recover_staging(&master, "device-a").unwrap(), 1);
+        assert_eq!(fs::read(&destination).unwrap(), b"verified-media");
+        assert!(!staged.exists());
+        assert!(!journal_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
