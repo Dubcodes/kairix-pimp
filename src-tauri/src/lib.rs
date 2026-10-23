@@ -209,7 +209,23 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     Ok(())
 }
 fn load_settings_file(app: &AppHandle) -> Result<DeviceSettings, String> {
-    read_json(&settings_path(app)?)
+    load_or_initialize_settings(&settings_path(app)?)
+}
+
+fn load_or_initialize_settings(path: &Path) -> Result<DeviceSettings, String> {
+    if path.exists()
+        || path
+            .with_file_name(format!(
+                "{}.backup",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ))
+            .exists()
+    {
+        return read_json(path);
+    }
+    let settings = DeviceSettings::default();
+    write_json(path, &settings)?;
+    Ok(settings)
 }
 fn catalogue_dir(settings: &DeviceSettings) -> Result<PathBuf, String> {
     if settings.master_bin_path.trim().is_empty() {
@@ -503,6 +519,12 @@ struct VerifiedCopy {
     journal_path: PathBuf,
 }
 
+#[derive(Default)]
+struct RecoverySummary {
+    recovered: usize,
+    needs_review: usize,
+}
+
 fn remove_journal(path: &Path) -> Result<(), String> {
     if path.is_file() {
         fs::remove_file(path).map_err(|error| error.to_string())?;
@@ -521,11 +543,11 @@ fn recover_staging(
     master: &Path,
     device_id: &str,
     catalogue_root: Option<&Path>,
-) -> Result<usize, String> {
+) -> Result<RecoverySummary, String> {
     let root = fs_safe::staging_root(master, device_id)?;
     let jobs = root.join("jobs");
     fs::create_dir_all(&jobs).map_err(|error| error.to_string())?;
-    let mut recovered = 0;
+    let mut summary = RecoverySummary::default();
     for entry in fs::read_dir(&jobs).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
@@ -578,17 +600,48 @@ fn recover_staging(
         if journal.status == "verified" {
             // A verified staged file is valuable and may be awaiting promotion.
             // Without a complete committed record, preserve both files and journal.
+            summary.needs_review += 1;
             continue;
         }
         if journal.status == "committed" {
             let (Some(media), Some(catalogue_root)) = (&journal.media, catalogue_root) else {
+                summary.needs_review += 1;
                 continue;
             };
             if !destination.is_file() {
+                summary.needs_review += 1;
+                continue;
+            }
+            let expected = match fs_safe::resolve_existing(master, &media.relative_path) {
+                Ok(expected) => expected,
+                Err(_) => {
+                    summary.needs_review += 1;
+                    continue;
+                }
+            };
+            let actual = destination
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            if actual != expected
+                || actual.metadata().map_err(|error| error.to_string())?.len()
+                    != media.technical.size_bytes
+                || sha256(&actual)? != media.sha256
+            {
+                summary.needs_review += 1;
                 continue;
             }
             let catalogue = catalogue::load(catalogue_root)?;
-            if !catalogue.media.iter().any(|item| item.id == media.id) {
+            if let Some(existing) = catalogue.media.iter().find(|item| {
+                item.id == media.id || item.relative_path == media.relative_path
+            }) {
+                if existing.id != media.id
+                    || existing.relative_path != media.relative_path
+                    || existing.sha256 != media.sha256
+                {
+                    summary.needs_review += 1;
+                    continue;
+                }
+            } else {
                 catalogue::append(
                     catalogue_root,
                     device_id,
@@ -604,9 +657,9 @@ fn recover_staging(
         // A committed journal owns only its staging artifact. The promoted
         // destination is durable user media and is reconciled by Rescan.
         remove_journal(&entry.path())?;
-        recovered += 1;
+        summary.recovered += 1;
     }
-    Ok(recovered)
+    Ok(summary)
 }
 
 fn copy_verified(
@@ -780,10 +833,17 @@ async fn start_ingest(
     state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
     let _guard = state.catalogue_write.lock().unwrap();
     let catalogue_root = catalogue_dir(&settings)?;
-    let recovered = recover_staging(&master, &settings.device_id, Some(&catalogue_root))?;
-    if recovered > 0 {
+    let recovery = recover_staging(&master, &settings.device_id, Some(&catalogue_root))?;
+    if recovery.recovered > 0 {
         result.failures.push(format!(
-            "Recovered {recovered} staging operation(s) before ingest"
+            "Recovered {} staging operation(s) before ingest",
+            recovery.recovered
+        ));
+    }
+    if recovery.needs_review > 0 {
+        result.failures.push(format!(
+            "{} staging operation(s) need review and were preserved",
+            recovery.needs_review
         ));
     }
     let catalogue = load_catalogue_file(&settings)?;
@@ -1478,6 +1538,29 @@ mod tests {
     }
 
     #[test]
+    fn first_launch_persists_one_immutable_device_identity_across_restart() {
+        let root = temporary("first-launch-identity");
+        let path = root.join("empty-config").join("device-settings.json");
+        let first = load_or_initialize_settings(&path).unwrap();
+        assert!(Uuid::parse_str(&first.device_id).is_ok());
+        assert!(path.is_file());
+
+        let restarted = load_or_initialize_settings(&path).unwrap();
+        assert_eq!(restarted.device_id, first.device_id);
+        assert_eq!(
+            preserve_device_identity(&restarted.device_id, &first.device_id).unwrap(),
+            first.device_id
+        );
+        assert!(preserve_device_identity(&restarted.device_id, &Uuid::new_v4().to_string()).is_err());
+
+        write_json(&path, &restarted).unwrap();
+        fs::remove_file(&path).unwrap();
+        let recovered = load_or_initialize_settings(&path).unwrap();
+        assert_eq!(recovered.device_id, restarted.device_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn date_folder_patterns_are_unambiguous_and_path_safe() {
         let date = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
         let time = chrono::NaiveTime::from_hms_opt(17, 42, 9).unwrap();
@@ -1583,7 +1666,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(recover_staging(&master, "device-a", None).unwrap(), 1);
+        assert_eq!(
+            recover_staging(&master, "device-a", None)
+                .unwrap()
+                .recovered,
+            1
+        );
         assert!(!owned.exists());
         assert!(!journal_path.exists());
         assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
@@ -1625,10 +1713,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            recover_staging(&master, "device-a", Some(&catalogue_root)).unwrap(),
-            1
-        );
+        let recovery = recover_staging(&master, "device-a", Some(&catalogue_root)).unwrap();
+        assert_eq!(recovery.recovered, 1);
+        assert_eq!(recovery.needs_review, 0);
         assert_eq!(fs::read(&destination).unwrap(), b"verified-media");
         assert!(!staged.exists());
         assert!(!journal_path.exists());
@@ -1665,9 +1752,195 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(recover_staging(&master, "device-a", None).unwrap(), 0);
+        let recovery = recover_staging(&master, "device-a", None).unwrap();
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.needs_review, 1);
         assert_eq!(fs::read(&staged).unwrap(), b"verified-bytes");
         assert!(journal_path.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_a_committed_journal_when_promoted_bytes_changed() {
+        let root = temporary("corrupt-promoted-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let destination = master.join("2026-10-23").join("clip.mp4");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"original-media").unwrap();
+        let mut media = new_media(
+            &destination,
+            "2026-10-23/clip.mp4".into(),
+            sha256(&destination).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        fs::write(&destination, b"modified-media").unwrap();
+        media.technical.size_bytes = fs::metadata(&destination).unwrap().len();
+
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("keep.part");
+        fs::write(&staged, b"staged-copy").unwrap();
+        let journal_path = staging.join("jobs").join("committed.json");
+        write_json(
+            &journal_path,
+            &IngestJournal {
+                job_id: "job".into(),
+                source_path: "source".into(),
+                destination_path: destination.to_string_lossy().into(),
+                staged_name: "keep.part".into(),
+                status: "committed".into(),
+                detail: None,
+                media: Some(media),
+            },
+        )
+        .unwrap();
+
+        let catalogue_root = master.join(".pimp");
+        let recovery = recover_staging(&master, "device-a", Some(&catalogue_root)).unwrap();
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.needs_review, 1);
+        assert_eq!(fs::read(&destination).unwrap(), b"modified-media");
+        assert!(staged.is_file());
+        assert!(journal_path.is_file());
+        assert!(catalogue::load(&catalogue_root).unwrap().media.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_a_destination_that_disagrees_with_the_media_path() {
+        let root = temporary("wrong-destination-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let expected = master.join("expected").join("clip.mp4");
+        let destination = master.join("other").join("clip.mp4");
+        fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&expected, b"same-media").unwrap();
+        fs::write(&destination, b"same-media").unwrap();
+        let media = new_media(
+            &expected,
+            "expected/clip.mp4".into(),
+            sha256(&expected).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("keep.part");
+        fs::write(&staged, b"same-media").unwrap();
+        let journal_path = staging.join("jobs").join("committed.json");
+        write_json(
+            &journal_path,
+            &IngestJournal {
+                job_id: "job".into(),
+                source_path: "source".into(),
+                destination_path: destination.to_string_lossy().into(),
+                staged_name: "keep.part".into(),
+                status: "committed".into(),
+                detail: None,
+                media: Some(media),
+            },
+        )
+        .unwrap();
+
+        let recovery =
+            recover_staging(&master, "device-a", Some(&master.join(".pimp"))).unwrap();
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.needs_review, 1);
+        assert!(journal_path.is_file());
+        assert!(staged.is_file());
+        assert_eq!(fs::read(&destination).unwrap(), b"same-media");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_a_journal_that_conflicts_with_existing_registration() {
+        let root = temporary("conflicting-registration-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let destination = master.join("2026-10-23").join("clip.mp4");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"verified-media").unwrap();
+        let media = new_media(
+            &destination,
+            "2026-10-23/clip.mp4".into(),
+            sha256(&destination).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        let mut conflicting = media.clone();
+        conflicting.id = "different-media-id".into();
+        let catalogue_root = master.join(".pimp");
+        catalogue::append(
+            &catalogue_root,
+            "device-a",
+            vec![CatalogueEvent::MediaRegistered { media: conflicting }],
+        )
+        .unwrap();
+
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("keep.part");
+        fs::write(&staged, b"verified-media").unwrap();
+        let journal_path = staging.join("jobs").join("committed.json");
+        write_json(
+            &journal_path,
+            &IngestJournal {
+                job_id: "job".into(),
+                source_path: "source".into(),
+                destination_path: destination.to_string_lossy().into(),
+                staged_name: "keep.part".into(),
+                status: "committed".into(),
+                detail: None,
+                media: Some(media),
+            },
+        )
+        .unwrap();
+
+        let recovery = recover_staging(&master, "device-a", Some(&catalogue_root)).unwrap();
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.needs_review, 1);
+        assert!(journal_path.is_file());
+        assert!(staged.is_file());
+        assert_eq!(catalogue::load(&catalogue_root).unwrap().media.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_journal_rewrite_leaves_the_last_complete_state_recoverable() {
+        let root = temporary("interrupted-journal-rewrite");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("keep.part");
+        fs::write(&staged, b"verified-media").unwrap();
+        let journal_path = staging.join("jobs").join("job.json");
+        let journal = IngestJournal {
+            job_id: "job".into(),
+            source_path: "source".into(),
+            destination_path: master
+                .join("2026-10-23")
+                .join("clip.mp4")
+                .to_string_lossy()
+                .into(),
+            staged_name: "keep.part".into(),
+            status: "verified".into(),
+            detail: None,
+            media: None,
+        };
+        write_json(&journal_path, &journal).unwrap();
+        fs::write(staging.join("jobs").join(".job.json.interrupted.tmp"), b"{").unwrap();
+
+        let recovery = recover_staging(&master, "device-a", None).unwrap();
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.needs_review, 1);
+        assert!(journal_path.is_file());
+        assert!(staged.is_file());
         fs::remove_dir_all(root).unwrap();
     }
 

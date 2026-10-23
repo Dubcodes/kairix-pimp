@@ -1,6 +1,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
@@ -1142,13 +1143,17 @@ pub fn pair_audio(catalogue: &mut Catalogue) {
     }
 }
 
-pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), String> {
+pub fn migrate_legacy_snapshot(root: &Path, _device_id: &str) -> Result<(), String> {
     fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let marker = root.join("migration-v2.json");
     if marker.exists() {
         let value: Value = serde_json::from_slice(&fs::read(&marker).map_err(|e| e.to_string())?)
             .map_err(|error| format!("Invalid migration marker: {error}"))?;
-        if value.get("source").and_then(Value::as_str) == Some("catalogue.json") {
+        if value.get("source").and_then(Value::as_str) == Some("none") {
+            if !root.join("catalogue.json").exists() {
+                return Ok(());
+            }
+        } else if value.get("source").and_then(Value::as_str) == Some("catalogue.json") {
             let backup = value
                 .get("backup")
                 .and_then(Value::as_str)
@@ -1160,21 +1165,30 @@ pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), Strin
                 .get("eventStream")
                 .and_then(Value::as_str)
                 .ok_or("Migration marker does not identify its event stream")?;
+            let backup_bytes = fs::read(root.join(backup)).map_err(|error| error.to_string())?;
+            let expected_hash = value
+                .get("sourceSha256")
+                .and_then(Value::as_str)
+                .ok_or("Migration marker does not identify the migrated source hash")?;
+            if sha256_bytes(&backup_bytes) != expected_hash {
+                return Err("Migration backup does not match the completed source hash".into());
+            }
+            let legacy: Catalogue = serde_json::from_slice(&backup_bytes)
+                .map_err(|error| format!("Migration backup is invalid: {error}"))?;
             let bytes = fs::read(event_dir(root).join(stream)).map_err(|_| {
                 "Migration marker exists but its event stream is missing".to_string()
             })?;
             if !bytes.is_empty() && !bytes.ends_with(b"\n") {
                 return Err("Migration event stream is truncated".into());
             }
+            if bytes != migration_content(&legacy).as_bytes() {
+                return Err("Migration event stream does not match its source snapshot".into());
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     let legacy_path = root.join("catalogue.json");
     if !legacy_path.exists() {
-        write_json(
-            &marker,
-            &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"none"}),
-        )?;
         return Ok(());
     }
     let bytes = fs::read(&legacy_path).map_err(|error| error.to_string())?;
@@ -1202,43 +1216,11 @@ pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), Strin
             "Existing migration backup differs from catalogue.json; refusing to continue".into(),
         );
     }
-    let migration_device = format!("migration-{device_id}");
-    let migration_path = event_dir(root).join(format!("{migration_device}.jsonl"));
+    let source_sha256 = sha256_bytes(&bytes);
+    let migration_path = event_dir(root).join("migration-v2.jsonl");
     if !migration_path.exists() {
         fs::create_dir_all(event_dir(root)).map_err(|error| error.to_string())?;
-        let mut content = String::new();
-        let mut sequence = 0u64;
-        let mut push = |event: CatalogueEvent, identity: String| {
-            sequence += 1;
-            let mut observed = BTreeMap::new();
-            observed.insert(migration_device.clone(), sequence - 1);
-            let envelope = EventEnvelope {
-                schema_version: EVENT_SCHEMA_VERSION,
-                event_id: format!("legacy-{identity}"),
-                device_id: migration_device.clone(),
-                sequence,
-                occurred_at: "1970-01-01T00:00:00Z".into(),
-                observed,
-                event,
-            };
-            content.push_str(&serde_json::to_string(&envelope).unwrap());
-            content.push('\n');
-        };
-        for media in legacy.media {
-            let identity = format!("media-{}", media.id);
-            push(
-                CatalogueEvent::MediaLegacySnapshotReplaced { media },
-                identity,
-            );
-        }
-        for project in legacy.projects {
-            let identity = format!("project-{}", project.id);
-            push(CatalogueEvent::ProjectUpserted { project }, identity);
-        }
-        for folder in legacy.folders {
-            let identity = format!("folder-{}", folder.id);
-            push(CatalogueEvent::FolderUpserted { folder }, identity);
-        }
+        let content = migration_content(&legacy);
         let temporary = root.join(format!(".migration-{}.tmp", Uuid::new_v4()));
         fs::write(&temporary, content).map_err(|error| error.to_string())?;
         OpenOptions::new()
@@ -1247,12 +1229,74 @@ pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), Strin
             .open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;
-        fs::rename(&temporary, &migration_path).map_err(|error| error.to_string())?;
+        if let Err(error) = fs::rename(&temporary, &migration_path) {
+            if !migration_path.is_file()
+                || fs::read(&migration_path).map_err(|read_error| read_error.to_string())?
+                    != content.as_bytes()
+            {
+                return Err(error.to_string());
+            }
+            let _ = fs::remove_file(&temporary);
+        }
+    } else if fs::read(&migration_path).map_err(|error| error.to_string())?
+        != migration_content(&legacy).as_bytes()
+    {
+        return Err("Existing migration stream differs from catalogue.json".into());
     }
     write_json(
         &marker,
-        &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"catalogue.json","backup":"catalogue.pre-events-v1.backup.json","eventStream":migration_path.file_name().unwrap().to_string_lossy()}),
+        &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"catalogue.json","sourceSha256":source_sha256,"backup":"catalogue.pre-events-v1.backup.json","eventStream":migration_path.file_name().unwrap().to_string_lossy(),"migrationOwner":"deterministic-v2"}),
     )
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn migration_content(legacy: &Catalogue) -> String {
+    let migration_device = "migration-v2".to_string();
+    let mut content = String::new();
+    let mut sequence = 0u64;
+    let mut push = |event: CatalogueEvent, identity: String| {
+        sequence += 1;
+        let observed = BTreeMap::from([(migration_device.clone(), sequence - 1)]);
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            event_id: format!("legacy-{identity}"),
+            device_id: migration_device.clone(),
+            sequence,
+            occurred_at: "1970-01-01T00:00:00Z".into(),
+            observed,
+            event,
+        };
+        content.push_str(&serde_json::to_string(&envelope).unwrap());
+        content.push('\n');
+    };
+    for media in &legacy.media {
+        push(
+            CatalogueEvent::MediaLegacySnapshotReplaced {
+                media: media.clone(),
+            },
+            format!("media-{}", media.id),
+        );
+    }
+    for project in &legacy.projects {
+        push(
+            CatalogueEvent::ProjectUpserted {
+                project: project.clone(),
+            },
+            format!("project-{}", project.id),
+        );
+    }
+    for folder in &legacy.folders {
+        push(
+            CatalogueEvent::FolderUpserted {
+                folder: folder.clone(),
+            },
+            format!("folder-{}", folder.id),
+        );
+    }
+    content
 }
 
 #[cfg(test)]
@@ -1812,11 +1856,11 @@ mod tests {
         )
         .unwrap();
         migrate_legacy_snapshot(&root, "device-a").unwrap();
-        let first = fs::read(event_dir(&root).join("migration-device-a.jsonl")).unwrap();
+        let first = fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap();
         migrate_legacy_snapshot(&root, "device-a").unwrap();
         assert_eq!(
             first,
-            fs::read(event_dir(&root).join("migration-device-a.jsonl")).unwrap()
+            fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap()
         );
         let rebuilt = load(&root).unwrap();
         assert_eq!(rebuilt.media[0].id, "legacy-media");
@@ -1836,11 +1880,11 @@ mod tests {
         .unwrap();
         fs::write(root.join("catalogue.json"), &original).unwrap();
         migrate_legacy_snapshot(&root, "desktop").unwrap();
-        let events = fs::read(event_dir(&root).join("migration-desktop.jsonl")).unwrap();
+        let events = fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap();
         fs::remove_file(root.join("migration-v2.json")).unwrap();
         migrate_legacy_snapshot(&root, "desktop").unwrap();
         assert_eq!(
-            fs::read(event_dir(&root).join("migration-desktop.jsonl")).unwrap(),
+            fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap(),
             events
         );
         assert_eq!(
@@ -1848,6 +1892,48 @@ mod tests {
             original
         );
         assert_eq!(load(&root).unwrap().media[0].id, "legacy-media");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn late_legacy_snapshot_is_not_blocked_by_an_empty_initialization() {
+        let root = temporary("late-legacy");
+        migrate_legacy_snapshot(&root, "device-a").unwrap();
+        assert!(!root.join("migration-v2.json").exists());
+        let legacy = Catalogue {
+            media: vec![item("late", "2026-10-24/late.mp4", "mp4")],
+            ..Default::default()
+        };
+        fs::write(
+            root.join("catalogue.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        migrate_legacy_snapshot(&root, "device-b").unwrap();
+        assert_eq!(load(&root).unwrap().media[0].id, "late");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn competing_devices_produce_one_identical_migration_representation() {
+        let root = temporary("competing-migration");
+        let legacy = Catalogue {
+            media: vec![item("shared", "2026-10-24/shared.mp4", "mp4")],
+            ..Default::default()
+        };
+        fs::write(
+            root.join("catalogue.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        migrate_legacy_snapshot(&root, "device-a").unwrap();
+        let first = fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap();
+        migrate_legacy_snapshot(&root, "device-b").unwrap();
+        assert_eq!(
+            fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap(),
+            first
+        );
+        assert_eq!(load(&root).unwrap().media.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1956,7 +2042,7 @@ mod tests {
         let root = temporary("incomplete-marker");
         fs::write(
             root.join("migration-v2.json"),
-            br#"{"schemaVersion":2,"source":"catalogue.json","backup":"catalogue.pre-events-v1.backup.json","eventStream":"migration-desktop.jsonl"}"#,
+            br#"{"schemaVersion":2,"source":"catalogue.json","sourceSha256":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","backup":"catalogue.pre-events-v1.backup.json","eventStream":"migration-v2.jsonl"}"#,
         )
         .unwrap();
         fs::write(root.join("catalogue.pre-events-v1.backup.json"), b"{}").unwrap();
