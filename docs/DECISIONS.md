@@ -155,7 +155,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 
 - **Date:** 2026-10-23
 - **Status:** Accepted
-- **Decision:** Use **DCM Master Bin** as the product term and default root-folder name. Retain the two organization modes, default a future date-format preference to `yyyyMMdd`, and never rename existing date folders when that preference changes.
+- **Decision:** Use **DCM Master Bin** as the product term and default root-folder name. Retain the two organization modes, use `yyyymmdd` (an alias of `yyyyMMdd`) for new installations, validate date/time tokens as a filename, and never rename existing date folders when that preference changes. Existing settings without the preference retain `yyyy-MM-dd`.
 - **Consequences:** Date formatting is presentation/configuration work, not a migration of existing media paths.
 
 ## ADR-020 — Durable ingest intent metadata

@@ -17,7 +17,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Contact sheets, preview player, custom thumbnails, folder rename/move journal
 - Evidence-scored and reversible DJI camera/audio pairing
-- Configurable date/time folder naming (default `yyyyMMdd`, including separators and 12-/24-hour patterns) without renaming existing folders
+- Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Ingest-time tags, project assignments, descriptions and favourites persisted with queued/retryable jobs
 - Rich library interaction: keyboard/multi-select batch actions, favourites, saved filters, previews and explicit review/conflict flows
 

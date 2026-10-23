@@ -13,6 +13,7 @@ export interface DeviceSettings {
   thumbnailCacheLimitBytes?: number;
   initializedCataloguePath?: string;
   projectPaths?: Record<string, string>;
+  dateFolderPattern?: string;
 }
 
 export interface SharedSettings {
@@ -53,6 +54,14 @@ export interface MediaItem {
   observedSize?: number;
   observedModifiedMillis?: number;
   missing?: boolean;
+  integrityByDevice?: Record<string, IntegrityEvidence>;
+}
+
+export interface IntegrityEvidence {
+  observedSize: number;
+  observedModifiedMillis?: number;
+  observedSha256?: string;
+  needsReview: boolean;
 }
 
 export interface FolderRecord {
@@ -77,8 +86,11 @@ export type CatalogueEvent =
   | { type: 'media.registered'; media: MediaItem }
   | { type: 'media.tags.added'; mediaId: string; values: string[] }
   | { type: 'media.tags.removed'; mediaId: string; values: string[] }
+  | { type: 'media.tags.replaced'; mediaId: string; values: string[] }
   | { type: 'media.projects.added'; mediaId: string; values: string[] }
   | { type: 'media.projects.removed'; mediaId: string; values: string[] }
+  | { type: 'media.projects.replaced'; mediaId: string; values: string[] }
+  | { type: 'media.legacy-snapshot-replaced'; media: MediaItem }
   | { type: 'media.notes.set'; mediaId: string; value: string }
   | {
       type: 'media.enriched';
@@ -91,6 +103,7 @@ export type CatalogueEvent =
       mediaId: string;
       observedSize: number;
       observedModifiedMillis?: number;
+      observedSha256?: string;
       needsReview: boolean;
     }
   | { type: 'folder.upserted'; folder: FolderRecord }
@@ -114,11 +127,18 @@ export interface MetadataConflict {
   values: unknown[];
 }
 
+export interface CatalogueIssue {
+  code: string;
+  source: string;
+  detail: string;
+}
+
 export interface CatalogueState {
   media: Record<string, MediaItem>;
   folders: Record<string, FolderRecord>;
   projects: Record<string, ProjectRecord>;
   conflicts: MetadataConflict[];
+  issues: CatalogueIssue[];
   appliedEventIds: string[];
 }
 
