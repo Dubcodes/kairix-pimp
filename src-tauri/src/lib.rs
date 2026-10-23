@@ -24,7 +24,11 @@ use walkdir::WalkDir;
 #[derive(Default)]
 struct NativeState {
     cancelled_jobs: Mutex<HashSet<String>>,
+    paused_jobs: Mutex<HashSet<String>>,
     catalogue_write: Mutex<()>,
+    job_store: Mutex<()>,
+    worker_active: Mutex<bool>,
+    availability: Mutex<HashMap<String, (String, bool)>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,6 +82,56 @@ struct IngestRequest {
     date_override: Option<String>,
     #[serde(default)]
     renamed_destinations: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ProvisionalMetadata {
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    project_ids: Vec<String>,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    favourite: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestJobFile {
+    id: String,
+    media_id: String,
+    source_path: String,
+    destination_path: String,
+    relative_path: String,
+    original_filename: String,
+    size_bytes: u64,
+    bytes_transferred: u64,
+    state: String,
+    error: Option<String>,
+    metadata: ProvisionalMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestJob {
+    schema_version: u32,
+    id: String,
+    state: String,
+    created_at: String,
+    updated_at: String,
+    batch_timestamp: String,
+    date_override: Option<String>,
+    files: Vec<IngestJobFile>,
+    #[serde(default)]
+    unsupported: Vec<String>,
+    #[serde(default)]
+    failures: Vec<String>,
+    current_file: Option<String>,
+    bytes_total: u64,
+    bytes_transferred: u64,
+    files_completed: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -134,6 +188,31 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("device-settings.json"))
+}
+fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("ingest-jobs.json"))
+}
+fn load_jobs_unlocked(app: &AppHandle) -> Result<Vec<IngestJob>, String> {
+    read_json(&jobs_path(app)?)
+}
+fn mutate_jobs<T>(
+    app: &AppHandle,
+    state: &NativeState,
+    operation: impl FnOnce(&mut Vec<IngestJob>) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = state.job_store.lock().unwrap();
+    let mut jobs = load_jobs_unlocked(app)?;
+    let result = operation(&mut jobs)?;
+    write_json(&jobs_path(app)?, &jobs)?;
+    let _ = app.emit("ingest-jobs-changed", &jobs);
+    Ok(result)
+}
+fn snapshot_jobs(app: &AppHandle, state: &NativeState) -> Result<Vec<IngestJob>, String> {
+    let _guard = state.job_store.lock().unwrap();
+    load_jobs_unlocked(app)
 }
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
@@ -317,7 +396,7 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
+fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catalogue, String> {
     let settings = load_settings_file(&app)?;
     let mut catalogue = load_catalogue_file(&settings)?;
     let master = PathBuf::from(&settings.master_bin_path);
@@ -336,7 +415,33 @@ fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
             project.working_directory = path.clone();
         }
     }
+    *state.availability.lock().unwrap() = catalogue
+        .media
+        .iter()
+        .map(|item| (item.id.clone(), (item.relative_path.clone(), item.available)))
+        .collect();
     Ok(catalogue)
+}
+
+#[tauri::command]
+fn refresh_media_availability(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<bool, String> {
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut availability = state.availability.lock().unwrap();
+    let mut changed = false;
+    for (_, (relative_path, available)) in availability.iter_mut() {
+        let next = fs_safe::resolve_existing(&master, relative_path)
+            .map(|path| path.is_file())
+            .unwrap_or(false);
+        if next != *available {
+            *available = next;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 #[tauri::command]
@@ -550,6 +655,41 @@ struct RecoverySummary {
     needs_review: usize,
 }
 
+fn update_job_progress(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+    file_id: &str,
+    phase: &str,
+    file_bytes: u64,
+    error: Option<String>,
+) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job no longer exists")?;
+        let file = job
+            .files
+            .iter_mut()
+            .find(|file| file.id == file_id)
+            .ok_or("Ingest job file no longer exists")?;
+        file.state = phase.into();
+        file.bytes_transferred = file_bytes.min(file.size_bytes);
+        file.error = error;
+        job.state = phase.into();
+        job.current_file = Some(file.original_filename.clone());
+        job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+        job.files_completed = job
+            .files
+            .iter()
+            .filter(|file| file.state == "completed")
+            .count();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
 fn remove_journal(path: &Path) -> Result<(), String> {
     if path.is_file() {
         fs::remove_file(path).map_err(|error| error.to_string())?;
@@ -692,6 +832,7 @@ fn copy_verified(
     state: &NativeState,
     settings: &DeviceSettings,
     job_id: &str,
+    file_id: &str,
     source: &Path,
     destination: &Path,
     base_bytes: u64,
@@ -728,6 +869,7 @@ fn copy_verified(
         let mut copied = 0u64;
         let mut source_hash = Sha256::new();
         let mut buffer = vec![0u8; 1024 * 1024];
+        let mut next_persist = 0u64;
         loop {
             if state.cancelled_jobs.lock().unwrap().contains(job_id) {
                 return Err("__cancelled__".into());
@@ -743,6 +885,10 @@ fn copy_verified(
                 .write_all(&buffer[..read])
                 .map_err(|error| format!("Interrupted staging write: {error}"))?;
             copied += read as u64;
+            if copied >= next_persist {
+                update_job_progress(app, state, job_id, file_id, "copying", copied, None)?;
+                next_persist = copied.saturating_add(8 * 1024 * 1024);
+            }
             let _ = app.emit(
                 "ingest-progress",
                 IngestProgress {
@@ -758,6 +904,19 @@ fn copy_verified(
         }
         output.sync_all().map_err(|error| error.to_string())?;
         drop(output);
+        update_job_progress(app, state, job_id, file_id, "verifying", copied, None)?;
+        let _ = app.emit(
+            "ingest-progress",
+            IngestProgress {
+                job_id: job_id.into(),
+                phase: "verifying".into(),
+                current_file: source.to_string_lossy().to_string(),
+                files_complete: file_index,
+                files_total: file_total,
+                bytes_complete: base_bytes + copied,
+                bytes_total: total_bytes,
+            },
+        );
         let copied_source_hash = format!("{:x}", source_hash.finalize());
         let after = fs_safe::snapshot(source)?;
         if before != after || copied != before.length {
@@ -822,6 +981,7 @@ fn new_media(
         tags: vec![],
         project_ids: vec![],
         notes: String::new(),
+        favourite: false,
         technical: TechnicalMetadata {
             size_bytes: metadata.len(),
             ..Default::default()
@@ -840,189 +1000,610 @@ fn new_media(
     })
 }
 
+fn metadata_events(media_id: &str, metadata: &ProvisionalMetadata) -> Vec<CatalogueEvent> {
+    let mut events = Vec::new();
+    if !metadata.tags.is_empty() {
+        events.push(CatalogueEvent::MediaTagsAdded {
+            media_id: media_id.into(),
+            values: normalized(&metadata.tags),
+        });
+    }
+    if !metadata.project_ids.is_empty() {
+        events.push(CatalogueEvent::MediaProjectsAdded {
+            media_id: media_id.into(),
+            values: normalized(&metadata.project_ids),
+        });
+    }
+    if !metadata.notes.is_empty() {
+        events.push(CatalogueEvent::MediaNotesSet {
+            media_id: media_id.into(),
+            value: metadata.notes.clone(),
+        });
+    }
+    if metadata.favourite {
+        events.push(CatalogueEvent::MediaFavouriteSet {
+            media_id: media_id.into(),
+            value: true,
+        });
+    }
+    events
+}
+
+fn commit_job_file(
+    app: &AppHandle,
+    state: &NativeState,
+    settings: &DeviceSettings,
+    job_id: &str,
+    file_id: &str,
+    hash: String,
+    journal_path: Option<&Path>,
+) -> Result<(), String> {
+    let _catalogue_guard = state.catalogue_write.lock().unwrap();
+    let _jobs_guard = state.job_store.lock().unwrap();
+    let mut jobs = load_jobs_unlocked(app)?;
+    let job = jobs
+        .iter_mut()
+        .find(|job| job.id == job_id)
+        .ok_or("Ingest job no longer exists")?;
+    let file = job
+        .files
+        .iter_mut()
+        .find(|file| file.id == file_id)
+        .ok_or("Ingest job file no longer exists")?;
+    let destination = PathBuf::from(&file.destination_path);
+    let (_, capture, provenance) = destination_date(
+        settings,
+        &PathBuf::from(&file.source_path),
+        &job.date_override,
+        &DateTime::parse_from_rfc3339(&job.batch_timestamp)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Local),
+    )?;
+    let mut item = new_media(
+        &destination,
+        file.relative_path.clone(),
+        hash,
+        capture,
+        provenance,
+        false,
+    )?;
+    item.id = file.media_id.clone();
+    item.tags = normalized(&file.metadata.tags);
+    item.project_ids = normalized(&file.metadata.project_ids);
+    item.notes = file.metadata.notes.clone();
+    item.favourite = file.metadata.favourite;
+    let catalogue = load_catalogue_file(settings)?;
+    let mut events = Vec::new();
+    if let Some(existing) = catalogue
+        .media
+        .iter()
+        .find(|existing| existing.id == item.id || existing.relative_path == item.relative_path)
+    {
+        if existing.sha256 != item.sha256 || existing.relative_path != item.relative_path {
+            return Err("Destination conflicts with an existing catalogue record".into());
+        }
+        file.media_id = existing.id.clone();
+        item.id = existing.id.clone();
+        events.extend(metadata_events(&existing.id, &file.metadata));
+    } else {
+        events.push(CatalogueEvent::MediaRegistered {
+            media: item.clone(),
+        });
+    }
+    if let Some(journal_path) = journal_path {
+        let mut journal: IngestJournal = read_json(journal_path)?;
+        journal.media = Some(item.clone());
+        write_json(journal_path, &journal)?;
+    }
+    append_events(settings, events)?;
+    file.state = "completed".into();
+    file.bytes_transferred = file.size_bytes;
+    file.error = None;
+    job.files_completed = job
+        .files
+        .iter()
+        .filter(|file| file.state == "completed")
+        .count();
+    job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+    job.updated_at = Utc::now().to_rfc3339();
+    write_json(&jobs_path(app)?, &jobs)?;
+    if let Some(journal_path) = journal_path {
+        remove_journal(journal_path)?;
+    }
+    let _ = app.emit("catalogue-changed", ());
+    let _ = app.emit("ingest-jobs-changed", &jobs);
+    Ok(())
+}
+
+fn finish_job(app: &AppHandle, state: &NativeState, job_id: &str) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job no longer exists")?;
+        job.current_file = None;
+        job.state = if job.files.iter().all(|file| file.state == "completed") {
+            "completed"
+        } else if job.files.iter().any(|file| file.state == "cancelled") {
+            "cancelled"
+        } else if job.files.iter().any(|file| file.state == "paused") {
+            "paused"
+        } else {
+            "failed"
+        }
+        .into();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
+fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
+    let state = app.state::<NativeState>();
+    let settings = load_settings_file(app)?;
+    let job = snapshot_jobs(app, &state)?
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .ok_or("Ingest job no longer exists")?;
+    let mut completed_bytes = job.bytes_transferred;
+    for (index, planned) in job.files.iter().enumerate() {
+        if planned.state == "completed" {
+            continue;
+        }
+        if state.cancelled_jobs.lock().unwrap().contains(job_id) {
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "cancelled",
+                planned.bytes_transferred,
+                None,
+            )?;
+            break;
+        }
+        if state.paused_jobs.lock().unwrap().contains(job_id) {
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "paused",
+                planned.bytes_transferred,
+                None,
+            )?;
+            break;
+        }
+        let source = PathBuf::from(&planned.source_path);
+        let destination = PathBuf::from(&planned.destination_path);
+        if !source.is_file() {
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "failed",
+                0,
+                Some("Source media is unavailable; reconnect it and retry".into()),
+            )?;
+            continue;
+        }
+        if destination.exists() {
+            match (sha256(&source), sha256(&destination)) {
+                (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
+                    commit_job_file(
+                        app,
+                        &state,
+                        &settings,
+                        job_id,
+                        &planned.id,
+                        destination_hash,
+                        None,
+                    )?;
+                    completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                    continue;
+                }
+                _ => {
+                    update_job_progress(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        "failed",
+                        0,
+                        Some("A different file already uses the planned destination".into()),
+                    )?;
+                    continue;
+                }
+            }
+        }
+        match copy_verified(
+            app,
+            &state,
+            &settings,
+            job_id,
+            &planned.id,
+            &source,
+            &destination,
+            completed_bytes,
+            job.bytes_total,
+            index,
+            job.files.len(),
+        ) {
+            Ok(copy) => {
+                if let Err(error) = commit_job_file(
+                    app,
+                    &state,
+                    &settings,
+                    job_id,
+                    &planned.id,
+                    copy.hash,
+                    Some(&copy.journal_path),
+                ) {
+                    update_job_progress(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        "failed",
+                        planned.size_bytes,
+                        Some(format!(
+                            "Media was promoted but catalogue persistence needs retry: {error}"
+                        )),
+                    )?;
+                } else {
+                    completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                }
+            }
+            Err(error) if error == "__cancelled__" => {
+                update_job_progress(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    "cancelled",
+                    0,
+                    None,
+                )?;
+                break;
+            }
+            Err(error) => {
+                update_job_progress(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    "failed",
+                    0,
+                    Some(error),
+                )?;
+            }
+        }
+    }
+    state.cancelled_jobs.lock().unwrap().remove(job_id);
+    finish_job(app, &state, job_id)
+}
+
+fn kick_ingest_worker(app: AppHandle) {
+    {
+        let state = app.state::<NativeState>();
+        let mut active = state.worker_active.lock().unwrap();
+        if *active {
+            return;
+        }
+        *active = true;
+    }
+    std::thread::spawn(move || {
+        loop {
+            let state = app.state::<NativeState>();
+            let next = mutate_jobs(&app, &state, |jobs| {
+                let Some(job) = jobs.iter_mut().find(|job| job.state == "queued") else {
+                    return Ok(None);
+                };
+                job.state = "copying".into();
+                job.updated_at = Utc::now().to_rfc3339();
+                Ok(Some(job.id.clone()))
+            })
+            .ok()
+            .flatten();
+            let Some(job_id) = next else {
+                *state.worker_active.lock().unwrap() = false;
+                break;
+            };
+            if let Err(error) = process_ingest_job(&app, &job_id) {
+                let _ = mutate_jobs(&app, &state, |jobs| {
+                    if let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) {
+                        job.state = "failed".into();
+                        job.failures.push(error);
+                        job.updated_at = Utc::now().to_rfc3339();
+                    }
+                    Ok(())
+                });
+            }
+        }
+    });
+}
+
 #[tauri::command]
-async fn start_ingest(
+fn start_ingest(
     app: AppHandle,
     state: State<'_, NativeState>,
     request: IngestRequest,
-) -> Result<IngestResult, String> {
+) -> Result<IngestJob, String> {
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let mut result = IngestResult::default();
-    let files = source_files(&request.sources, &mut result.unsupported);
-    let total_bytes = files
-        .iter()
-        .filter_map(|p| p.metadata().ok().map(|m| m.len()))
-        .sum();
-    let mut completed_bytes = 0u64;
-    state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
-    let _guard = state.catalogue_write.lock().unwrap();
-    let catalogue_root = catalogue_dir(&settings)?;
-    let recovery = recover_staging(&master, &settings.device_id, Some(&catalogue_root))?;
-    if recovery.recovered > 0 {
-        result.failures.push(format!(
-            "Recovered {} staging operation(s) before ingest",
-            recovery.recovered
-        ));
-    }
-    if recovery.needs_review > 0 {
-        result.failures.push(format!(
-            "{} staging operation(s) need review and were preserved",
-            recovery.needs_review
-        ));
-    }
-    let catalogue = load_catalogue_file(&settings)?;
+    let mut unsupported = Vec::new();
+    let sources = source_files(&request.sources, &mut unsupported);
     let batch_timestamp = Local::now();
-    let mut known_paths: HashSet<String> = catalogue
-        .media
+    let reserved: HashSet<String> = snapshot_jobs(&app, &state)?
         .iter()
-        .map(|item| item.relative_path.clone())
+        .filter(|job| !matches!(job.state.as_str(), "completed" | "cancelled"))
+        .flat_map(|job| job.files.iter().map(|file| file.destination_path.clone()))
         .collect();
-    for (index, source) in files.iter().enumerate() {
-        if state
-            .cancelled_jobs
-            .lock()
-            .unwrap()
-            .contains(&request.job_id)
-        {
-            result.cancelled = true;
-            break;
-        }
-        let source_size = source.metadata().map(|m| m.len()).unwrap_or(0);
-        let (date, capture, provenance) = destination_date(
+    let mut planned_paths = HashSet::new();
+    let mut files = Vec::new();
+    for source in sources {
+        let (date, _, _) = destination_date(
             &settings,
-            source,
+            &source,
             &request.date_override,
             &batch_timestamp,
         )?;
         let compact_date = date.replace('-', "");
         let date_folder = if master.join(&date).is_dir() {
-            date.clone()
+            date
         } else if master.join(&compact_date).is_dir() {
             compact_date
         } else {
             date
         };
-        let requested_name = request
+        let filename = request
             .renamed_destinations
             .get(&source.to_string_lossy().to_string())
-            .cloned();
-        let filename = requested_name
+            .cloned()
             .unwrap_or_else(|| source.file_name().unwrap().to_string_lossy().to_string());
-        if Path::new(&filename).file_name().and_then(|x| x.to_str()) != Some(filename.as_str()) {
-            result.failures.push(format!(
-                "{}: invalid destination filename",
-                source.display()
-            ));
-            continue;
+        if Path::new(&filename).file_name().and_then(|value| value.to_str())
+            != Some(filename.as_str())
+        {
+            return Err(format!("{} has an invalid destination filename", source.display()));
         }
-        let relative = format!("{date_folder}/{filename}").replace('\\', "/");
-        let destination = match fs_safe::resolve_for_create(&master, &relative) {
-            Ok(path) => path,
-            Err(error) => {
-                result
-                    .failures
-                    .push(format!("{}: {error}", source.display()));
-                continue;
-            }
-        };
-        if destination.exists() {
-            match (sha256(source), sha256(&destination)) {
-                (Ok(a), Ok(b)) if a == b => {
-                    result.duplicates.push(source.to_string_lossy().to_string());
-                    if !known_paths.contains(&relative) {
-                        let item = new_media(
-                            &destination,
-                            relative,
-                            b,
-                            capture,
-                            provenance,
-                            false,
-                        )?;
-                        append_events(
-                            &settings,
-                            vec![CatalogueEvent::MediaRegistered {
-                                media: item.clone(),
-                            }],
-                        )?;
-                        known_paths.insert(item.relative_path.clone());
-                        result.imported.push(item);
+        let relative_path = format!("{date_folder}/{filename}").replace('\\', "/");
+        let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
+        let destination_path = destination.to_string_lossy().to_string();
+        let collision = reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
+        files.push(IngestJobFile {
+            id: Uuid::new_v4().to_string(),
+            media_id: Uuid::new_v4().to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            destination_path,
+            relative_path,
+            original_filename: source.file_name().unwrap().to_string_lossy().to_string(),
+            size_bytes: source.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            bytes_transferred: 0,
+            state: if collision { "failed" } else { "queued" }.into(),
+            error: collision.then(|| "Another queued ingest already reserves this destination".into()),
+            metadata: ProvisionalMetadata::default(),
+        });
+    }
+    let now = Utc::now().to_rfc3339();
+    let job = IngestJob {
+        schema_version: 1,
+        id: request.job_id,
+        state: if files.iter().any(|file| file.state == "queued") {
+            "queued"
+        } else {
+            "failed"
+        }
+        .into(),
+        created_at: now.clone(),
+        updated_at: now,
+        batch_timestamp: batch_timestamp.to_rfc3339(),
+        date_override: request.date_override,
+        bytes_total: files.iter().map(|file| file.size_bytes).sum(),
+        bytes_transferred: 0,
+        files_completed: 0,
+        current_file: None,
+        files,
+        unsupported,
+        failures: Vec::new(),
+    };
+    mutate_jobs(&app, &state, |jobs| {
+        if jobs.iter().any(|existing| existing.id == job.id) {
+            return Err("An ingest job with this ID already exists".into());
+        }
+        jobs.push(job.clone());
+        Ok(())
+    })?;
+    kick_ingest_worker(app);
+    Ok(job)
+}
+
+#[tauri::command]
+fn list_ingest_jobs(app: AppHandle, state: State<'_, NativeState>) -> Result<Vec<IngestJob>, String> {
+    snapshot_jobs(&app, &state)
+}
+
+#[tauri::command]
+fn initialize_ingest_jobs(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<Vec<IngestJob>, String> {
+    if *state.worker_active.lock().unwrap() {
+        return Err("Cannot run startup recovery while an ingest worker is active".into());
+    }
+    mutate_jobs(&app, &state, |jobs| {
+        for job in jobs {
+            if matches!(job.state.as_str(), "queued" | "copying" | "verifying") {
+                job.state = "interrupted".into();
+                job.current_file = None;
+                job.updated_at = Utc::now().to_rfc3339();
+                for file in &mut job.files {
+                    if matches!(file.state.as_str(), "queued" | "copying" | "verifying") {
+                        file.state = "interrupted".into();
+                        file.error = Some("Application stopped before this file completed".into());
                     }
                 }
-                _ => result.conflicts.push(IngestConflict {
-                    source_path: source.to_string_lossy().to_string(),
-                    destination_path: destination.to_string_lossy().to_string(),
-                    reason: "A different file already uses this destination name. Skip it, choose another date, or explicitly rename the incoming copy.".into(),
-                }),
             }
-            completed_bytes += source_size;
-            continue;
         }
-        match copy_verified(
-            &app,
-            &state,
-            &settings,
-            &request.job_id,
-            source,
-            &destination,
-            completed_bytes,
-            total_bytes,
-            index,
-            files.len(),
-        ) {
-            Ok(copy) => {
-                let item = new_media(
-                    &destination,
-                    relative,
-                    copy.hash,
-                    capture,
-                    provenance,
-                    false,
-                )?;
-                let mut journal: IngestJournal = read_json(&copy.journal_path)?;
-                if journal.status != "committed" {
-                    return Err("Ingest journal lost its committed lifecycle state".into());
+        Ok(())
+    })?;
+    let settings = load_settings_file(&app)?;
+    if !settings.master_bin_path.trim().is_empty() {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        let catalogue_root = catalogue_dir(&settings)?;
+        let recovery = recover_staging(
+            Path::new(&settings.master_bin_path),
+            &settings.device_id,
+            Some(&catalogue_root),
+        )?;
+        let catalogue = load_catalogue_file(&settings)?;
+        mutate_jobs(&app, &state, |jobs| {
+            for job in jobs {
+                for file in &mut job.files {
+                    if file.state == "completed" {
+                        continue;
+                    }
+                    if let Some(media) = catalogue.media.iter().find(|media| {
+                        media.id == file.media_id || media.relative_path == file.relative_path
+                    }) {
+                        file.media_id = media.id.clone();
+                        file.state = "completed".into();
+                        file.bytes_transferred = file.size_bytes;
+                        file.error = None;
+                    }
                 }
-                journal.media = Some(item.clone());
-                write_json(&copy.journal_path, &journal)?;
-                if let Err(error) = append_events(
-                    &settings,
-                    vec![CatalogueEvent::MediaRegistered {
-                        media: item.clone(),
-                    }],
-                ) {
-                    result.failures.push(format!(
-                        "{} was safely copied but catalogue persistence failed: {error}. Rescan can recover it.",
-                        destination.display()
+                job.files_completed = job
+                    .files
+                    .iter()
+                    .filter(|file| file.state == "completed")
+                    .count();
+                job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+                if job.files_completed == job.files.len() && !job.files.is_empty() {
+                    job.state = "completed".into();
+                }
+                if recovery.needs_review > 0 && job.state == "interrupted" {
+                    job.failures.push(format!(
+                        "{} staging operation(s) require manual review",
+                        recovery.needs_review
                     ));
-                } else {
-                    remove_journal(&copy.journal_path)?;
-                    known_paths.insert(item.relative_path.clone());
-                    result.imported.push(item);
                 }
             }
-            Err(error) if error == "__cancelled__" => {
-                result.cancelled = true;
-                break;
-            }
-            Err(error) if error == "__race__" => result.conflicts.push(IngestConflict {
-                source_path: source.to_string_lossy().to_string(),
-                destination_path: destination.to_string_lossy().to_string(),
-                reason: "Another operation created the destination while copying; the verified staged copy was discarded without replacing it.".into(),
-            }),
-            Err(error) => result
-                .failures
-                .push(format!("{}: {error}", source.display())),
-        }
-        completed_bytes += source_size;
+            Ok(())
+        })?;
     }
-    state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
-    let _ = app.emit("catalogue-changed", ());
-    Ok(result)
+    snapshot_jobs(&app, &state)
 }
+
 #[tauri::command]
-fn cancel_ingest(state: State<NativeState>, job_id: String) {
-    state.cancelled_jobs.lock().unwrap().insert(job_id);
+fn update_ingest_file_metadata(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+    file_id: String,
+    metadata: ProvisionalMetadata,
+) -> Result<IngestJob, String> {
+    let normalized_metadata = ProvisionalMetadata {
+        tags: normalized(&metadata.tags),
+        project_ids: normalized(&metadata.project_ids),
+        notes: metadata.notes,
+        favourite: metadata.favourite,
+    };
+    let (job, completed_media_id) = mutate_jobs(&app, &state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job not found")?;
+        let file = job
+            .files
+            .iter_mut()
+            .find(|file| file.id == file_id)
+            .ok_or("Ingest job file not found")?;
+        file.metadata = normalized_metadata.clone();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok((
+            job.clone(),
+            (file.state == "completed").then(|| file.media_id.clone()),
+        ))
+    })?;
+    if let Some(media_id) = completed_media_id {
+        let settings = load_settings_file(&app)?;
+        let _guard = state.catalogue_write.lock().unwrap();
+        append_events(&settings, metadata_events(&media_id, &normalized_metadata))?;
+        let _ = app.emit("catalogue-changed", ());
+    }
+    Ok(job)
+}
+
+#[tauri::command]
+fn pause_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+    state.paused_jobs.lock().unwrap().insert(job_id.clone());
+    mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        if job.state == "queued" {
+            job.state = "paused".into();
+        }
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn resume_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+    state.paused_jobs.lock().unwrap().remove(&job_id);
+    mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        if job.state != "paused" {
+            return Err("Only a paused ingest can be resumed".into());
+        }
+        job.state = "queued".into();
+        for file in &mut job.files {
+            if file.state == "paused" {
+                file.state = "queued".into();
+            }
+        }
+        Ok(())
+    })?;
+    kick_ingest_worker(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn retry_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+    state.cancelled_jobs.lock().unwrap().remove(&job_id);
+    state.paused_jobs.lock().unwrap().remove(&job_id);
+    mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        for file in &mut job.files {
+            if matches!(file.state.as_str(), "failed" | "cancelled" | "interrupted") {
+                file.state = "queued".into();
+                file.error = None;
+                file.bytes_transferred = 0;
+            }
+        }
+        job.state = "queued".into();
+        job.failures.clear();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })?;
+    kick_ingest_worker(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_ingest(app: AppHandle, state: State<NativeState>, job_id: String) -> Result<(), String> {
+    state.cancelled_jobs.lock().unwrap().insert(job_id.clone());
+    mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        if matches!(job.state.as_str(), "queued" | "paused" | "interrupted") {
+            job.state = "cancelled".into();
+            for file in &mut job.files {
+                if matches!(file.state.as_str(), "queued" | "paused" | "interrupted") {
+                    file.state = "cancelled".into();
+                }
+            }
+        }
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
 }
 fn normalized(values: &[String]) -> Vec<String> {
     let mut out: Vec<_> = values
@@ -1522,7 +2103,14 @@ pub fn run() {
             save_settings,
             load_catalogue,
             catalogue_signature,
+            refresh_media_availability,
             start_ingest,
+            initialize_ingest_jobs,
+            list_ingest_jobs,
+            update_ingest_file_metadata,
+            pause_ingest,
+            resume_ingest,
+            retry_ingest,
             cancel_ingest,
             update_media,
             create_project,

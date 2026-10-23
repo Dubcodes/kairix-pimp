@@ -29,6 +29,7 @@ export interface MediaItem {
   tags: string[];
   projectIds: string[];
   notes: string;
+  favourite?: boolean;
   technical: {
     sizeBytes: number;
     durationSeconds?: number;
@@ -88,6 +89,50 @@ export interface IngestResult {
   failures: string[];
   cancelled: boolean;
 }
+export type IngestJobState =
+  | 'queued'
+  | 'copying'
+  | 'verifying'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  | 'paused';
+export interface ProvisionalMetadata {
+  tags: string[];
+  projectIds: string[];
+  notes: string;
+  favourite: boolean;
+}
+export interface IngestJobFile {
+  id: string;
+  mediaId: string;
+  sourcePath: string;
+  destinationPath: string;
+  relativePath: string;
+  originalFilename: string;
+  sizeBytes: number;
+  bytesTransferred: number;
+  state: IngestJobState;
+  error?: string;
+  metadata: ProvisionalMetadata;
+}
+export interface IngestJob {
+  schemaVersion: number;
+  id: string;
+  state: IngestJobState;
+  createdAt: string;
+  updatedAt: string;
+  batchTimestamp: string;
+  dateOverride?: string;
+  files: IngestJobFile[];
+  unsupported: string[];
+  failures: string[];
+  currentFile?: string;
+  bytesTotal: number;
+  bytesTransferred: number;
+  filesCompleted: number;
+}
 
 export const nativeAvailable = () => isTauri();
 export const emptySettings = (): DeviceSettings => ({
@@ -137,12 +182,34 @@ export const desktopBridge = {
     sources: string[];
     dateOverride?: string;
     renamedDestinations?: Record<string, string>;
-  }) => invoke<IngestResult>('start_ingest', { request }),
+  }) => invoke<IngestJob>('start_ingest', { request }),
+  initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
+  listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
+  updateIngestFileMetadata: (
+    jobId: string,
+    fileId: string,
+    metadata: ProvisionalMetadata,
+  ) =>
+    invoke<IngestJob>('update_ingest_file_metadata', {
+      jobId,
+      fileId,
+      metadata,
+    }),
+  pauseIngest: (jobId: string) => invoke<void>('pause_ingest', { jobId }),
+  resumeIngest: (jobId: string) => invoke<void>('resume_ingest', { jobId }),
+  retryIngest: (jobId: string) => invoke<void>('retry_ingest', { jobId }),
   cancelIngest: (jobId: string) => invoke<void>('cancel_ingest', { jobId }),
+  refreshMediaAvailability: () => invoke<boolean>('refresh_media_availability'),
   onProgress: (
     handler: (progress: IngestProgress) => void,
   ): Promise<UnlistenFn> =>
     listen<IngestProgress>('ingest-progress', (event) =>
+      handler(event.payload),
+    ),
+  onIngestJobsChanged: (
+    handler: (jobs: IngestJob[]) => void,
+  ): Promise<UnlistenFn> =>
+    listen<IngestJob[]>('ingest-jobs-changed', (event) =>
       handler(event.payload),
     ),
   onFileDrop: (handler: (paths: string[]) => void): Promise<UnlistenFn> =>

@@ -23,6 +23,10 @@ const mocks = vi.hoisted(() => ({
   saveSettings: vi.fn(),
   loadCatalogue: vi.fn(),
   catalogueSignature: vi.fn(),
+  jobs: [] as import('./bridge').IngestJob[],
+  initializeIngestJobs: vi.fn(),
+  updateIngestFileMetadata: vi.fn(),
+  refreshMediaAvailability: vi.fn(),
   rescan: vi.fn(),
 }));
 
@@ -35,7 +39,15 @@ vi.mock('./bridge', () => ({
     saveSettings: mocks.saveSettings,
     loadCatalogue: mocks.loadCatalogue,
     catalogueSignature: mocks.catalogueSignature,
+    refreshMediaAvailability: mocks.refreshMediaAvailability,
+    initializeIngestJobs: mocks.initializeIngestJobs,
+    listIngestJobs: vi.fn(async () => []),
+    updateIngestFileMetadata: mocks.updateIngestFileMetadata,
+    pauseIngest: vi.fn(),
+    resumeIngest: vi.fn(),
+    retryIngest: vi.fn(),
     onProgress: vi.fn(async () => () => undefined),
+    onIngestJobsChanged: vi.fn(async () => () => undefined),
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
     chooseFiles: vi.fn(async () => []),
@@ -67,6 +79,12 @@ describe('native application integration', () => {
     mocks.loadCatalogue.mockImplementation(async () => mocks.catalogue);
     mocks.catalogueSignature.mockReset();
     mocks.catalogueSignature.mockResolvedValue('initial-signature');
+    mocks.jobs = [];
+    mocks.initializeIngestJobs.mockReset();
+    mocks.initializeIngestJobs.mockImplementation(async () => mocks.jobs);
+    mocks.updateIngestFileMetadata.mockReset();
+    mocks.refreshMediaAvailability.mockReset();
+    mocks.refreshMediaAvailability.mockResolvedValue(false);
     mocks.rescan.mockReset();
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
@@ -156,4 +174,98 @@ describe('native application integration', () => {
       }
     },
   );
+
+  it('keeps the library usable while editing metadata on a copying file', async () => {
+    mocks.jobs = [
+      {
+        schemaVersion: 1,
+        id: 'job-1',
+        state: 'copying',
+        createdAt: '2026-10-24T00:00:00Z',
+        updatedAt: '2026-10-24T00:00:00Z',
+        batchTimestamp: '2026-10-24T00:00:00Z',
+        files: [
+          {
+            id: 'file-1',
+            mediaId: 'media-1',
+            sourcePath: 'E:/clip.mp4',
+            destinationPath: 'C:/Master/20261024/clip.mp4',
+            relativePath: '20261024/clip.mp4',
+            originalFilename: 'clip.mp4',
+            sizeBytes: 100,
+            bytesTransferred: 25,
+            state: 'copying',
+            metadata: {
+              tags: [],
+              projectIds: [],
+              notes: '',
+              favourite: false,
+            },
+          },
+        ],
+        unsupported: [],
+        failures: [],
+        currentFile: 'clip.mp4',
+        bytesTotal: 100,
+        bytesTransferred: 25,
+        filesCompleted: 0,
+      },
+    ];
+    mocks.updateIngestFileMetadata.mockImplementation(
+      async () => mocks.jobs[0],
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    const tags = screen.getByPlaceholderText('Track, onboard, interview');
+    await user.type(tags, 'Race');
+    expect(mocks.updateIngestFileMetadata).toHaveBeenLastCalledWith(
+      'job-1',
+      'file-1',
+      expect.objectContaining({ tags: ['Race'] }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    expect(screen.getByRole('heading', { name: 'Library' })).toBeVisible();
+  });
+
+  it('refreshes local availability without a catalogue event or media rescan', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      mocks.catalogue = {
+        media: [
+          {
+            id: 'arrived',
+            relativePath: '20261024/arrived.mp4',
+            originalFilename: 'arrived.mp4',
+            sha256: 'abc',
+            captureDateProvenance: 'unknown',
+            ingestDate: '2026-10-24',
+            fileType: 'mp4',
+            tags: [],
+            projectIds: [],
+            notes: '',
+            technical: { sizeBytes: 10 },
+            available: true,
+            needsReview: false,
+          },
+        ],
+        projects: [],
+        updatedAt: '2026-10-24T00:00:00Z',
+      };
+      mocks.refreshMediaAvailability.mockResolvedValue(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_000);
+      });
+      expect(screen.getByText('arrived.mp4')).toBeVisible();
+      expect(mocks.rescan).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

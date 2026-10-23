@@ -23,6 +23,8 @@ import {
   nativeAvailable,
   type Catalogue,
   type DeviceSettings,
+  type IngestJob,
+  type IngestJobFile,
   type IngestProgress,
   type IngestResult,
 } from './bridge';
@@ -60,6 +62,9 @@ export function App() {
   const [dateOverride, setDateOverride] = useState('default');
   const [chosenDate, setChosenDate] = useState('');
   const [progress, setProgress] = useState<IngestProgress>();
+  const [jobs, setJobs] = useState<IngestJob[]>([]);
+  const [jobsOpen, setJobsOpen] = useState(false);
+  const [startingIngest, setStartingIngest] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -78,22 +83,27 @@ export function App() {
     let disposed = false;
     let stopProgress: (() => void) | undefined;
     let stopDrop: (() => void) | undefined;
+    let stopJobs: (() => void) | undefined;
     Promise.all([
       desktopBridge.loadSettings(),
       desktopBridge.onProgress(setProgress),
+      desktopBridge.onIngestJobsChanged(setJobs),
       desktopBridge.onFileDrop((paths) =>
         setSources((current) => [...new Set([...current, ...paths])]),
       ),
     ])
-      .then(async ([loaded, unlistenProgress, unlistenDrop]) => {
+      .then(async ([loaded, unlistenProgress, unlistenJobs, unlistenDrop]) => {
         if (disposed) {
           unlistenProgress();
+          unlistenJobs();
           unlistenDrop();
           return;
         }
         stopProgress = unlistenProgress;
+        stopJobs = unlistenJobs;
         stopDrop = unlistenDrop;
         setSettings(loaded);
+        setJobs(await desktopBridge.initializeIngestJobs());
         if (loaded.initializedCataloguePath) {
           const before = await desktopBridge.catalogueSignature();
           let nextCatalogue = await desktopBridge.loadCatalogue();
@@ -108,6 +118,7 @@ export function App() {
     return () => {
       disposed = true;
       stopProgress?.();
+      stopJobs?.();
       stopDrop?.();
     };
   }, [native]);
@@ -148,6 +159,15 @@ export function App() {
       disposed = true;
       window.clearInterval(timer);
     };
+  }, [configured, native]);
+  useEffect(() => {
+    if (!native || !configured) return;
+    const timer = window.setInterval(() => {
+      void desktopBridge.refreshMediaAvailability().then(async (changed) => {
+        if (changed) setCatalogue(await desktopBridge.loadCatalogue());
+      });
+    }, 3_000);
+    return () => window.clearInterval(timer);
   }, [configured, native]);
   useEffect(() => {
     if (!native || !configured) return;
@@ -250,12 +270,12 @@ export function App() {
   };
   const ingest = async (renamedDestinations: Record<string, string> = {}) => {
     if (!sources.length) return;
-    setBusy(true);
+    setStartingIngest(true);
     setError('');
     setMessage('');
     const jobId = crypto.randomUUID();
     try {
-      const result = await desktopBridge.startIngest({
+      const job = await desktopBridge.startIngest({
         jobId,
         sources,
         dateOverride:
@@ -266,41 +286,46 @@ export function App() {
               : dateOverride,
         renamedDestinations,
       });
-      await refresh();
-      setConflicts(result.conflicts);
-      setSources(result.conflicts.map((item) => item.sourcePath));
-      setProgress(undefined);
-      const parts = [
-        `${result.imported.length} imported`,
-        `${result.duplicates.length} exact duplicates skipped`,
-      ];
-      if (result.conflicts.length)
-        parts.push(
-          `${result.conflicts.length} conflicts need a new date or explicit filename`,
-        );
-      if (result.unsupported.length)
-        parts.push(`${result.unsupported.length} unsupported inputs reported`);
-      if (result.failures.length)
-        parts.push(`${result.failures.length} failures`);
-      setMessage(parts.join(' · '));
-      if (result.conflicts.length || result.failures.length)
-        setError(
-          [
-            ...result.conflicts.map(
-              (item) => `${item.sourcePath}: ${item.reason}`,
-            ),
-            ...result.failures,
-          ].join('\n'),
-        );
-      void desktopBridge
-        .enrichMedia()
-        .then(refresh)
-        .catch(() => undefined);
+      setJobs((current) => [...current, job]);
+      setSources([]);
+      setConflicts([]);
+      setRenames({});
+      setJobsOpen(true);
+      setMessage(
+        `Ingest queued with ${job.files.length} file${job.files.length === 1 ? '' : 's'}. You can keep browsing and edit metadata now.`,
+      );
     } catch (reason) {
       setError(errorText(reason));
     } finally {
-      setBusy(false);
+      setStartingIngest(false);
     }
+  };
+  const updateJobFile = (
+    jobId: string,
+    fileId: string,
+    update: Partial<IngestJobFile['metadata']>,
+  ) => {
+    const job = jobs.find((candidate) => candidate.id === jobId);
+    const file = job?.files.find((candidate) => candidate.id === fileId);
+    if (!file) return;
+    const metadata = { ...file.metadata, ...update };
+    setJobs((current) =>
+      current.map((candidate) =>
+        candidate.id !== jobId
+          ? candidate
+          : {
+              ...candidate,
+              files: candidate.files.map((candidateFile) =>
+                candidateFile.id === fileId
+                  ? { ...candidateFile, metadata }
+                  : candidateFile,
+              ),
+            },
+      ),
+    );
+    void desktopBridge
+      .updateIngestFileMetadata(jobId, fileId, metadata)
+      .catch((reason) => setError(errorText(reason)));
   };
   const updateSelection = async (next: {
     addTags?: string[];
@@ -349,6 +374,17 @@ export function App() {
       setBusy(false);
     }
   };
+  const activeJobs = jobs.filter(
+    (job) => !['completed', 'cancelled', 'failed'].includes(job.state),
+  );
+  const totalJobBytes = activeJobs.reduce(
+    (total, job) => total + job.bytesTotal,
+    0,
+  );
+  const transferredJobBytes = activeJobs.reduce(
+    (total, job) => total + job.bytesTransferred,
+    0,
+  );
 
   return (
     <div className="app-shell">
@@ -409,11 +445,147 @@ export function App() {
             </p>
             <h1>{view}</h1>
           </div>
-          <div className="sync">
-            {native ? 'Native desktop' : 'Web preview'}{' '}
-            <span>{configured ? 'persisted' : 'not configured'}</span>
+          <div className="header-actions">
+            {native && configured && jobs.length > 0 && (
+              <button
+                className="job-indicator"
+                aria-expanded={jobsOpen}
+                onClick={() => setJobsOpen((open) => !open)}
+              >
+                {activeJobs.length > 0
+                  ? `${activeJobs.length} active · ${Math.round(
+                      (transferredJobBytes / Math.max(totalJobBytes, 1)) * 100,
+                    )}%`
+                  : `${jobs.length} ingest job${jobs.length === 1 ? '' : 's'}`}
+              </button>
+            )}
+            <div className="sync">
+              {native ? 'Native desktop' : 'Web preview'}{' '}
+              <span>{configured ? 'persisted' : 'not configured'}</span>
+            </div>
           </div>
         </header>
+        {jobsOpen && (
+          <section className="job-panel" aria-label="Ingest jobs">
+            <div className="job-panel-heading">
+              <div>
+                <strong>Background ingest</strong>
+                <small>Pause takes effect safely between files.</small>
+              </div>
+              <button onClick={() => setJobsOpen(false)}>Close</button>
+            </div>
+            {jobs.map((job) => (
+              <article className="job-card" key={job.id}>
+                <header>
+                  <div>
+                    <strong>{job.files.length} file ingest</strong>
+                    <small>
+                      {job.state} · {job.filesCompleted}/{job.files.length}{' '}
+                      complete · {size(job.bytesTransferred)} /{' '}
+                      {size(job.bytesTotal)}
+                    </small>
+                  </div>
+                  <div className="job-actions">
+                    {['copying', 'queued', 'verifying'].includes(job.state) && (
+                      <button onClick={() => desktopBridge.pauseIngest(job.id)}>
+                        Pause between files
+                      </button>
+                    )}
+                    {job.state === 'paused' && (
+                      <button
+                        onClick={() => desktopBridge.resumeIngest(job.id)}
+                      >
+                        Resume
+                      </button>
+                    )}
+                    {['failed', 'cancelled', 'interrupted'].includes(
+                      job.state,
+                    ) && (
+                      <button onClick={() => desktopBridge.retryIngest(job.id)}>
+                        Retry
+                      </button>
+                    )}
+                    {!['completed', 'cancelled'].includes(job.state) && (
+                      <button
+                        onClick={() => desktopBridge.cancelIngest(job.id)}
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                </header>
+                <progress
+                  value={job.bytesTransferred}
+                  max={job.bytesTotal || 1}
+                />
+                <div className="job-files">
+                  {job.files.map((file) => (
+                    <div className="job-file" key={file.id}>
+                      <div className="job-file-title">
+                        <strong>{file.originalFilename}</strong>
+                        <span>{file.state}</span>
+                      </div>
+                      {file.error && (
+                        <small className="job-error">{file.error}</small>
+                      )}
+                      <label>
+                        Tags
+                        <input
+                          value={file.metadata.tags.join(', ')}
+                          onChange={(event) =>
+                            updateJobFile(job.id, file.id, {
+                              tags: event.target.value
+                                .split(',')
+                                .map((tag) => tag.trim())
+                                .filter(Boolean),
+                            })
+                          }
+                          placeholder="Track, onboard, interview"
+                        />
+                      </label>
+                      <SearchableComboBox
+                        label="Projects"
+                        mode="multiple"
+                        options={catalogue.projects.map((project) => ({
+                          id: project.id,
+                          label: project.name,
+                        }))}
+                        selectedIds={file.metadata.projectIds}
+                        onSelectionChange={(projectIds) =>
+                          updateJobFile(job.id, file.id, { projectIds })
+                        }
+                        placeholder="Assign projects…"
+                      />
+                      <label>
+                        Description
+                        <textarea
+                          value={file.metadata.notes}
+                          onChange={(event) =>
+                            updateJobFile(job.id, file.id, {
+                              notes: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label className="job-favourite">
+                        <input
+                          type="checkbox"
+                          checked={file.metadata.favourite}
+                          onChange={(event) =>
+                            updateJobFile(job.id, file.id, {
+                              favourite: event.target.checked,
+                            })
+                          }
+                        />{' '}
+                        Favourite
+                      </label>
+                    </div>
+                  ))}
+                </div>
+              </article>
+            ))}
+          </section>
+        )}
         {(message || error) && (
           <section className={`notice ${error ? 'error' : ''}`}>
             <span>{error || message}</span>
@@ -881,7 +1053,7 @@ export function App() {
               <button
                 className="primary"
                 disabled={
-                  busy ||
+                  startingIngest ||
                   !sources.length ||
                   (dateOverride === 'choose' && !chosenDate)
                 }
@@ -895,15 +1067,10 @@ export function App() {
                   )
                 }
               >
-                {busy ? 'Ingesting and verifying…' : 'Start verified ingest'}
+                {startingIngest
+                  ? 'Creating ingest job…'
+                  : 'Start verified ingest'}
               </button>
-              {busy && progress && (
-                <button
-                  onClick={() => desktopBridge.cancelIngest(progress.jobId)}
-                >
-                  Cancel safely
-                </button>
-              )}
             </div>
           </section>
         ) : view === 'Projects' ? (

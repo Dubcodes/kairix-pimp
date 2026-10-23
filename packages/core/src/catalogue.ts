@@ -194,6 +194,25 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         item.notes = event.value;
       }
       fieldVersions.set(key, { envelope, value: event.value });
+    } else if (event.type === 'media.favourite.set') {
+      const item = state.media[event.mediaId];
+      if (!item) continue;
+      const key = `${event.mediaId}:favourite`;
+      const previous = fieldVersions.get(key);
+      if (previous && !happensBefore(previous.envelope, envelope)) {
+        addConflict({
+          entityId: event.mediaId,
+          field: 'favourite',
+          eventIds: [previous.envelope.eventId, envelope.eventId],
+          values: [previous.value, event.value],
+        });
+        const currentKey = `${previous.envelope.deviceId}:${previous.envelope.sequence}:${previous.envelope.eventId}`;
+        const nextKey = `${envelope.deviceId}:${envelope.sequence}:${envelope.eventId}`;
+        if (nextKey > currentKey) item.favourite = event.value;
+      } else {
+        item.favourite = event.value;
+      }
+      fieldVersions.set(key, { envelope, value: event.value });
     } else if (event.type === 'media.enriched') {
       const item = state.media[event.mediaId];
       if (!item) continue;
