@@ -1232,6 +1232,41 @@ mod tests {
     }
 
     #[test]
+    fn manual_metadata_events_do_not_clear_integrity_warnings() {
+        let mut changed = item("m", "a.mp4", "mp4");
+        changed.needs_review = true;
+        let catalogue = rebuild(EventRead {
+            events: vec![
+                envelope(
+                    "desktop",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: changed },
+                ),
+                envelope(
+                    "desktop",
+                    2,
+                    CatalogueEvent::MediaTagsAdded {
+                        media_id: "m".into(),
+                        values: vec!["Track".into()],
+                    },
+                ),
+                envelope(
+                    "desktop",
+                    3,
+                    CatalogueEvent::MediaNotesSet {
+                        media_id: "m".into(),
+                        value: "Keep warning".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        });
+        assert!(catalogue.media[0].needs_review);
+        assert_eq!(catalogue.media[0].tags, vec!["Track"]);
+        assert_eq!(catalogue.media[0].notes, "Keep warning");
+    }
+
+    #[test]
     fn pairing_requires_same_directory_and_unambiguous_audio() {
         let mut catalogue = Catalogue {
             media: vec![

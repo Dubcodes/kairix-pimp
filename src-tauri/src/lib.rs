@@ -3,9 +3,7 @@ mod discovery;
 mod fs_safe;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use catalogue::{
-    Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
-};
+use catalogue::{Catalogue, CatalogueEvent, MediaItem, ProjectRecord, TechnicalMetadata};
 use chrono::{DateTime, Duration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -282,15 +280,7 @@ fn save_settings(
 #[tauri::command]
 fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
     let settings = load_settings_file(&app)?;
-    let recovered = recover_staging(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let mut catalogue = load_catalogue_file(&settings)?;
-    if recovered > 0 {
-        catalogue.issues.push(CatalogueIssue {
-            code: "ingest-recovery".into(),
-            source: "device-local staging".into(),
-            detail: format!("Recovered {recovered} interrupted staging operation(s)"),
-        });
-    }
     let master = PathBuf::from(&settings.master_bin_path);
     for item in &mut catalogue.media {
         item.available = fs_safe::resolve_existing(&master, &item.relative_path)
@@ -914,12 +904,6 @@ async fn update_media(
                 value: notes.clone(),
             });
         }
-        events.push(CatalogueEvent::MediaEvidenceObserved {
-            media_id: item.id.clone(),
-            observed_size: item.observed_size.unwrap_or(item.technical.size_bytes),
-            observed_modified_millis: item.observed_modified_millis,
-            needs_review: false,
-        });
     }
     events.retain(|event| match event {
         CatalogueEvent::MediaTagsAdded { values, .. }
@@ -1307,6 +1291,22 @@ mod tests {
         assert!(recover_staging(&master, "device-a").is_err());
         assert_eq!(fs::read(&staged).unwrap(), b"incomplete");
         assert!(journal.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalogue_refresh_does_not_touch_active_staging() {
+        let root = temporary("refresh-active-staging");
+        let master = root.join("master");
+        let catalogue_root = master.join(".pimp");
+        fs::create_dir_all(&catalogue_root).unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let active = staging.join("files").join("active.part");
+        fs::write(&active, b"still-copying").unwrap();
+        for _ in 0..10 {
+            catalogue::load(&catalogue_root).unwrap();
+        }
+        assert_eq!(fs::read(&active).unwrap(), b"still-copying");
         fs::remove_dir_all(root).unwrap();
     }
 

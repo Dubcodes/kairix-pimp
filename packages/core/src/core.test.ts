@@ -176,6 +176,25 @@ describe('catalogue reducer', () => {
       needsReview: true,
     });
   });
+  it('does not clear an integrity warning during ordinary metadata edits', () => {
+    const state = rebuildCatalogue([
+      envelope({
+        type: 'media.registered',
+        media: { ...media, needsReview: true },
+      }),
+      envelope(
+        { type: 'media.tags.added', mediaId: 'm1', values: ['Track'] },
+        'e2',
+      ),
+      envelope(
+        { type: 'media.notes.set', mediaId: 'm1', value: 'Keep warning' },
+        'e3',
+      ),
+    ]);
+    expect(state.media.m1.needsReview).toBe(true);
+    expect(state.media.m1.tags).toEqual(['Track']);
+    expect(state.media.m1.notes).toBe('Keep warning');
+  });
   it('surfaces concurrent project record changes', () => {
     const project = {
       id: 'p1',
