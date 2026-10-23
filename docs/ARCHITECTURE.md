@@ -46,7 +46,7 @@ The implemented single-file reference transaction:
 6. Append and flush `media.registered` only after successful promotion. A persistence failure leaves a verified orphan that conservative discovery can recover; it never rolls back by deleting the media.
 7. Probe and preview as separately retryable work; their failure does not invalidate the verified ingest.
 
-Long work executes outside the render thread with stable job IDs, progress events and cancellation. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence; restart recovery never removes a promoted destination. Byte-offset resume and retry scheduling remain future work. Event handlers are idempotent because reconnect/replay can redeliver state.
+Long work executes outside the render thread with stable job IDs, progress events and cancellation. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence; restart recovery verifies the promoted path, size, checksum and catalogue identity before registration, and never removes a promoted destination. Ambiguous recovery state remains intact for review. Byte-offset resume and retry scheduling remain future work. Event handlers are idempotent because reconnect/replay can redeliver state.
 
 The target job architecture persists versioned intent, progress and retry state for ingest, enrichment, consolidation and cleanup, then resumes eligible work at startup. Ingest intent will include initial tags, projects, description and favourite state without making incomplete media visible in the committed catalogue.
 
@@ -63,7 +63,7 @@ device C events ─┘                                  ├─ in-memory state (
                                                     └─ SQLite/FTS (planned)
 ```
 
-SQLite/FTS is a disposable device-local search projection, never a synchronized live database. Rebuilding it reads validated authoritative events plus media availability. Syncthing temporary and conflict files are detected and reported, not silently treated as authoritative. Its optional local REST API supplies read-only health hints; PIMP works without it. Detailed rules are in [SYNCTHING_DESIGN.md](SYNCTHING_DESIGN.md).
+SQLite/FTS is a disposable device-local search projection, never a synchronized live database. Rebuilding it reads validated authoritative events plus media availability. The open Library polls a cheap event-file signature and rebuilds only after the shared streams change; media discovery remains a separate operation. Syncthing temporary and conflict files are detected and reported, not silently treated as authoritative. Its optional local REST API supplies read-only health hints; PIMP works without it. Detailed rules are in [SYNCTHING_DESIGN.md](SYNCTHING_DESIGN.md).
 
 ## Identity and project architecture
 

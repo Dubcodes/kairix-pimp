@@ -242,8 +242,12 @@ fn normalized(values: &[String]) -> Vec<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect();
-    out.sort_by_key(|value| value.to_lowercase());
-    out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    out.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+    out.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
     out
 }
 
@@ -774,10 +778,13 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 } else {
                     "projectIds"
                 };
-                let removed: HashSet<_> = normalized(values).into_iter().collect();
+                let removed: HashSet<_> = normalized(values)
+                    .into_iter()
+                    .map(|value| value.to_lowercase())
+                    .collect();
                 if let Some(set) = additions.get_mut(&format!("{media_id}:{field}")) {
                     set.retain(|_, addition| {
-                        !removed.contains(&addition.value)
+                        !removed.contains(&addition.value.to_lowercase())
                             || !happens_before(&addition.envelope, &envelope)
                     });
                 }
@@ -1032,6 +1039,40 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
 
 pub fn load(root: &Path) -> Result<Catalogue, String> {
     Ok(rebuild(read_events(root)?))
+}
+
+pub fn event_signature(root: &Path) -> Result<String, String> {
+    let directory = event_dir(root);
+    if !directory.is_dir() {
+        return Ok(sha256_bytes(b"empty-event-directory"));
+    }
+    let mut entries = fs::read_dir(&directory)
+        .map_err(|error| error.to_string())?
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                return Ok(None);
+            }
+            let metadata = entry.metadata().map_err(|error| error.to_string())?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            Ok(Some(format!(
+                "{}\0{}\0{}",
+                entry.file_name().to_string_lossy(),
+                metadata.len(),
+                modified
+            )))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(sha256_bytes(entries.join("\n").as_bytes()))
 }
 
 pub fn append(root: &Path, device_id: &str, events: Vec<CatalogueEvent>) -> Result<(), String> {
@@ -1390,6 +1431,86 @@ mod tests {
         });
         assert_eq!(first.media[0].tags, vec!["Night", "Track"]);
         assert_eq!(first.media[0].tags, second.media[0].tags);
+    }
+
+    #[test]
+    fn metadata_normalization_is_case_insensitive_unicode_aware_and_convergent() {
+        let registered = envelope(
+            "normalizer",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "2026-10-22/a.mp4", "mp4"),
+            },
+        );
+        let variants = envelope(
+            "normalizer",
+            2,
+            CatalogueEvent::MediaTagsAdded {
+                media_id: "m".into(),
+                values: vec![" Race ".into(), "race".into(), "Ångström".into()],
+            },
+        );
+        let more_variants = envelope(
+            "normalizer",
+            3,
+            CatalogueEvent::MediaTagsAdded {
+                media_id: "m".into(),
+                values: vec!["RACE".into(), " ångström ".into(), "Race".into()],
+            },
+        );
+        let first = rebuild(EventRead {
+            events: vec![
+                registered.clone(),
+                variants.clone(),
+                more_variants.clone(),
+                more_variants.clone(),
+            ],
+            ..Default::default()
+        });
+        let second = rebuild(EventRead {
+            events: vec![more_variants, variants, registered],
+            ..Default::default()
+        });
+        assert_eq!(first.media[0].tags, vec!["RACE", "Ångström"]);
+        assert_eq!(first.media[0].tags, second.media[0].tags);
+    }
+
+    #[test]
+    fn metadata_removal_matches_the_same_case_insensitive_key() {
+        let events = vec![
+            envelope(
+                "normalizer",
+                1,
+                CatalogueEvent::MediaRegistered {
+                    media: item("m", "2026-10-22/a.mp4", "mp4"),
+                },
+            ),
+            envelope(
+                "normalizer",
+                2,
+                CatalogueEvent::MediaTagsAdded {
+                    media_id: "m".into(),
+                    values: vec!["Race".into(), "Ångström".into()],
+                },
+            ),
+            envelope(
+                "normalizer",
+                3,
+                CatalogueEvent::MediaTagsRemoved {
+                    media_id: "m".into(),
+                    values: vec!["race".into()],
+                },
+            ),
+        ];
+        assert_eq!(
+            rebuild(EventRead {
+                events,
+                ..Default::default()
+            })
+            .media[0]
+                .tags,
+            vec!["Ångström"]
+        );
     }
 
     #[test]
@@ -1938,6 +2059,46 @@ mod tests {
     }
 
     #[test]
+    fn event_signature_changes_for_remote_metadata_only_events() {
+        let root = temporary("metadata-signature");
+        let media = item("shared", "2026-10-24/shared.mp4", "mp4");
+        append(
+            &root,
+            "device-a",
+            vec![CatalogueEvent::MediaRegistered {
+                media: media.clone(),
+            }],
+        )
+        .unwrap();
+        let registered = event_signature(&root).unwrap();
+        assert_eq!(registered, event_signature(&root).unwrap());
+
+        append(
+            &root,
+            "device-b",
+            vec![CatalogueEvent::MediaTagsAdded {
+                media_id: media.id.clone(),
+                values: vec!["Remote tag".into()],
+            }],
+        )
+        .unwrap();
+        let tagged = event_signature(&root).unwrap();
+        assert_ne!(tagged, registered);
+
+        append(
+            &root,
+            "device-b",
+            vec![CatalogueEvent::MediaProjectsAdded {
+                media_id: media.id,
+                values: vec!["remote-project".into()],
+            }],
+        )
+        .unwrap();
+        assert_ne!(event_signature(&root).unwrap(), tagged);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn append_refuses_a_truncated_owned_stream() {
         let root = temporary("truncated");
         fs::create_dir_all(event_dir(&root)).unwrap();
@@ -2048,6 +2209,48 @@ mod tests {
         fs::write(root.join("catalogue.pre-events-v1.backup.json"), b"{}").unwrap();
         let error = migrate_legacy_snapshot(&root, "desktop").unwrap_err();
         assert!(error.contains("event stream is missing"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partially_arrived_migration_stream_is_preserved_and_rejected() {
+        let root = temporary("partial-migration-stream");
+        let legacy = Catalogue {
+            media: vec![item("legacy", "2026-10-24/legacy.mp4", "mp4")],
+            ..Default::default()
+        };
+        let backup = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(
+            root.join("catalogue.pre-events-v1.backup.json"),
+            &backup,
+        )
+        .unwrap();
+        fs::create_dir_all(event_dir(&root)).unwrap();
+        let partial = br#"{"schemaVersion":2"#;
+        fs::write(event_dir(&root).join("migration-v2.jsonl"), partial).unwrap();
+        fs::write(
+            root.join("migration-v2.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "source": "catalogue.json",
+                "sourceSha256": sha256_bytes(&backup),
+                "backup": "catalogue.pre-events-v1.backup.json",
+                "eventStream": "migration-v2.jsonl"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = migrate_legacy_snapshot(&root, "desktop").unwrap_err();
+        assert!(error.contains("truncated"));
+        assert_eq!(
+            fs::read(event_dir(&root).join("migration-v2.jsonl")).unwrap(),
+            partial
+        );
+        assert_eq!(
+            fs::read(root.join("catalogue.pre-events-v1.backup.json")).unwrap(),
+            backup
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

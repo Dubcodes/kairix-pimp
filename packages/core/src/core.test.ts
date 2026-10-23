@@ -101,6 +101,82 @@ describe('catalogue reducer', () => {
     expect(state.media.m1.tags).toEqual(['Workshop']);
     expect(state.media.m1.projectIds).toEqual(['p1', 'p2']);
   });
+  it('normalizes case, whitespace and Unicode identically in every delivery order', () => {
+    const registered = envelope({ type: 'media.registered', media }, 'n1', 'n');
+    const variants = {
+      ...envelope(
+        {
+          type: 'media.tags.added' as const,
+          mediaId: 'm1',
+          values: [' Race ', 'race', 'Ångström'],
+        },
+        'n2',
+        'n',
+      ),
+      sequence: 2,
+      observed: { n: 1 },
+    };
+    const moreVariants = {
+      ...envelope(
+        {
+          type: 'media.tags.added' as const,
+          mediaId: 'm1',
+          values: ['RACE', ' ångström ', 'Race'],
+        },
+        'n3',
+        'n',
+      ),
+      sequence: 3,
+      observed: { n: 2 },
+    };
+    const forward = rebuildCatalogue([
+      registered,
+      variants,
+      moreVariants,
+      moreVariants,
+    ]);
+    const reverse = rebuildCatalogue([
+      moreVariants,
+      variants,
+      registered,
+      moreVariants,
+    ]);
+    expect(forward.media.m1.tags).toEqual(['RACE', 'Ångström']);
+    expect(reverse.media.m1.tags).toEqual(forward.media.m1.tags);
+  });
+  it('matches case-insensitive removals without dropping unrelated Unicode tags', () => {
+    const removed = {
+      ...envelope(
+        {
+          type: 'media.tags.removed' as const,
+          mediaId: 'm1',
+          values: ['race'],
+        },
+        'n3',
+        'n',
+      ),
+      sequence: 3,
+      observed: { n: 2 },
+    };
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media }, 'n1', 'n'),
+      {
+        ...envelope(
+          {
+            type: 'media.tags.added' as const,
+            mediaId: 'm1',
+            values: ['Race', 'Ångström'],
+          },
+          'n2',
+          'n',
+        ),
+        sequence: 2,
+        observed: { n: 1 },
+      },
+      removed,
+    ]);
+    expect(state.media.m1.tags).toEqual(['Ångström']);
+  });
   it('merges simultaneous independent set additions', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),

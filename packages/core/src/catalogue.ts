@@ -14,10 +14,28 @@ export const emptyCatalogue = (): CatalogueState => ({
   appliedEventIds: [],
 });
 
-const normalized = (values: string[]) =>
-  [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort(
-    (a, b) => a.localeCompare(b),
+const compareCodePoints = (a: string, b: string) => {
+  const left = Array.from(a, (value) => value.codePointAt(0)!);
+  const right = Array.from(b, (value) => value.codePointAt(0)!);
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1)
+    if (left[index] !== right[index]) return left[index] - right[index];
+  return left.length - right.length;
+};
+const normalizedKey = (value: string) => value.trim().toLowerCase();
+const normalized = (values: string[]) => {
+  const sorted = values
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .sort(
+      (a, b) =>
+        compareCodePoints(normalizedKey(a), normalizedKey(b)) ||
+        compareCodePoints(a, b),
+    );
+  return sorted.filter(
+    (value, index) =>
+      index === 0 || normalizedKey(value) !== normalizedKey(sorted[index - 1]),
   );
+};
 
 export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
   const state = emptyCatalogue();
@@ -142,10 +160,10 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         for (const value of normalized(event.values))
           adds.set(`${envelope.eventId}:${value}`, { value, envelope });
       } else if (event.type.endsWith('.removed')) {
-        const removed = new Set(normalized(event.values));
+        const removed = new Set(normalized(event.values).map(normalizedKey));
         for (const [token, addition] of adds)
           if (
-            removed.has(addition.value) &&
+            removed.has(normalizedKey(addition.value)) &&
             happensBefore(addition.envelope, envelope)
           )
             adds.delete(token);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Clock3,
@@ -69,6 +69,7 @@ export function App() {
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
+  const catalogueSignature = useRef<string | undefined>(undefined);
 
   const configured = Boolean(settings.initializedCataloguePath);
   const refresh = async () => setCatalogue(await desktopBridge.loadCatalogue());
@@ -93,8 +94,15 @@ export function App() {
         stopProgress = unlistenProgress;
         stopDrop = unlistenDrop;
         setSettings(loaded);
-        if (loaded.initializedCataloguePath)
-          setCatalogue(await desktopBridge.loadCatalogue());
+        if (loaded.initializedCataloguePath) {
+          const before = await desktopBridge.catalogueSignature();
+          let nextCatalogue = await desktopBridge.loadCatalogue();
+          const after = await desktopBridge.catalogueSignature();
+          if (after !== before)
+            nextCatalogue = await desktopBridge.loadCatalogue();
+          catalogueSignature.current = after;
+          setCatalogue(nextCatalogue);
+        }
       })
       .catch((reason) => setError(errorText(reason)));
     return () => {
@@ -103,6 +111,44 @@ export function App() {
       stopDrop?.();
     };
   }, [native]);
+  useEffect(() => {
+    if (!native || !configured) return;
+    let disposed = false;
+    let checking = false;
+    const checkForSharedMetadata = async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        let observed = await desktopBridge.catalogueSignature();
+        if (catalogueSignature.current === undefined) {
+          catalogueSignature.current = observed;
+          return;
+        }
+        if (observed === catalogueSignature.current) return;
+        let nextCatalogue = await desktopBridge.loadCatalogue();
+        const settled = await desktopBridge.catalogueSignature();
+        if (settled !== observed) {
+          observed = settled;
+          nextCatalogue = await desktopBridge.loadCatalogue();
+        }
+        if (!disposed) {
+          catalogueSignature.current = observed;
+          setCatalogue(nextCatalogue);
+        }
+      } catch {
+        // A partial Syncthing delivery is retried on the next poll.
+      } finally {
+        checking = false;
+      }
+    };
+    const timer = window.setInterval(() => {
+      void checkForSharedMetadata();
+    }, 3_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [configured, native]);
   useEffect(() => {
     if (!native || !configured) return;
     const timer = window.setInterval(() => {

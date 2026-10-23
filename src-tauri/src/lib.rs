@@ -5,6 +5,8 @@ mod fs_safe;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use catalogue::{Catalogue, CatalogueEvent, MediaItem, ProjectRecord, TechnicalMetadata};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
+#[cfg(test)]
+use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -336,6 +338,12 @@ fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
     }
     Ok(catalogue)
 }
+
+#[tauri::command]
+fn catalogue_signature(app: AppHandle) -> Result<String, String> {
+    let settings = load_settings_file(&app)?;
+    catalogue::event_signature(&catalogue_dir(&settings)?)
+}
 fn supported(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -411,32 +419,49 @@ fn destination_date(
     settings: &DeviceSettings,
     source: &Path,
     override_date: &Option<String>,
+    batch_timestamp: &DateTime<Local>,
 ) -> Result<(String, Option<String>, String), String> {
     let modified = source
         .metadata()
         .ok()
         .and_then(|m| m.modified().ok())
         .map(DateTime::<Local>::from);
-    let capture = modified.map(|d| d.format("%Y-%m-%dT%H:%M:%S%:z").to_string());
-    let today = Local::now().date_naive();
-    let chosen = match override_date.as_deref() {
-        Some("today") => today,
-        Some("yesterday") => today - Duration::days(1),
-        Some(date) if date.len() == 10 => {
-            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap_or(today)
+    destination_date_from_modified(settings, modified, override_date, batch_timestamp)
+}
+
+fn destination_date_from_modified(
+    settings: &DeviceSettings,
+    modified: Option<DateTime<Local>>,
+    override_date: &Option<String>,
+    batch_timestamp: &DateTime<Local>,
+) -> Result<(String, Option<String>, String), String> {
+    let has_modified = modified.is_some();
+    let capture = modified
+        .as_ref()
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%S%:z").to_string());
+    let (date, time) = match override_date.as_deref() {
+        Some("today") => (batch_timestamp.date_naive(), batch_timestamp.time()),
+        Some("yesterday") => (
+            batch_timestamp.date_naive() - Duration::days(1),
+            batch_timestamp.time(),
+        ),
+        Some(date) => {
+            let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .map_err(|_| "Date override must use YYYY-MM-DD".to_string())?;
+            (date, batch_timestamp.time())
         }
-        _ if settings.ingest_date_organization == "original-file-dates" => {
-            modified.map(|d| d.date_naive()).unwrap_or(today)
+        None if settings.ingest_date_organization == "original-file-dates" => {
+            modified
+                .as_ref()
+                .map(|value| (value.date_naive(), value.time()))
+                .unwrap_or((batch_timestamp.date_naive(), batch_timestamp.time()))
         }
-        _ => today,
+        None => (batch_timestamp.date_naive(), batch_timestamp.time()),
     };
-    let time = modified
-        .map(|value| value.time())
-        .unwrap_or_else(|| Local::now().time());
     Ok((
-        format_date_folder(&settings.date_folder_pattern, chosen, time)?,
+        format_date_folder(&settings.date_folder_pattern, date, time)?,
         capture,
-        if modified.is_some() {
+        if has_modified {
             "filesystem".into()
         } else {
             "unknown".into()
@@ -847,6 +872,7 @@ async fn start_ingest(
         ));
     }
     let catalogue = load_catalogue_file(&settings)?;
+    let batch_timestamp = Local::now();
     let mut known_paths: HashSet<String> = catalogue
         .media
         .iter()
@@ -863,8 +889,12 @@ async fn start_ingest(
             break;
         }
         let source_size = source.metadata().map(|m| m.len()).unwrap_or(0);
-        let (date, capture, provenance) =
-            destination_date(&settings, source, &request.date_override)?;
+        let (date, capture, provenance) = destination_date(
+            &settings,
+            source,
+            &request.date_override,
+            &batch_timestamp,
+        )?;
         let compact_date = date.replace('-', "");
         let date_folder = if master.join(&date).is_dir() {
             date.clone()
@@ -1000,9 +1030,20 @@ fn normalized(values: &[String]) -> Vec<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .collect();
-    out.sort_by_key(|a| a.to_lowercase());
-    out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    out.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+    out.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
     out
+}
+
+fn contains_normalized(values: &[String], candidate: &str) -> bool {
+    let key = candidate.trim().to_lowercase();
+    values
+        .iter()
+        .any(|value| value.trim().to_lowercase() == key)
 }
 
 fn write_project_manifest(
@@ -1072,7 +1113,7 @@ async fn update_media(
                 media_id: item.id.clone(),
                 values: desired
                     .iter()
-                    .filter(|value| !item.tags.contains(value))
+                    .filter(|value| !contains_normalized(&item.tags, value))
                     .cloned()
                     .collect(),
             });
@@ -1081,7 +1122,7 @@ async fn update_media(
                 values: item
                     .tags
                     .iter()
-                    .filter(|value| !desired.contains(value))
+                    .filter(|value| !contains_normalized(&desired, value))
                     .cloned()
                     .collect(),
             });
@@ -1092,7 +1133,7 @@ async fn update_media(
                 media_id: item.id.clone(),
                 values: desired
                     .iter()
-                    .filter(|value| !item.project_ids.contains(value))
+                    .filter(|value| !contains_normalized(&item.project_ids, value))
                     .cloned()
                     .collect(),
             });
@@ -1101,7 +1142,7 @@ async fn update_media(
                 values: item
                     .project_ids
                     .iter()
-                    .filter(|value| !desired.contains(value))
+                    .filter(|value| !contains_normalized(&desired, value))
                     .cloned()
                     .collect(),
             });
@@ -1229,6 +1270,7 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
     let now = Utc::now().timestamp();
     let mut events = Vec::new();
     let mut result = RescanResult::default();
+    let batch_timestamp = Local::now();
     for entry in WalkDir::new(&master)
         .follow_links(false)
         .into_iter()
@@ -1275,7 +1317,8 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
                 result.changed += 1;
             }
         } else {
-            let (_, capture, provenance) = destination_date(&settings, path, &None)?;
+            let (_, capture, provenance) =
+                destination_date(&settings, path, &None, &batch_timestamp)?;
             let item = new_media(path, relative.clone(), hash, capture, provenance, true)?;
             events.push(CatalogueEvent::MediaRegistered { media: item });
             result.registered += 1;
@@ -1478,6 +1521,7 @@ pub fn run() {
             load_settings,
             save_settings,
             load_catalogue,
+            catalogue_signature,
             start_ingest,
             cancel_ingest,
             update_media,
@@ -1578,6 +1622,67 @@ mod tests {
         );
         assert!(format_date_folder("yyyy/MM/dd", date, time).is_err());
         assert!(format_date_folder("yyyy:MM:dd", date, time).is_err());
+    }
+
+    #[test]
+    fn date_time_folders_use_one_batch_time_or_each_original_file_time() {
+        let batch = Local.with_ymd_and_hms(2026, 10, 24, 12, 34, 56).unwrap();
+        let first = Local.with_ymd_and_hms(2026, 10, 20, 8, 15, 1).unwrap();
+        let second = Local.with_ymd_and_hms(2026, 10, 21, 19, 45, 2).unwrap();
+        let mut settings = DeviceSettings::default();
+        settings.date_folder_pattern = "yyyyMMdd-HHmmss".into();
+        settings.ingest_date_organization = "today".into();
+
+        let today_first = destination_date_from_modified(
+            &settings,
+            Some(first.clone()),
+            &None,
+            &batch,
+        )
+        .unwrap()
+        .0;
+        let today_second = destination_date_from_modified(
+            &settings,
+            Some(second.clone()),
+            &None,
+            &batch,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(today_first, "20261024-123456");
+        assert_eq!(today_first, today_second);
+
+        settings.ingest_date_organization = "original-file-dates".into();
+        assert_eq!(
+            destination_date_from_modified(&settings, Some(first.clone()), &None, &batch)
+                .unwrap()
+                .0,
+            "20261020-081501"
+        );
+        assert_eq!(
+            destination_date_from_modified(&settings, Some(second.clone()), &None, &batch)
+                .unwrap()
+                .0,
+            "20261021-194502"
+        );
+        assert_eq!(
+            destination_date_from_modified(
+                &settings,
+                Some(first.clone()),
+                &Some("2026-10-22".into()),
+                &batch,
+            )
+            .unwrap()
+            .0,
+            "20261022-123456"
+        );
+        assert!(destination_date_from_modified(
+            &settings,
+            Some(first),
+            &Some("2026-99-99".into()),
+            &batch,
+        )
+        .is_err());
     }
 
     #[test]

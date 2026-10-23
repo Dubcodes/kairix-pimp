@@ -10,6 +10,8 @@ Syncthing conflict copies are never ingested automatically as authoritative stre
 
 Replay accepts valid events surrounding a malformed record, deduplicates repeated event IDs, reports and excludes an unterminated final record, rejects non-monotonic owned sequences, and quarantines unsupported newer schemas. Topological ordering enforces all available causal edges. A writer refuses to append to its own truncated stream rather than compounding damage. One in-process mutex serializes commands and the desktop single-instance guard prevents a second local writer; each appended record is flushed before success is reported.
 
+While the Library is open, the host exposes a signature derived from event-stream filenames, sizes and modification evidence. The UI polls that signature and reloads the catalogue only when it changes, so remote tag, project and conflict events appear without invoking media discovery or requiring the Syncthing REST API.
+
 ## Incomplete transfers and status
 
 PIMP ignores known Syncthing/browser partial names, conflict copies and private metadata. An external candidate must keep the same size and modification evidence across multiple observations spanning at least 15 seconds before hashing. Changed known files return to that process and are marked for review if their hash differs. Stability is evidence, not proof of transfer completion; pending candidates are reported, and a future watcher or Syncthing completion signal can strengthen the decision.
@@ -22,4 +24,4 @@ Optional REST reads use a user-supplied API key stored in the OS credential stor
 
 ## Rename, case, and migration handling
 
-Renames/moves remain planned explicit events against stable IDs. Before materializing or resolving a path, PIMP rejects traversal and validates canonical containment, including symlink/junction escape where the platform exposes it. Schema readers adapt supported v1 TypeScript/Rust records, reject unsupported newer versions visibly, and never rewrite other devices' logs. Legacy `catalogue.json` is migrated once into deterministic bootstrap events; the source and a recovery backup remain unchanged. Project manifests are portable projections, not competing authoritative databases.
+Renames/moves remain planned explicit events against stable IDs. Before materializing or resolving a path, PIMP rejects traversal and validates canonical containment, including symlink/junction escape where the platform exposes it. Schema readers adapt supported v1 TypeScript/Rust records, reject unsupported newer versions visibly, and never rewrite other devices' logs. Legacy `catalogue.json` is migrated into one deterministic, source-hash-verified bootstrap stream; the source and a recovery backup remain unchanged. Absence of a legacy snapshot creates no shared completion marker, so a snapshot arriving later can still migrate. Project manifests are portable projections, not competing authoritative databases.

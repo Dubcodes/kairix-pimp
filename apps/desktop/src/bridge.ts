@@ -114,6 +114,7 @@ export const desktopBridge = {
   saveSettings: (settings: DeviceSettings) =>
     invoke<DeviceSettings>('save_settings', { settings }),
   loadCatalogue: () => invoke<Catalogue>('load_catalogue'),
+  catalogueSignature: () => invoke<string>('catalogue_signature'),
   chooseFiles: async () => {
     const value = await open({
       multiple: true,
