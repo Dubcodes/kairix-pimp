@@ -1532,6 +1532,43 @@ mod tests {
     }
 
     #[test]
+    fn divergent_duplicate_event_ids_are_deterministic_and_reported() {
+        let mut first = envelope(
+            "device-a",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "clip.mp4", "mp4"),
+            },
+        );
+        first.event_id = "duplicate-id".into();
+        let mut changed = item("m", "clip.mp4", "mp4");
+        changed.notes = "different".into();
+        let mut second = envelope(
+            "device-b",
+            1,
+            CatalogueEvent::MediaRegistered { media: changed },
+        );
+        second.event_id = "duplicate-id".into();
+        let forward = rebuild(EventRead {
+            events: vec![first.clone(), second.clone()],
+            ..Default::default()
+        });
+        let reverse = rebuild(EventRead {
+            events: vec![second, first],
+            ..Default::default()
+        });
+        assert_eq!(forward.media, reverse.media);
+        assert!(forward
+            .issues
+            .iter()
+            .any(|issue| issue.code == "duplicate-event-conflict"));
+        assert!(reverse
+            .issues
+            .iter()
+            .any(|issue| issue.code == "duplicate-event-conflict"));
+    }
+
+    #[test]
     fn concurrent_notes_are_retained_as_conflict_despite_clock_order() {
         let registered = envelope(
             "seed",

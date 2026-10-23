@@ -61,6 +61,27 @@ describe('catalogue reducer', () => {
     const event = envelope({ type: 'media.registered', media });
     expect(Object.keys(rebuildCatalogue([event, event]).media)).toEqual(['m1']);
   });
+  it('selects divergent duplicate event IDs deterministically and reports them', () => {
+    const first = envelope(
+      { type: 'media.registered', media: { ...media, notes: 'A' } },
+      'duplicate-id',
+      'device-a',
+    );
+    const second = envelope(
+      { type: 'media.registered', media: { ...media, notes: 'B' } },
+      'duplicate-id',
+      'device-b',
+    );
+    const forward = rebuildCatalogue([first, second]);
+    const reverse = rebuildCatalogue([second, first]);
+    expect(forward.media).toEqual(reverse.media);
+    expect(forward.issues.map((issue) => issue.code)).toContain(
+      'duplicate-event-conflict',
+    );
+    expect(reverse.issues.map((issue) => issue.code)).toContain(
+      'duplicate-event-conflict',
+    );
+  });
   it('persists tagging and multiple project assignment', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),
