@@ -2,7 +2,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -138,6 +138,12 @@ pub enum CatalogueEvent {
         media_id: String,
         values: Vec<String>,
     },
+    #[serde(rename = "media.tags.replaced")]
+    MediaTagsReplaced {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        values: Vec<String>,
+    },
     #[serde(rename = "media.projects.added")]
     MediaProjectsAdded {
         #[serde(rename = "mediaId")]
@@ -150,6 +156,14 @@ pub enum CatalogueEvent {
         media_id: String,
         values: Vec<String>,
     },
+    #[serde(rename = "media.projects.replaced")]
+    MediaProjectsReplaced {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        values: Vec<String>,
+    },
+    #[serde(rename = "media.legacy-snapshot-replaced")]
+    MediaLegacySnapshotReplaced { media: MediaItem },
     #[serde(rename = "media.notes.set")]
     MediaNotesSet {
         #[serde(rename = "mediaId")]
@@ -246,6 +260,7 @@ fn parse_legacy(value: &Value, line_number: u64) -> Result<EventEnvelope, String
         .and_then(Value::as_str)
         .map(String::from)
         .unwrap_or_else(|| format!("legacy-{device_id}-{sequence}"));
+    let event_id = format!("v1-adapted-{event_id}");
     let occurred_at = value
         .get("occurredAt")
         .and_then(Value::as_str)
@@ -265,11 +280,11 @@ fn parse_legacy(value: &Value, line_number: u64) -> Result<EventEnvelope, String
             )
             .map_err(|error| error.to_string())?,
         },
-        "media.tags-set" => CatalogueEvent::MediaTagsAdded {
+        "media.tags-set" => CatalogueEvent::MediaTagsReplaced {
             media_id: body["mediaId"].as_str().unwrap_or_default().into(),
             values: serde_json::from_value(body["tags"].clone()).unwrap_or_default(),
         },
-        "media.projects-set" => CatalogueEvent::MediaProjectsAdded {
+        "media.projects-set" => CatalogueEvent::MediaProjectsReplaced {
             media_id: body["mediaId"].as_str().unwrap_or_default().into(),
             values: serde_json::from_value(body["projectIds"].clone()).unwrap_or_default(),
         },
@@ -289,9 +304,7 @@ fn parse_legacy(value: &Value, line_number: u64) -> Result<EventEnvelope, String
             folder_id: body["folderId"].as_str().unwrap_or_default().into(),
             relative_path: body["relativePath"].as_str().unwrap_or_default().into(),
         },
-        // The v1 Rust host wrote the whole final item. Registering it preserves
-        // legacy-only logs; the snapshot migration below preserves its final state.
-        "media.updated" => CatalogueEvent::MediaRegistered {
+        "media.updated" => CatalogueEvent::MediaLegacySnapshotReplaced {
             media: serde_json::from_value(body.clone()).map_err(|error| error.to_string())?,
         },
         other => return Err(format!("unsupported legacy event type {other}")),
@@ -347,7 +360,12 @@ pub fn read_events(root: &Path) -> Result<EventRead, String> {
             .and_then(|value| value.to_str())
             .unwrap_or_default();
         let mut last_sequence = 0u64;
-        for (index, line) in content.lines().enumerate() {
+        let committed = if !content.is_empty() && !content.ends_with('\n') {
+            content.rsplit_once('\n').map_or("", |(prefix, _)| prefix)
+        } else {
+            content.as_str()
+        };
+        for (index, line) in committed.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -445,23 +463,154 @@ fn happens_before(a: &EventEnvelope, b: &EventEnvelope) -> bool {
         || b.observed.get(&a.device_id).copied().unwrap_or(0) >= a.sequence
 }
 
-fn event_order(a: &EventEnvelope, b: &EventEnvelope) -> std::cmp::Ordering {
-    if a.device_id == b.device_id {
-        return a
-            .sequence
-            .cmp(&b.sequence)
-            .then_with(|| a.event_id.cmp(&b.event_id));
+fn concurrent_key(event: &EventEnvelope) -> (u8, String, u64, String) {
+    (
+        match &event.event {
+            CatalogueEvent::MediaRegistered { .. } if event.event_id.starts_with("legacy-") => 0,
+            CatalogueEvent::MediaRegistered { .. } => 1,
+            CatalogueEvent::MediaLegacySnapshotReplaced { .. } => 3,
+            _ => 2,
+        },
+        event.device_id.clone(),
+        event.sequence,
+        event.event_id.clone(),
+    )
+}
+
+fn causal_order(input: Vec<EventEnvelope>, issues: &mut Vec<CatalogueIssue>) -> Vec<EventEnvelope> {
+    let mut unique = BTreeMap::<String, EventEnvelope>::new();
+    for event in input {
+        match unique.get(&event.event_id) {
+            None => {
+                unique.insert(event.event_id.clone(), event);
+            }
+            Some(previous) if previous != &event => {
+                issues.push(issue(
+                    "duplicate-event-conflict",
+                    event.event_id.clone(),
+                    "Duplicate event ID has different content; deterministic copy retained",
+                ));
+                let incoming = serde_json::to_string(&event).unwrap();
+                let existing = serde_json::to_string(previous).unwrap();
+                if incoming < existing {
+                    unique.insert(event.event_id.clone(), event);
+                }
+            }
+            Some(_) => {}
+        }
     }
-    if a.observed.get(&b.device_id).copied().unwrap_or(0) >= b.sequence {
-        return std::cmp::Ordering::Greater;
+    let mut nodes: Vec<_> = unique.into_values().collect();
+    nodes.sort_by_key(concurrent_key);
+    let mut by_device = BTreeMap::<String, Vec<usize>>::new();
+    for (index, event) in nodes.iter().enumerate() {
+        by_device
+            .entry(event.device_id.clone())
+            .or_default()
+            .push(index);
     }
-    if b.observed.get(&a.device_id).copied().unwrap_or(0) >= a.sequence {
-        return std::cmp::Ordering::Less;
+    for indexes in by_device.values_mut() {
+        indexes.sort_by_key(|index| nodes[*index].sequence);
     }
-    a.device_id
-        .cmp(&b.device_id)
-        .then_with(|| a.sequence.cmp(&b.sequence))
-        .then_with(|| a.event_id.cmp(&b.event_id))
+    let mut outgoing = vec![BTreeSet::<usize>::new(); nodes.len()];
+    let mut indegree = vec![0usize; nodes.len()];
+    let add_edge =
+        |from: usize, to: usize, outgoing: &mut Vec<BTreeSet<usize>>, indegree: &mut Vec<usize>| {
+            if from != to && outgoing[from].insert(to) {
+                indegree[to] += 1;
+            }
+        };
+    for (device_id, indexes) in &by_device {
+        for pair in indexes.windows(2) {
+            let previous = &nodes[pair[0]];
+            let current = &nodes[pair[1]];
+            add_edge(pair[0], pair[1], &mut outgoing, &mut indegree);
+            if current.sequence != previous.sequence + 1 {
+                issues.push(issue(
+                    "missing-causal-dependency",
+                    current.event_id.clone(),
+                    format!(
+                        "{device_id} sequence {} follows {}",
+                        current.sequence, previous.sequence
+                    ),
+                ));
+            }
+        }
+    }
+    for (index, event) in nodes.iter().enumerate() {
+        for (device_id, observed_sequence) in &event.observed {
+            if device_id == &event.device_id && *observed_sequence >= event.sequence {
+                issues.push(issue(
+                    "invalid-causal-metadata",
+                    event.event_id.clone(),
+                    "An event cannot observe its own sequence or a future one",
+                ));
+                continue;
+            }
+            if *observed_sequence == 0 {
+                continue;
+            }
+            let dependency = by_device.get(device_id).and_then(|indexes| {
+                indexes
+                    .iter()
+                    .copied()
+                    .filter(|candidate| nodes[*candidate].sequence <= *observed_sequence)
+                    .next_back()
+            });
+            if dependency
+                .map(|candidate| nodes[candidate].sequence < *observed_sequence)
+                .unwrap_or(true)
+            {
+                issues.push(issue(
+                    "missing-causal-dependency",
+                    event.event_id.clone(),
+                    format!(
+                        "Observed {device_id} sequence {observed_sequence}, which is not available"
+                    ),
+                ));
+            }
+            if let Some(dependency) = dependency {
+                add_edge(dependency, index, &mut outgoing, &mut indegree);
+            }
+        }
+    }
+    let mut ready = BTreeSet::<((u8, String, u64, String), usize)>::new();
+    for (index, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.insert((concurrent_key(&nodes[index]), index));
+        }
+    }
+    let mut emitted = vec![false; nodes.len()];
+    let mut ordered = Vec::with_capacity(nodes.len());
+    while let Some((key, index)) = ready.pop_first() {
+        let _ = key;
+        if emitted[index] {
+            continue;
+        }
+        emitted[index] = true;
+        ordered.push(nodes[index].clone());
+        for dependent in &outgoing[index] {
+            indegree[*dependent] -= 1;
+            if indegree[*dependent] == 0 {
+                ready.insert((concurrent_key(&nodes[*dependent]), *dependent));
+            }
+        }
+    }
+    if ordered.len() != nodes.len() {
+        issues.push(issue(
+            "causal-cycle",
+            "event-streams",
+            "Cyclic causal metadata was detected; affected events use deterministic fallback order",
+        ));
+        let mut remaining: Vec<_> = nodes
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !emitted[*index])
+            .map(|(_, event)| event)
+            .collect();
+        remaining.sort_by_key(concurrent_key);
+        ordered.extend(remaining);
+    }
+    ordered
 }
 
 #[derive(Clone)]
@@ -481,17 +630,7 @@ fn add_conflict(catalogue: &mut Catalogue, conflict: MetadataConflict) {
 }
 
 pub fn rebuild(mut read: EventRead) -> Catalogue {
-    read.events.sort_by(event_order);
-    // A registration establishes the entity identity. Replaying registrations
-    // first also lets partially synchronized streams retain dependent edits
-    // until the corresponding registration arrives, independent of filenames
-    // or delivery order.
-    read.events.sort_by_key(|envelope| {
-        (
-            !matches!(envelope.event, CatalogueEvent::MediaRegistered { .. }),
-            !envelope.event_id.starts_with("legacy-"),
-        )
-    });
+    let events = causal_order(std::mem::take(&mut read.events), &mut read.issues);
     let mut catalogue = Catalogue::default();
     let mut seen = HashSet::new();
     let mut media = HashMap::<String, MediaItem>::new();
@@ -500,16 +639,14 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
     let mut additions = HashMap::<String, HashMap<String, Addition>>::new();
     let mut scalar_versions = HashMap::<String, (EventEnvelope, Value)>::new();
 
-    for envelope in read.events {
+    for envelope in events {
         if !seen.insert(envelope.event_id.clone()) {
             continue;
         }
         match &envelope.event {
             CatalogueEvent::MediaRegistered { media: item } => {
                 if let Some(existing) = media.get(&item.id) {
-                    if existing.sha256 != item.sha256
-                        || existing.relative_path != item.relative_path
-                    {
+                    if existing != item {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
@@ -547,6 +684,42 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                             },
                         );
                     }
+                }
+                media.insert(item.id.clone(), item);
+            }
+            CatalogueEvent::MediaLegacySnapshotReplaced { media: item } => {
+                if let Some(existing) = media.get(&item.id) {
+                    if existing != item {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: item.id.clone(),
+                                field: "legacy-snapshot".into(),
+                                event_ids: vec![envelope.event_id.clone()],
+                                values: vec![
+                                    serde_json::to_value(existing).unwrap(),
+                                    serde_json::to_value(item).unwrap(),
+                                ],
+                            },
+                        );
+                    }
+                }
+                let mut item = item.clone();
+                let original_tags = std::mem::take(&mut item.tags);
+                let original_projects = std::mem::take(&mut item.project_ids);
+                for (field, values) in [("tags", original_tags), ("projectIds", original_projects)]
+                {
+                    let mut set = HashMap::new();
+                    for value in normalized(&values) {
+                        set.insert(
+                            format!("{}:{value}", envelope.event_id),
+                            Addition {
+                                value,
+                                envelope: envelope.clone(),
+                            },
+                        );
+                    }
+                    additions.insert(format!("{}:{field}", item.id), set);
                 }
                 media.insert(item.id.clone(), item);
             }
@@ -593,6 +766,37 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                         !removed.contains(&addition.value)
                             || !happens_before(&addition.envelope, &envelope)
                     });
+                }
+            }
+            CatalogueEvent::MediaTagsReplaced { media_id, values }
+            | CatalogueEvent::MediaProjectsReplaced { media_id, values } => {
+                if !media.contains_key(media_id) {
+                    add_conflict(
+                        &mut catalogue,
+                        MetadataConflict {
+                            entity_id: media_id.clone(),
+                            field: "missing-media".into(),
+                            event_ids: vec![envelope.event_id.clone()],
+                            values: vec![serde_json::to_value(&envelope.event).unwrap()],
+                        },
+                    );
+                    continue;
+                }
+                let field = if matches!(envelope.event, CatalogueEvent::MediaTagsReplaced { .. }) {
+                    "tags"
+                } else {
+                    "projectIds"
+                };
+                let set = additions.entry(format!("{media_id}:{field}")).or_default();
+                set.retain(|_, addition| !happens_before(&addition.envelope, &envelope));
+                for value in normalized(values) {
+                    set.insert(
+                        format!("{}:{value}", envelope.event_id),
+                        Addition {
+                            value,
+                            envelope: envelope.clone(),
+                        },
+                    );
                 }
             }
             CatalogueEvent::MediaNotesSet { media_id, value } => {
@@ -910,6 +1114,27 @@ pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), Strin
     fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let marker = root.join("migration-v2.json");
     if marker.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(&marker).map_err(|e| e.to_string())?)
+            .map_err(|error| format!("Invalid migration marker: {error}"))?;
+        if value.get("source").and_then(Value::as_str) == Some("catalogue.json") {
+            let backup = value
+                .get("backup")
+                .and_then(Value::as_str)
+                .unwrap_or("catalogue.pre-events-v1.backup.json");
+            if !root.join(backup).is_file() {
+                return Err("Migration marker exists but its legacy backup is missing".into());
+            }
+            let stream = value
+                .get("eventStream")
+                .and_then(Value::as_str)
+                .ok_or("Migration marker does not identify its event stream")?;
+            let bytes = fs::read(event_dir(root).join(stream)).map_err(|_| {
+                "Migration marker exists but its event stream is missing".to_string()
+            })?;
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                return Err("Migration event stream is truncated".into());
+            }
+        }
         return Ok(());
     }
     let legacy_path = root.join("catalogue.json");
@@ -969,7 +1194,10 @@ pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), Strin
         };
         for media in legacy.media {
             let identity = format!("media-{}", media.id);
-            push(CatalogueEvent::MediaRegistered { media }, identity);
+            push(
+                CatalogueEvent::MediaLegacySnapshotReplaced { media },
+                identity,
+            );
         }
         for project in legacy.projects {
             let identity = format!("project-{}", project.id);
@@ -991,7 +1219,7 @@ pub fn migrate_legacy_snapshot(root: &Path, device_id: &str) -> Result<(), Strin
     }
     write_json(
         &marker,
-        &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"catalogue.json","backup":"catalogue.pre-events-v1.backup.json"}),
+        &serde_json::json!({"schemaVersion":2,"migratedAt":Utc::now().to_rfc3339(),"source":"catalogue.json","backup":"catalogue.pre-events-v1.backup.json","eventStream":migration_path.file_name().unwrap().to_string_lossy()}),
     )
 }
 
@@ -1085,6 +1313,80 @@ mod tests {
         });
         assert_eq!(first.media[0].tags, vec!["Night", "Track"]);
         assert_eq!(first.media[0].tags, second.media[0].tags);
+    }
+
+    #[test]
+    fn three_device_causal_replay_converges_for_every_delivery_order() {
+        let z = envelope(
+            "z-device",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "2026-10-22/a.mp4", "mp4"),
+            },
+        );
+        let mut a = envelope(
+            "a-device",
+            1,
+            CatalogueEvent::MediaTagsAdded {
+                media_id: "m".into(),
+                values: vec!["Observed Z".into()],
+            },
+        );
+        a.observed.insert("z-device".into(), 1);
+        let b = envelope(
+            "b-device",
+            1,
+            CatalogueEvent::MediaTagsAdded {
+                media_id: "m".into(),
+                values: vec!["Concurrent B".into()],
+            },
+        );
+        let permutations = vec![
+            vec![z.clone(), a.clone(), b.clone()],
+            vec![z.clone(), b.clone(), a.clone()],
+            vec![a.clone(), z.clone(), b.clone()],
+            vec![a.clone(), b.clone(), z.clone()],
+            vec![b.clone(), z.clone(), a.clone()],
+            vec![b, a, z],
+        ];
+        let projections: Vec<_> = permutations
+            .into_iter()
+            .map(|events| {
+                rebuild(EventRead {
+                    events,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        for projection in &projections {
+            assert_eq!(projection.media[0].tags, vec!["Concurrent B", "Observed Z"]);
+            assert!(projection.issues.is_empty());
+        }
+        for projection in &projections[1..] {
+            assert_eq!(projection.media, projections[0].media);
+            assert_eq!(projection.conflicts, projections[0].conflicts);
+        }
+    }
+
+    #[test]
+    fn missing_causal_dependencies_are_reported_without_dropping_valid_events() {
+        let mut dependent = envelope(
+            "a-device",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("m", "a.mp4", "mp4"),
+            },
+        );
+        dependent.observed.insert("z-device".into(), 3);
+        let catalogue = rebuild(EventRead {
+            events: vec![dependent],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.media.len(), 1);
+        assert!(catalogue
+            .issues
+            .iter()
+            .any(|issue| issue.code == "missing-causal-dependency"));
     }
 
     #[test]
@@ -1449,6 +1751,103 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("truncated"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncated_final_record_is_reported_but_never_replayed() {
+        let root = temporary("truncated-read");
+        fs::create_dir_all(event_dir(&root)).unwrap();
+        let valid = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            event_id: "committed".into(),
+            device_id: "desktop".into(),
+            sequence: 1,
+            occurred_at: "2026-10-22T00:00:00Z".into(),
+            observed: BTreeMap::new(),
+            event: CatalogueEvent::MediaRegistered {
+                media: item("committed", "committed.mp4", "mp4"),
+            },
+        };
+        let partial = EventEnvelope {
+            event_id: "uncommitted".into(),
+            sequence: 2,
+            event: CatalogueEvent::MediaRegistered {
+                media: item("uncommitted", "uncommitted.mp4", "mp4"),
+            },
+            ..valid.clone()
+        };
+        fs::write(
+            event_dir(&root).join("desktop.jsonl"),
+            format!(
+                "{}\n{}",
+                serde_json::to_string(&valid).unwrap(),
+                serde_json::to_string(&partial).unwrap()
+            ),
+        )
+        .unwrap();
+        let catalogue = load(&root).unwrap();
+        assert_eq!(catalogue.media.len(), 1);
+        assert_eq!(catalogue.media[0].id, "committed");
+        assert!(catalogue
+            .issues
+            .iter()
+            .any(|issue| issue.code == "truncated-stream"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_set_and_update_events_preserve_exact_final_state() {
+        let root = temporary("legacy-replacements");
+        fs::create_dir_all(event_dir(&root)).unwrap();
+        let mut initial = item("m", "old.mp4", "mp4");
+        initial.tags = vec!["remove-me".into(), "keep".into()];
+        initial.project_ids = vec!["old-project".into()];
+        let mut updated = initial.clone();
+        updated.relative_path = "new.mp4".into();
+        updated.tags = vec!["keep".into()];
+        updated.project_ids.clear();
+        updated.notes = "final note".into();
+        let records = vec![
+            serde_json::json!({"schemaVersion":1,"eventId":"one","deviceId":"legacy","sequence":1,"type":"media.registered","payload":initial}),
+            serde_json::json!({"schemaVersion":1,"eventId":"two","deviceId":"legacy","sequence":2,"type":"media.tags-set","payload":{"mediaId":"m","tags":["keep"]}}),
+            serde_json::json!({"schemaVersion":1,"eventId":"three","deviceId":"legacy","sequence":3,"type":"media.projects-set","payload":{"mediaId":"m","projectIds":[]}}),
+        ];
+        let content = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(event_dir(&root).join("legacy.jsonl"), content).unwrap();
+        let replaced = load(&root).unwrap();
+        assert_eq!(replaced.media[0].tags, vec!["keep"]);
+        assert!(replaced.media[0].project_ids.is_empty());
+        let update = serde_json::json!({"schemaVersion":1,"eventId":"four","deviceId":"legacy","sequence":4,"type":"media.updated","payload":updated});
+        let mut stream = OpenOptions::new()
+            .append(true)
+            .open(event_dir(&root).join("legacy.jsonl"))
+            .unwrap();
+        writeln!(stream, "{}", serde_json::to_string(&update).unwrap()).unwrap();
+        let catalogue = load(&root).unwrap();
+        assert_eq!(catalogue.media[0].relative_path, "new.mp4");
+        assert_eq!(catalogue.media[0].notes, "final note");
+        assert_eq!(catalogue.media[0].tags, vec!["keep"]);
+        assert!(catalogue.media[0].project_ids.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_migration_marker_is_not_accepted_as_proof() {
+        let root = temporary("incomplete-marker");
+        fs::write(
+            root.join("migration-v2.json"),
+            br#"{"schemaVersion":2,"source":"catalogue.json","backup":"catalogue.pre-events-v1.backup.json","eventStream":"migration-desktop.jsonl"}"#,
+        )
+        .unwrap();
+        fs::write(root.join("catalogue.pre-events-v1.backup.json"), b"{}").unwrap();
+        let error = migrate_legacy_snapshot(&root, "desktop").unwrap_err();
+        assert!(error.contains("event stream is missing"));
         fs::remove_dir_all(root).unwrap();
     }
 

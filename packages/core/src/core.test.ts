@@ -97,6 +97,67 @@ describe('catalogue reducer', () => {
     expect(state.media.m1.tags).toEqual(['A', 'B']);
     expect(state.conflicts).toHaveLength(0);
   });
+  it('topologically replays three-device causality for every delivery order', () => {
+    const z = {
+      ...envelope({ type: 'media.registered', media }, 'z1', 'z-device'),
+      sequence: 1,
+      observed: { 'z-device': 0 },
+    };
+    const a = {
+      ...envelope(
+        { type: 'media.tags.added', mediaId: 'm1', values: ['Observed Z'] },
+        'a1',
+        'a-device',
+      ),
+      observed: { 'a-device': 0, 'z-device': 1 },
+    };
+    const b = {
+      ...envelope(
+        { type: 'media.tags.added', mediaId: 'm1', values: ['Concurrent B'] },
+        'b1',
+        'b-device',
+      ),
+      observed: { 'b-device': 0 },
+    };
+    const permutations = [
+      [z, a, b],
+      [z, b, a],
+      [a, z, b],
+      [a, b, z],
+      [b, z, a],
+      [b, a, z],
+    ];
+    const projections = permutations.map((events) => rebuildCatalogue(events));
+    for (const state of projections) {
+      expect(state.media.m1.tags).toEqual(['Concurrent B', 'Observed Z']);
+      expect(state.appliedEventIds.indexOf('z1')).toBeLessThan(
+        state.appliedEventIds.indexOf('a1'),
+      );
+      expect(state.issues).toEqual([]);
+    }
+    expect(
+      projections.map(({ media, conflicts, appliedEventIds }) => ({
+        media,
+        conflicts,
+        appliedEventIds,
+      })),
+    ).toEqual(
+      Array.from({ length: 6 }, () => ({
+        media: projections[0].media,
+        conflicts: projections[0].conflicts,
+        appliedEventIds: projections[0].appliedEventIds,
+      })),
+    );
+  });
+  it('reports unavailable causal dependencies while retaining valid events', () => {
+    const dependent = {
+      ...envelope({ type: 'media.registered', media }, 'a1', 'a-device'),
+      observed: { 'a-device': 0, 'z-device': 3 },
+    };
+    const state = rebuildCatalogue([dependent]);
+    expect(state.media.m1).toBeDefined();
+    expect(state.issues[0].code).toBe('missing-causal-dependency');
+  });
   it('retains concurrent scalar values as a conflict despite clock skew', () => {
     const registered = envelope({ type: 'media.registered', media });
     const first = envelope(
@@ -144,6 +205,52 @@ describe('catalogue reducer', () => {
       rebuildCatalogue([laptopAdd, remove, registered, desktopAdd]).media.m1
         .tags,
     ).toEqual(['Night']);
+  });
+  it('replays legacy replacement events with exact set and record semantics', () => {
+    const registered = envelope({
+      type: 'media.registered',
+      media: { ...media, tags: ['old', 'keep'], projectIds: ['old-project'] },
+    });
+    const tags = {
+      ...envelope(
+        { type: 'media.tags.replaced', mediaId: 'm1', values: ['keep'] },
+        'e2',
+      ),
+      sequence: 2,
+      observed: { a: 1 },
+    };
+    const projects = {
+      ...envelope(
+        { type: 'media.projects.replaced', mediaId: 'm1', values: [] },
+        'e3',
+      ),
+      sequence: 3,
+      observed: { a: 2 },
+    };
+    const snapshot = {
+      ...envelope(
+        {
+          type: 'media.legacy-snapshot-replaced',
+          media: {
+            ...media,
+            relativePath: 'final.mp4',
+            tags: ['keep'],
+            projectIds: [],
+            notes: 'final note',
+          },
+        },
+        'e4',
+      ),
+      sequence: 4,
+      observed: { a: 3 },
+    };
+    const state = rebuildCatalogue([snapshot, projects, registered, tags]);
+    expect(state.media.m1).toMatchObject({
+      relativePath: 'final.mp4',
+      tags: ['keep'],
+      projectIds: [],
+      notes: 'final note',
+    });
   });
   it('replays enrichment and changed-file evidence from the canonical contract', () => {
     const state = rebuildCatalogue([

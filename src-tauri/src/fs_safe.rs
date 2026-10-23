@@ -53,6 +53,53 @@ pub fn validate_relative(relative: &str) -> Result<PathBuf, String> {
     if clean.as_os_str().is_empty() {
         return Err("Path must contain a filename".into());
     }
+    for component in clean.components() {
+        let Component::Normal(value) = component else {
+            continue;
+        };
+        let value = value
+            .to_str()
+            .ok_or("Path components must be valid Unicode")?;
+        if value.ends_with([' ', '.'])
+            || value
+                .chars()
+                .any(|character| character.is_control() || r#"<>:"/\|?*"#.contains(character))
+        {
+            return Err(format!("Unsafe Windows path component: {value}"));
+        }
+        let stem = value
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ) {
+            return Err(format!("Reserved Windows path component: {value}"));
+        }
+    }
     Ok(clean)
 }
 
@@ -91,16 +138,69 @@ pub fn resolve_for_create(root: &Path, relative: &str) -> Result<PathBuf, String
         .canonicalize()
         .map_err(|error| format!("Cannot resolve authorized root: {error}"))?;
     let relative = validate_relative(relative)?;
-    let candidate = root.join(&relative);
-    let parent = candidate.parent().ok_or("Destination has no parent")?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let parent = parent
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve destination parent: {error}"))?;
-    if !within(&root, &parent) {
-        return Err("Destination parent escapes the authorized root".into());
+    let filename = relative.file_name().ok_or("Destination has no filename")?;
+    let mut current = root.clone();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let Component::Normal(component) = component else {
+                return Err("Destination parent contains an unsafe component".into());
+            };
+            let next = current.join(component);
+            match fs::symlink_metadata(&next) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        return Err(format!(
+                            "Destination parent is not a directory: {}",
+                            next.display()
+                        ));
+                    }
+                    let canonical = next.canonicalize().map_err(|error| {
+                        format!(
+                            "Cannot resolve destination parent {}: {error}",
+                            next.display()
+                        )
+                    })?;
+                    if !within(&root, &canonical) {
+                        return Err("Destination parent escapes the authorized root".into());
+                    }
+                    if !canonical.is_dir() {
+                        return Err(format!(
+                            "Destination parent is not a directory: {}",
+                            next.display()
+                        ));
+                    }
+                    current = canonical;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if !within(&root, &current) {
+                        return Err("Destination parent escapes the authorized root".into());
+                    }
+                    fs::create_dir(&next).map_err(|error| {
+                        format!(
+                            "Cannot create destination directory {}: {error}",
+                            next.display()
+                        )
+                    })?;
+                    let canonical = next.canonicalize().map_err(|error| {
+                        format!("Cannot resolve created destination directory: {error}")
+                    })?;
+                    if !within(&root, &canonical) {
+                        return Err(
+                            "Created destination directory escaped the authorized root".into()
+                        );
+                    }
+                    current = canonical;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect destination directory {}: {error}",
+                        next.display()
+                    ))
+                }
+            }
+        }
     }
-    Ok(parent.join(candidate.file_name().ok_or("Destination has no filename")?))
+    Ok(current.join(filename))
 }
 
 pub fn staging_root(master: &Path, device_id: &str) -> Result<PathBuf, String> {
@@ -204,6 +304,37 @@ mod tests {
             validate_relative("日付/clip ü.mp4").unwrap(),
             PathBuf::from("日付/clip ü.mp4")
         );
+        for unsafe_name in ["CON.mp4", "clip?.mp4", "trailing. ", "bad:name.mp4"] {
+            assert!(validate_relative(unsafe_name).is_err(), "{unsafe_name}");
+        }
+        assert!(validate_relative("2026 10 23/clip ü 01.mp4").is_ok());
+    }
+
+    #[test]
+    fn create_validation_rejects_directory_link_escape_before_side_effects() {
+        let root = temporary("link-escape");
+        let master = root.join("master");
+        let outside = root.join("outside");
+        fs::create_dir(&master).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let link = master.join("escape");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link);
+        if let Err(error) = linked {
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                eprintln!("directory-link creation is unavailable in this test environment");
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("cannot create test directory link: {error}");
+        }
+        let result = resolve_for_create(&master, "escape/new/clip.mp4");
+        assert!(result.is_err());
+        assert!(!outside.join("new").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

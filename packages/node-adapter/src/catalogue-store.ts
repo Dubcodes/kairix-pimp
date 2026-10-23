@@ -31,18 +31,18 @@ function migrateLegacyEnvelope(
     };
   } else if (type === 'media.updated') {
     event = {
-      type: 'media.registered',
+      type: 'media.legacy-snapshot-replaced',
       media: rawEvent as unknown as MediaItem,
     };
   } else if (type === 'media.tags-set') {
     event = {
-      type: 'media.tags.added',
+      type: 'media.tags.replaced',
       mediaId: String(rawEvent.mediaId),
       values: (rawEvent.tags as string[]) ?? [],
     };
   } else if (type === 'media.projects-set') {
     event = {
-      type: 'media.projects.added',
+      type: 'media.projects.replaced',
       mediaId: String(rawEvent.mediaId),
       values: (rawEvent.projectIds as string[]) ?? [],
     };
@@ -56,7 +56,7 @@ function migrateLegacyEnvelope(
   }
   return {
     schemaVersion: SCHEMA_VERSION,
-    eventId: String(value.eventId ?? `legacy-${deviceId}-${sequence}`),
+    eventId: `v1-adapted-${String(value.eventId ?? `legacy-${deviceId}-${sequence}`)}`,
     deviceId,
     sequence,
     occurredAt: String(value.occurredAt ?? '1970-01-01T00:00:00Z'),
@@ -135,7 +135,12 @@ export async function loadCatalogue(masterBin: string) {
       path.join(eventDirectory(masterBin), file),
       'utf8',
     );
-    for (const [index, line] of content.split(/\r?\n/).entries()) {
+    const committed = content.endsWith('\n')
+      ? content
+      : content.slice(0, Math.max(0, content.lastIndexOf('\n') + 1));
+    if (committed.length !== content.length)
+      malformed.push(`${file}:truncated`);
+    for (const [index, line] of committed.split(/\r?\n/).entries()) {
       if (!line.trim()) continue;
       try {
         const value = JSON.parse(line) as Record<string, unknown>;
