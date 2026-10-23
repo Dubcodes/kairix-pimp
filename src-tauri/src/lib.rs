@@ -494,6 +494,8 @@ struct IngestJournal {
     staged_name: String,
     status: String,
     detail: Option<String>,
+    #[serde(default)]
+    media: Option<MediaItem>,
 }
 
 struct VerifiedCopy {
@@ -515,7 +517,11 @@ fn remove_journal(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn recover_staging(master: &Path, device_id: &str) -> Result<usize, String> {
+fn recover_staging(
+    master: &Path,
+    device_id: &str,
+    catalogue_root: Option<&Path>,
+) -> Result<usize, String> {
     let root = fs_safe::staging_root(master, device_id)?;
     let jobs = root.join("jobs");
     fs::create_dir_all(&jobs).map_err(|error| error.to_string())?;
@@ -569,6 +575,29 @@ fn recover_staging(master: &Path, device_id: &str) -> Result<usize, String> {
                 ));
             }
         }
+        if journal.status == "verified" {
+            // A verified staged file is valuable and may be awaiting promotion.
+            // Without a complete committed record, preserve both files and journal.
+            continue;
+        }
+        if journal.status == "committed" {
+            let (Some(media), Some(catalogue_root)) = (&journal.media, catalogue_root) else {
+                continue;
+            };
+            if !destination.is_file() {
+                continue;
+            }
+            let catalogue = catalogue::load(catalogue_root)?;
+            if !catalogue.media.iter().any(|item| item.id == media.id) {
+                catalogue::append(
+                    catalogue_root,
+                    device_id,
+                    vec![CatalogueEvent::MediaRegistered {
+                        media: media.clone(),
+                    }],
+                )?;
+            }
+        }
         if staged.is_file() {
             fs::remove_file(&staged).map_err(|error| error.to_string())?;
         }
@@ -607,6 +636,7 @@ fn copy_verified(
         staged_name,
         status: "copying".into(),
         detail: None,
+        media: None,
     };
     write_json(&journal_path, &journal)?;
     let operation: Result<String, String> = (|| {
@@ -749,10 +779,11 @@ async fn start_ingest(
     let mut completed_bytes = 0u64;
     state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
     let _guard = state.catalogue_write.lock().unwrap();
-    let recovered = recover_staging(&master, &settings.device_id)?;
+    let catalogue_root = catalogue_dir(&settings)?;
+    let recovered = recover_staging(&master, &settings.device_id, Some(&catalogue_root))?;
     if recovered > 0 {
         result.failures.push(format!(
-            "Recovered {recovered} interrupted staging operation(s) before ingest"
+            "Recovered {recovered} staging operation(s) before ingest"
         ));
     }
     let catalogue = load_catalogue_file(&settings)?;
@@ -858,6 +889,12 @@ async fn start_ingest(
                     provenance,
                     false,
                 )?;
+                let mut journal: IngestJournal = read_json(&copy.journal_path)?;
+                if journal.status != "committed" {
+                    return Err("Ingest journal lost its committed lifecycle state".into());
+                }
+                journal.media = Some(item.clone());
+                write_json(&copy.journal_path, &journal)?;
                 if let Err(error) = append_events(
                     &settings,
                     vec![CatalogueEvent::MediaRegistered {
@@ -1500,7 +1537,7 @@ mod tests {
         fs::write(&staged, b"incomplete").unwrap();
         fs::create_dir_all(journal.parent().unwrap()).unwrap();
         fs::write(&journal, b"{not-json}").unwrap();
-        assert!(recover_staging(&master, "device-a").is_err());
+        assert!(recover_staging(&master, "device-a", None).is_err());
         assert_eq!(fs::read(&staged).unwrap(), b"incomplete");
         assert!(journal.exists());
         fs::remove_dir_all(root).unwrap();
@@ -1542,10 +1579,11 @@ mod tests {
                 staged_name: "owned.part".into(),
                 status: "copying".into(),
                 detail: None,
+                media: None,
             },
         )
         .unwrap();
-        assert_eq!(recover_staging(&master, "device-a").unwrap(), 1);
+        assert_eq!(recover_staging(&master, "device-a", None).unwrap(), 1);
         assert!(!owned.exists());
         assert!(!journal_path.exists());
         assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
@@ -1564,6 +1602,16 @@ mod tests {
         let staged = staging.join("files").join("already-promoted.part");
         fs::write(&staged, b"stale-stage").unwrap();
         let journal_path = staging.join("jobs").join("committed.json");
+        let media = new_media(
+            &destination,
+            "2026-10-23/clip.mp4".into(),
+            sha256(&destination).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        let catalogue_root = master.join(".pimp");
         write_json(
             &journal_path,
             &IngestJournal {
@@ -1573,13 +1621,53 @@ mod tests {
                 staged_name: "already-promoted.part".into(),
                 status: "committed".into(),
                 detail: None,
+                media: Some(media.clone()),
             },
         )
         .unwrap();
-        assert_eq!(recover_staging(&master, "device-a").unwrap(), 1);
+        assert_eq!(
+            recover_staging(&master, "device-a", Some(&catalogue_root)).unwrap(),
+            1
+        );
         assert_eq!(fs::read(&destination).unwrap(), b"verified-media");
         assert!(!staged.exists());
         assert!(!journal_path.exists());
+        assert_eq!(
+            catalogue::load(&catalogue_root).unwrap().media[0].id,
+            media.id
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_verified_work_when_promotion_is_uncertain() {
+        let root = temporary("verified-recovery");
+        let master = root.join("master");
+        fs::create_dir(&master).unwrap();
+        let staging = fs_safe::staging_root(&master, "device-a").unwrap();
+        let staged = staging.join("files").join("verified.part");
+        fs::write(&staged, b"verified-bytes").unwrap();
+        let journal_path = staging.join("jobs").join("verified.json");
+        write_json(
+            &journal_path,
+            &IngestJournal {
+                job_id: "job".into(),
+                source_path: "source".into(),
+                destination_path: master
+                    .join("2026-10-23")
+                    .join("clip.mp4")
+                    .to_string_lossy()
+                    .into(),
+                staged_name: "verified.part".into(),
+                status: "verified".into(),
+                detail: None,
+                media: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(recover_staging(&master, "device-a", None).unwrap(), 0);
+        assert_eq!(fs::read(&staged).unwrap(), b"verified-bytes");
+        assert!(journal_path.is_file());
         fs::remove_dir_all(root).unwrap();
     }
 
