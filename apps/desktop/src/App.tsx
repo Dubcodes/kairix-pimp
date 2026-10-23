@@ -26,8 +26,10 @@ import {
   type IngestProgress,
   type IngestResult,
 } from './bridge';
+import { datePatternPreview } from './date-pattern';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
+
 const icons = {
   Ingest: Inbox,
   Library,
@@ -500,6 +502,25 @@ export function App() {
                 Use original file dates
               </label>
             </fieldset>
+            <label>
+              Date-folder naming pattern
+              <input
+                value={settings.dateFolderPattern ?? 'yyyymmdd'}
+                onChange={(event) =>
+                  setSettings({
+                    ...settings,
+                    dateFolderPattern: event.target.value,
+                  })
+                }
+                placeholder="yyyymmdd"
+              />
+              <small>
+                Preview: {datePatternPreview(settings.dateFolderPattern)}. Use
+                MM for month, mm for minute, HH for 24-hour time, hh and a for
+                12-hour time. yyyymmdd is supported as a familiar date-only
+                alias.
+              </small>
+            </label>
             {settings.initializedCataloguePath && (
               <small>
                 Catalogue location is locked until a safe migration workflow is

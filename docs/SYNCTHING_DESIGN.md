@@ -8,7 +8,7 @@ Synchronizing an open SQLite database is unsafe because pages and transactions c
 
 Syncthing conflict copies are never ingested automatically as authoritative streams. PIMP identifies `.sync-conflict-*` files and reports them. Replace-style concurrent edits retain competing values for later resolution. Tags and project memberships use causal add/remove semantics: a removal can remove only additions that device observed, so concurrent additions converge without being lost.
 
-Replay accepts valid events surrounding a malformed record, deduplicates repeated event IDs, reports truncated files, rejects non-monotonic owned sequences, and quarantines unsupported newer schemas. A writer refuses to append to its own truncated stream rather than compounding damage. One in-process mutex serializes native catalogue writers; each appended record is flushed before success is reported.
+Replay accepts valid events surrounding a malformed record, deduplicates repeated event IDs, reports and excludes an unterminated final record, rejects non-monotonic owned sequences, and quarantines unsupported newer schemas. Topological ordering enforces all available causal edges. A writer refuses to append to its own truncated stream rather than compounding damage. One in-process mutex serializes commands and the desktop single-instance guard prevents a second local writer; each appended record is flushed before success is reported.
 
 ## Incomplete transfers and status
 

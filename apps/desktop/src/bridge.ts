@@ -13,6 +13,7 @@ export interface DeviceSettings {
   thumbnailCachePath: string;
   thumbnailCacheLimitBytes: number;
   ingestDateOrganization: DateMode;
+  dateFolderPattern: string;
   initializedCataloguePath: string;
   projectPaths: Record<string, string>;
 }
@@ -98,6 +99,7 @@ export const emptySettings = (): DeviceSettings => ({
   thumbnailCachePath: '',
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   ingestDateOrganization: 'original-file-dates',
+  dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
   projectPaths: {},
 });

@@ -46,7 +46,7 @@ The implemented single-file reference transaction:
 6. Append and flush `media.registered` only after successful promotion. A persistence failure leaves a verified orphan that conservative discovery can recover; it never rolls back by deleting the media.
 7. Probe and preview as separately retryable work; their failure does not invalidate the verified ingest.
 
-Long work executes outside the render thread with stable job IDs, progress events and cancellation. A minimal journal identifies abandoned PIMP-owned staging files after restart. Byte-offset resume and retry scheduling remain future work. Event handlers are idempotent because reconnect/replay can redeliver state.
+Long work executes outside the render thread with stable job IDs, progress events and cancellation. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence; restart recovery never removes a promoted destination. Byte-offset resume and retry scheduling remain future work. Event handlers are idempotent because reconnect/replay can redeliver state.
 
 The target job architecture persists versioned intent, progress and retry state for ingest, enrichment, consolidation and cleanup, then resumes eligible work at startup. Ingest intent will include initial tags, projects, description and favourite state without making incomplete media visible in the committed catalogue.
 
@@ -54,7 +54,7 @@ FFprobe and thumbnail enrichment run sequentially only for records missing requi
 
 ## Metadata, search, and Syncthing
 
-The synchronized Master Bin contains portable relative paths, stable IDs and device-partitioned append-only schema-2 event logs. Devices never write another device's stream. Deterministic replay deduplicates event IDs, uses causal vectors for set additions/removals and retains ambiguous concurrent scalar updates for resolution. The legacy snapshot is retained for recovery but is no longer operational state.
+The synchronized Master Bin contains portable relative paths, stable IDs and device-partitioned append-only schema-2 event logs. Devices never write another device's stream. A deterministic topological replay respects device sequence and observed-vector edges, then applies stable ordering only to concurrent events. Integrity observations are retained by device. The legacy snapshot is retained for recovery but is no longer operational state.
 
 ```text
 device A events ─┐

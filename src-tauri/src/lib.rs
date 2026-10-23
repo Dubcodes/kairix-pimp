@@ -4,7 +4,7 @@ mod fs_safe;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use catalogue::{Catalogue, CatalogueEvent, MediaItem, ProjectRecord, TechnicalMetadata};
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -37,6 +37,8 @@ struct DeviceSettings {
     thumbnail_cache_limit_bytes: u64,
     #[serde(default = "default_date_mode")]
     ingest_date_organization: String,
+    #[serde(default = "legacy_date_folder_pattern")]
+    date_folder_pattern: String,
     #[serde(default)]
     initialized_catalogue_path: String,
     #[serde(default)]
@@ -44,6 +46,9 @@ struct DeviceSettings {
 }
 fn default_date_mode() -> String {
     "original-file-dates".into()
+}
+fn legacy_date_folder_pattern() -> String {
+    "yyyy-MM-dd".into()
 }
 impl Default for DeviceSettings {
     fn default() -> Self {
@@ -56,6 +61,7 @@ impl Default for DeviceSettings {
             thumbnail_cache_path: String::new(),
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             ingest_date_organization: default_date_mode(),
+            date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
             project_paths: HashMap::new(),
         }
@@ -254,6 +260,11 @@ fn save_settings(
     {
         return Err("Master Bin and Working Projects directories are required".into());
     }
+    format_date_folder(
+        &settings.date_folder_pattern,
+        Local::now().date_naive(),
+        Local::now().time(),
+    )?;
     fs::create_dir_all(settings.master_bin_path.trim())
         .map_err(|e| format!("Cannot create Master Bin: {e}"))?;
     fs::create_dir_all(settings.working_projects_path.trim())
@@ -384,7 +395,7 @@ fn destination_date(
     settings: &DeviceSettings,
     source: &Path,
     override_date: &Option<String>,
-) -> (String, Option<String>, String) {
+) -> Result<(String, Option<String>, String), String> {
     let modified = source
         .metadata()
         .ok()
@@ -403,15 +414,75 @@ fn destination_date(
         }
         _ => today,
     };
-    (
-        chosen.format("%Y-%m-%d").to_string(),
+    let time = modified
+        .map(|value| value.time())
+        .unwrap_or_else(|| Local::now().time());
+    Ok((
+        format_date_folder(&settings.date_folder_pattern, chosen, time)?,
         capture,
         if modified.is_some() {
             "filesystem".into()
         } else {
             "unknown".into()
         },
-    )
+    ))
+}
+
+fn format_date_folder(
+    pattern: &str,
+    date: NaiveDate,
+    time: chrono::NaiveTime,
+) -> Result<String, String> {
+    let pattern = if pattern == "yyyymmdd" {
+        "yyyyMMdd"
+    } else {
+        pattern
+    };
+    if pattern.trim().is_empty()
+        || pattern.contains(['/', '\\'])
+        || pattern.chars().any(char::is_control)
+    {
+        return Err("Date folder pattern must be a non-empty filename, not a path".into());
+    }
+    let mut output = String::new();
+    let mut offset = 0;
+    let tokens = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss", "a"];
+    while offset < pattern.len() {
+        let tail = &pattern[offset..];
+        if let Some(token) = tokens.iter().find(|token| tail.starts_with(**token)) {
+            let value = match *token {
+                "yyyy" => format!("{:04}", date.year()),
+                "yy" => format!("{:02}", date.year().rem_euclid(100)),
+                "MM" => format!("{:02}", date.month()),
+                "dd" => format!("{:02}", date.day()),
+                "HH" => format!("{:02}", time.hour()),
+                "hh" => format!(
+                    "{:02}",
+                    match time.hour() % 12 {
+                        0 => 12,
+                        hour => hour,
+                    }
+                ),
+                "mm" => format!("{:02}", time.minute()),
+                "ss" => format!("{:02}", time.second()),
+                "a" => if time.hour() < 12 { "AM" } else { "PM" }.into(),
+                _ => unreachable!(),
+            };
+            output.push_str(&value);
+            offset += token.len();
+        } else {
+            let character = tail.chars().next().unwrap();
+            if r#"<>:\"|?*"#.contains(character) {
+                return Err(format!(
+                    "Illegal character in date folder pattern: {character}"
+                ));
+            }
+            output.push(character);
+            offset += character.len_utf8();
+        }
+    }
+    fs_safe::validate_relative(&output)?;
+    Ok(output)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -702,7 +773,7 @@ async fn start_ingest(
         }
         let source_size = source.metadata().map(|m| m.len()).unwrap_or(0);
         let (date, capture, provenance) =
-            destination_date(&settings, source, &request.date_override);
+            destination_date(&settings, source, &request.date_override)?;
         let compact_date = date.replace('-', "");
         let date_folder = if master.join(&date).is_dir() {
             date.clone()
@@ -1107,7 +1178,7 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
                 result.changed += 1;
             }
         } else {
-            let (_, capture, provenance) = destination_date(&settings, path, &None);
+            let (_, capture, provenance) = destination_date(&settings, path, &None)?;
             let item = new_media(path, relative.clone(), hash, capture, provenance, true)?;
             events.push(CatalogueEvent::MediaRegistered { media: item });
             result.registered += 1;
@@ -1367,6 +1438,43 @@ mod tests {
         assert_eq!(preserve_device_identity(&identity, "").unwrap(), identity);
         assert!(preserve_device_identity(&identity, &Uuid::new_v4().to_string()).is_err());
         assert!(preserve_device_identity("", "desktop").is_err());
+    }
+
+    #[test]
+    fn date_folder_patterns_are_unambiguous_and_path_safe() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        let time = chrono::NaiveTime::from_hms_opt(17, 42, 9).unwrap();
+        assert_eq!(
+            format_date_folder("yyyymmdd", date, time).unwrap(),
+            "20261023"
+        );
+        assert_eq!(
+            format_date_folder("yyyy-MM-dd HH-mm", date, time).unwrap(),
+            "2026-10-23 17-42"
+        );
+        assert_eq!(
+            format_date_folder("yyyy MM dd hh-mm a", date, time).unwrap(),
+            "2026 10 23 05-42 PM"
+        );
+        assert!(format_date_folder("yyyy/MM/dd", date, time).is_err());
+        assert!(format_date_folder("yyyy:MM:dd", date, time).is_err());
+    }
+
+    #[test]
+    fn older_settings_keep_the_existing_dashed_date_pattern() {
+        let value = serde_json::json!({
+            "deviceId": Uuid::new_v4().to_string(),
+            "masterBinPath": "master",
+            "workingProjectsPath": "projects",
+            "catalogueInMasterBin": true,
+            "sharedCataloguePath": "",
+            "thumbnailCachePath": "cache",
+            "thumbnailCacheLimitBytes": 1,
+            "ingestDateOrganization": "original-file-dates"
+        });
+        let settings: DeviceSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.date_folder_pattern, "yyyy-MM-dd");
+        assert_eq!(DeviceSettings::default().date_folder_pattern, "yyyymmdd");
     }
 
     #[test]

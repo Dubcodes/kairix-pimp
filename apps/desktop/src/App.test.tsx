@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     thumbnailCachePath: 'C:\\Cache',
     thumbnailCacheLimitBytes: 2147483648,
     ingestDateOrganization: 'original-file-dates' as const,
+    dateFolderPattern: 'yyyymmdd',
     initializedCataloguePath: 'C:\\Master\\.pimp',
     projectPaths: {},
   },
@@ -45,8 +46,16 @@ vi.mock('./bridge', () => ({
 }));
 
 import { App } from './App';
+import { datePatternPreview } from './date-pattern';
 
 describe('native application integration', () => {
+  it('previews date, 24-hour and 12-hour folder tokens', () => {
+    expect(datePatternPreview('yyyymmdd')).toBe('20261023');
+    expect(datePatternPreview('yyyy-MM-dd HH-mm')).toBe('2026-10-23 17-42');
+    expect(datePatternPreview('yyyy MM dd hh-mm a')).toBe(
+      '2026 10 23 05-42 PM',
+    );
+  });
   beforeEach(() => {
     mocks.native = true;
     mocks.saveSettings.mockReset();

@@ -13,6 +13,7 @@ export interface DeviceSettings {
   thumbnailCacheLimitBytes?: number;
   initializedCataloguePath?: string;
   projectPaths?: Record<string, string>;
+  dateFolderPattern?: string;
 }
 
 export interface SharedSettings {
