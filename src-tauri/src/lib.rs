@@ -2263,6 +2263,10 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
             Ok(path) if path.is_file() => path,
             _ => continue,
         };
+        let source_before = match fs_safe::snapshot(&source) {
+            Ok(snapshot) => snapshot,
+            Err(_) => continue,
+        };
         let thumbnail_ref = format!("{}.jpg", item.id);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
             continue;
@@ -2323,6 +2327,9 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
                 .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
                 .arg(&thumbnail)
                 .output();
+        }
+        if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
+            continue;
         }
         candidates.push((
             item.id.clone(),
