@@ -1683,15 +1683,18 @@ fn apply_pending_metadata_write(
         .pending_metadata
         .clone()
         .ok_or("No pending metadata write exists")?;
-    if file.state != "completed" {
-        return Err("Metadata cannot become authoritative before ingest completion".into());
-    }
-    let media = catalogue
-        .media
-        .iter()
-        .find(|item| item.id == file.media_id)
-        .ok_or("Completed ingest media is missing from the catalogue")?;
-    match append(metadata_update_events(media, &pending)) {
+    let outcome = (|| {
+        if file.state != "completed" {
+            return Err("Metadata cannot become authoritative before ingest completion".into());
+        }
+        let media = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == file.media_id)
+            .ok_or("Completed ingest media is missing from the catalogue")?;
+        append(metadata_update_events(media, &pending))
+    })();
+    match outcome {
         Ok(()) => {
             file.pending_metadata = None;
             file.metadata_error = None;
