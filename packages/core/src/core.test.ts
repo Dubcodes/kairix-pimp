@@ -273,6 +273,16 @@ describe('catalogue reducer', () => {
     expect(state.conflicts).toHaveLength(1);
     expect(state.conflicts[0].values).toEqual(['Desktop note', 'Laptop note']);
   });
+  it('projects favourite events independently of registration defaults', () => {
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media }),
+      envelope(
+        { type: 'media.favourite.set', mediaId: 'm1', value: true },
+        'e2',
+      ),
+    ]);
+    expect(state.media.m1.favourite).toBe(true);
+  });
   it('only removes set additions observed by the removing device', () => {
     const registered = envelope({ type: 'media.registered', media });
     const desktopAdd = envelope(

@@ -24,7 +24,13 @@ use walkdir::WalkDir;
 #[derive(Default)]
 struct NativeState {
     cancelled_jobs: Mutex<HashSet<String>>,
+    paused_jobs: Mutex<HashSet<String>>,
     catalogue_write: Mutex<()>,
+    discovery_write: Mutex<()>,
+    enrichment_write: Mutex<()>,
+    job_store: Mutex<()>,
+    worker_active: Mutex<bool>,
+    availability: Mutex<HashMap<String, (String, bool)>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,6 +86,71 @@ struct IngestRequest {
     renamed_destinations: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ProvisionalMetadata {
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    project_ids: Vec<String>,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    favourite: bool,
+    #[serde(default)]
+    edited_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvisionalMetadataPatch {
+    tags: Option<Vec<String>>,
+    project_ids: Option<Vec<String>>,
+    notes: Option<String>,
+    favourite: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct IngestJobFile {
+    id: String,
+    media_id: String,
+    source_path: String,
+    destination_path: String,
+    relative_path: String,
+    original_filename: String,
+    size_bytes: u64,
+    bytes_transferred: u64,
+    state: String,
+    error: Option<String>,
+    metadata: ProvisionalMetadata,
+    #[serde(default)]
+    pending_metadata: Option<ProvisionalMetadata>,
+    #[serde(default)]
+    metadata_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct IngestJob {
+    schema_version: u32,
+    id: String,
+    state: String,
+    created_at: String,
+    updated_at: String,
+    batch_timestamp: String,
+    date_override: Option<String>,
+    files: Vec<IngestJobFile>,
+    #[serde(default)]
+    unsupported: Vec<String>,
+    #[serde(default)]
+    failures: Vec<String>,
+    current_file: Option<String>,
+    bytes_total: u64,
+    bytes_transferred: u64,
+    files_completed: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IngestProgress {
@@ -90,25 +161,6 @@ struct IngestProgress {
     files_total: usize,
     bytes_complete: u64,
     bytes_total: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestResult {
-    imported: Vec<MediaItem>,
-    duplicates: Vec<String>,
-    conflicts: Vec<IngestConflict>,
-    unsupported: Vec<String>,
-    failures: Vec<String>,
-    cancelled: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestConflict {
-    source_path: String,
-    destination_path: String,
-    reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -134,6 +186,31 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("device-settings.json"))
+}
+fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("ingest-jobs.json"))
+}
+fn load_jobs_unlocked(app: &AppHandle) -> Result<Vec<IngestJob>, String> {
+    read_json(&jobs_path(app)?)
+}
+fn mutate_jobs<T>(
+    app: &AppHandle,
+    state: &NativeState,
+    operation: impl FnOnce(&mut Vec<IngestJob>) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = state.job_store.lock().unwrap();
+    let mut jobs = load_jobs_unlocked(app)?;
+    let result = operation(&mut jobs)?;
+    write_json(&jobs_path(app)?, &jobs)?;
+    let _ = app.emit("ingest-jobs-changed", &jobs);
+    Ok(result)
+}
+fn snapshot_jobs(app: &AppHandle, state: &NativeState) -> Result<Vec<IngestJob>, String> {
+    let _guard = state.job_store.lock().unwrap();
+    load_jobs_unlocked(app)
 }
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
@@ -317,7 +394,7 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
+fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catalogue, String> {
     let settings = load_settings_file(&app)?;
     let mut catalogue = load_catalogue_file(&settings)?;
     let master = PathBuf::from(&settings.master_bin_path);
@@ -336,7 +413,33 @@ fn load_catalogue(app: AppHandle) -> Result<Catalogue, String> {
             project.working_directory = path.clone();
         }
     }
+    *state.availability.lock().unwrap() = catalogue
+        .media
+        .iter()
+        .map(|item| (item.id.clone(), (item.relative_path.clone(), item.available)))
+        .collect();
     Ok(catalogue)
+}
+
+#[tauri::command]
+fn refresh_media_availability(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<bool, String> {
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut availability = state.availability.lock().unwrap();
+    let mut changed = false;
+    for (_, (relative_path, available)) in availability.iter_mut() {
+        let next = fs_safe::resolve_existing(&master, relative_path)
+            .map(|path| path.is_file())
+            .unwrap_or(false);
+        if next != *available {
+            *available = next;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 #[tauri::command]
@@ -550,6 +653,41 @@ struct RecoverySummary {
     needs_review: usize,
 }
 
+fn update_job_progress(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+    file_id: &str,
+    phase: &str,
+    file_bytes: u64,
+    error: Option<String>,
+) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job no longer exists")?;
+        let file = job
+            .files
+            .iter_mut()
+            .find(|file| file.id == file_id)
+            .ok_or("Ingest job file no longer exists")?;
+        file.state = phase.into();
+        file.bytes_transferred = file_bytes.min(file.size_bytes);
+        file.error = error;
+        job.state = phase.into();
+        job.current_file = Some(file.original_filename.clone());
+        job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+        job.files_completed = job
+            .files
+            .iter()
+            .filter(|file| file.state == "completed")
+            .count();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
 fn remove_journal(path: &Path) -> Result<(), String> {
     if path.is_file() {
         fs::remove_file(path).map_err(|error| error.to_string())?;
@@ -692,6 +830,7 @@ fn copy_verified(
     state: &NativeState,
     settings: &DeviceSettings,
     job_id: &str,
+    file_id: &str,
     source: &Path,
     destination: &Path,
     base_bytes: u64,
@@ -728,6 +867,7 @@ fn copy_verified(
         let mut copied = 0u64;
         let mut source_hash = Sha256::new();
         let mut buffer = vec![0u8; 1024 * 1024];
+        let mut next_persist = 0u64;
         loop {
             if state.cancelled_jobs.lock().unwrap().contains(job_id) {
                 return Err("__cancelled__".into());
@@ -743,6 +883,10 @@ fn copy_verified(
                 .write_all(&buffer[..read])
                 .map_err(|error| format!("Interrupted staging write: {error}"))?;
             copied += read as u64;
+            if copied >= next_persist {
+                update_job_progress(app, state, job_id, file_id, "copying", copied, None)?;
+                next_persist = copied.saturating_add(8 * 1024 * 1024);
+            }
             let _ = app.emit(
                 "ingest-progress",
                 IngestProgress {
@@ -758,6 +902,19 @@ fn copy_verified(
         }
         output.sync_all().map_err(|error| error.to_string())?;
         drop(output);
+        update_job_progress(app, state, job_id, file_id, "verifying", copied, None)?;
+        let _ = app.emit(
+            "ingest-progress",
+            IngestProgress {
+                job_id: job_id.into(),
+                phase: "verifying".into(),
+                current_file: source.to_string_lossy().to_string(),
+                files_complete: file_index,
+                files_total: file_total,
+                bytes_complete: base_bytes + copied,
+                bytes_total: total_bytes,
+            },
+        );
         let copied_source_hash = format!("{:x}", source_hash.finalize());
         let after = fs_safe::snapshot(source)?;
         if before != after || copied != before.length {
@@ -822,6 +979,7 @@ fn new_media(
         tags: vec![],
         project_ids: vec![],
         notes: String::new(),
+        favourite: false,
         technical: TechnicalMetadata {
             size_bytes: metadata.len(),
             ..Default::default()
@@ -840,189 +998,891 @@ fn new_media(
     })
 }
 
+fn metadata_update_events(item: &MediaItem, metadata: &ProvisionalMetadata) -> Vec<CatalogueEvent> {
+    let desired_tags = normalized(&metadata.tags);
+    let desired_projects = normalized(&metadata.project_ids);
+    let edited = |field: &str| metadata.edited_fields.iter().any(|value| value == field);
+    let mut events = Vec::new();
+    if edited("tags") {
+        events.push(CatalogueEvent::MediaTagsAdded {
+            media_id: item.id.clone(),
+            values: desired_tags
+                .iter()
+                .filter(|value| !contains_normalized(&item.tags, value))
+                .cloned()
+                .collect(),
+        });
+        events.push(CatalogueEvent::MediaTagsRemoved {
+            media_id: item.id.clone(),
+            values: item
+                .tags
+                .iter()
+                .filter(|value| !contains_normalized(&desired_tags, value))
+                .cloned()
+                .collect(),
+        });
+    }
+    if edited("projectIds") {
+        events.push(CatalogueEvent::MediaProjectsAdded {
+            media_id: item.id.clone(),
+            values: desired_projects
+                .iter()
+                .filter(|value| !contains_normalized(&item.project_ids, value))
+                .cloned()
+                .collect(),
+        });
+        events.push(CatalogueEvent::MediaProjectsRemoved {
+            media_id: item.id.clone(),
+            values: item
+                .project_ids
+                .iter()
+                .filter(|value| !contains_normalized(&desired_projects, value))
+                .cloned()
+                .collect(),
+        });
+    }
+    if edited("notes") && item.notes != metadata.notes {
+        events.push(CatalogueEvent::MediaNotesSet {
+            media_id: item.id.clone(),
+            value: metadata.notes.clone(),
+        });
+    }
+    if edited("favourite") && item.favourite != metadata.favourite {
+        events.push(CatalogueEvent::MediaFavouriteSet {
+            media_id: item.id.clone(),
+            value: metadata.favourite,
+        });
+    }
+    events.retain(|event| match event {
+        CatalogueEvent::MediaTagsAdded { values, .. }
+        | CatalogueEvent::MediaTagsRemoved { values, .. }
+        | CatalogueEvent::MediaProjectsAdded { values, .. }
+        | CatalogueEvent::MediaProjectsRemoved { values, .. } => !values.is_empty(),
+        _ => true,
+    });
+    events
+}
+
+fn commit_job_file(
+    app: &AppHandle,
+    state: &NativeState,
+    settings: &DeviceSettings,
+    job_id: &str,
+    file_id: &str,
+    hash: String,
+    journal_path: Option<&Path>,
+) -> Result<(), String> {
+    let _catalogue_guard = state.catalogue_write.lock().unwrap();
+    let _jobs_guard = state.job_store.lock().unwrap();
+    let mut jobs = load_jobs_unlocked(app)?;
+    let job = jobs
+        .iter_mut()
+        .find(|job| job.id == job_id)
+        .ok_or("Ingest job no longer exists")?;
+    let file = job
+        .files
+        .iter_mut()
+        .find(|file| file.id == file_id)
+        .ok_or("Ingest job file no longer exists")?;
+    let destination = PathBuf::from(&file.destination_path);
+    let (_, capture, provenance) = destination_date(
+        settings,
+        &PathBuf::from(&file.source_path),
+        &job.date_override,
+        &DateTime::parse_from_rfc3339(&job.batch_timestamp)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Local),
+    )?;
+    let mut item = new_media(
+        &destination,
+        file.relative_path.clone(),
+        hash,
+        capture,
+        provenance,
+        false,
+    )?;
+    item.id = file.media_id.clone();
+    item.tags = normalized(&file.metadata.tags);
+    item.project_ids = normalized(&file.metadata.project_ids);
+    item.notes = file.metadata.notes.clone();
+    item.favourite = file.metadata.favourite;
+    let catalogue = load_catalogue_file(settings)?;
+    let mut events = Vec::new();
+    if let Some(existing) = catalogue
+        .media
+        .iter()
+        .find(|existing| existing.id == item.id || existing.relative_path == item.relative_path)
+    {
+        if existing.sha256 != item.sha256 || existing.relative_path != item.relative_path {
+            return Err("Destination conflicts with an existing catalogue record".into());
+        }
+        file.media_id = existing.id.clone();
+        item.id = existing.id.clone();
+        events.extend(metadata_update_events(existing, &file.metadata));
+    } else {
+        events.push(CatalogueEvent::MediaRegistered {
+            media: item.clone(),
+        });
+    }
+    if let Some(journal_path) = journal_path {
+        let mut journal: IngestJournal = read_json(journal_path)?;
+        journal.media = Some(item.clone());
+        write_json(journal_path, &journal)?;
+    }
+    append_events(settings, events)?;
+    file.state = "completed".into();
+    file.bytes_transferred = file.size_bytes;
+    file.error = None;
+    job.files_completed = job
+        .files
+        .iter()
+        .filter(|file| file.state == "completed")
+        .count();
+    job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+    job.updated_at = Utc::now().to_rfc3339();
+    write_json(&jobs_path(app)?, &jobs)?;
+    if let Some(journal_path) = journal_path {
+        remove_journal(journal_path)?;
+    }
+    let _ = app.emit("catalogue-changed", ());
+    let _ = app.emit("ingest-jobs-changed", &jobs);
+    Ok(())
+}
+
+fn finish_job(app: &AppHandle, state: &NativeState, job_id: &str) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job no longer exists")?;
+        job.current_file = None;
+        job.state = if job.files.iter().all(|file| file.state == "completed") {
+            "completed"
+        } else if job.files.iter().any(|file| file.state == "failed") {
+            "failed"
+        } else if job.files.iter().any(|file| file.state == "cancelled") {
+            "cancelled"
+        } else if job.files.iter().any(|file| file.state == "paused") {
+            "paused"
+        } else {
+            "failed"
+        }
+        .into();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
+fn validate_job_action(state: &str, action: &str) -> Result<(), String> {
+    let allowed = match action {
+        "pause" => matches!(state, "queued" | "copying" | "verifying"),
+        "resume" => state == "paused",
+        "retry" => matches!(state, "failed" | "cancelled" | "interrupted"),
+        "cancel" => matches!(
+            state,
+            "queued" | "copying" | "verifying" | "paused" | "interrupted"
+        ),
+        _ => false,
+    };
+    allowed.then_some(()).ok_or_else(|| {
+        format!("Cannot {action} an ingest job while it is {state}")
+    })
+}
+
+fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
+    let state = app.state::<NativeState>();
+    let settings = load_settings_file(app)?;
+    let job = snapshot_jobs(app, &state)?
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .ok_or("Ingest job no longer exists")?;
+    let mut completed_bytes = job.bytes_transferred;
+    for (index, planned) in job.files.iter().enumerate() {
+        if matches!(planned.state.as_str(), "completed" | "failed" | "cancelled") {
+            continue;
+        }
+        if state.cancelled_jobs.lock().unwrap().contains(job_id) {
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "cancelled",
+                planned.bytes_transferred,
+                None,
+            )?;
+            break;
+        }
+        if state.paused_jobs.lock().unwrap().contains(job_id) {
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "paused",
+                planned.bytes_transferred,
+                None,
+            )?;
+            break;
+        }
+        let source = PathBuf::from(&planned.source_path);
+        let destination = PathBuf::from(&planned.destination_path);
+        if !source.is_file() {
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "failed",
+                0,
+                Some("Source media is unavailable; reconnect it and retry".into()),
+            )?;
+            continue;
+        }
+        if destination.exists() {
+            match (sha256(&source), sha256(&destination)) {
+                (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
+                    commit_job_file(
+                        app,
+                        &state,
+                        &settings,
+                        job_id,
+                        &planned.id,
+                        destination_hash,
+                        None,
+                    )?;
+                    completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                    continue;
+                }
+                _ => {
+                    update_job_progress(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        "failed",
+                        0,
+                        Some("A different file already uses the planned destination".into()),
+                    )?;
+                    continue;
+                }
+            }
+        }
+        match copy_verified(
+            app,
+            &state,
+            &settings,
+            job_id,
+            &planned.id,
+            &source,
+            &destination,
+            completed_bytes,
+            job.bytes_total,
+            index,
+            job.files.len(),
+        ) {
+            Ok(copy) => {
+                if let Err(error) = commit_job_file(
+                    app,
+                    &state,
+                    &settings,
+                    job_id,
+                    &planned.id,
+                    copy.hash,
+                    Some(&copy.journal_path),
+                ) {
+                    update_job_progress(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        "failed",
+                        planned.size_bytes,
+                        Some(format!(
+                            "Media was promoted but catalogue persistence needs retry: {error}"
+                        )),
+                    )?;
+                } else {
+                    completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                }
+            }
+            Err(error) if error == "__cancelled__" => {
+                update_job_progress(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    "cancelled",
+                    0,
+                    None,
+                )?;
+                break;
+            }
+            Err(error) => {
+                update_job_progress(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    "failed",
+                    0,
+                    Some(error),
+                )?;
+            }
+        }
+    }
+    state.cancelled_jobs.lock().unwrap().remove(job_id);
+    finish_job(app, &state, job_id)
+}
+
+fn kick_ingest_worker(app: AppHandle) {
+    {
+        let state = app.state::<NativeState>();
+        let mut active = state.worker_active.lock().unwrap();
+        if *active {
+            return;
+        }
+        *active = true;
+    }
+    std::thread::spawn(move || {
+        loop {
+            let state = app.state::<NativeState>();
+            let next = mutate_jobs(&app, &state, |jobs| {
+                let Some(job) = jobs.iter_mut().find(|job| job.state == "queued") else {
+                    return Ok(None);
+                };
+                job.state = "copying".into();
+                job.updated_at = Utc::now().to_rfc3339();
+                Ok(Some(job.id.clone()))
+            })
+            .ok()
+            .flatten();
+            let Some(job_id) = next else {
+                // Close the enqueue/worker-exit race while holding the same
+                // job-store lock used by start_ingest. If a producer queued
+                // work after the first snapshot it observed worker_active=true;
+                // keep this worker alive to claim it.
+                let queued_after_snapshot = {
+                    let _jobs_guard = state.job_store.lock().unwrap();
+                    let queued = load_jobs_unlocked(&app)
+                        .map(|jobs| jobs.iter().any(|job| job.state == "queued"))
+                        .unwrap_or(false);
+                    if !queued {
+                        *state.worker_active.lock().unwrap() = false;
+                    }
+                    queued
+                };
+                if queued_after_snapshot {
+                    continue;
+                }
+                break;
+            };
+            if let Err(error) = process_ingest_job(&app, &job_id) {
+                let _ = mutate_jobs(&app, &state, |jobs| {
+                    if let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) {
+                        job.state = "failed".into();
+                        job.failures.push(error);
+                        job.updated_at = Utc::now().to_rfc3339();
+                    }
+                    Ok(())
+                });
+            }
+        }
+    });
+}
+
+fn active_destination_reservations(jobs: &[IngestJob]) -> HashSet<String> {
+    jobs.iter()
+        .filter(|job| !matches!(job.state.as_str(), "completed" | "cancelled"))
+        .flat_map(|job| job.files.iter().map(|file| file.destination_path.clone()))
+        .collect()
+}
+
 #[tauri::command]
-async fn start_ingest(
+fn start_ingest(
     app: AppHandle,
     state: State<'_, NativeState>,
     request: IngestRequest,
-) -> Result<IngestResult, String> {
+) -> Result<IngestJob, String> {
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let mut result = IngestResult::default();
-    let files = source_files(&request.sources, &mut result.unsupported);
-    let total_bytes = files
-        .iter()
-        .filter_map(|p| p.metadata().ok().map(|m| m.len()))
-        .sum();
-    let mut completed_bytes = 0u64;
-    state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
-    let _guard = state.catalogue_write.lock().unwrap();
-    let catalogue_root = catalogue_dir(&settings)?;
-    let recovery = recover_staging(&master, &settings.device_id, Some(&catalogue_root))?;
-    if recovery.recovered > 0 {
-        result.failures.push(format!(
-            "Recovered {} staging operation(s) before ingest",
-            recovery.recovered
-        ));
-    }
-    if recovery.needs_review > 0 {
-        result.failures.push(format!(
-            "{} staging operation(s) need review and were preserved",
-            recovery.needs_review
-        ));
-    }
-    let catalogue = load_catalogue_file(&settings)?;
+    let mut unsupported = Vec::new();
+    let sources = source_files(&request.sources, &mut unsupported);
     let batch_timestamp = Local::now();
-    let mut known_paths: HashSet<String> = catalogue
-        .media
-        .iter()
-        .map(|item| item.relative_path.clone())
-        .collect();
-    for (index, source) in files.iter().enumerate() {
-        if state
-            .cancelled_jobs
-            .lock()
-            .unwrap()
-            .contains(&request.job_id)
-        {
-            result.cancelled = true;
-            break;
-        }
-        let source_size = source.metadata().map(|m| m.len()).unwrap_or(0);
-        let (date, capture, provenance) = destination_date(
+    let reserved = active_destination_reservations(&snapshot_jobs(&app, &state)?);
+    let mut planned_paths = HashSet::new();
+    let mut files = Vec::new();
+    for source in sources {
+        let (date, _, _) = destination_date(
             &settings,
-            source,
+            &source,
             &request.date_override,
             &batch_timestamp,
         )?;
         let compact_date = date.replace('-', "");
         let date_folder = if master.join(&date).is_dir() {
-            date.clone()
+            date
         } else if master.join(&compact_date).is_dir() {
             compact_date
         } else {
             date
         };
-        let requested_name = request
+        let filename = request
             .renamed_destinations
             .get(&source.to_string_lossy().to_string())
-            .cloned();
-        let filename = requested_name
+            .cloned()
             .unwrap_or_else(|| source.file_name().unwrap().to_string_lossy().to_string());
-        if Path::new(&filename).file_name().and_then(|x| x.to_str()) != Some(filename.as_str()) {
-            result.failures.push(format!(
-                "{}: invalid destination filename",
-                source.display()
-            ));
-            continue;
+        if Path::new(&filename).file_name().and_then(|value| value.to_str())
+            != Some(filename.as_str())
+        {
+            return Err(format!("{} has an invalid destination filename", source.display()));
         }
-        let relative = format!("{date_folder}/{filename}").replace('\\', "/");
-        let destination = match fs_safe::resolve_for_create(&master, &relative) {
-            Ok(path) => path,
-            Err(error) => {
-                result
-                    .failures
-                    .push(format!("{}: {error}", source.display()));
-                continue;
+        let relative_path = format!("{date_folder}/{filename}").replace('\\', "/");
+        let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
+        let destination_path = destination.to_string_lossy().to_string();
+        let collision = reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
+        files.push(IngestJobFile {
+            id: Uuid::new_v4().to_string(),
+            media_id: Uuid::new_v4().to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            destination_path,
+            relative_path,
+            original_filename: source.file_name().unwrap().to_string_lossy().to_string(),
+            size_bytes: source.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            bytes_transferred: 0,
+            state: if collision { "failed" } else { "queued" }.into(),
+            error: collision.then(|| "Another queued ingest already reserves this destination".into()),
+            metadata: ProvisionalMetadata::default(),
+            pending_metadata: None,
+            metadata_error: None,
+        });
+    }
+    let now = Utc::now().to_rfc3339();
+    let job = IngestJob {
+        schema_version: 2,
+        id: request.job_id,
+        state: if files.iter().any(|file| file.state == "queued") {
+            "queued"
+        } else {
+            "failed"
+        }
+        .into(),
+        created_at: now.clone(),
+        updated_at: now,
+        batch_timestamp: batch_timestamp.to_rfc3339(),
+        date_override: request.date_override,
+        bytes_total: files.iter().map(|file| file.size_bytes).sum(),
+        bytes_transferred: 0,
+        files_completed: 0,
+        current_file: None,
+        files,
+        unsupported,
+        failures: Vec::new(),
+    };
+    mutate_jobs(&app, &state, |jobs| {
+        if jobs.iter().any(|existing| existing.id == job.id) {
+            return Err("An ingest job with this ID already exists".into());
+        }
+        jobs.push(job.clone());
+        Ok(())
+    })?;
+    kick_ingest_worker(app);
+    Ok(job)
+}
+
+#[tauri::command]
+fn list_ingest_jobs(app: AppHandle, state: State<'_, NativeState>) -> Result<Vec<IngestJob>, String> {
+    snapshot_jobs(&app, &state)
+}
+
+fn mark_active_jobs_interrupted(jobs: &mut [IngestJob]) {
+    for job in jobs {
+        if matches!(job.state.as_str(), "queued" | "copying" | "verifying") {
+            job.state = "interrupted".into();
+            job.current_file = None;
+            job.updated_at = Utc::now().to_rfc3339();
+            for file in &mut job.files {
+                if matches!(file.state.as_str(), "queued" | "copying" | "verifying") {
+                    file.state = "interrupted".into();
+                    file.error = Some("Application stopped before this file completed".into());
+                }
             }
-        };
-        if destination.exists() {
-            match (sha256(source), sha256(&destination)) {
-                (Ok(a), Ok(b)) if a == b => {
-                    result.duplicates.push(source.to_string_lossy().to_string());
-                    if !known_paths.contains(&relative) {
-                        let item = new_media(
-                            &destination,
-                            relative,
-                            b,
-                            capture,
-                            provenance,
-                            false,
-                        )?;
-                        append_events(
-                            &settings,
-                            vec![CatalogueEvent::MediaRegistered {
-                                media: item.clone(),
-                            }],
-                        )?;
-                        known_paths.insert(item.relative_path.clone());
-                        result.imported.push(item);
+        }
+    }
+}
+
+fn prepare_job_retry(job: &mut IngestJob) {
+    for file in &mut job.files {
+        if matches!(file.state.as_str(), "failed" | "cancelled" | "interrupted") {
+            file.state = "queued".into();
+            file.error = None;
+            file.bytes_transferred = 0;
+        }
+    }
+    job.state = "queued".into();
+    job.failures.clear();
+    job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+    job.updated_at = Utc::now().to_rfc3339();
+}
+
+fn verified_completed_media(
+    master: &Path,
+    file: &IngestJobFile,
+    catalogue: &Catalogue,
+) -> Result<String, String> {
+    let candidates: Vec<_> = catalogue
+        .media
+        .iter()
+        .filter(|media| media.id == file.media_id || media.relative_path == file.relative_path)
+        .collect();
+    if candidates.len() != 1 {
+        return Err(if candidates.is_empty() {
+            "No authoritative catalogue registration matches this job file".into()
+        } else {
+            "Conflicting catalogue registrations match this job file".into()
+        });
+    }
+    let media = candidates[0];
+    if media.id != file.media_id || media.relative_path != file.relative_path {
+        return Err("Catalogue identity or relative path disagrees with the persisted job plan".into());
+    }
+    let planned = PathBuf::from(&file.destination_path);
+    if !planned.is_file() {
+        return Err("The planned destination is missing or incomplete".into());
+    }
+    let expected = fs_safe::resolve_existing(master, &file.relative_path)
+        .map_err(|error| format!("The planned destination is outside the configured root: {error}"))?;
+    let actual = planned
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve the planned destination: {error}"))?;
+    if actual != expected {
+        return Err("The persisted destination path disagrees with its relative path".into());
+    }
+    let size = actual
+        .metadata()
+        .map_err(|error| format!("Cannot inspect the planned destination: {error}"))?
+        .len();
+    if size != file.size_bytes || size != media.technical.size_bytes {
+        return Err("Destination size disagrees with the job or catalogue record".into());
+    }
+    if sha256(&actual)? != media.sha256 {
+        return Err("Destination SHA-256 disagrees with the catalogue record".into());
+    }
+    Ok(media.id.clone())
+}
+
+#[tauri::command]
+fn initialize_ingest_jobs(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<Vec<IngestJob>, String> {
+    if *state.worker_active.lock().unwrap() {
+        return Err("Cannot run startup recovery while an ingest worker is active".into());
+    }
+    mutate_jobs(&app, &state, |jobs| {
+        mark_active_jobs_interrupted(jobs);
+        Ok(())
+    })?;
+    let settings = load_settings_file(&app)?;
+    if !settings.master_bin_path.trim().is_empty() {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        let catalogue_root = catalogue_dir(&settings)?;
+        let recovery = recover_staging(
+            Path::new(&settings.master_bin_path),
+            &settings.device_id,
+            Some(&catalogue_root),
+        )?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let master = Path::new(&settings.master_bin_path);
+        mutate_jobs(&app, &state, |jobs| {
+            for job in jobs {
+                for file in &mut job.files {
+                    if file.state == "completed" {
+                        continue;
+                    }
+                    let has_catalogue_candidate = catalogue.media.iter().any(|media| {
+                        media.id == file.media_id || media.relative_path == file.relative_path
+                    });
+                    if file.state != "interrupted"
+                        && !Path::new(&file.destination_path).exists()
+                        && !has_catalogue_candidate
+                    {
+                        continue;
+                    }
+                    match verified_completed_media(master, file, &catalogue) {
+                        Ok(media_id) => {
+                            file.media_id = media_id;
+                            file.state = "completed".into();
+                            file.bytes_transferred = file.size_bytes;
+                            file.error = None;
+                        }
+                        Err(error) => {
+                            file.error = Some(format!("Startup reconciliation: {error}"));
+                        }
                     }
                 }
-                _ => result.conflicts.push(IngestConflict {
-                    source_path: source.to_string_lossy().to_string(),
-                    destination_path: destination.to_string_lossy().to_string(),
-                    reason: "A different file already uses this destination name. Skip it, choose another date, or explicitly rename the incoming copy.".into(),
-                }),
-            }
-            completed_bytes += source_size;
-            continue;
-        }
-        match copy_verified(
-            &app,
-            &state,
-            &settings,
-            &request.job_id,
-            source,
-            &destination,
-            completed_bytes,
-            total_bytes,
-            index,
-            files.len(),
-        ) {
-            Ok(copy) => {
-                let item = new_media(
-                    &destination,
-                    relative,
-                    copy.hash,
-                    capture,
-                    provenance,
-                    false,
-                )?;
-                let mut journal: IngestJournal = read_json(&copy.journal_path)?;
-                if journal.status != "committed" {
-                    return Err("Ingest journal lost its committed lifecycle state".into());
+                job.files_completed = job
+                    .files
+                    .iter()
+                    .filter(|file| file.state == "completed")
+                    .count();
+                job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+                if job.files_completed == job.files.len() && !job.files.is_empty() {
+                    job.state = "completed".into();
                 }
-                journal.media = Some(item.clone());
-                write_json(&copy.journal_path, &journal)?;
-                if let Err(error) = append_events(
-                    &settings,
-                    vec![CatalogueEvent::MediaRegistered {
-                        media: item.clone(),
-                    }],
-                ) {
-                    result.failures.push(format!(
-                        "{} was safely copied but catalogue persistence failed: {error}. Rescan can recover it.",
-                        destination.display()
+                if recovery.needs_review > 0 && job.state == "interrupted" {
+                    job.failures.push(format!(
+                        "{} staging operation(s) require manual review",
+                        recovery.needs_review
                     ));
-                } else {
-                    remove_journal(&copy.journal_path)?;
-                    known_paths.insert(item.relative_path.clone());
-                    result.imported.push(item);
                 }
             }
-            Err(error) if error == "__cancelled__" => {
-                result.cancelled = true;
-                break;
-            }
-            Err(error) if error == "__race__" => result.conflicts.push(IngestConflict {
-                source_path: source.to_string_lossy().to_string(),
-                destination_path: destination.to_string_lossy().to_string(),
-                reason: "Another operation created the destination while copying; the verified staged copy was discarded without replacing it.".into(),
-            }),
-            Err(error) => result
-                .failures
-                .push(format!("{}: {error}", source.display())),
-        }
-        completed_bytes += source_size;
+            Ok(())
+        })?;
     }
-    state.cancelled_jobs.lock().unwrap().remove(&request.job_id);
-    let _ = app.emit("catalogue-changed", ());
-    Ok(result)
+    recover_pending_metadata(&app, &state)?;
+    snapshot_jobs(&app, &state)
 }
+
+fn apply_metadata_patch(
+    metadata: &mut ProvisionalMetadata,
+    patch: &ProvisionalMetadataPatch,
+) {
+    if let Some(tags) = &patch.tags {
+        metadata.tags = normalized(tags);
+        if !metadata.edited_fields.iter().any(|value| value == "tags") {
+            metadata.edited_fields.push("tags".into());
+        }
+    }
+    if let Some(project_ids) = &patch.project_ids {
+        metadata.project_ids = normalized(project_ids);
+        if !metadata.edited_fields.iter().any(|value| value == "projectIds") {
+            metadata.edited_fields.push("projectIds".into());
+        }
+    }
+    if let Some(notes) = &patch.notes {
+        metadata.notes = notes.clone();
+        if !metadata.edited_fields.iter().any(|value| value == "notes") {
+            metadata.edited_fields.push("notes".into());
+        }
+    }
+    if let Some(favourite) = patch.favourite {
+        metadata.favourite = favourite;
+        if !metadata.edited_fields.iter().any(|value| value == "favourite") {
+            metadata.edited_fields.push("favourite".into());
+        }
+    }
+}
+
+fn apply_pending_metadata_write(
+    file: &mut IngestJobFile,
+    catalogue: &Catalogue,
+    append: impl FnOnce(Vec<CatalogueEvent>) -> Result<(), String>,
+) -> Result<(), String> {
+    let pending = file
+        .pending_metadata
+        .clone()
+        .ok_or("No pending metadata write exists")?;
+    let outcome = (|| {
+        if file.state != "completed" {
+            return Err("Metadata cannot become authoritative before ingest completion".into());
+        }
+        let media = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == file.media_id)
+            .ok_or("Completed ingest media is missing from the catalogue")?;
+        append(metadata_update_events(media, &pending))
+    })();
+    match outcome {
+        Ok(()) => {
+            file.pending_metadata = None;
+            file.metadata_error = None;
+            Ok(())
+        }
+        Err(error) => {
+            file.metadata_error = Some(error.clone());
+            Err(format!(
+                "Metadata is saved locally but catalogue persistence failed: {error}"
+            ))
+        }
+    }
+}
+
+fn flush_pending_metadata(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+    file_id: &str,
+) -> Result<IngestJob, String> {
+    let settings = load_settings_file(app)?;
+    let _catalogue_guard = state.catalogue_write.lock().unwrap();
+    let _jobs_guard = state.job_store.lock().unwrap();
+    let mut jobs = load_jobs_unlocked(app)?;
+    let job_index = jobs
+        .iter()
+        .position(|job| job.id == job_id)
+        .ok_or("Ingest job not found")?;
+    let file_index = jobs[job_index]
+        .files
+        .iter()
+        .position(|file| file.id == file_id)
+        .ok_or("Ingest job file not found")?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let outcome = apply_pending_metadata_write(
+        &mut jobs[job_index].files[file_index],
+        &catalogue,
+        |events| append_events(&settings, events),
+    );
+    if let Err(error) = outcome {
+        write_json(&jobs_path(app)?, &jobs)?;
+        let _ = app.emit("ingest-jobs-changed", &jobs);
+        return Err(error);
+    }
+    jobs[job_index].updated_at = Utc::now().to_rfc3339();
+    let updated = jobs[job_index].clone();
+    write_json(&jobs_path(app)?, &jobs)?;
+    let _ = app.emit("ingest-jobs-changed", &jobs);
+    let _ = app.emit("catalogue-changed", ());
+    Ok(updated)
+}
+
+fn recover_pending_metadata(app: &AppHandle, state: &NativeState) -> Result<(), String> {
+    let pending: Vec<_> = snapshot_jobs(app, state)?
+        .into_iter()
+        .flat_map(|job| {
+            let job_id = job.id;
+            job.files
+                .into_iter()
+                .filter(|file| file.state == "completed" && file.pending_metadata.is_some())
+                .map(move |file| (job_id.clone(), file.id))
+        })
+        .collect();
+    for (job_id, file_id) in pending {
+        let _ = flush_pending_metadata(app, state, &job_id, &file_id);
+    }
+    Ok(())
+}
+
 #[tauri::command]
-fn cancel_ingest(state: State<NativeState>, job_id: String) {
-    state.cancelled_jobs.lock().unwrap().insert(job_id);
+fn update_ingest_file_metadata(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+    file_id: String,
+    patch: ProvisionalMetadataPatch,
+) -> Result<IngestJob, String> {
+    let (job, completed) = mutate_jobs(&app, &state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job not found")?;
+        let file = job
+            .files
+            .iter_mut()
+            .find(|file| file.id == file_id)
+            .ok_or("Ingest job file not found")?;
+        apply_metadata_patch(&mut file.metadata, &patch);
+        let completed = if file.state == "completed" {
+            let pending = file.pending_metadata.get_or_insert_with(Default::default);
+            apply_metadata_patch(pending, &patch);
+            file.metadata_error = None;
+            Some(())
+        } else {
+            None
+        };
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok((job.clone(), completed))
+    })?;
+    if completed.is_some() {
+        return flush_pending_metadata(&app, &state, &job_id, &file_id);
+    }
+    Ok(job)
+}
+
+#[tauri::command]
+fn pause_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+    let result = mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        validate_job_action(&job.state, "pause")?;
+        if job.state == "queued" {
+            job.state = "paused".into();
+        }
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    });
+    if result.is_ok() {
+        state.paused_jobs.lock().unwrap().insert(job_id);
+    }
+    result
+}
+
+#[tauri::command]
+fn resume_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+    let current = snapshot_jobs(&app, &state)?
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .ok_or("Ingest job not found")?;
+    validate_job_action(&current.state, "resume")?;
+    state.paused_jobs.lock().unwrap().remove(&job_id);
+    let result = mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        validate_job_action(&job.state, "resume")?;
+        job.state = "queued".into();
+        for file in &mut job.files {
+            if file.state == "paused" {
+                file.state = "queued".into();
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        state.paused_jobs.lock().unwrap().insert(job_id);
+        return Err(error);
+    }
+    kick_ingest_worker(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn retry_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+    let current = snapshot_jobs(&app, &state)?
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .ok_or("Ingest job not found")?;
+    validate_job_action(&current.state, "retry")?;
+    state.cancelled_jobs.lock().unwrap().remove(&job_id);
+    state.paused_jobs.lock().unwrap().remove(&job_id);
+    mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        validate_job_action(&job.state, "retry")?;
+        prepare_job_retry(job);
+        Ok(())
+    })?;
+    kick_ingest_worker(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_ingest(app: AppHandle, state: State<NativeState>, job_id: String) -> Result<(), String> {
+    let result = mutate_jobs(&app, &state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        validate_job_action(&job.state, "cancel")?;
+        if matches!(job.state.as_str(), "queued" | "paused" | "interrupted") {
+            job.state = "cancelled".into();
+            for file in &mut job.files {
+                if matches!(file.state.as_str(), "queued" | "paused" | "interrupted") {
+                    file.state = "cancelled".into();
+                }
+            }
+        }
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    });
+    if result.is_ok() {
+        state.cancelled_jobs.lock().unwrap().insert(job_id);
+    }
+    result
 }
 fn normalized(values: &[String]) -> Vec<String> {
     let mut out: Vec<_> = values
@@ -1255,7 +2115,7 @@ fn create_project(
 async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanResult, String> {
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let _guard = state.catalogue_write.lock().unwrap();
+    let _discovery_guard = state.discovery_write.lock().unwrap();
     let catalogue = load_catalogue_file(&settings)?;
     let known: HashMap<_, _> = catalogue
         .media
@@ -1305,6 +2165,10 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
             continue;
         }
         let hash = sha256(path)?;
+        if fs_safe::snapshot(path).ok().as_ref() != Some(&snapshot) {
+            result.pending += 1;
+            continue;
+        }
         if let Some(item) = known.get(&relative) {
             events.push(CatalogueEvent::MediaEvidenceObserved {
                 media_id: item.id.clone(),
@@ -1313,20 +2177,43 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
                 observed_sha256: Some(hash.clone()),
                 needs_review: hash != item.sha256,
             });
-            if hash != item.sha256 {
-                result.changed += 1;
-            }
         } else {
             let (_, capture, provenance) =
                 destination_date(&settings, path, &None, &batch_timestamp)?;
             let item = new_media(path, relative.clone(), hash, capture, provenance, true)?;
             events.push(CatalogueEvent::MediaRegistered { media: item });
-            result.registered += 1;
         }
         observations.verified(&relative);
     }
-    append_events(&settings, events)?;
     discovery::save(&discovery_path, &observations)?;
+    let _guard = state.catalogue_write.lock().unwrap();
+    let current = load_catalogue_file(&settings)?;
+    events.retain(|event| match event {
+        CatalogueEvent::MediaRegistered { media } => !current.media.iter().any(|item| {
+            item.id == media.id || item.relative_path == media.relative_path
+        }),
+        CatalogueEvent::MediaEvidenceObserved { media_id, .. } => {
+            current.media.iter().any(|item| item.id == *media_id)
+        }
+        _ => true,
+    });
+    result.registered = events
+        .iter()
+        .filter(|event| matches!(event, CatalogueEvent::MediaRegistered { .. }))
+        .count();
+    result.changed = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                CatalogueEvent::MediaEvidenceObserved {
+                    needs_review: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    append_events(&settings, events)?;
     Ok(result)
 }
 
@@ -1365,17 +2252,20 @@ fn verify_media_integrity(
 #[tauri::command]
 async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, String> {
     let settings = load_settings_file(&app)?;
+    let _enrichment_guard = state.enrichment_write.lock().unwrap();
     let master = PathBuf::from(&settings.master_bin_path);
     let cache = PathBuf::from(&settings.thumbnail_cache_path);
     fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-    let _guard = state.catalogue_write.lock().unwrap();
     let catalogue = load_catalogue_file(&settings)?;
-    let mut events = Vec::new();
-    let mut changed = 0;
+    let mut candidates = Vec::new();
     for item in &catalogue.media {
         let source = match fs_safe::resolve_existing(&master, &item.relative_path) {
             Ok(path) if path.is_file() => path,
             _ => continue,
+        };
+        let source_before = match fs_safe::snapshot(&source) {
+            Ok(snapshot) => snapshot,
+            Err(_) => continue,
         };
         let thumbnail_ref = format!("{}.jpg", item.id);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
@@ -1438,13 +2328,43 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
                 .arg(&thumbnail)
                 .output();
         }
-        events.push(CatalogueEvent::MediaEnriched {
-            media_id: item.id.clone(),
-            technical,
-            thumbnail_ref: thumbnail.is_file().then_some(thumbnail_ref),
-        });
-        changed += 1;
+        if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
+            continue;
+        }
+        candidates.push((
+            item.id.clone(),
+            item.relative_path.clone(),
+            item.sha256.clone(),
+            item.technical.clone(),
+            item.thumbnail_path.clone(),
+            CatalogueEvent::MediaEnriched {
+                media_id: item.id.clone(),
+                technical,
+                thumbnail_ref: thumbnail.is_file().then_some(thumbnail_ref),
+            },
+        ));
     }
+    let _guard = state.catalogue_write.lock().unwrap();
+    let current = load_catalogue_file(&settings)?;
+    let events: Vec<_> = candidates
+        .into_iter()
+        .filter_map(
+            |(id, relative_path, sha256, technical, thumbnail_path, event)| {
+                current
+                    .media
+                    .iter()
+                    .find(|item| item.id == id)
+                    .filter(|item| {
+                        item.relative_path == relative_path
+                            && item.sha256 == sha256
+                            && item.technical == technical
+                            && item.thumbnail_path == thumbnail_path
+                    })
+                    .map(|_| event)
+            },
+        )
+        .collect();
+    let changed = events.len();
     append_events(&settings, events)?;
     Ok(changed)
 }
@@ -1522,7 +2442,14 @@ pub fn run() {
             save_settings,
             load_catalogue,
             catalogue_signature,
+            refresh_media_availability,
             start_ingest,
+            initialize_ingest_jobs,
+            list_ingest_jobs,
+            update_ingest_file_metadata,
+            pause_ingest,
+            resume_ingest,
+            retry_ingest,
             cancel_ingest,
             update_media,
             create_project,
@@ -1547,6 +2474,379 @@ mod tests {
             .join(format!("pimp-native-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn ingest_job(state: &str, file_state: &str) -> IngestJob {
+        IngestJob {
+            schema_version: 2,
+            id: "job-1".into(),
+            state: state.into(),
+            created_at: "2026-10-24T00:00:00Z".into(),
+            updated_at: "2026-10-24T00:00:00Z".into(),
+            batch_timestamp: "2026-10-24T00:00:00+00:00".into(),
+            date_override: None,
+            files: vec![IngestJobFile {
+                id: "file-1".into(),
+                media_id: "media-1".into(),
+                source_path: "missing-source.mp4".into(),
+                destination_path: "master/20261024/clip.mp4".into(),
+                relative_path: "20261024/clip.mp4".into(),
+                original_filename: "clip.mp4".into(),
+                size_bytes: 12,
+                bytes_transferred: 5,
+                state: file_state.into(),
+                error: None,
+                metadata: ProvisionalMetadata {
+                    tags: vec!["Interview".into()],
+                    project_ids: vec!["project-1".into()],
+                    notes: "Retain through restart".into(),
+                    favourite: true,
+                    edited_fields: vec![
+                        "tags".into(),
+                        "projectIds".into(),
+                        "notes".into(),
+                        "favourite".into(),
+                    ],
+                },
+                pending_metadata: None,
+                metadata_error: None,
+            }],
+            unsupported: Vec::new(),
+            failures: vec!["previous failure".into()],
+            current_file: Some("clip.mp4".into()),
+            bytes_total: 12,
+            bytes_transferred: 5,
+            files_completed: 0,
+        }
+    }
+
+    fn completion_fixture(name: &str) -> (PathBuf, PathBuf, IngestJobFile, Catalogue) {
+        let root = temporary(name);
+        let master = root.join("master");
+        let destination = master.join("20261024").join("clip.mp4");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"verified-media").unwrap();
+        let media = new_media(
+            &destination,
+            "20261024/clip.mp4".into(),
+            sha256(&destination).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        let file = IngestJobFile {
+            id: "file-1".into(),
+            media_id: media.id.clone(),
+            source_path: root.join("missing-card.mp4").to_string_lossy().into(),
+            destination_path: destination.to_string_lossy().into(),
+            relative_path: media.relative_path.clone(),
+            original_filename: "clip.mp4".into(),
+            size_bytes: media.technical.size_bytes,
+            bytes_transferred: media.technical.size_bytes,
+            state: "interrupted".into(),
+            error: None,
+            metadata: ProvisionalMetadata::default(),
+            pending_metadata: None,
+            metadata_error: None,
+        };
+        let catalogue = Catalogue {
+            media: vec![media],
+            ..Default::default()
+        };
+        (root, master, file, catalogue)
+    }
+
+    #[test]
+    fn persistent_jobs_round_trip_provisional_metadata() {
+        let root = temporary("job-round-trip");
+        let path = root.join("ingest-jobs.json");
+        let jobs = vec![ingest_job("failed", "failed")];
+        write_json(&path, &jobs).unwrap();
+        assert_eq!(read_json::<Vec<IngestJob>>(&path).unwrap(), jobs);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_marks_active_work_interrupted_without_auto_resuming_missing_sources() {
+        let mut jobs = vec![ingest_job("copying", "verifying")];
+        mark_active_jobs_interrupted(&mut jobs);
+        assert_eq!(jobs[0].state, "interrupted");
+        assert_eq!(jobs[0].files[0].state, "interrupted");
+        assert_eq!(jobs[0].bytes_transferred, 5);
+        assert_eq!(jobs[0].files[0].bytes_transferred, 5);
+        assert_eq!(jobs[0].files[0].metadata.notes, "Retain through restart");
+        assert!(jobs[0].files[0].error.as_deref().unwrap().contains("stopped"));
+    }
+
+    #[test]
+    fn retry_preserves_completed_files_and_metadata_but_restarts_partial_files() {
+        let mut job = ingest_job("failed", "interrupted");
+        let mut completed = job.files[0].clone();
+        completed.id = "file-2".into();
+        completed.media_id = "media-2".into();
+        completed.state = "completed".into();
+        completed.bytes_transferred = completed.size_bytes;
+        job.files.push(completed);
+        prepare_job_retry(&mut job);
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.files[0].state, "queued");
+        assert_eq!(job.files[0].bytes_transferred, 0);
+        assert_eq!(job.files[0].metadata.tags, vec!["Interview"]);
+        assert_eq!(job.files[1].state, "completed");
+        assert_eq!(job.files[1].bytes_transferred, 12);
+        assert_eq!(job.bytes_transferred, 12);
+        assert!(job.failures.is_empty());
+    }
+
+    #[test]
+    fn native_job_actions_reject_illegal_lifecycle_transitions() {
+        assert!(validate_job_action("copying", "retry").is_err());
+        assert!(validate_job_action("verifying", "retry").is_err());
+        assert!(validate_job_action("completed", "retry").is_err());
+        assert!(validate_job_action("failed", "retry").is_ok());
+        assert!(validate_job_action("interrupted", "retry").is_ok());
+        assert!(validate_job_action("copying", "pause").is_ok());
+        assert!(validate_job_action("failed", "pause").is_err());
+        assert!(validate_job_action("paused", "resume").is_ok());
+        assert!(validate_job_action("queued", "resume").is_err());
+        assert!(validate_job_action("completed", "cancel").is_err());
+        assert!(validate_job_action("queued", "cancel").is_ok());
+    }
+
+    #[test]
+    fn queued_jobs_reserve_destinations_until_completion_or_cancellation() {
+        let queued = ingest_job("queued", "queued");
+        let destination = queued.files[0].destination_path.clone();
+        assert!(active_destination_reservations(&[queued.clone()]).contains(&destination));
+
+        let mut completed = queued.clone();
+        completed.state = "completed".into();
+        let mut cancelled = queued;
+        cancelled.state = "cancelled".into();
+        assert!(active_destination_reservations(&[completed, cancelled]).is_empty());
+    }
+
+    #[test]
+    fn duplicate_with_unspecified_metadata_preserves_the_existing_record() {
+        let (root, _master, _file, mut catalogue) = completion_fixture("duplicate-metadata");
+        let media = &mut catalogue.media[0];
+        media.tags = vec!["Race".into()];
+        media.project_ids = vec!["project-1".into(), "project-2".into()];
+        media.notes = "Existing note".into();
+        media.favourite = true;
+        let expected = media.clone();
+        let catalogue_root = root.join("catalogue");
+        catalogue::append(
+            &catalogue_root,
+            "device-a",
+            vec![CatalogueEvent::MediaRegistered {
+                media: expected.clone(),
+            }],
+        )
+        .unwrap();
+        let registered = catalogue::load(&catalogue_root).unwrap();
+        let duplicate_events =
+            metadata_update_events(&registered.media[0], &ProvisionalMetadata::default());
+        assert!(duplicate_events.is_empty());
+        catalogue::append(&catalogue_root, "device-a", duplicate_events).unwrap();
+        let after_duplicate = catalogue::load(&catalogue_root).unwrap();
+        assert_eq!(after_duplicate.media[0], expected);
+        assert_eq!(fs::read(root.join("master/20261024/clip.mp4")).unwrap(), b"verified-media");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciliation_accepts_only_a_fully_verified_promoted_copy() {
+        let (root, master, file, catalogue) = completion_fixture("valid-completion");
+        assert_eq!(
+            verified_completed_media(&master, &file, &catalogue).unwrap(),
+            file.media_id
+        );
+        assert!(!Path::new(&file.source_path).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciliation_rejects_same_path_with_a_different_hash() {
+        let (root, master, file, mut catalogue) = completion_fixture("wrong-hash");
+        catalogue.media[0].sha256 = "different".into();
+        assert!(verified_completed_media(&master, &file, &catalogue)
+            .unwrap_err()
+            .contains("SHA-256"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciliation_rejects_same_id_with_a_different_path() {
+        let (root, master, file, mut catalogue) = completion_fixture("wrong-path");
+        catalogue.media[0].relative_path = "20261024/other.mp4".into();
+        assert!(verified_completed_media(&master, &file, &catalogue)
+            .unwrap_err()
+            .contains("relative path"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciliation_rejects_missing_and_partial_destinations() {
+        let (root, master, file, catalogue) = completion_fixture("missing-partial");
+        fs::write(&file.destination_path, b"partial").unwrap();
+        assert!(verified_completed_media(&master, &file, &catalogue)
+            .unwrap_err()
+            .contains("size"));
+        fs::remove_file(&file.destination_path).unwrap();
+        assert!(verified_completed_media(&master, &file, &catalogue)
+            .unwrap_err()
+            .contains("missing"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciliation_rejects_conflicting_registrations() {
+        let (root, master, file, mut catalogue) = completion_fixture("conflicting-completion");
+        let mut conflict = catalogue.media[0].clone();
+        conflict.id = "other-media".into();
+        catalogue.media.push(conflict);
+        assert!(verified_completed_media(&master, &file, &catalogue)
+            .unwrap_err()
+            .contains("Conflicting"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_job_metadata_becomes_authoritative_events() {
+        let metadata = ingest_job("queued", "queued")
+            .files
+            .into_iter()
+            .next()
+            .unwrap()
+            .metadata;
+        let root = temporary("metadata-add-events");
+        let path = root.join("clip.mp4");
+        fs::write(&path, b"media").unwrap();
+        let media = new_media(
+            &path,
+            "20261024/clip.mp4".into(),
+            sha256(&path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata_update_events(&media, &metadata),
+            vec![
+                CatalogueEvent::MediaTagsAdded {
+                    media_id: media.id.clone(),
+                    values: vec!["Interview".into()],
+                },
+                CatalogueEvent::MediaProjectsAdded {
+                    media_id: media.id.clone(),
+                    values: vec!["project-1".into()],
+                },
+                CatalogueEvent::MediaNotesSet {
+                    media_id: media.id.clone(),
+                    value: "Retain through restart".into(),
+                },
+                CatalogueEvent::MediaFavouriteSet {
+                    media_id: media.id.clone(),
+                    value: true,
+                },
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_job_metadata_can_be_cleared_without_replacing_concurrent_additions() {
+        let root = temporary("metadata-update-events");
+        let path = root.join("clip.mp4");
+        fs::write(&path, b"media").unwrap();
+        let mut media = new_media(
+            &path,
+            "20261024/clip.mp4".into(),
+            sha256(&path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        media.tags = vec!["Race".into()];
+        media.project_ids = vec!["project-1".into()];
+        media.notes = "Old note".into();
+        media.favourite = true;
+        let cleared = ProvisionalMetadata {
+            edited_fields: vec![
+                "tags".into(),
+                "projectIds".into(),
+                "notes".into(),
+                "favourite".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            metadata_update_events(&media, &cleared),
+            vec![
+                CatalogueEvent::MediaTagsRemoved {
+                    media_id: media.id.clone(),
+                    values: vec!["Race".into()],
+                },
+                CatalogueEvent::MediaProjectsRemoved {
+                    media_id: media.id.clone(),
+                    values: vec!["project-1".into()],
+                },
+                CatalogueEvent::MediaNotesSet {
+                    media_id: media.id.clone(),
+                    value: String::new(),
+                },
+                CatalogueEvent::MediaFavouriteSet {
+                    media_id: media.id.clone(),
+                    value: false,
+                },
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_completed_metadata_write_remains_durable_and_recovers_idempotently() {
+        let (root, _master, mut file, mut catalogue) = completion_fixture("pending-metadata");
+        file.state = "completed".into();
+        catalogue.media[0].notes = "Old note".into();
+        let patch = ProvisionalMetadataPatch {
+            notes: Some(String::new()),
+            ..Default::default()
+        };
+        apply_metadata_patch(&mut file.metadata, &patch);
+        let mut pending = ProvisionalMetadata::default();
+        apply_metadata_patch(&mut pending, &patch);
+        file.pending_metadata = Some(pending);
+
+        let error = apply_pending_metadata_write(&mut file, &catalogue, |_| {
+            Err("simulated append failure".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("saved locally"));
+        assert!(file.pending_metadata.is_some());
+        assert_eq!(file.metadata_error.as_deref(), Some("simulated append failure"));
+
+        let path = root.join("failed-job.json");
+        write_json(&path, &file).unwrap();
+        let mut restarted: IngestJobFile =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // Simulate the uncertain case where the event reached disk before the
+        // caller observed an error. Recovery must not emit it a second time.
+        catalogue.media[0].notes.clear();
+        let mut recovered_events = None;
+        apply_pending_metadata_write(&mut restarted, &catalogue, |events| {
+            recovered_events = Some(events);
+            Ok(())
+        })
+        .unwrap();
+        assert!(recovered_events.unwrap().is_empty());
+        assert!(restarted.pending_metadata.is_none());
+        assert!(restarted.metadata_error.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1745,6 +3045,14 @@ mod tests {
         }
         assert_eq!(fs::read(&active).unwrap(), b"still-copying");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_background_coordination_does_not_own_the_catalogue_write_lock() {
+        let state = NativeState::default();
+        let _discovery = state.discovery_write.lock().unwrap();
+        let _enrichment = state.enrichment_write.lock().unwrap();
+        assert!(state.catalogue_write.try_lock().is_ok());
     }
 
     #[test]
