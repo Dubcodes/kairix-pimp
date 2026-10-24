@@ -27,6 +27,7 @@ struct NativeState {
     paused_jobs: Mutex<HashSet<String>>,
     catalogue_write: Mutex<()>,
     discovery_write: Mutex<()>,
+    enrichment_write: Mutex<()>,
     job_store: Mutex<()>,
     worker_active: Mutex<bool>,
     availability: Mutex<HashMap<String, (String, bool)>>,
@@ -160,25 +161,6 @@ struct IngestProgress {
     files_total: usize,
     bytes_complete: u64,
     bytes_total: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestResult {
-    imported: Vec<MediaItem>,
-    duplicates: Vec<String>,
-    conflicts: Vec<IngestConflict>,
-    unsupported: Vec<String>,
-    failures: Vec<String>,
-    cancelled: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestConflict {
-    source_path: String,
-    destination_path: String,
-    reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1477,7 +1459,7 @@ fn start_ingest(
     }
     let now = Utc::now().to_rfc3339();
     let job = IngestJob {
-        schema_version: 1,
+        schema_version: 2,
         id: request.job_id,
         state: if files.iter().any(|file| file.state == "queued") {
             "queued"
@@ -2267,6 +2249,7 @@ fn verify_media_integrity(
 #[tauri::command]
 async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, String> {
     let settings = load_settings_file(&app)?;
+    let _enrichment_guard = state.enrichment_write.lock().unwrap();
     let master = PathBuf::from(&settings.master_bin_path);
     let cache = PathBuf::from(&settings.thumbnail_cache_path);
     fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
@@ -2485,7 +2468,7 @@ mod tests {
 
     fn ingest_job(state: &str, file_state: &str) -> IngestJob {
         IngestJob {
-            schema_version: 1,
+            schema_version: 2,
             id: "job-1".into(),
             state: state.into(),
             created_at: "2026-10-24T00:00:00Z".into(),
@@ -2823,7 +2806,8 @@ mod tests {
 
         let path = root.join("failed-job.json");
         write_json(&path, &file).unwrap();
-        let mut restarted: IngestJobFile = read_json(&path).unwrap();
+        let mut restarted: IngestJobFile =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         // Simulate the uncertain case where the event reached disk before the
         // caller observed an error. Recovery must not emit it a second time.
         catalogue.media[0].notes.clear();
@@ -3035,6 +3019,14 @@ mod tests {
         }
         assert_eq!(fs::read(&active).unwrap(), b"still-copying");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_background_coordination_does_not_own_the_catalogue_write_lock() {
+        let state = NativeState::default();
+        let _discovery = state.discovery_write.lock().unwrap();
+        let _enrichment = state.enrichment_write.lock().unwrap();
+        assert!(state.catalogue_write.try_lock().is_ok());
     }
 
     #[test]

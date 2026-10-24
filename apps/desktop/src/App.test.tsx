@@ -26,6 +26,8 @@ const mocks = vi.hoisted(() => ({
   jobs: [] as import('./bridge').IngestJob[],
   initializeIngestJobs: vi.fn(),
   updateIngestFileMetadata: vi.fn(),
+  jobListener: undefined as
+    ((jobs: import('./bridge').IngestJob[]) => void) | undefined,
   refreshMediaAvailability: vi.fn(),
   rescan: vi.fn(),
 }));
@@ -47,7 +49,10 @@ vi.mock('./bridge', () => ({
     resumeIngest: vi.fn(),
     retryIngest: vi.fn(),
     onProgress: vi.fn(async () => () => undefined),
-    onIngestJobsChanged: vi.fn(async () => () => undefined),
+    onIngestJobsChanged: vi.fn(async (handler) => {
+      mocks.jobListener = handler;
+      return () => undefined;
+    }),
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
     chooseFiles: vi.fn(async () => []),
@@ -83,6 +88,7 @@ describe('native application integration', () => {
     mocks.initializeIngestJobs.mockReset();
     mocks.initializeIngestJobs.mockImplementation(async () => mocks.jobs);
     mocks.updateIngestFileMetadata.mockReset();
+    mocks.jobListener = undefined;
     mocks.refreshMediaAvailability.mockReset();
     mocks.refreshMediaAvailability.mockResolvedValue(false);
     mocks.rescan.mockReset();
@@ -241,6 +247,105 @@ describe('native application integration', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Library' }));
     expect(screen.getByRole('heading', { name: 'Library' })).toBeVisible();
+  });
+
+  it('keeps an unsaved favourite edit across interleaved progress and completion updates', async () => {
+    mocks.jobs = [
+      {
+        schemaVersion: 1,
+        id: 'job-1',
+        state: 'copying',
+        createdAt: '2026-10-24T00:00:00Z',
+        updatedAt: '2026-10-24T00:00:00Z',
+        batchTimestamp: '2026-10-24T00:00:00Z',
+        files: [
+          {
+            id: 'file-1',
+            mediaId: 'media-1',
+            sourcePath: 'E:/clip.mp4',
+            destinationPath: 'C:/Master/20261024/clip.mp4',
+            relativePath: '20261024/clip.mp4',
+            originalFilename: 'clip.mp4',
+            sizeBytes: 100,
+            bytesTransferred: 25,
+            state: 'copying',
+            metadata: { tags: [], projectIds: [], notes: '', favourite: false },
+          },
+        ],
+        unsupported: [],
+        failures: [],
+        currentFile: 'clip.mp4',
+        bytesTotal: 100,
+        bytesTransferred: 25,
+        filesCompleted: 0,
+      },
+    ];
+    let resolveWrite: ((job: import('./bridge').IngestJob) => void) | undefined;
+    mocks.updateIngestFileMetadata.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveWrite = resolve;
+        }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    const favourite = screen.getByRole('checkbox', { name: 'Favourite' });
+    await user.click(favourite);
+    expect(favourite).toBeChecked();
+
+    const staleCompletion = structuredClone(mocks.jobs);
+    staleCompletion[0].state = 'completed';
+    staleCompletion[0].files[0].state = 'completed';
+    staleCompletion[0].files[0].bytesTransferred = 100;
+    await act(async () => mocks.jobListener?.(staleCompletion));
+    expect(screen.getByRole('checkbox', { name: 'Favourite' })).toBeChecked();
+
+    await act(async () => resolveWrite?.(staleCompletion[0]));
+  });
+
+  it('reports a metadata persistence error without reverting the local edit', async () => {
+    mocks.jobs = [
+      {
+        schemaVersion: 1,
+        id: 'job-1',
+        state: 'copying',
+        createdAt: '2026-10-24T00:00:00Z',
+        updatedAt: '2026-10-24T00:00:00Z',
+        batchTimestamp: '2026-10-24T00:00:00Z',
+        files: [
+          {
+            id: 'file-1',
+            mediaId: 'media-1',
+            sourcePath: 'E:/clip.mp4',
+            destinationPath: 'C:/Master/20261024/clip.mp4',
+            relativePath: '20261024/clip.mp4',
+            originalFilename: 'clip.mp4',
+            sizeBytes: 100,
+            bytesTransferred: 25,
+            state: 'copying',
+            metadata: { tags: [], projectIds: [], notes: '', favourite: false },
+          },
+        ],
+        unsupported: [],
+        failures: [],
+        currentFile: 'clip.mp4',
+        bytesTotal: 100,
+        bytesTransferred: 25,
+        filesCompleted: 0,
+      },
+    ];
+    mocks.updateIngestFileMetadata.mockRejectedValue(
+      new Error('simulated metadata write failure'),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    await user.click(screen.getByRole('checkbox', { name: 'Favourite' }));
+    expect(screen.getByRole('checkbox', { name: 'Favourite' })).toBeChecked();
+    expect(
+      await screen.findByText('simulated metadata write failure'),
+    ).toBeVisible();
   });
 
   it('refreshes local availability without a catalogue event or media rescan', async () => {

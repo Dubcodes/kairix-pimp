@@ -50,6 +50,10 @@ Long work executes outside the render thread through a device-local versioned jo
 
 Startup does not assume removable sources are present: queued, copying and verifying work becomes interrupted and waits for explicit retry. Recovery verifies promoted path, size, checksum and catalogue identity before registration, never removes a promoted destination and preserves ambiguous state for review. Completed files are checkpoints and are not copied again; an incomplete file restarts from byte zero because byte-offset resume is not implemented. Provisional metadata stays local until verified registration, then enters the authoritative event stream. This ingest job manager is the foundation for future enrichment, consolidation and cleanup jobs; those job types are not implemented.
 
+Provisional metadata records which fields the user explicitly edited. An exact duplicate with untouched defaults reuses the existing media ID without emitting replacement/removal events. Completed-file edits first enter a durable pending slot in the local job record; successful authoritative append clears it, while startup retries unresolved writes against the latest projection. Progress events are merged with pending UI field patches so transfer updates cannot revert text currently being saved.
+
+Discovery traversal/hashing and enrichment FFprobe/FFmpeg processes run outside the catalogue write mutex. Before appending events, each operation reloads the projection and rejects registrations or enrichment results made stale by a concurrent ingest or metadata commit.
+
 FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. A native notification watcher remains pending.
 
 ## Metadata, search, and Syncthing
