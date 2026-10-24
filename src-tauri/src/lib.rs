@@ -97,7 +97,7 @@ struct ProvisionalMetadata {
     favourite: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct IngestJobFile {
     id: String,
@@ -113,7 +113,7 @@ struct IngestJobFile {
     metadata: ProvisionalMetadata,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct IngestJob {
     schema_version: u32,
@@ -1323,6 +1323,13 @@ fn kick_ingest_worker(app: AppHandle) {
     });
 }
 
+fn active_destination_reservations(jobs: &[IngestJob]) -> HashSet<String> {
+    jobs.iter()
+        .filter(|job| !matches!(job.state.as_str(), "completed" | "cancelled"))
+        .flat_map(|job| job.files.iter().map(|file| file.destination_path.clone()))
+        .collect()
+}
+
 #[tauri::command]
 fn start_ingest(
     app: AppHandle,
@@ -1334,11 +1341,7 @@ fn start_ingest(
     let mut unsupported = Vec::new();
     let sources = source_files(&request.sources, &mut unsupported);
     let batch_timestamp = Local::now();
-    let reserved: HashSet<String> = snapshot_jobs(&app, &state)?
-        .iter()
-        .filter(|job| !matches!(job.state.as_str(), "completed" | "cancelled"))
-        .flat_map(|job| job.files.iter().map(|file| file.destination_path.clone()))
-        .collect();
+    let reserved = active_destination_reservations(&snapshot_jobs(&app, &state)?);
     let mut planned_paths = HashSet::new();
     let mut files = Vec::new();
     for source in sources {
@@ -1422,6 +1425,36 @@ fn list_ingest_jobs(app: AppHandle, state: State<'_, NativeState>) -> Result<Vec
     snapshot_jobs(&app, &state)
 }
 
+fn mark_active_jobs_interrupted(jobs: &mut [IngestJob]) {
+    for job in jobs {
+        if matches!(job.state.as_str(), "queued" | "copying" | "verifying") {
+            job.state = "interrupted".into();
+            job.current_file = None;
+            job.updated_at = Utc::now().to_rfc3339();
+            for file in &mut job.files {
+                if matches!(file.state.as_str(), "queued" | "copying" | "verifying") {
+                    file.state = "interrupted".into();
+                    file.error = Some("Application stopped before this file completed".into());
+                }
+            }
+        }
+    }
+}
+
+fn prepare_job_retry(job: &mut IngestJob) {
+    for file in &mut job.files {
+        if matches!(file.state.as_str(), "failed" | "cancelled" | "interrupted") {
+            file.state = "queued".into();
+            file.error = None;
+            file.bytes_transferred = 0;
+        }
+    }
+    job.state = "queued".into();
+    job.failures.clear();
+    job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+    job.updated_at = Utc::now().to_rfc3339();
+}
+
 #[tauri::command]
 fn initialize_ingest_jobs(
     app: AppHandle,
@@ -1431,19 +1464,7 @@ fn initialize_ingest_jobs(
         return Err("Cannot run startup recovery while an ingest worker is active".into());
     }
     mutate_jobs(&app, &state, |jobs| {
-        for job in jobs {
-            if matches!(job.state.as_str(), "queued" | "copying" | "verifying") {
-                job.state = "interrupted".into();
-                job.current_file = None;
-                job.updated_at = Utc::now().to_rfc3339();
-                for file in &mut job.files {
-                    if matches!(file.state.as_str(), "queued" | "copying" | "verifying") {
-                        file.state = "interrupted".into();
-                        file.error = Some("Application stopped before this file completed".into());
-                    }
-                }
-            }
-        }
+        mark_active_jobs_interrupted(jobs);
         Ok(())
     })?;
     let settings = load_settings_file(&app)?;
@@ -1571,16 +1592,7 @@ fn retry_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -
     state.paused_jobs.lock().unwrap().remove(&job_id);
     mutate_jobs(&app, &state, |jobs| {
         let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
-        for file in &mut job.files {
-            if matches!(file.state.as_str(), "failed" | "cancelled" | "interrupted") {
-                file.state = "queued".into();
-                file.error = None;
-                file.bytes_transferred = 0;
-            }
-        }
-        job.state = "queued".into();
-        job.failures.clear();
-        job.updated_at = Utc::now().to_rfc3339();
+        prepare_job_retry(job);
         Ok(())
     })?;
     kick_ingest_worker(app);
@@ -2134,6 +2146,128 @@ mod tests {
             .join(format!("pimp-native-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn ingest_job(state: &str, file_state: &str) -> IngestJob {
+        IngestJob {
+            schema_version: 1,
+            id: "job-1".into(),
+            state: state.into(),
+            created_at: "2026-10-24T00:00:00Z".into(),
+            updated_at: "2026-10-24T00:00:00Z".into(),
+            batch_timestamp: "2026-10-24T00:00:00+00:00".into(),
+            date_override: None,
+            files: vec![IngestJobFile {
+                id: "file-1".into(),
+                media_id: "media-1".into(),
+                source_path: "missing-source.mp4".into(),
+                destination_path: "master/20261024/clip.mp4".into(),
+                relative_path: "20261024/clip.mp4".into(),
+                original_filename: "clip.mp4".into(),
+                size_bytes: 12,
+                bytes_transferred: 5,
+                state: file_state.into(),
+                error: None,
+                metadata: ProvisionalMetadata {
+                    tags: vec!["Interview".into()],
+                    project_ids: vec!["project-1".into()],
+                    notes: "Retain through restart".into(),
+                    favourite: true,
+                },
+            }],
+            unsupported: Vec::new(),
+            failures: vec!["previous failure".into()],
+            current_file: Some("clip.mp4".into()),
+            bytes_total: 12,
+            bytes_transferred: 5,
+            files_completed: 0,
+        }
+    }
+
+    #[test]
+    fn persistent_jobs_round_trip_provisional_metadata() {
+        let root = temporary("job-round-trip");
+        let path = root.join("ingest-jobs.json");
+        let jobs = vec![ingest_job("failed", "failed")];
+        write_json(&path, &jobs).unwrap();
+        assert_eq!(read_json::<Vec<IngestJob>>(&path).unwrap(), jobs);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_marks_active_work_interrupted_without_auto_resuming_missing_sources() {
+        let mut jobs = vec![ingest_job("copying", "verifying")];
+        mark_active_jobs_interrupted(&mut jobs);
+        assert_eq!(jobs[0].state, "interrupted");
+        assert_eq!(jobs[0].files[0].state, "interrupted");
+        assert_eq!(jobs[0].bytes_transferred, 5);
+        assert_eq!(jobs[0].files[0].bytes_transferred, 5);
+        assert_eq!(jobs[0].files[0].metadata.notes, "Retain through restart");
+        assert!(jobs[0].files[0].error.as_deref().unwrap().contains("stopped"));
+    }
+
+    #[test]
+    fn retry_preserves_completed_files_and_metadata_but_restarts_partial_files() {
+        let mut job = ingest_job("failed", "interrupted");
+        let mut completed = job.files[0].clone();
+        completed.id = "file-2".into();
+        completed.media_id = "media-2".into();
+        completed.state = "completed".into();
+        completed.bytes_transferred = completed.size_bytes;
+        job.files.push(completed);
+        prepare_job_retry(&mut job);
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.files[0].state, "queued");
+        assert_eq!(job.files[0].bytes_transferred, 0);
+        assert_eq!(job.files[0].metadata.tags, vec!["Interview"]);
+        assert_eq!(job.files[1].state, "completed");
+        assert_eq!(job.files[1].bytes_transferred, 12);
+        assert_eq!(job.bytes_transferred, 12);
+        assert!(job.failures.is_empty());
+    }
+
+    #[test]
+    fn queued_jobs_reserve_destinations_until_completion_or_cancellation() {
+        let queued = ingest_job("queued", "queued");
+        let destination = queued.files[0].destination_path.clone();
+        assert!(active_destination_reservations(&[queued.clone()]).contains(&destination));
+
+        let mut completed = queued.clone();
+        completed.state = "completed".into();
+        let mut cancelled = queued;
+        cancelled.state = "cancelled".into();
+        assert!(active_destination_reservations(&[completed, cancelled]).is_empty());
+    }
+
+    #[test]
+    fn provisional_metadata_becomes_authoritative_events_after_registration() {
+        let metadata = ingest_job("queued", "queued")
+            .files
+            .into_iter()
+            .next()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata_events("media-1", &metadata),
+            vec![
+                CatalogueEvent::MediaTagsAdded {
+                    media_id: "media-1".into(),
+                    values: vec!["Interview".into()],
+                },
+                CatalogueEvent::MediaProjectsAdded {
+                    media_id: "media-1".into(),
+                    values: vec!["project-1".into()],
+                },
+                CatalogueEvent::MediaNotesSet {
+                    media_id: "media-1".into(),
+                    value: "Retain through restart".into(),
+                },
+                CatalogueEvent::MediaFavouriteSet {
+                    media_id: "media-1".into(),
+                    value: true,
+                },
+            ]
+        );
     }
 
     #[test]

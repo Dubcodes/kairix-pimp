@@ -10,7 +10,7 @@ Tauri was selected over Electron for a smaller runtime distribution and explicit
 ┌──────────────── React UI / WebView ────────────────┐
 │ views, shared searchable controls, progress/errors │
 └──────────────────────┬─────────────────────────────┘
-                       │ typed commands/events (planned)
+                       │ typed commands/events
 ┌──────────────────────▼─────────────────────────────┐
 │ application services + background job coordinator │
 └──────────────┬──────────────────┬──────────────────┘
@@ -31,7 +31,7 @@ The frontend never receives broad arbitrary-filesystem permission. A host comman
 - `apps/desktop`: presentation and local interaction state. `SearchableComboBox` is the shared stable-ID selector for growing lists; Ariakit supplies ARIA/keyboard/focus/popover primitives while PIMP supplies filtering, result caps, explicit creation, and styling.
 - `packages/core`: platform-neutral identities, catalogue events/projection, search, date rules, and optional AI contracts. It cannot import browser, Node, Tauri, OS, or model dependencies.
 - `packages/node-adapter`: tested reference filesystem/process implementation for atomic records, safe ingest, manifests, FFprobe, and thumbnails.
-- `src-tauri`: production trust boundary for purpose-built commands, event replay/migration, capability enforcement, safe ingest/discovery, OS integration, and minimal durable operation records.
+- `src-tauri`: production trust boundary for purpose-built commands, event replay/migration, capability enforcement, safe ingest/discovery, OS integration, durable ingest jobs and operation journals.
 - future adapters/workers: local SQLite/FTS projection, Syncthing read-only status, optional Full AI workers, and Premiere UXP extension.
 
 ## Ingest and background jobs
@@ -46,9 +46,9 @@ The implemented single-file reference transaction:
 6. Append and flush `media.registered` only after successful promotion. A persistence failure leaves a verified orphan that conservative discovery can recover; it never rolls back by deleting the media.
 7. Probe and preview as separately retryable work; their failure does not invalidate the verified ingest.
 
-Long work executes outside the render thread with stable job IDs, progress events and cancellation. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence; restart recovery verifies the promoted path, size, checksum and catalogue identity before registration, and never removes a promoted destination. Ambiguous recovery state remains intact for review. Byte-offset resume and retry scheduling remain future work. Event handlers are idempotent because reconnect/replay can redeliver state.
+Long work executes outside the render thread through a device-local versioned job store. Jobs retain source inventory, destination reservations, per-file and aggregate progress, failures, and provisional tags, projects, notes and favourite state. One bounded worker processes jobs sequentially. Copying and hashing occur without the catalogue write mutex; only registration and event append use the narrow write critical section. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence.
 
-The target job architecture persists versioned intent, progress and retry state for ingest, enrichment, consolidation and cleanup, then resumes eligible work at startup. Ingest intent will include initial tags, projects, description and favourite state without making incomplete media visible in the committed catalogue.
+Startup does not assume removable sources are present: queued, copying and verifying work becomes interrupted and waits for explicit retry. Recovery verifies promoted path, size, checksum and catalogue identity before registration, never removes a promoted destination and preserves ambiguous state for review. Completed files are checkpoints and are not copied again; an incomplete file restarts from byte zero because byte-offset resume is not implemented. Provisional metadata stays local until verified registration, then enters the authoritative event stream. This ingest job manager is the foundation for future enrichment, consolidation and cleanup jobs; those job types are not implemented.
 
 FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. A native notification watcher remains pending.
 
@@ -63,7 +63,7 @@ device C events ─┘                                  ├─ in-memory state (
                                                     └─ SQLite/FTS (planned)
 ```
 
-SQLite/FTS is a disposable device-local search projection, never a synchronized live database. Rebuilding it reads validated authoritative events plus media availability. The open Library polls a cheap event-file signature and rebuilds only after the shared streams change; media discovery remains a separate operation. Syncthing temporary and conflict files are detected and reported, not silently treated as authoritative. Its optional local REST API supplies read-only health hints; PIMP works without it. Detailed rules are in [SYNCTHING_DESIGN.md](SYNCTHING_DESIGN.md).
+SQLite/FTS is a disposable device-local search projection, never a synchronized live database. Rebuilding it reads validated authoritative events plus media availability. The open Library polls a cheap event-file signature and rebuilds after shared streams change; a separate cheap path check updates device-local availability when Syncthing materializes known media without creating catalogue events or running discovery. Media discovery remains a separate operation. Syncthing temporary and conflict files are detected and reported, not silently treated as authoritative. Its optional local REST API supplies read-only health hints; PIMP works without it. Detailed rules are in [SYNCTHING_DESIGN.md](SYNCTHING_DESIGN.md).
 
 ## Identity and project architecture
 

@@ -224,6 +224,20 @@ describe('native application integration', () => {
       'file-1',
       expect.objectContaining({ tags: ['Race'] }),
     );
+    await user.type(
+      screen.getByRole('textbox', { name: 'Description' }),
+      'Lead lap',
+    );
+    await user.click(screen.getByRole('checkbox', { name: 'Favourite' }));
+    expect(mocks.updateIngestFileMetadata).toHaveBeenLastCalledWith(
+      'job-1',
+      'file-1',
+      expect.objectContaining({
+        tags: ['Race'],
+        notes: 'Lead lap',
+        favourite: true,
+      }),
+    );
     await user.click(screen.getByRole('button', { name: 'Library' }));
     expect(screen.getByRole('heading', { name: 'Library' })).toBeVisible();
   });
