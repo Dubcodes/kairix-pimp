@@ -103,7 +103,11 @@ export interface ProvisionalMetadata {
   projectIds: string[];
   notes: string;
   favourite: boolean;
+  editedFields?: string[];
 }
+export type ProvisionalMetadataPatch = Partial<
+  Pick<ProvisionalMetadata, 'tags' | 'projectIds' | 'notes' | 'favourite'>
+>;
 export interface IngestJobFile {
   id: string;
   mediaId: string;
@@ -116,6 +120,8 @@ export interface IngestJobFile {
   state: IngestJobState;
   error?: string;
   metadata: ProvisionalMetadata;
+  pendingMetadata?: ProvisionalMetadata;
+  metadataError?: string;
 }
 export interface IngestJob {
   schemaVersion: number;
@@ -188,12 +194,12 @@ export const desktopBridge = {
   updateIngestFileMetadata: (
     jobId: string,
     fileId: string,
-    metadata: ProvisionalMetadata,
+    patch: ProvisionalMetadataPatch,
   ) =>
     invoke<IngestJob>('update_ingest_file_metadata', {
       jobId,
       fileId,
-      metadata,
+      patch,
     }),
   pauseIngest: (jobId: string) => invoke<void>('pause_ingest', { jobId }),
   resumeIngest: (jobId: string) => invoke<void>('resume_ingest', { jobId }),

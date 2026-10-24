@@ -27,6 +27,7 @@ import {
   type IngestJobFile,
   type IngestProgress,
   type IngestResult,
+  type ProvisionalMetadataPatch,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
 
@@ -76,9 +77,26 @@ export function App() {
   const [projectDirectory, setProjectDirectory] = useState('');
   const catalogueSignature = useRef<string | undefined>(undefined);
   const metadataWrites = useRef(new Map<string, Promise<void>>());
+  const pendingMetadataPatches = useRef(
+    new Map<string, ProvisionalMetadataPatch>(),
+  );
 
   const configured = Boolean(settings.initializedCataloguePath);
   const refresh = async () => setCatalogue(await desktopBridge.loadCatalogue());
+  const receiveJobs = (incoming: IngestJob[]) =>
+    setJobs(
+      incoming.map((job) => ({
+        ...job,
+        files: job.files.map((file) => {
+          const pending = pendingMetadataPatches.current.get(
+            `${job.id}:${file.id}`,
+          );
+          return pending
+            ? { ...file, metadata: { ...file.metadata, ...pending } }
+            : file;
+        }),
+      })),
+    );
   useEffect(() => {
     if (!native) return;
     let disposed = false;
@@ -88,7 +106,7 @@ export function App() {
     Promise.all([
       desktopBridge.loadSettings(),
       desktopBridge.onProgress(setProgress),
-      desktopBridge.onIngestJobsChanged(setJobs),
+      desktopBridge.onIngestJobsChanged(receiveJobs),
       desktopBridge.onFileDrop((paths) =>
         setSources((current) => [...new Set([...current, ...paths])]),
       ),
@@ -328,13 +346,18 @@ export function App() {
       ),
     );
     const key = `${jobId}:${fileId}`;
+    pendingMetadataPatches.current.set(key, {
+      ...pendingMetadataPatches.current.get(key),
+      ...update,
+    });
     const previous = metadataWrites.current.get(key) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
-      .then(() =>
-        desktopBridge.updateIngestFileMetadata(jobId, fileId, metadata),
-      )
-      .then(() => undefined)
+      .then(() => desktopBridge.updateIngestFileMetadata(jobId, fileId, update))
+      .then(() => {
+        if (metadataWrites.current.get(key) === next)
+          pendingMetadataPatches.current.delete(key);
+      })
       .catch((reason) => setError(errorText(reason)));
     metadataWrites.current.set(key, next);
     void next.finally(() => {
@@ -542,6 +565,12 @@ export function App() {
                       </div>
                       {file.error && (
                         <small className="job-error">{file.error}</small>
+                      )}
+                      {file.metadataError && (
+                        <small className="job-error">
+                          Metadata not yet saved to the catalogue:{' '}
+                          {file.metadataError}
+                        </small>
                       )}
                       <label>
                         Tags
