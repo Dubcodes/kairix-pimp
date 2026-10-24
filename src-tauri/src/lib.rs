@@ -2625,7 +2625,23 @@ mod tests {
         media.project_ids = vec!["project-1".into(), "project-2".into()];
         media.notes = "Existing note".into();
         media.favourite = true;
-        assert!(metadata_update_events(media, &ProvisionalMetadata::default()).is_empty());
+        let expected = media.clone();
+        let catalogue_root = root.join("catalogue");
+        catalogue::append(
+            &catalogue_root,
+            "device-a",
+            vec![CatalogueEvent::MediaRegistered {
+                media: expected.clone(),
+            }],
+        )
+        .unwrap();
+        let registered = catalogue::load(&catalogue_root).unwrap();
+        let duplicate_events =
+            metadata_update_events(&registered.media[0], &ProvisionalMetadata::default());
+        assert!(duplicate_events.is_empty());
+        catalogue::append(&catalogue_root, "device-a", duplicate_events).unwrap();
+        let after_duplicate = catalogue::load(&catalogue_root).unwrap();
+        assert_eq!(after_duplicate.media[0], expected);
         assert_eq!(fs::read(root.join("master/20261024/clip.mp4")).unwrap(), b"verified-media");
         fs::remove_dir_all(root).unwrap();
     }
