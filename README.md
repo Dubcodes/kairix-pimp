@@ -1,7 +1,8 @@
 # Kairix PIMP
 
-> **Early development:** PIMP is not yet ready for production media, and no
-> installable release is available.
+> **Unsigned internal beta:** Windows installer artifacts are produced for
+> disposable-media testing. PIMP is not yet approved for production media while
+> real two-device Syncthing acceptance, signing and upgrade testing remain open.
 
 Kairix PIMP (Production Ingest & Media Processor) is a desktop companion for Syncthing that safely ingests, catalogues, searches, and assigns production media. Syncthing remains the synchronization engine; PIMP owns media workflow and portable metadata.
 
@@ -27,6 +28,12 @@ New installations use `yyyymmdd` date folders. Settings provide a live preview a
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 
 The native host, web frontend, unsigned MSI and NSIS installers build on Windows. Installer signing and upgrades, a notification-based filesystem watcher, safe catalogue-location relocation, folder notes, preview-frame selection and Premiere integration remain incomplete.
+
+Successful **Windows beta installer** workflow runs publish a downloadable MSI
+and NSIS installer artifact identified by version, commit and unsigned status.
+See the [Windows beta installation and acceptance guide](docs/BETA_TESTING.md).
+FFmpeg/FFprobe are optional PATH-based tools: missing tools disable thumbnails
+and technical probing but do not block verified ingest or catalogue work.
 
 Windows is the first release target. The core and adapter boundaries are designed for future Linux and macOS support, but neither platform is currently verified.
 
@@ -93,6 +100,10 @@ No software license has been selected yet. Public availability does not grant pe
 - `packages/node-adapter`: verified filesystem operations and FFmpeg integration
 - `src-tauri`: restricted Tauri 2 filesystem/catalogue host and dialog capability
 - `docs`: project brief, product/architecture/data rules, decision log, testing strategy, Syncthing design, research, roadmap, and future task template
+
+The future cloud-backup boundary is documented in the
+[provider-neutral backup manifest](docs/BACKUP_MANIFEST.md). No current feature
+depends on Degoo or another cloud provider.
 
 ## Development preview
 

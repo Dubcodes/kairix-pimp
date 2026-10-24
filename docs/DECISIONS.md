@@ -192,3 +192,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Native ingest is coordinated by a versioned device-local job store and a bounded single worker. Jobs persist stable source/destination plans, progress, errors and provisional metadata. Copying, hashing and probing occur outside the catalogue write mutex; only verified registration and authoritative event persistence use it. Pause is supported between files. Startup marks active work interrupted and requires explicit retry rather than assuming removable media is present.
 - **Consequences:** Completed files form safe retry checkpoints, but partial-file byte offsets are not resumed. Operation journals remain the ownership and crash-recovery record for staging and promotion. Queue state and file availability are not synchronized through Syncthing.
+
+## ADR-025 — Unsigned beta packaging and constrained Windows file actions
+
+- **Date:** 2026-10-25
+- **Status:** Accepted
+- **Decision:** CI builds unsigned MSI and NSIS artifacts identified by version and commit. Versioned beta tags may publish prereleases only after review and merge. FFmpeg/FFprobe remain optional PATH-based tools for this beta. Reveal/open/copy UI actions accept only catalogue media IDs and resolve an existing path canonically beneath Master Bin in the native host.
+- **Consequences:** SmartScreen warnings and optional-media-tool limitations are explicit. The UI receives no arbitrary shell or filesystem capability. Signing, installer upgrades and bundled third-party media binaries remain later release work.

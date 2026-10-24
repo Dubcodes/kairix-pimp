@@ -72,6 +72,12 @@ export interface RescanResult {
   changed: number;
   pending: number;
 }
+export interface MediaToolsStatus {
+  ffmpegAvailable: boolean;
+  ffprobeAvailable: boolean;
+  ffmpegVersion?: string;
+  ffprobeVersion?: string;
+}
 export interface IngestProgress {
   jobId: string;
   phase: string;
@@ -149,7 +155,7 @@ export const emptySettings = (): DeviceSettings => ({
   sharedCataloguePath: '',
   thumbnailCachePath: '',
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
-  ingestDateOrganization: 'original-file-dates',
+  ingestDateOrganization: 'today',
   dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
   projectPaths: {},
@@ -236,6 +242,13 @@ export const desktopBridge = {
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),
   enrichMedia: () => invoke<number>('enrich_media'),
+  mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
+  resolveMediaPath: (mediaId: string) =>
+    invoke<string>('resolve_media_path', { mediaId }),
+  revealMediaInExplorer: (mediaId: string) =>
+    invoke<void>('reveal_media_in_explorer', { mediaId }),
+  openMediaFolder: (mediaId: string) =>
+    invoke<void>('open_media_folder', { mediaId }),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),
 };

@@ -43,7 +43,7 @@ struct DeviceSettings {
     shared_catalogue_path: String,
     thumbnail_cache_path: String,
     thumbnail_cache_limit_bytes: u64,
-    #[serde(default = "default_date_mode")]
+    #[serde(default = "legacy_date_mode")]
     ingest_date_organization: String,
     #[serde(default = "legacy_date_folder_pattern")]
     date_folder_pattern: String,
@@ -52,7 +52,7 @@ struct DeviceSettings {
     #[serde(default)]
     project_paths: HashMap<String, String>,
 }
-fn default_date_mode() -> String {
+fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
 fn legacy_date_folder_pattern() -> String {
@@ -68,7 +68,7 @@ impl Default for DeviceSettings {
             shared_catalogue_path: String::new(),
             thumbnail_cache_path: String::new(),
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
-            ingest_date_organization: default_date_mode(),
+            ingest_date_organization: "today".into(),
             date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
             project_paths: HashMap::new(),
@@ -169,6 +169,15 @@ struct RescanResult {
     registered: usize,
     changed: usize,
     pending: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaToolsStatus {
+    ffmpeg_available: bool,
+    ffprobe_available: bool,
+    ffmpeg_version: Option<String>,
+    ffprobe_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2368,20 +2377,86 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
     append_events(&settings, events)?;
     Ok(changed)
 }
-#[tauri::command]
-fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String> {
-    let settings = load_settings_file(&app)?;
-    let catalogue = load_catalogue_file(&settings)?;
+fn resolve_catalogue_media_path(
+    settings: &DeviceSettings,
+    media_id: &str,
+) -> Result<PathBuf, String> {
+    let catalogue = load_catalogue_file(settings)?;
     let item = catalogue
         .media
         .iter()
         .find(|m| m.id == media_id)
         .ok_or("Unknown media item")?;
-    Ok(
-        fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?
-            .to_string_lossy()
-            .to_string(),
-    )
+    let path =
+        fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?;
+    if !path.is_file() {
+        return Err("This recording is not available locally yet".into());
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String> {
+    let settings = load_settings_file(&app)?;
+    Ok(resolve_catalogue_media_path(&settings, &media_id)?
+        .to_string_lossy()
+        .to_string())
+}
+
+#[tauri::command]
+fn reveal_media_in_explorer(app: AppHandle, media_id: String) -> Result<(), String> {
+    let settings = load_settings_file(&app)?;
+    let path = resolve_catalogue_media_path(&settings, &media_id)?;
+    #[cfg(target_os = "windows")]
+    Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.to_string_lossy()))
+        .spawn()
+        .map_err(|error| format!("Could not open Windows Explorer: {error}"))?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Reveal in Explorer is available only in the Windows build".into());
+    Ok(())
+}
+
+#[tauri::command]
+fn open_media_folder(app: AppHandle, media_id: String) -> Result<(), String> {
+    let settings = load_settings_file(&app)?;
+    let path = resolve_catalogue_media_path(&settings, &media_id)?;
+    let folder = path
+        .parent()
+        .ok_or("The recording does not have a containing folder")?;
+    #[cfg(target_os = "windows")]
+    Command::new("explorer.exe")
+        .arg(folder)
+        .spawn()
+        .map_err(|error| format!("Could not open Windows Explorer: {error}"))?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Open containing folder is available only in the Windows build".into());
+    Ok(())
+}
+
+fn tool_version(command: &str) -> Option<String> {
+    let output = Command::new(command).arg("-version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+}
+
+#[tauri::command]
+fn media_tools_status() -> MediaToolsStatus {
+    let ffmpeg_version = tool_version("ffmpeg");
+    let ffprobe_version = tool_version("ffprobe");
+    MediaToolsStatus {
+        ffmpeg_available: ffmpeg_version.is_some(),
+        ffprobe_available: ffprobe_version.is_some(),
+        ffmpeg_version,
+        ffprobe_version,
+    }
 }
 
 #[tauri::command]
@@ -2456,7 +2531,10 @@ pub fn run() {
             rescan,
             verify_media_integrity,
             enrich_media,
+            media_tools_status,
             resolve_media_path,
+            reveal_media_in_explorer,
+            open_media_folder,
             load_thumbnail
         ])
         .run(tauri::generate_context!())
@@ -2887,6 +2965,7 @@ mod tests {
         let path = root.join("empty-config").join("device-settings.json");
         let first = load_or_initialize_settings(&path).unwrap();
         assert!(Uuid::parse_str(&first.device_id).is_ok());
+        assert_eq!(first.ingest_date_organization, "today");
         assert!(path.is_file());
 
         let restarted = load_or_initialize_settings(&path).unwrap();
@@ -2902,6 +2981,17 @@ mod tests {
         let recovered = load_or_initialize_settings(&path).unwrap();
         assert_eq!(recovered.device_id, restarted.device_id);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_settings_without_a_date_mode_keep_the_previous_default() {
+        let mut value = serde_json::to_value(DeviceSettings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("ingestDateOrganization");
+        let settings: DeviceSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.ingest_date_organization, "original-file-dates");
     }
 
     #[test]

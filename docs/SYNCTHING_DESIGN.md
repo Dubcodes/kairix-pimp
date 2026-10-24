@@ -20,6 +20,12 @@ Native ingest does not stage inside Master Bin. It uses a device-owned hidden si
 
 This is outside synchronization when DCM Master Bin itself is the Syncthing folder, which is the supported arrangement. If a broader parent directory is synchronized, its `.DCM Master Bin.pimp-staging-*` sibling must be explicitly excluded; PIMP cannot infer every external Syncthing folder definition. The application fails closed if it cannot create same-filesystem sibling staging.
 
+For a broader synchronized parent, add the root-relative pattern
+`/.DCM Master Bin.pimp-staging-*` to that folder's `.stignore`. The preferred
+configuration needs no exclusion because DCM Master Bin itself is the Syncthing
+folder and the staging sibling is outside it. See [BETA_TESTING.md](BETA_TESTING.md)
+for the disposable two-device acceptance procedure.
+
 Optional REST reads use a user-supplied API key stored in the OS credential store. Useful endpoints are `/rest/system/status`, `/rest/db/status`, and filtered `/rest/events`. API absence never blocks ingest or browsing. Expensive status calls are throttled.
 
 ## Rename, case, and migration handling

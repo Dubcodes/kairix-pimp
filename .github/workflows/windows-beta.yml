@@ -1,0 +1,96 @@
+name: Windows beta installer
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*-beta.*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-beta:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install FFmpeg for acceptance tests
+        run: choco install ffmpeg --no-progress --yes
+
+      - name: Run TypeScript and web checks
+        run: |
+          npm test
+          npm run lint
+          npm run format
+          npm run build
+          npm audit --audit-level=high
+
+      - name: Run native checks
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build unsigned MSI and NSIS installers
+        run: npm run tauri -- build --bundles msi,nsis
+
+      - name: Record build identity
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $shortSha = '${{ github.sha }}'.Substring(0, 12)
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHORT_SHA=$shortSha" | Out-File -FilePath $env:GITHUB_ENV -Append
+          @(
+            "Kairix PIMP Windows beta"
+            "Version: $version"
+            "Commit: ${{ github.sha }}"
+            "Unsigned: yes"
+            "Windows may display a SmartScreen warning because this internal beta is not code-signed."
+          ) | Set-Content src-tauri/target/release/bundle/BUILD-INFO.txt
+
+      - name: Upload unsigned Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kairix-PIMP-${{ env.APP_VERSION }}-${{ env.SHORT_SHA }}-unsigned-windows
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/BUILD-INFO.txt
+
+      - name: Publish versioned beta release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = @(
+            Get-ChildItem src-tauri/target/release/bundle/msi/*.msi
+            Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe
+            Get-Item src-tauri/target/release/bundle/BUILD-INFO.txt
+          )
+          gh release create '${{ github.ref_name }}' $files.FullName --prerelease --generate-notes --title "Kairix PIMP ${{ github.ref_name }} (unsigned beta)"

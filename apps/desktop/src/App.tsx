@@ -2,10 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Clock3,
+  Copy,
   Folder,
+  FolderOpen,
   HardDrive,
   Inbox,
   Library,
+  LocateFixed,
   RefreshCw,
   Search,
   Settings,
@@ -27,6 +30,7 @@ import {
   type IngestJobFile,
   type IngestProgress,
   type IngestResult,
+  type MediaToolsStatus,
   type ProvisionalMetadataPatch,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
@@ -71,6 +75,7 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
   const [batchTags, setBatchTags] = useState<string[]>([]);
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
   const [projectName, setProjectName] = useState('');
@@ -110,29 +115,39 @@ export function App() {
       desktopBridge.onFileDrop((paths) =>
         setSources((current) => [...new Set([...current, ...paths])]),
       ),
+      desktopBridge.mediaToolsStatus(),
     ])
-      .then(async ([loaded, unlistenProgress, unlistenJobs, unlistenDrop]) => {
-        if (disposed) {
-          unlistenProgress();
-          unlistenJobs();
-          unlistenDrop();
-          return;
-        }
-        stopProgress = unlistenProgress;
-        stopJobs = unlistenJobs;
-        stopDrop = unlistenDrop;
-        setSettings(loaded);
-        setJobs(await desktopBridge.initializeIngestJobs());
-        if (loaded.initializedCataloguePath) {
-          const before = await desktopBridge.catalogueSignature();
-          let nextCatalogue = await desktopBridge.loadCatalogue();
-          const after = await desktopBridge.catalogueSignature();
-          if (after !== before)
-            nextCatalogue = await desktopBridge.loadCatalogue();
-          catalogueSignature.current = after;
-          setCatalogue(nextCatalogue);
-        }
-      })
+      .then(
+        async ([
+          loaded,
+          unlistenProgress,
+          unlistenJobs,
+          unlistenDrop,
+          tools,
+        ]) => {
+          if (disposed) {
+            unlistenProgress();
+            unlistenJobs();
+            unlistenDrop();
+            return;
+          }
+          stopProgress = unlistenProgress;
+          stopJobs = unlistenJobs;
+          stopDrop = unlistenDrop;
+          setSettings(loaded);
+          setMediaTools(tools);
+          setJobs(await desktopBridge.initializeIngestJobs());
+          if (loaded.initializedCataloguePath) {
+            const before = await desktopBridge.catalogueSignature();
+            let nextCatalogue = await desktopBridge.loadCatalogue();
+            const after = await desktopBridge.catalogueSignature();
+            if (after !== before)
+              nextCatalogue = await desktopBridge.loadCatalogue();
+            catalogueSignature.current = after;
+            setCatalogue(nextCatalogue);
+          }
+        },
+      )
       .catch((reason) => setError(errorText(reason)));
     return () => {
       disposed = true;
@@ -374,6 +389,31 @@ export function App() {
       setCatalogue(
         await desktopBridge.updateMedia({ mediaIds: selected, ...next }),
       );
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
+  const selectedRecording =
+    selected.length === 1
+      ? catalogue.media.find((item) => item.id === selected[0])
+      : undefined;
+  const runSelectedFileAction = async (
+    action: 'reveal' | 'folder' | 'copy',
+  ) => {
+    if (!selectedRecording?.available) return;
+    setError('');
+    try {
+      if (action === 'reveal') {
+        await desktopBridge.revealMediaInExplorer(selectedRecording.id);
+        setMessage('Recording revealed in Windows Explorer.');
+      } else if (action === 'folder') {
+        await desktopBridge.openMediaFolder(selectedRecording.id);
+        setMessage('Containing date folder opened in Windows Explorer.');
+      } else {
+        const path = await desktopBridge.resolveMediaPath(selectedRecording.id);
+        await navigator.clipboard.writeText(path);
+        setMessage('Absolute recording path copied to the clipboard.');
+      }
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -643,6 +683,21 @@ export function App() {
             </button>
           </section>
         )}
+        {mediaTools &&
+          (!mediaTools.ffmpegAvailable || !mediaTools.ffprobeAvailable) && (
+            <section className="notice tool-warning" role="status">
+              <span>
+                Optional media tools are missing. Verified ingest, catalogue,
+                search and metadata remain available.
+                {!mediaTools.ffmpegAvailable &&
+                  ' FFmpeg thumbnails are disabled.'}
+                {!mediaTools.ffprobeAvailable &&
+                  ' FFprobe technical metadata is disabled.'}{' '}
+                Install FFmpeg with <code>winget install Gyan.FFmpeg</code>,
+                then restart PIMP.
+              </span>
+            </section>
+          )}
         {((catalogue.conflicts?.length ?? 0) > 0 ||
           (catalogue.issues?.length ?? 0) > 0) && (
           <section className="notice error" role="status">
@@ -922,7 +977,9 @@ export function App() {
                                 <VolumeX size={12} />
                               ) : null}
                               {size(item.technical.sizeBytes)} ·{' '}
-                              {item.available ? 'Available' : 'Offline'}
+                              {item.available
+                                ? 'Available locally'
+                                : 'Synchronizing / unavailable locally'}
                             </span>
                           </footer>
                         </div>
@@ -970,6 +1027,28 @@ export function App() {
                     placeholder="Search projects…"
                   />
                 </div>
+                {selectedRecording && (
+                  <div className="file-actions" aria-label="Recording actions">
+                    <button
+                      disabled={!selectedRecording.available}
+                      onClick={() => void runSelectedFileAction('reveal')}
+                    >
+                      <LocateFixed size={13} /> Reveal in Explorer
+                    </button>
+                    <button
+                      disabled={!selectedRecording.available}
+                      onClick={() => void runSelectedFileAction('folder')}
+                    >
+                      <FolderOpen size={13} /> Open date folder
+                    </button>
+                    <button
+                      disabled={!selectedRecording.available}
+                      onClick={() => void runSelectedFileAction('copy')}
+                    >
+                      <Copy size={13} /> Copy path
+                    </button>
+                  </div>
+                )}
                 <button
                   className="batch-clear"
                   onClick={() => {

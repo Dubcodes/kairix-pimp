@@ -49,4 +49,4 @@ The versioned background job foundation is implemented for ingest: it persists i
 
 ## Milestone 7 — packaging and additional platforms
 
-Produce separate Windows Light and Full installers from the same codebase, verify binary dependency contents, sign, test upgrade/rollback, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.
+Implemented for internal Light beta testing: repeatable Windows CI builds of unsigned MSI and NSIS installers, artifact identity metadata, and prerelease publishing from versioned beta tags. Remaining release work: verify binary dependency contents, complete installed schema-2 and two-device Syncthing acceptance, sign, test upgrade/rollback, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.

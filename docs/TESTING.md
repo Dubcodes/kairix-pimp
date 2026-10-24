@@ -15,7 +15,7 @@ npm run build
 npm audit --audit-level=high
 ```
 
-`npm test` runs portable core, Node adapter, and jsdom React component/integration tests. `npm run build` type-checks project references and creates the production web bundle. CI repeats these checks on Ubuntu with Node 24 and FFmpeg. A separate `windows-latest` job now runs native `cargo test` and `cargo check` with a cached stable Rust toolchain. Release bundling remains an explicit milestone/release check.
+`npm test` runs portable core, Node adapter, and jsdom React component/integration tests. `npm run build` type-checks project references and creates the production web bundle. CI repeats these checks on Ubuntu with Node 24 and FFmpeg. A separate `windows-latest` job runs native `cargo test` and `cargo check` with a cached stable Rust toolchain. The **Windows beta installer** workflow repeats TypeScript and Rust checks, builds unsigned MSI and NSIS bundles, and uploads them with a version/commit identity file. A `v*-beta.*` tag can publish the same files as a prerelease after reviewed changes are merged.
 
 The October 2026 milestone acceptance pass used disposable generated H.264/AAC MP4 and WAV media in the native packaged application. It verified folder selection, recursive ingest, independent checksums, FFprobe metadata, MP4/WAV pairing, thumbnail generation, tag and project assignment, and persistence after restart. It did not use personal media or substitute browser-only behavior for native validation.
 

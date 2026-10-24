@@ -30,6 +30,10 @@ const mocks = vi.hoisted(() => ({
     ((jobs: import('./bridge').IngestJob[]) => void) | undefined,
   refreshMediaAvailability: vi.fn(),
   rescan: vi.fn(),
+  resolveMediaPath: vi.fn(),
+  revealMediaInExplorer: vi.fn(),
+  openMediaFolder: vi.fn(),
+  mediaToolsStatus: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -62,6 +66,11 @@ vi.mock('./bridge', () => ({
     createProject: vi.fn(),
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
+    mediaToolsStatus: mocks.mediaToolsStatus,
+    resolveMediaPath: mocks.resolveMediaPath,
+    revealMediaInExplorer: mocks.revealMediaInExplorer,
+    openMediaFolder: mocks.openMediaFolder,
+    loadThumbnail: vi.fn(async () => null),
     thumbnailUrl: (path: string) => path,
   },
 }));
@@ -92,6 +101,15 @@ describe('native application integration', () => {
     mocks.refreshMediaAvailability.mockReset();
     mocks.refreshMediaAvailability.mockResolvedValue(false);
     mocks.rescan.mockReset();
+    mocks.resolveMediaPath.mockReset();
+    mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
+    mocks.revealMediaInExplorer.mockReset();
+    mocks.openMediaFolder.mockReset();
+    mocks.mediaToolsStatus.mockReset();
+    mocks.mediaToolsStatus.mockResolvedValue({
+      ffmpegAvailable: true,
+      ffprobeAvailable: true,
+    });
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -120,6 +138,62 @@ describe('native application integration', () => {
     await user.click(await screen.findByRole('button', { name: 'Settings' }));
     expect(screen.getByDisplayValue('C:\\Master')).toBeVisible();
     expect(screen.getByText(/Catalogue location is locked/)).toBeVisible();
+  });
+
+  it('offers validated Windows file actions for one locally available recording', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'media-1',
+          relativePath: '20261024/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'abc',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<App />);
+    await user.click(await screen.findByText('clip.mp4'));
+
+    await user.click(
+      screen.getByRole('button', { name: /Reveal in Explorer/ }),
+    );
+    await user.click(screen.getByRole('button', { name: /Open date folder/ }));
+    await user.click(screen.getByRole('button', { name: /Copy path/ }));
+
+    expect(mocks.revealMediaInExplorer).toHaveBeenCalledWith('media-1');
+    expect(mocks.openMediaFolder).toHaveBeenCalledWith('media-1');
+    expect(writeText).toHaveBeenCalledWith('C:\\Master\\20261024\\clip.mp4');
+  });
+
+  it('explains optional feature loss when FFmpeg tools are missing', async () => {
+    mocks.mediaToolsStatus.mockResolvedValue({
+      ffmpegAvailable: false,
+      ffprobeAvailable: false,
+    });
+    render(<App />);
+    expect(
+      await screen.findByText(/FFmpeg thumbnails are disabled/),
+    ).toHaveTextContent(
+      'Verified ingest, catalogue, search and metadata remain available',
+    );
+    expect(screen.getByText('winget install Gyan.FFmpeg')).toBeVisible();
   });
 
   it.each([
