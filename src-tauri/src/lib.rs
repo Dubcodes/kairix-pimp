@@ -1146,7 +1146,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
         .ok_or("Ingest job no longer exists")?;
     let mut completed_bytes = job.bytes_transferred;
     for (index, planned) in job.files.iter().enumerate() {
-        if planned.state == "completed" {
+        if matches!(planned.state.as_str(), "completed" | "failed" | "cancelled") {
             continue;
         }
         if state.cancelled_jobs.lock().unwrap().contains(job_id) {
@@ -1518,11 +1518,10 @@ fn update_ingest_file_metadata(
             .find(|file| file.id == file_id)
             .ok_or("Ingest job file not found")?;
         file.metadata = normalized_metadata.clone();
+        let completed_media_id =
+            (file.state == "completed").then(|| file.media_id.clone());
         job.updated_at = Utc::now().to_rfc3339();
-        Ok((
-            job.clone(),
-            (file.state == "completed").then(|| file.media_id.clone()),
-        ))
+        Ok((job.clone(), completed_media_id))
     })?;
     if let Some(media_id) = completed_media_id {
         let settings = load_settings_file(&app)?;
