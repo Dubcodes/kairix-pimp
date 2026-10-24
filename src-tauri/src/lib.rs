@@ -1000,32 +1000,64 @@ fn new_media(
     })
 }
 
-fn metadata_events(media_id: &str, metadata: &ProvisionalMetadata) -> Vec<CatalogueEvent> {
-    let mut events = Vec::new();
-    if !metadata.tags.is_empty() {
-        events.push(CatalogueEvent::MediaTagsAdded {
-            media_id: media_id.into(),
-            values: normalized(&metadata.tags),
-        });
-    }
-    if !metadata.project_ids.is_empty() {
-        events.push(CatalogueEvent::MediaProjectsAdded {
-            media_id: media_id.into(),
-            values: normalized(&metadata.project_ids),
-        });
-    }
-    if !metadata.notes.is_empty() {
+fn metadata_update_events(item: &MediaItem, metadata: &ProvisionalMetadata) -> Vec<CatalogueEvent> {
+    let desired_tags = normalized(&metadata.tags);
+    let desired_projects = normalized(&metadata.project_ids);
+    let mut events = vec![
+        CatalogueEvent::MediaTagsAdded {
+            media_id: item.id.clone(),
+            values: desired_tags
+                .iter()
+                .filter(|value| !contains_normalized(&item.tags, value))
+                .cloned()
+                .collect(),
+        },
+        CatalogueEvent::MediaTagsRemoved {
+            media_id: item.id.clone(),
+            values: item
+                .tags
+                .iter()
+                .filter(|value| !contains_normalized(&desired_tags, value))
+                .cloned()
+                .collect(),
+        },
+        CatalogueEvent::MediaProjectsAdded {
+            media_id: item.id.clone(),
+            values: desired_projects
+                .iter()
+                .filter(|value| !contains_normalized(&item.project_ids, value))
+                .cloned()
+                .collect(),
+        },
+        CatalogueEvent::MediaProjectsRemoved {
+            media_id: item.id.clone(),
+            values: item
+                .project_ids
+                .iter()
+                .filter(|value| !contains_normalized(&desired_projects, value))
+                .cloned()
+                .collect(),
+        },
+    ];
+    if item.notes != metadata.notes {
         events.push(CatalogueEvent::MediaNotesSet {
-            media_id: media_id.into(),
+            media_id: item.id.clone(),
             value: metadata.notes.clone(),
         });
     }
-    if metadata.favourite {
+    if item.favourite != metadata.favourite {
         events.push(CatalogueEvent::MediaFavouriteSet {
-            media_id: media_id.into(),
-            value: true,
+            media_id: item.id.clone(),
+            value: metadata.favourite,
         });
     }
+    events.retain(|event| match event {
+        CatalogueEvent::MediaTagsAdded { values, .. }
+        | CatalogueEvent::MediaTagsRemoved { values, .. }
+        | CatalogueEvent::MediaProjectsAdded { values, .. }
+        | CatalogueEvent::MediaProjectsRemoved { values, .. } => !values.is_empty(),
+        _ => true,
+    });
     events
 }
 
@@ -1084,7 +1116,7 @@ fn commit_job_file(
         }
         file.media_id = existing.id.clone();
         item.id = existing.id.clone();
-        events.extend(metadata_events(&existing.id, &file.metadata));
+        events.extend(metadata_update_events(existing, &file.metadata));
     } else {
         events.push(CatalogueEvent::MediaRegistered {
             media: item.clone(),
@@ -1306,7 +1338,23 @@ fn kick_ingest_worker(app: AppHandle) {
             .ok()
             .flatten();
             let Some(job_id) = next else {
-                *state.worker_active.lock().unwrap() = false;
+                // Close the enqueue/worker-exit race while holding the same
+                // job-store lock used by start_ingest. If a producer queued
+                // work after the first snapshot it observed worker_active=true;
+                // keep this worker alive to claim it.
+                let queued_after_snapshot = {
+                    let _jobs_guard = state.job_store.lock().unwrap();
+                    let queued = load_jobs_unlocked(&app)
+                        .map(|jobs| jobs.iter().any(|job| job.state == "queued"))
+                        .unwrap_or(false);
+                    if !queued {
+                        *state.worker_active.lock().unwrap() = false;
+                    }
+                    queued
+                };
+                if queued_after_snapshot {
+                    continue;
+                }
                 break;
             };
             if let Err(error) = process_ingest_job(&app, &job_id) {
@@ -1547,7 +1595,13 @@ fn update_ingest_file_metadata(
     if let Some(media_id) = completed_media_id {
         let settings = load_settings_file(&app)?;
         let _guard = state.catalogue_write.lock().unwrap();
-        append_events(&settings, metadata_events(&media_id, &normalized_metadata))?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let media = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or("Completed ingest media is missing from the catalogue")?;
+        append_events(&settings, metadata_update_events(media, &normalized_metadata))?;
         let _ = app.emit("catalogue-changed", ());
     }
     Ok(job)
@@ -2240,34 +2294,89 @@ mod tests {
     }
 
     #[test]
-    fn provisional_metadata_becomes_authoritative_events_after_registration() {
+    fn completed_job_metadata_becomes_authoritative_events() {
         let metadata = ingest_job("queued", "queued")
             .files
             .into_iter()
             .next()
             .unwrap()
             .metadata;
+        let root = temporary("metadata-add-events");
+        let path = root.join("clip.mp4");
+        fs::write(&path, b"media").unwrap();
+        let media = new_media(
+            &path,
+            "20261024/clip.mp4".into(),
+            sha256(&path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
-            metadata_events("media-1", &metadata),
+            metadata_update_events(&media, &metadata),
             vec![
                 CatalogueEvent::MediaTagsAdded {
-                    media_id: "media-1".into(),
+                    media_id: media.id.clone(),
                     values: vec!["Interview".into()],
                 },
                 CatalogueEvent::MediaProjectsAdded {
-                    media_id: "media-1".into(),
+                    media_id: media.id.clone(),
                     values: vec!["project-1".into()],
                 },
                 CatalogueEvent::MediaNotesSet {
-                    media_id: "media-1".into(),
+                    media_id: media.id.clone(),
                     value: "Retain through restart".into(),
                 },
                 CatalogueEvent::MediaFavouriteSet {
-                    media_id: "media-1".into(),
+                    media_id: media.id.clone(),
                     value: true,
                 },
             ]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_job_metadata_can_be_cleared_without_replacing_concurrent_additions() {
+        let root = temporary("metadata-update-events");
+        let path = root.join("clip.mp4");
+        fs::write(&path, b"media").unwrap();
+        let mut media = new_media(
+            &path,
+            "20261024/clip.mp4".into(),
+            sha256(&path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        media.tags = vec!["Race".into()];
+        media.project_ids = vec!["project-1".into()];
+        media.notes = "Old note".into();
+        media.favourite = true;
+        assert_eq!(
+            metadata_update_events(&media, &ProvisionalMetadata::default()),
+            vec![
+                CatalogueEvent::MediaTagsRemoved {
+                    media_id: media.id.clone(),
+                    values: vec!["Race".into()],
+                },
+                CatalogueEvent::MediaProjectsRemoved {
+                    media_id: media.id.clone(),
+                    values: vec!["project-1".into()],
+                },
+                CatalogueEvent::MediaNotesSet {
+                    media_id: media.id.clone(),
+                    value: String::new(),
+                },
+                CatalogueEvent::MediaFavouriteSet {
+                    media_id: media.id.clone(),
+                    value: false,
+                },
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

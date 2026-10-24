@@ -75,6 +75,7 @@ export function App() {
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
   const catalogueSignature = useRef<string | undefined>(undefined);
+  const metadataWrites = useRef(new Map<string, Promise<void>>());
 
   const configured = Boolean(settings.initializedCataloguePath);
   const refresh = async () => setCatalogue(await desktopBridge.loadCatalogue());
@@ -163,9 +164,12 @@ export function App() {
   useEffect(() => {
     if (!native || !configured) return;
     const timer = window.setInterval(() => {
-      void desktopBridge.refreshMediaAvailability().then(async (changed) => {
-        if (changed) setCatalogue(await desktopBridge.loadCatalogue());
-      });
+      void desktopBridge
+        .refreshMediaAvailability()
+        .then(async (changed) => {
+          if (changed) setCatalogue(await desktopBridge.loadCatalogue());
+        })
+        .catch(() => undefined);
     }, 3_000);
     return () => window.clearInterval(timer);
   }, [configured, native]);
@@ -323,9 +327,20 @@ export function App() {
             },
       ),
     );
-    void desktopBridge
-      .updateIngestFileMetadata(jobId, fileId, metadata)
+    const key = `${jobId}:${fileId}`;
+    const previous = metadataWrites.current.get(key) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() =>
+        desktopBridge.updateIngestFileMetadata(jobId, fileId, metadata),
+      )
+      .then(() => undefined)
       .catch((reason) => setError(errorText(reason)));
+    metadataWrites.current.set(key, next);
+    void next.finally(() => {
+      if (metadataWrites.current.get(key) === next)
+        metadataWrites.current.delete(key);
+    });
   };
   const updateSelection = async (next: {
     addTags?: string[];
