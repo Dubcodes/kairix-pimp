@@ -249,6 +249,26 @@ fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn load_jobs_unlocked(app: &AppHandle) -> Result<Vec<IngestJob>, String> {
     read_json(&jobs_path(app)?)
 }
+const RETAINED_TERMINAL_JOBS: usize = 100;
+
+fn prune_terminal_jobs(jobs: &mut Vec<IngestJob>) {
+    let terminal_count = jobs
+        .iter()
+        .filter(|job| matches!(job.state.as_str(), "completed" | "cancelled" | "failed"))
+        .count();
+    let mut remove = terminal_count.saturating_sub(RETAINED_TERMINAL_JOBS);
+    jobs.retain(|job| {
+        if remove > 0
+            && matches!(job.state.as_str(), "completed" | "cancelled" | "failed")
+        {
+            remove -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 fn mutate_jobs<T>(
     app: &AppHandle,
     state: &NativeState,
@@ -257,6 +277,7 @@ fn mutate_jobs<T>(
     let _guard = state.job_store.lock().unwrap();
     let mut jobs = load_jobs_unlocked(app)?;
     let result = operation(&mut jobs)?;
+    prune_terminal_jobs(&mut jobs);
     write_json(&jobs_path(app)?, &jobs)?;
     let _ = app.emit("ingest-jobs-changed", &jobs);
     Ok(result)
@@ -1379,6 +1400,33 @@ fn validate_job_action(state: &str, action: &str) -> Result<(), String> {
     })
 }
 
+fn actionable_ingest_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let guidance = if lower.contains("not enough space")
+        || lower.contains("no space left")
+        || lower.contains("disk full")
+    {
+        "The destination drive is full. Free space in the Master Bin drive, then retry."
+    } else if lower.contains("cannot read source")
+        || lower.contains("interrupted source read")
+        || lower.contains("access is denied")
+        || lower.contains("permission denied")
+    {
+        "The source file could not be read. Reconnect the card, check permissions, then retry."
+    } else if lower.contains("sha-256 verification failed") {
+        "The copied bytes did not match the source. The staged copy was rejected; check the source and destination drives before retrying."
+    } else if lower.contains("source changed during transfer")
+        || lower.contains("source content changed during transfer")
+    {
+        "The source changed during copying. Stop other software from modifying the card, then retry."
+    } else if error == "__race__" || lower.contains("destination exists") {
+        "A file appeared at the destination while copying. Nothing was overwritten; review the collision and choose another name."
+    } else {
+        "The copy could not be completed. Check that the source and Master Bin are connected and writable, then retry."
+    };
+    format!("{guidance} Technical detail: {error}")
+}
+
 fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
     let state = app.state::<NativeState>();
     let settings = load_settings_file(app)?;
@@ -1516,7 +1564,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     &planned.id,
                     "failed",
                     0,
-                    Some(error),
+                    Some(actionable_ingest_error(&error)),
                 )?;
             }
         }
@@ -3221,6 +3269,55 @@ mod tests {
         assert_eq!(inventory.issues.len(), 1);
         assert!(inventory.issues[0].contains("unavailable"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_folder_inventory_is_complete_and_deterministic() {
+        let root = temporary("inventory-large");
+        for directory in 0..8 {
+            let folder = root.join(format!("card-{directory:02}"));
+            fs::create_dir_all(&folder).unwrap();
+            for file in 0..64 {
+                fs::write(folder.join(format!("clip-{file:03}.MXF")), [file as u8]).unwrap();
+            }
+        }
+        let first = build_source_inventory(&[root.to_string_lossy().into()]);
+        let second = build_source_inventory(&[root.to_string_lossy().into()]);
+        assert_eq!(first.copy_file_count, 512);
+        assert_eq!(first.total_file_count, 512);
+        assert_eq!(first.files, second.files);
+        assert!(first.files.iter().all(|file| file.preserve_hierarchy));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ingest_errors_include_recovery_guidance_and_technical_detail() {
+        let full = actionable_ingest_error("Interrupted staging write: no space left on device");
+        assert!(full.contains("destination drive is full"));
+        assert!(full.contains("no space left on device"));
+        let unreadable = actionable_ingest_error("Cannot read source: Access is denied");
+        assert!(unreadable.contains("Reconnect the card"));
+        let mismatch = actionable_ingest_error("Independent SHA-256 verification failed");
+        assert!(mismatch.contains("staged copy was rejected"));
+        let collision = actionable_ingest_error("__race__");
+        assert!(collision.contains("Nothing was overwritten"));
+    }
+
+    #[test]
+    fn job_history_is_bounded_without_removing_active_work() {
+        let mut jobs = Vec::new();
+        for index in 0..125 {
+            let mut job = ingest_job("completed", "completed");
+            job.id = format!("completed-{index}");
+            jobs.push(job);
+        }
+        let mut active = ingest_job("interrupted", "interrupted");
+        active.id = "recoverable-active".into();
+        jobs.insert(0, active);
+        prune_terminal_jobs(&mut jobs);
+        assert_eq!(jobs.len(), RETAINED_TERMINAL_JOBS + 1);
+        assert_eq!(jobs[0].id, "recoverable-active");
+        assert_eq!(jobs[1].id, "completed-25");
     }
 
     #[test]

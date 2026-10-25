@@ -33,16 +33,24 @@ the installed application, not `npm run dev`.
 - [ ] Configure empty **DCM Master Bin** and **Working Projects** directories.
 - [ ] Confirm a new installation selects **Use today's date** by default.
 - [ ] Drag a fixture folder into Ingest and retain the source fixtures.
+- [ ] Review the pre-copy inventory count, bytes, hierarchy-preserved files,
+      exclusions and any issues before starting the ingest.
 - [ ] Confirm background byte/file progress and independently verified results.
 - [ ] While copying, add tags, project assignments, a description and favourite.
 - [ ] Close and reopen PIMP; confirm catalogue and job state persist.
 - [ ] Interrupt a multi-file job, reopen, reconnect its source and explicitly retry.
 - [ ] Re-ingest a duplicate and confirm existing metadata is retained.
 - [ ] Search the Library and confirm generated thumbnails when FFmpeg is present.
+- [ ] Exercise click, Ctrl+click, Shift+click and Ctrl+A selection; batch add and
+      remove tags/projects, set a description and favourite state.
+- [ ] Copy multiple CRLF-separated paths for manual Premiere import and confirm
+      the right-click actions match the visible selection actions.
 - [ ] Confirm **Reveal in Explorer**, **Open date folder** and **Copy path**.
 - [ ] Remove FFmpeg/FFprobe from `PATH`, restart, and confirm the warning while
       verified ingest and ordinary catalogue use remain functional.
 - [ ] Confirm no source file was renamed, changed or deleted.
+- [ ] Safely simulate a removed source and an unavailable/full destination where
+      practical; confirm the job fails with a recovery action plus technical detail.
 
 Record the Windows version, installer filename, commit SHA, FFmpeg version and
 result of every item. A browser test is not evidence for a native checklist item.
@@ -74,3 +82,7 @@ synced instead, add this root-relative pattern to that parent's `.stignore`:
 
 The real two-device result must be recorded before using the beta with production
 media.
+
+Automated tests use two independent disposable catalogue roots and exchange only
+their owned append-only event logs to simulate offline edits and delayed delivery.
+That local simulation is not evidence of a genuine two-machine Syncthing pass.

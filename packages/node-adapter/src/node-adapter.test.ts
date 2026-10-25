@@ -129,6 +129,25 @@ describe('safe ingest', () => {
       false,
     );
   });
+  it('verifies a larger synthetic transfer without modifying its source', async () => {
+    const { source, master } = await fixture();
+    const input = path.join(source, 'large-verified.mov');
+    const bytes = Buffer.alloc(32 * 1024 * 1024, 0x5a);
+    await writeFile(input, bytes);
+    const before = await stat(input);
+    const result = await ingestFile({
+      masterBin: master,
+      sourcePath: input,
+      dateOrganization: 'today',
+      now: new Date(2026, 9, 22),
+    });
+    expect(result.status).toBe('imported');
+    expect((await stat(result.destination)).size).toBe(bytes.length);
+    expect((await stat(input)).size).toBe(before.size);
+    await expect(
+      verifyMatchingChecksums(input, result.destination),
+    ).resolves.toBe(result.media.sha256);
+  });
   it('reports a source removed before ingest', async () => {
     const { source, master } = await fixture();
     await expect(
