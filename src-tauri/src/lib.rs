@@ -1357,6 +1357,12 @@ fn commit_job_file(
     Ok(())
 }
 
+fn all_job_files_completed(job: &IngestJob) -> bool {
+    job.inventory_issues.is_empty()
+        && !job.files.is_empty()
+        && job.files.iter().all(|file| file.state == "completed")
+}
+
 fn finish_job(app: &AppHandle, state: &NativeState, job_id: &str) -> Result<(), String> {
     mutate_jobs(app, state, |jobs| {
         let job = jobs
@@ -1364,10 +1370,7 @@ fn finish_job(app: &AppHandle, state: &NativeState, job_id: &str) -> Result<(), 
             .find(|job| job.id == job_id)
             .ok_or("Ingest job no longer exists")?;
         job.current_file = None;
-        job.state = if job.inventory_issues.is_empty()
-            && !job.files.is_empty()
-            && job.files.iter().all(|file| file.state == "completed")
-        {
+        job.state = if all_job_files_completed(job) {
             "completed"
         } else if job.files.iter().any(|file| file.state == "failed") {
             "failed"
@@ -1888,7 +1891,7 @@ fn initialize_ingest_jobs(
                     .filter(|file| file.state == "completed")
                     .count();
                 job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
-                if job.files_completed == job.files.len() && !job.files.is_empty() {
+                if all_job_files_completed(job) {
                     job.state = "completed".into();
                 }
                 if recovery.needs_review > 0 && job.state == "interrupted" {
@@ -3301,6 +3304,15 @@ mod tests {
         assert!(mismatch.contains("staged copy was rejected"));
         let collision = actionable_ingest_error("__race__");
         assert!(collision.contains("Nothing was overwritten"));
+    }
+
+    #[test]
+    fn unresolved_inventory_issues_prevent_job_completion() {
+        let mut job = ingest_job("copying", "completed");
+        assert!(all_job_files_completed(&job));
+        job.inventory_issues
+            .push("Card folder could not be traversed".into());
+        assert!(!all_job_files_completed(&job));
     }
 
     #[test]

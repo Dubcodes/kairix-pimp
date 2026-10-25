@@ -28,3 +28,16 @@ Absolute device paths, credentials, provider object IDs and mutable upload state
 must remain outside the portable manifest. A future implementation must validate
 canonical paths, verify remote bytes independently and never treat a Syncthing
 replica as an independent backup.
+
+## Manual backup for this beta
+
+PIMP does not upload to Degoo or any other cloud provider. After Premiere Project
+Manager has collected a completed project into DCM Content, close Premiere and
+PIMP, then copy that intact project folder with an existing backup tool to an
+external drive and, if desired, to Degoo. Verify the copied file counts and sizes;
+for critical work, independently hash the backup or use a backup product that
+performs verification. Keep the collected `.prproj` and its media together.
+
+Starting an upload, seeing an upload progress indicator, or receiving a provider
+success message never authorizes deletion from Master Bin or DCM Content. This
+beta implements no automatic source deletion or cleanup.

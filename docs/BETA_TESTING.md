@@ -10,7 +10,8 @@ pass is complete. Do not make it the only copy of production footage.
    commit and download its `Kairix-PIMP-...-unsigned-windows` artifact.
 2. Extract the artifact and run either the NSIS `setup.exe` or MSI installer.
 3. Windows SmartScreen may warn because the beta is not code-signed. Confirm
-   the artifact's commit in `BUILD-INFO.txt` before choosing **Run anyway**.
+   the artifact's commit in `BUILD-INFO.txt` and verify the installer against
+   `SHA256SUMS.txt` before choosing **Run anyway**.
 4. WebView2 is included with current supported Windows versions. If Windows
    reports that it is missing, install the Microsoft WebView2 Evergreen runtime.
 5. FFmpeg is optional. For thumbnails and FFprobe technical metadata, install
@@ -30,6 +31,8 @@ Use newly generated MP4/WAV fixtures and empty directories. Perform this against
 the installed application, not `npm run dev`.
 
 - [ ] Fresh install and first launch create one stable device identity.
+- [ ] Reinstall the same build over the first installation; confirm settings,
+      device identity, catalogue and job history remain intact.
 - [ ] Configure empty **DCM Master Bin** and **Working Projects** directories.
 - [ ] Confirm a new installation selects **Use today's date** by default.
 - [ ] Drag a fixture folder into Ingest and retain the source fixtures.

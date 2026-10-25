@@ -30,7 +30,8 @@ Configure DCM Master Bin itself as the Syncthing folder. If a broader parent dir
 The native host, web frontend, unsigned MSI and NSIS installers build on Windows. Installer signing and upgrades, a notification-based filesystem watcher, safe catalogue-location relocation, folder notes, preview-frame selection and automated Premiere integration remain incomplete.
 
 Successful **Windows beta installer** workflow runs publish a downloadable MSI
-and NSIS installer artifact identified by version, commit and unsigned status.
+and NSIS installer artifact identified by version, commit and unsigned status,
+with SHA-256 checksums for both installers.
 See the [Windows beta installation and acceptance guide](docs/BETA_TESTING.md).
 FFmpeg/FFprobe are optional PATH-based tools: missing tools disable thumbnails
 and technical probing but do not block verified ingest or catalogue work.
@@ -86,7 +87,7 @@ See the [project brief](docs/PROJECT_BRIEF.md), [development roadmap](docs/DEVEL
 - Interrupted jobs retain intent and verified completed files, but an incomplete current file restarts from byte zero when explicitly retried; jobs are not automatically resumed when removable source media may be absent.
 - Metadata conflicts are reported as a count; field-level conflict resolution UI remains planned.
 - Thumbnail cache references are portable and root-validated, but configured-budget eviction remains deferred.
-- No Premiere integration, AI processing, project consolidation, or cleanup is functional yet.
+- Manual multi-path Premiere handoff is available; automated Premiere integration, AI processing, project consolidation, and cleanup are not functional.
 - Unsigned MSI and NSIS bundles build and the packaged native workflow is verified; release signing and upgrade behavior remain unverified.
 
 ## License
