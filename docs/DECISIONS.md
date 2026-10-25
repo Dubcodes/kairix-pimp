@@ -199,3 +199,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** CI builds unsigned MSI and NSIS artifacts identified by version and commit. Versioned beta tags may publish prereleases only after review and merge. FFmpeg/FFprobe remain optional PATH-based tools for this beta. Reveal/open/copy UI actions accept only catalogue media IDs and resolve an existing path canonically beneath Master Bin in the native host.
 - **Consequences:** SmartScreen warnings and optional-media-tool limitations are explicit. The UI receives no arbitrary shell or filesystem capability. Signing, installer upgrades and bundled third-party media binaries remain later release work.
+
+## ADR-026 — Recovery-safe job retention and package-coherent planning
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** Automatically bound only fully completed ingest jobs with no pending metadata or recovery evidence. Failed, cancelled, interrupted and otherwise recoverable jobs remain until a future explicit user-authorized discard operation exists. When separately selected roots would collide, retain deterministic source-root identity in the planned relative path. In original-file mode, detected camera packages use their earliest available member modification time as one package date; independent files continue to use their own times.
+- **Consequences:** Repeated failures can grow the local job store until the user has an explicit discard control, but retry intent and evidence are never silently lost. Package sidecars stay with their media, and pre-copy path previews match queued path planning.

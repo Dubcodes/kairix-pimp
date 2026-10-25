@@ -99,6 +99,7 @@ export interface IngestResult {
 export interface InventoryFile {
   sourcePath: string;
   sourceRelativePath: string;
+  plannedRelativePath: string;
   sizeBytes: number;
   kind: 'video' | 'audio' | 'image' | 'camera-support' | 'unknown';
   analysisSupported: boolean;
@@ -245,8 +246,8 @@ export const desktopBridge = {
     const value = await open({ multiple: false, directory: true });
     return typeof value === 'string' ? value : undefined;
   },
-  inventorySources: (sources: string[]) =>
-    invoke<SourceInventory>('inventory_sources', { sources }),
+  inventorySources: (sources: string[], dateOverride?: string) =>
+    invoke<SourceInventory>('inventory_sources', { sources, dateOverride }),
   startIngest: (request: {
     jobId: string;
     sources: string[];

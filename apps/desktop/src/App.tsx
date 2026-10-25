@@ -177,10 +177,19 @@ export function App() {
   useEffect(() => {
     if (!native || sources.length === 0) return;
     let current = true;
+    const previewDateOverride =
+      dateOverride === 'default'
+        ? undefined
+        : dateOverride === 'choose'
+          ? chosenDate || undefined
+          : dateOverride;
     void desktopBridge
-      .inventorySources(sources)
+      .inventorySources(sources, previewDateOverride)
       .then((result) => {
-        if (current) setInventory(result);
+        if (current) {
+          setInventory(result);
+          setInventoryError('');
+        }
       })
       .catch((reason) => {
         if (current) setInventoryError(errorText(reason));
@@ -191,7 +200,7 @@ export function App() {
     return () => {
       current = false;
     };
-  }, [native, sources]);
+  }, [native, sources, dateOverride, chosenDate]);
   useEffect(() => {
     if (!native || !configured) return;
     let disposed = false;
@@ -1439,6 +1448,14 @@ export function App() {
                     }{' '}
                     will be safely retained without technical analysis.
                   </small>
+                  <details>
+                    <summary>Review planned destination paths</summary>
+                    {inventory.files.map((file) => (
+                      <small key={file.sourcePath}>
+                        {file.sourceRelativePath} → {file.plannedRelativePath}
+                      </small>
+                    ))}
+                  </details>
                   {inventory.excluded.map((item) => (
                     <small key={item.path}>
                       Excluded: {item.path} — {item.reason}

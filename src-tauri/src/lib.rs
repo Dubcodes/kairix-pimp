@@ -91,10 +91,22 @@ struct IngestRequest {
 struct InventoryFile {
     source_path: String,
     source_relative_path: String,
+    #[serde(default)]
+    planned_relative_path: String,
     size_bytes: u64,
     kind: String,
     analysis_supported: bool,
     preserve_hierarchy: bool,
+    #[serde(skip)]
+    source_root_path: String,
+    #[serde(skip)]
+    source_root_label: String,
+    #[serde(skip)]
+    include_source_root: bool,
+    #[serde(skip)]
+    package_key: Option<String>,
+    #[serde(skip)]
+    package_date_source_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -251,16 +263,27 @@ fn load_jobs_unlocked(app: &AppHandle) -> Result<Vec<IngestJob>, String> {
 }
 const RETAINED_TERMINAL_JOBS: usize = 100;
 
+fn job_is_fully_finalized(job: &IngestJob) -> bool {
+    job.state == "completed"
+        && !job.files.is_empty()
+        && job.inventory_issues.is_empty()
+        && job.failures.is_empty()
+        && job.files.iter().all(|file| {
+            file.state == "completed"
+                && file.pending_metadata.is_none()
+                && file.metadata_error.is_none()
+                && file.error.is_none()
+        })
+}
+
 fn prune_terminal_jobs(jobs: &mut Vec<IngestJob>) {
-    let terminal_count = jobs
+    let finalized_count = jobs
         .iter()
-        .filter(|job| matches!(job.state.as_str(), "completed" | "cancelled" | "failed"))
+        .filter(|job| job_is_fully_finalized(job))
         .count();
-    let mut remove = terminal_count.saturating_sub(RETAINED_TERMINAL_JOBS);
+    let mut remove = finalized_count.saturating_sub(RETAINED_TERMINAL_JOBS);
     jobs.retain(|job| {
-        if remove > 0
-            && matches!(job.state.as_str(), "completed" | "cancelled" | "failed")
-        {
+        if remove > 0 && job_is_fully_finalized(job) {
             remove -= 1;
             false
         } else {
@@ -595,6 +618,23 @@ fn package_component(path: &Path) -> bool {
     })
 }
 
+fn camera_package_root(relative: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            continue;
+        };
+        prefix.push(value);
+        if matches!(
+            value.to_string_lossy().to_ascii_uppercase().as_str(),
+            "XDROOT" | "PRIVATE" | "AVCHD" | "BPAV" | "CONTENTS" | "M4ROOT" | "DCIM"
+        ) {
+            return Some(prefix);
+        }
+    }
+    None
+}
+
 fn portable_relative(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -609,6 +649,7 @@ fn inventory_candidate(
     inventory: &mut SourceInventory,
     candidate: &Path,
     relative: &Path,
+    source_root: &Path,
     root_is_package: bool,
 ) {
     let size = candidate.metadata().ok().map(|metadata| metadata.len());
@@ -629,23 +670,31 @@ fn inventory_candidate(
         ));
         return;
     }
-    let mut source_relative = relative.to_path_buf();
-    if root_is_package {
-        if let Some(root_name) = candidate
-            .ancestors()
-            .nth(relative.components().count())
-            .and_then(Path::file_name)
-        {
-            source_relative = PathBuf::from(root_name).join(relative);
-        }
-    }
+    let source_root_path = source_root.to_string_lossy().to_string();
+    let source_root_label = source_root
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let package_key = if root_is_package {
+        Some(source_root_path.clone())
+    } else {
+        camera_package_root(relative)
+            .map(|package_root| source_root.join(package_root).to_string_lossy().to_string())
+    };
     inventory.files.push(InventoryFile {
         source_path: candidate.to_string_lossy().into(),
-        source_relative_path: portable_relative(&source_relative),
+        source_relative_path: portable_relative(relative),
+        planned_relative_path: String::new(),
         size_bytes: size.unwrap_or(0),
         kind: media_kind(candidate).into(),
         analysis_supported: analysis_supported(candidate),
         preserve_hierarchy: root_is_package || package_component(relative),
+        source_root_path,
+        source_root_label,
+        include_source_root: root_is_package,
+        package_key,
+        package_date_source_path: None,
     });
 }
 
@@ -655,7 +704,8 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
         let path = PathBuf::from(source);
         if path.is_file() {
             let relative = PathBuf::from(path.file_name().unwrap_or_default());
-            inventory_candidate(&mut inventory, &path, &relative, false);
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            inventory_candidate(&mut inventory, &path, &relative, root, false);
         } else if path.is_dir() {
             let root_is_package = package_component(&path);
             for result in WalkDir::new(&path).follow_links(false) {
@@ -666,6 +716,7 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
                             &mut inventory,
                             entry.path(),
                             relative,
+                            &path,
                             root_is_package,
                         );
                     }
@@ -684,6 +735,81 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
     }
     inventory.files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
     inventory.files.dedup_by(|left, right| left.source_path == right.source_path);
+    let mut roots = inventory
+        .files
+        .iter()
+        .map(|file| (file.source_root_path.clone(), file.source_root_label.clone()))
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| left.0.cmp(&right.0));
+    roots.dedup_by(|left, right| left.0 == right.0);
+    let mut root_labels = HashMap::new();
+    let mut used_labels = HashSet::new();
+    for (root, label) in roots {
+        let base = if label.trim().is_empty() {
+            "source".to_string()
+        } else {
+            label
+        };
+        let mut candidate = base.clone();
+        let mut suffix = 2;
+        while !used_labels.insert(candidate.to_ascii_lowercase()) {
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        root_labels.insert(root, candidate);
+    }
+    let mut relative_paths = HashMap::<String, usize>::new();
+    for file in &inventory.files {
+        *relative_paths
+            .entry(file.source_relative_path.to_ascii_lowercase())
+            .or_default() += 1;
+    }
+    for file in &mut inventory.files {
+        if file.include_source_root
+            || relative_paths
+                .get(&file.source_relative_path.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0)
+                > 1
+        {
+            let label = root_labels
+                .get(&file.source_root_path)
+                .cloned()
+                .unwrap_or_else(|| "source".into());
+            file.source_relative_path = portable_relative(
+                &PathBuf::from(label).join(&file.source_relative_path),
+            );
+            file.preserve_hierarchy = true;
+        }
+    }
+    let mut package_representatives = HashMap::<String, (Option<std::time::SystemTime>, String)>::new();
+    for file in &inventory.files {
+        let Some(package_key) = &file.package_key else {
+            continue;
+        };
+        let modified = Path::new(&file.source_path)
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        let candidate = (modified, file.source_path.clone());
+        package_representatives
+            .entry(package_key.clone())
+            .and_modify(|current| {
+                let candidate_key = (candidate.0.is_none(), candidate.0, &candidate.1);
+                let current_key = (current.0.is_none(), current.0, &current.1);
+                if candidate_key < current_key {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    for file in &mut inventory.files {
+        if let Some(package_key) = &file.package_key {
+            file.package_date_source_path = package_representatives
+                .get(package_key)
+                .map(|(_, path)| path.clone());
+        }
+    }
     let mut names = HashMap::<String, usize>::new();
     for file in &inventory.files {
         let name = Path::new(&file.source_path)
@@ -707,8 +833,31 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
 }
 
 #[tauri::command]
-fn inventory_sources(sources: Vec<String>) -> SourceInventory {
-    build_source_inventory(&sources)
+fn inventory_sources(
+    app: AppHandle,
+    sources: Vec<String>,
+    date_override: Option<String>,
+) -> Result<SourceInventory, String> {
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let batch_timestamp = Local::now();
+    let mut inventory = build_source_inventory(&sources);
+    for file in &mut inventory.files {
+        let filename = Path::new(&file.source_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        file.planned_relative_path = planned_relative_path(
+            &settings,
+            &master,
+            file,
+            &date_override,
+            &batch_timestamp,
+            &filename,
+        )?;
+    }
+    Ok(inventory)
 }
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
@@ -774,6 +923,48 @@ fn destination_date_from_modified(
         } else {
             "unknown".into()
         },
+    ))
+}
+
+fn planned_relative_path(
+    settings: &DeviceSettings,
+    master: &Path,
+    inventory_file: &InventoryFile,
+    override_date: &Option<String>,
+    batch_timestamp: &DateTime<Local>,
+    filename: &str,
+) -> Result<String, String> {
+    let date_source = inventory_file
+        .package_date_source_path
+        .as_deref()
+        .unwrap_or(&inventory_file.source_path);
+    let (date, _, _) = destination_date(
+        settings,
+        Path::new(date_source),
+        override_date,
+        batch_timestamp,
+    )?;
+    let compact_date = date.replace('-', "");
+    let date_folder = if !settings.master_bin_path.trim().is_empty() && master.join(&date).is_dir()
+    {
+        date
+    } else if !settings.master_bin_path.trim().is_empty() && master.join(&compact_date).is_dir() {
+        compact_date
+    } else {
+        date
+    };
+    let destination_suffix = if inventory_file.preserve_hierarchy {
+        let source_relative = PathBuf::from(&inventory_file.source_relative_path);
+        source_relative
+            .parent()
+            .map(|parent| parent.join(filename))
+            .unwrap_or_else(|| PathBuf::from(filename))
+    } else {
+        PathBuf::from(filename)
+    };
+    Ok(format!(
+        "{date_folder}/{}",
+        portable_relative(&destination_suffix)
     ))
 }
 
@@ -1660,20 +1851,6 @@ fn start_ingest(
     let mut files = Vec::new();
     for inventory_file in &inventory.files {
         let source = PathBuf::from(&inventory_file.source_path);
-        let (date, _, _) = destination_date(
-            &settings,
-            &source,
-            &request.date_override,
-            &batch_timestamp,
-        )?;
-        let compact_date = date.replace('-', "");
-        let date_folder = if master.join(&date).is_dir() {
-            date
-        } else if master.join(&compact_date).is_dir() {
-            compact_date
-        } else {
-            date
-        };
         let filename = request
             .renamed_destinations
             .get(&source.to_string_lossy().to_string())
@@ -1684,19 +1861,14 @@ fn start_ingest(
         {
             return Err(format!("{} has an invalid destination filename", source.display()));
         }
-        let destination_suffix = if inventory_file.preserve_hierarchy {
-            let source_relative = PathBuf::from(&inventory_file.source_relative_path);
-            source_relative
-                .parent()
-                .map(|parent| parent.join(&filename))
-                .unwrap_or_else(|| PathBuf::from(&filename))
-        } else {
-            PathBuf::from(&filename)
-        };
-        let relative_path = format!(
-            "{date_folder}/{}",
-            portable_relative(&destination_suffix)
-        );
+        let relative_path = planned_relative_path(
+            &settings,
+            &master,
+            inventory_file,
+            &request.date_override,
+            &batch_timestamp,
+            &filename,
+        )?;
         let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
         let destination_path = destination.to_string_lossy().to_string();
         let collision = reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
@@ -3264,6 +3436,127 @@ mod tests {
     }
 
     #[test]
+    fn independent_selected_roots_keep_distinct_destination_hierarchies() {
+        let root = temporary("inventory-independent-roots");
+        let card_a = root.join("card-a");
+        let card_b = root.join("card-b");
+        for card in [&card_a, &card_b] {
+            fs::create_dir_all(card.join("XDROOT").join("Clip")).unwrap();
+            fs::write(card.join("clip.mp4"), b"standalone").unwrap();
+            fs::write(
+                card.join("XDROOT").join("Clip").join("clip.mxf"),
+                b"package",
+            )
+            .unwrap();
+        }
+
+        let inventory = build_source_inventory(&[
+            card_a.to_string_lossy().into(),
+            card_b.to_string_lossy().into(),
+        ]);
+        let relative_paths = inventory
+            .files
+            .iter()
+            .map(|file| file.source_relative_path.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(relative_paths.len(), 4);
+        assert!(relative_paths.contains("card-a/clip.mp4"));
+        assert!(relative_paths.contains("card-b/clip.mp4"));
+        assert!(relative_paths.contains("card-a/XDROOT/Clip/clip.mxf"));
+        assert!(relative_paths.contains("card-b/XDROOT/Clip/clip.mxf"));
+
+        let settings = DeviceSettings::default();
+        let batch = Local.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+        let planned = inventory
+            .files
+            .iter()
+            .map(|file| {
+                let filename = Path::new(&file.source_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy();
+                planned_relative_path(
+                    &settings,
+                    Path::new(""),
+                    file,
+                    &None,
+                    &batch,
+                    &filename,
+                )
+                .unwrap()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(planned.len(), 4);
+        assert!(planned.contains("20261026/card-a/clip.mp4"));
+        assert!(planned.contains("20261026/card-b/clip.mp4"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn camera_package_uses_earliest_member_date_without_splitting_sidecars() {
+        let root = temporary("inventory-package-dates");
+        let package = root.join("card").join("XDROOT");
+        let clip = package.join("Clip").join("A001.MXF");
+        let sidecar = package.join("General").join("Sony").join("A001.XML");
+        let standalone = root.join("standalone.mp4");
+        fs::create_dir_all(clip.parent().unwrap()).unwrap();
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(&clip, b"mxf").unwrap();
+        fs::write(&sidecar, b"xml").unwrap();
+        fs::write(&standalone, b"mp4").unwrap();
+        let day_20 = Local.with_ymd_and_hms(2026, 10, 20, 8, 0, 0).unwrap();
+        let day_21 = Local.with_ymd_and_hms(2026, 10, 21, 9, 0, 0).unwrap();
+        let day_22 = Local.with_ymd_and_hms(2026, 10, 22, 10, 0, 0).unwrap();
+        for (path, modified) in [(&clip, day_20), (&sidecar, day_21), (&standalone, day_22)] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(modified.timestamp() as u64),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let inventory = build_source_inventory(&[root.to_string_lossy().into()]);
+        let mut settings = DeviceSettings::default();
+        settings.ingest_date_organization = "original-file-dates".into();
+        let batch = Local.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+        let planned = inventory
+            .files
+            .iter()
+            .map(|file| {
+                let filename = Path::new(&file.source_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy();
+                (
+                    filename.to_string(),
+                    planned_relative_path(
+                        &settings,
+                        Path::new(""),
+                        file,
+                        &None,
+                        &batch,
+                        &filename,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(planned["A001.MXF"], "20261020/card/XDROOT/Clip/A001.MXF");
+        assert_eq!(
+            planned["A001.XML"],
+            "20261020/card/XDROOT/General/Sony/A001.XML"
+        );
+        assert_eq!(planned["standalone.mp4"], "20261022/standalone.mp4");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn missing_sources_are_reported_as_inventory_issues() {
         let root = temporary("inventory-missing");
         let missing = root.join("removed-card");
@@ -3321,6 +3614,7 @@ mod tests {
         for index in 0..125 {
             let mut job = ingest_job("completed", "completed");
             job.id = format!("completed-{index}");
+            job.failures.clear();
             jobs.push(job);
         }
         let mut active = ingest_job("interrupted", "interrupted");
@@ -3330,6 +3624,42 @@ mod tests {
         assert_eq!(jobs.len(), RETAINED_TERMINAL_JOBS + 1);
         assert_eq!(jobs[0].id, "recoverable-active");
         assert_eq!(jobs[1].id, "completed-25");
+    }
+
+    #[test]
+    fn pruning_never_discards_failed_or_cancelled_jobs_with_pending_intent() {
+        let mut jobs = Vec::new();
+        for index in 0..220 {
+            let state = if index % 2 == 0 { "failed" } else { "cancelled" };
+            let mut job = ingest_job(state, state);
+            job.id = format!("recoverable-{index}");
+            job.files[0].metadata.tags = vec![format!("tag-{index}")];
+            job.files[0].metadata.notes = format!("notes-{index}");
+            job.files[0].pending_metadata = Some(job.files[0].metadata.clone());
+            job.files[0].metadata_error = Some("Pending catalogue write".into());
+            jobs.push(job);
+        }
+        for index in 0..125 {
+            let mut job = ingest_job("completed", "completed");
+            job.id = format!("finalized-{index}");
+            job.failures.clear();
+            jobs.push(job);
+        }
+
+        prune_terminal_jobs(&mut jobs);
+
+        assert_eq!(jobs.len(), 220 + RETAINED_TERMINAL_JOBS);
+        let recoverable = jobs
+            .iter()
+            .filter(|job| job.id.starts_with("recoverable-"))
+            .collect::<Vec<_>>();
+        assert_eq!(recoverable.len(), 220);
+        assert!(recoverable.iter().all(|job| {
+            !job.files[0].metadata.tags.is_empty()
+                && !job.files[0].metadata.notes.is_empty()
+                && job.files[0].pending_metadata.is_some()
+                && job.files[0].metadata_error.is_some()
+        }));
     }
 
     #[test]

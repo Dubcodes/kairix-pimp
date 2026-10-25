@@ -157,6 +157,7 @@ describe('native application integration', () => {
         {
           sourcePath: 'E:\\XDROOT\\Clip\\A001.MXF',
           sourceRelativePath: 'XDROOT/Clip/A001.MXF',
+          plannedRelativePath: '20261026/XDROOT/Clip/A001.MXF',
           sizeBytes: 4096,
           kind: 'video',
           analysisSupported: false,
@@ -186,6 +187,9 @@ describe('native application integration', () => {
     expect(
       screen.getByText(/Excluded:.*Syncthing temporary file/),
     ).toBeVisible();
+    expect(
+      screen.getByText('XDROOT/Clip/A001.MXF → 20261026/XDROOT/Clip/A001.MXF'),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: 'Start verified ingest' }),
     ).toBeEnabled();
