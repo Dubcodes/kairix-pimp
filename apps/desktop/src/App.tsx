@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Search,
   Settings,
+  Star,
   Tag,
   UploadCloud,
   UsersRound,
@@ -81,7 +82,15 @@ export function App() {
   const [error, setError] = useState('');
   const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
   const [batchTags, setBatchTags] = useState<string[]>([]);
+  const [removeBatchTags, setRemoveBatchTags] = useState<string[]>([]);
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
+  const [removeBatchProjects, setRemoveBatchProjects] = useState<string[]>([]);
+  const [batchDescription, setBatchDescription] = useState('');
+  const [contextMenu, setContextMenu] = useState<{
+    mediaId: string;
+    x: number;
+    y: number;
+  }>();
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
   const catalogueSignature = useRef<string | undefined>(undefined);
@@ -89,6 +98,7 @@ export function App() {
   const pendingMetadataPatches = useRef(
     new Map<string, ProvisionalMetadataPatch>(),
   );
+  const selectionAnchor = useRef<string | undefined>(undefined);
 
   const configured = Boolean(settings.initializedCataloguePath);
   const refresh = async () => setCatalogue(await desktopBridge.loadCatalogue());
@@ -297,6 +307,32 @@ export function App() {
     () => [...new Set(catalogue.media.flatMap((item) => item.tags))].sort(),
     [catalogue.media],
   );
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (view !== 'Library' || !(event.ctrlKey || event.metaKey)) return;
+      if (event.key.toLowerCase() !== 'a') return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, [contenteditable="true"]')) return;
+      event.preventDefault();
+      setSelected(filtered.map((item) => item.id));
+      selectionAnchor.current = filtered.at(-1)?.id;
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [filtered, view]);
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(undefined);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [contextMenu]);
 
   const saveConfiguration = async () => {
     setError('');
@@ -422,6 +458,10 @@ export function App() {
   const updateSelection = async (next: {
     addTags?: string[];
     addProjectIds?: string[];
+    removeTags?: string[];
+    removeProjectIds?: string[];
+    notes?: string;
+    favourite?: boolean;
   }) => {
     if (!selected.length) return;
     try {
@@ -432,27 +472,77 @@ export function App() {
       setError(errorText(reason));
     }
   };
+  const selectRecording = (
+    mediaId: string,
+    options: { toggle: boolean; range: boolean },
+  ) => {
+    if (options.range && selectionAnchor.current) {
+      const start = filtered.findIndex(
+        (item) => item.id === selectionAnchor.current,
+      );
+      const end = filtered.findIndex((item) => item.id === mediaId);
+      if (start >= 0 && end >= 0) {
+        const [from, to] = start < end ? [start, end] : [end, start];
+        const range = filtered.slice(from, to + 1).map((item) => item.id);
+        setSelected((current) =>
+          options.toggle ? [...new Set([...current, ...range])] : range,
+        );
+        return;
+      }
+    }
+    selectionAnchor.current = mediaId;
+    setSelected((current) => {
+      if (!options.toggle) return [mediaId];
+      return current.includes(mediaId)
+        ? current.filter((id) => id !== mediaId)
+        : [...current, mediaId];
+    });
+  };
   const selectedRecording =
     selected.length === 1
       ? catalogue.media.find((item) => item.id === selected[0])
       : undefined;
+  const contextRecording = contextMenu
+    ? catalogue.media.find((item) => item.id === contextMenu.mediaId)
+    : undefined;
   const runSelectedFileAction = async (
     action: 'reveal' | 'folder' | 'copy',
+    recording = selectedRecording,
   ) => {
-    if (!selectedRecording?.available) return;
+    if (!recording?.available) return;
     setError('');
     try {
       if (action === 'reveal') {
-        await desktopBridge.revealMediaInExplorer(selectedRecording.id);
+        await desktopBridge.revealMediaInExplorer(recording.id);
         setMessage('Recording revealed in Windows Explorer.');
       } else if (action === 'folder') {
-        await desktopBridge.openMediaFolder(selectedRecording.id);
+        await desktopBridge.openMediaFolder(recording.id);
         setMessage('Containing date folder opened in Windows Explorer.');
       } else {
-        const path = await desktopBridge.resolveMediaPath(selectedRecording.id);
+        const path = await desktopBridge.resolveMediaPath(recording.id);
         await navigator.clipboard.writeText(path);
         setMessage('Absolute recording path copied to the clipboard.');
       }
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
+  const copySelectedPaths = async () => {
+    const recordings = selected
+      .map((id) => catalogue.media.find((item) => item.id === id))
+      .filter((item): item is NonNullable<typeof item> => Boolean(item));
+    const available = recordings.filter((item) => item.available);
+    if (!available.length) return;
+    setError('');
+    try {
+      const paths = await Promise.all(
+        available.map((item) => desktopBridge.resolveMediaPath(item.id)),
+      );
+      await navigator.clipboard.writeText(paths.join('\r\n'));
+      const skipped = recordings.length - available.length;
+      setMessage(
+        `${paths.length} media path${paths.length === 1 ? '' : 's'} copied for manual Premiere import${skipped ? `; ${skipped} unavailable item${skipped === 1 ? '' : 's'} skipped` : ''}.`,
+      );
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -975,18 +1065,49 @@ export function App() {
                     </button>
                   </div>
                 ) : (
-                  <div className="cards">
+                  <div
+                    className="cards"
+                    role="listbox"
+                    aria-label="Media library"
+                    aria-multiselectable="true"
+                  >
                     {filtered.map((item) => (
                       <article
                         className={selected.includes(item.id) ? 'selected' : ''}
                         key={item.id}
-                        onClick={() =>
-                          setSelected((current) =>
-                            current.includes(item.id)
-                              ? current.filter((id) => id !== item.id)
-                              : [...current, item.id],
-                          )
-                        }
+                        role="option"
+                        tabIndex={0}
+                        aria-selected={selected.includes(item.id)}
+                        onClick={(event) => {
+                          setContextMenu(undefined);
+                          selectRecording(item.id, {
+                            toggle: event.ctrlKey || event.metaKey,
+                            range: event.shiftKey,
+                          });
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key !== 'Enter' && event.key !== ' ')
+                            return;
+                          event.preventDefault();
+                          selectRecording(item.id, {
+                            toggle: event.ctrlKey || event.metaKey,
+                            range: event.shiftKey,
+                          });
+                        }}
+                        onContextMenu={(event) => {
+                          event.preventDefault();
+                          if (!selected.includes(item.id)) {
+                            selectRecording(item.id, {
+                              toggle: false,
+                              range: false,
+                            });
+                          }
+                          setContextMenu({
+                            mediaId: item.id,
+                            x: event.clientX,
+                            y: event.clientY,
+                          });
+                        }}
                       >
                         <div
                           className={`thumb ${!item.available ? 'unavailable' : ''}`}
@@ -1005,6 +1126,11 @@ export function App() {
                         </div>
                         <div className="card-body">
                           <strong>{item.originalFilename}</strong>
+                          {item.favourite && (
+                            <span className="favourite" aria-label="Favourite">
+                              <Star size={13} fill="currentColor" /> Favourite
+                            </span>
+                          )}
                           <small>{item.relativePath}</small>
                           <div className="pills">
                             {item.tags.map((tag) => (
@@ -1066,6 +1192,20 @@ export function App() {
                   />
                 </div>
                 <div className="batch-combo">
+                  <Tag size={15} />
+                  <SearchableComboBox
+                    label="Remove tags"
+                    mode="multiple"
+                    options={knownTags.map((tag) => ({ id: tag, label: tag }))}
+                    selectedIds={removeBatchTags}
+                    onSelectionChange={(ids) => {
+                      setRemoveBatchTags(ids);
+                      void updateSelection({ removeTags: ids });
+                    }}
+                    placeholder="Remove tags…"
+                  />
+                </div>
+                <div className="batch-combo">
                   <UsersRound size={15} />
                   <SearchableComboBox
                     label="Add projects"
@@ -1081,6 +1221,63 @@ export function App() {
                     }}
                     placeholder="Search projects…"
                   />
+                </div>
+                <div className="batch-combo">
+                  <UsersRound size={15} />
+                  <SearchableComboBox
+                    label="Remove projects"
+                    mode="multiple"
+                    options={catalogue.projects.map((project) => ({
+                      id: project.id,
+                      label: project.name,
+                    }))}
+                    selectedIds={removeBatchProjects}
+                    onSelectionChange={(ids) => {
+                      setRemoveBatchProjects(ids);
+                      void updateSelection({ removeProjectIds: ids });
+                    }}
+                    placeholder="Remove projects…"
+                  />
+                </div>
+                <label className="batch-description">
+                  Description for selection
+                  <input
+                    value={batchDescription}
+                    onChange={(event) =>
+                      setBatchDescription(event.target.value)
+                    }
+                    placeholder="Replace description on selected media"
+                  />
+                  <button
+                    disabled={busy}
+                    onClick={() =>
+                      void updateSelection({ notes: batchDescription })
+                    }
+                  >
+                    Apply description
+                  </button>
+                </label>
+                <div className="file-actions" aria-label="Selection actions">
+                  <button
+                    onClick={() => void updateSelection({ favourite: true })}
+                  >
+                    <Star size={13} /> Favourite
+                  </button>
+                  <button
+                    onClick={() => void updateSelection({ favourite: false })}
+                  >
+                    Remove favourite
+                  </button>
+                  <button
+                    disabled={selected.every(
+                      (id) =>
+                        !catalogue.media.find((item) => item.id === id)
+                          ?.available,
+                    )}
+                    onClick={() => void copySelectedPaths()}
+                  >
+                    <Copy size={13} /> Copy paths for Premiere
+                  </button>
                 </div>
                 {selectedRecording && (
                   <div className="file-actions" aria-label="Recording actions">
@@ -1109,10 +1306,66 @@ export function App() {
                   onClick={() => {
                     setSelected([]);
                     setBatchTags([]);
+                    setRemoveBatchTags([]);
                     setBatchProjects([]);
+                    setRemoveBatchProjects([]);
+                    setBatchDescription('');
+                    selectionAnchor.current = undefined;
                   }}
                 >
                   Clear selection
+                </button>
+              </div>
+            )}
+            {contextMenu && contextRecording && (
+              <div
+                className="context-menu"
+                role="menu"
+                aria-label="Recording context menu"
+                style={{ left: contextMenu.x, top: contextMenu.y }}
+              >
+                <button
+                  role="menuitem"
+                  disabled={!contextRecording.available}
+                  onClick={() => {
+                    setContextMenu(undefined);
+                    void runSelectedFileAction('reveal', contextRecording);
+                  }}
+                >
+                  Reveal in Explorer
+                </button>
+                <button
+                  role="menuitem"
+                  disabled={!contextRecording.available}
+                  onClick={() => {
+                    setContextMenu(undefined);
+                    void runSelectedFileAction('folder', contextRecording);
+                  }}
+                >
+                  Open containing folder
+                </button>
+                <button
+                  role="menuitem"
+                  disabled={!contextRecording.available}
+                  onClick={() => {
+                    setContextMenu(undefined);
+                    void copySelectedPaths();
+                  }}
+                >
+                  Copy path for Premiere
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setContextMenu(undefined);
+                    void updateSelection({
+                      favourite: !contextRecording.favourite,
+                    });
+                  }}
+                >
+                  {contextRecording.favourite
+                    ? 'Remove favourite'
+                    : 'Favourite'}
                 </button>
               </div>
             )}

@@ -292,7 +292,10 @@ export const desktopBridge = {
     projectIds?: string[];
     addTags?: string[];
     addProjectIds?: string[];
+    removeTags?: string[];
+    removeProjectIds?: string[];
     notes?: string;
+    favourite?: boolean;
   }) => invoke<Catalogue>('update_media', { update }),
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),

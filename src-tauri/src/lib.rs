@@ -229,7 +229,10 @@ struct MediaUpdate {
     project_ids: Option<Vec<String>>,
     add_tags: Option<Vec<String>>,
     add_project_ids: Option<Vec<String>>,
+    remove_tags: Option<Vec<String>>,
+    remove_project_ids: Option<Vec<String>>,
     notes: Option<String>,
+    favourite: Option<bool>,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2229,10 +2232,28 @@ async fn update_media(
                 values: normalized(projects),
             });
         }
+        if let Some(tags) = &update.remove_tags {
+            events.push(CatalogueEvent::MediaTagsRemoved {
+                media_id: item.id.clone(),
+                values: normalized(tags),
+            });
+        }
+        if let Some(projects) = &update.remove_project_ids {
+            events.push(CatalogueEvent::MediaProjectsRemoved {
+                media_id: item.id.clone(),
+                values: normalized(projects),
+            });
+        }
         if let Some(notes) = &update.notes {
             events.push(CatalogueEvent::MediaNotesSet {
                 media_id: item.id.clone(),
                 value: notes.clone(),
+            });
+        }
+        if let Some(favourite) = update.favourite {
+            events.push(CatalogueEvent::MediaFavouriteSet {
+                media_id: item.id.clone(),
+                value: favourite,
             });
         }
     }

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Catalogue } from './bridge';
@@ -36,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   mediaToolsStatus: vi.fn(),
   chooseFiles: vi.fn(),
   inventorySources: vi.fn(),
+  updateMedia: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -65,7 +66,7 @@ vi.mock('./bridge', () => ({
     inventorySources: mocks.inventorySources,
     startIngest: vi.fn(),
     cancelIngest: vi.fn(),
-    updateMedia: vi.fn(),
+    updateMedia: mocks.updateMedia,
     createProject: vi.fn(),
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
@@ -125,6 +126,8 @@ describe('native application integration', () => {
       copyFileCount: 0,
       copyBytes: 0,
     });
+    mocks.updateMedia.mockReset();
+    mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -231,11 +234,87 @@ describe('native application integration', () => {
       screen.getByRole('button', { name: /Reveal in Explorer/ }),
     );
     await user.click(screen.getByRole('button', { name: /Open date folder/ }));
-    await user.click(screen.getByRole('button', { name: /Copy path/ }));
+    await user.click(screen.getByRole('button', { name: /^Copy path$/ }));
 
     expect(mocks.revealMediaInExplorer).toHaveBeenCalledWith('media-1');
     expect(mocks.openMediaFolder).toHaveBeenCalledWith('media-1');
     expect(writeText).toHaveBeenCalledWith('C:\\Master\\20261024\\clip.mp4');
+  });
+
+  it('supports desktop selection, batch favourites, multi-path copy and context actions', async () => {
+    mocks.catalogue = {
+      media: ['one', 'two', 'three'].map((name, index) => ({
+        id: `media-${index + 1}`,
+        relativePath: `20261024/${name}.mp4`,
+        originalFilename: `${name}.mp4`,
+        sha256: name,
+        captureDateProvenance: 'unknown' as const,
+        ingestDate: '2026-10-24',
+        fileType: 'mp4',
+        tags: [],
+        projectIds: [],
+        notes: '',
+        favourite: false,
+        technical: { sizeBytes: 10 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.resolveMediaPath.mockImplementation(
+      async (mediaId: string) => `C:\\Master\\${mediaId}.mp4`,
+    );
+    const user = userEvent.setup();
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<App />);
+
+    await user.click(await screen.findByText('one.mp4'));
+    await user.keyboard('{Control>}');
+    await user.click(screen.getByText('three.mp4'));
+    await user.keyboard('{/Control}');
+    expect(screen.getByText('2 selected')).toBeVisible();
+
+    await user.keyboard('{Shift>}');
+    await user.click(screen.getByText('two.mp4'));
+    await user.keyboard('{/Shift}');
+    expect(screen.getByRole('option', { name: /one.mp4/ })).toHaveAttribute(
+      'aria-selected',
+      'false',
+    );
+    expect(screen.getByRole('option', { name: /two.mp4/ })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+
+    await user.keyboard('{Control>}a{/Control}');
+    expect(screen.getByText('3 selected')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Favourite' }));
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['media-1', 'media-2', 'media-3'],
+      favourite: true,
+    });
+
+    await user.click(
+      screen.getByRole('button', { name: /Copy paths for Premiere/ }),
+    );
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        'C:\\Master\\media-1.mp4\r\nC:\\Master\\media-2.mp4\r\nC:\\Master\\media-3.mp4',
+      ),
+    );
+
+    await user.pointer({
+      keys: '[MouseRight]',
+      target: screen.getByText('two.mp4'),
+    });
+    expect(
+      screen.getByRole('menu', { name: 'Recording context menu' }),
+    ).toBeVisible();
   });
 
   it('explains optional feature loss when FFmpeg tools are missing', async () => {
