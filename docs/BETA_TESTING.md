@@ -10,8 +10,9 @@ pass is complete. Do not make it the only copy of production footage.
    commit and download its `Kairix-PIMP-...-unsigned-windows` artifact.
 2. Extract the artifact and run either the NSIS `setup.exe` or MSI installer.
 3. Windows SmartScreen may warn because the beta is not code-signed. Confirm
-   the artifact's commit in `BUILD-INFO.txt` and verify the installer against
-   `SHA256SUMS.txt` before choosing **Run anyway**.
+   the artifact's source and build/test commits in `BUILD-INFO.txt`, then verify
+   the installer against its relative path in `SHA256SUMS.txt` before choosing
+   **Run anyway**.
 4. WebView2 is included with current supported Windows versions. If Windows
    reports that it is missing, install the Microsoft WebView2 Evergreen runtime.
 5. FFmpeg is optional. For thumbnails and FFprobe technical metadata, install

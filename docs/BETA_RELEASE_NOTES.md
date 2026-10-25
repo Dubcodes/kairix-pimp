@@ -1,7 +1,7 @@
 # Kairix PIMP 0.1.0 beta
 
 This is an unsigned Windows beta for disposable-media testing. Confirm the
-source commit in `BUILD-INFO.txt` and verify an installer with
+source and build/test commits in `BUILD-INFO.txt` and verify an installer with
 `SHA256SUMS.txt` before running it.
 
 ## Verified by automated tests and Windows CI

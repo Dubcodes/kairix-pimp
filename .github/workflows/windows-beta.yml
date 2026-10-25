@@ -60,7 +60,10 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $shortSha = '${{ github.sha }}'.Substring(0, 12)
+          $sourceSha = '${{ github.event.pull_request.head.sha || github.sha }}'
+          $buildSha = '${{ github.sha }}'
+          $shortSha = $sourceSha.Substring(0, 12)
+          $bundleRoot = (Resolve-Path src-tauri/target/release/bundle).Path
           $installers = @(
             Get-ChildItem src-tauri/target/release/bundle/msi/*.msi
             Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe
@@ -77,14 +80,16 @@ jobs:
           @(
             "Kairix PIMP Windows beta"
             "Version: $version"
-            "Commit: ${{ github.sha }}"
+            "Source commit: $sourceSha"
+            "Build/test commit: $buildSha"
             "Unsigned: yes"
             "FFmpeg/FFprobe: optional PATH-based tools; not bundled"
             "Windows may display a SmartScreen warning because this internal beta is not code-signed."
           ) | Set-Content src-tauri/target/release/bundle/BUILD-INFO.txt
           $installers | ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-            "$hash  $($_.Name)"
+            $relativePath = [System.IO.Path]::GetRelativePath($bundleRoot, $_.FullName).Replace('\', '/')
+            "$hash  $relativePath"
           } | Set-Content src-tauri/target/release/bundle/SHA256SUMS.txt
 
       - name: Upload unsigned Windows installers
