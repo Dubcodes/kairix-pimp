@@ -88,6 +88,37 @@ struct IngestRequest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct InventoryFile {
+    source_path: String,
+    source_relative_path: String,
+    size_bytes: u64,
+    kind: String,
+    analysis_supported: bool,
+    preserve_hierarchy: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct InventoryExclusion {
+    path: String,
+    reason: String,
+    size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SourceInventory {
+    files: Vec<InventoryFile>,
+    excluded: Vec<InventoryExclusion>,
+    issues: Vec<String>,
+    total_file_count: usize,
+    total_bytes: u64,
+    copy_file_count: usize,
+    copy_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct ProvisionalMetadata {
     #[serde(default)]
     tags: Vec<String>,
@@ -116,6 +147,8 @@ struct IngestJobFile {
     id: String,
     media_id: String,
     source_path: String,
+    #[serde(default)]
+    source_relative_path: String,
     destination_path: String,
     relative_path: String,
     original_filename: String,
@@ -145,6 +178,14 @@ struct IngestJob {
     unsupported: Vec<String>,
     #[serde(default)]
     failures: Vec<String>,
+    #[serde(default)]
+    inventory_excluded: Vec<InventoryExclusion>,
+    #[serde(default)]
+    inventory_issues: Vec<String>,
+    #[serde(default)]
+    inventory_total_file_count: usize,
+    #[serde(default)]
+    inventory_total_bytes: u64,
     current_file: Option<String>,
     bytes_total: u64,
     bytes_transferred: u64,
@@ -456,63 +497,194 @@ fn catalogue_signature(app: AppHandle) -> Result<String, String> {
     let settings = load_settings_file(&app)?;
     catalogue::event_signature(&catalogue_dir(&settings)?)
 }
+fn extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn media_kind(path: &Path) -> &'static str {
+    match extension(path).as_str() {
+        "mp4" | "mov" | "m4v" | "mxf" | "h264" | "h265" | "hevc" | "mts"
+        | "m2ts" | "avi" | "r3d" | "braw" => "video",
+        "wav" | "bwf" | "aif" | "aiff" | "mp3" | "m4a" => "audio",
+        "jpg" | "jpeg" | "png" | "tif" | "tiff" | "dng" | "arw" | "cr2"
+        | "cr3" => "image",
+        "xml" | "xmp" | "bim" | "thm" | "cpi" | "mpl" | "bdm" | "idx"
+        | "ind" | "pro" | "dat" | "bin" | "srt" | "lrv" | "csv" | "json" => {
+            "camera-support"
+        }
+        _ => "unknown",
+    }
+}
+
 fn supported(path: &Path) -> bool {
     matches!(
-        path.extension()
-            .and_then(|x| x.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "mp4" | "mov" | "m4v" | "h264" | "h265" | "hevc" | "wav"
+        extension(path).as_str(),
+        "mp4" | "mov" | "m4v" | "mxf" | "h264" | "h265" | "hevc" | "mts"
+            | "m2ts" | "avi" | "wav" | "bwf" | "aif" | "aiff" | "mp3" | "m4a"
+            | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "dng" | "arw" | "cr2"
+            | "cr3" | "r3d" | "braw"
     )
 }
-fn ignored(path: &Path) -> bool {
+
+fn analysis_supported(path: &Path) -> bool {
+    matches!(extension(path).as_str(), "mp4" | "mov" | "m4v" | "wav")
+}
+
+fn exclusion_reason(path: &Path) -> Option<&'static str> {
     let name = path
         .file_name()
         .and_then(|x| x.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    name.starts_with(".syncthing.")
-        || name.ends_with(".tmp")
+    if path.components().any(|component| component.as_os_str() == ".pimp") {
+        Some("Kairix PIMP application data")
+    } else if name.starts_with(".syncthing.") {
+        Some("Syncthing temporary file")
+    } else if name.contains(".sync-conflict-") {
+        Some("Syncthing conflict copy")
+    } else if name.ends_with(".tmp")
         || name.ends_with(".part")
         || name.ends_with(".partial")
         || name.ends_with(".crdownload")
         || name.contains(".pimp-part-")
-        || name.contains(".sync-conflict-")
-        || path.components().any(|c| c.as_os_str() == ".pimp")
+    {
+        Some("Incomplete or temporary file")
+    } else {
+        None
+    }
 }
-fn source_files(sources: &[String], unsupported: &mut Vec<String>) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+
+fn ignored(path: &Path) -> bool {
+    exclusion_reason(path).is_some()
+}
+
+fn package_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_string_lossy().to_ascii_uppercase().as_str(),
+            "XDROOT" | "PRIVATE" | "AVCHD" | "BPAV" | "CONTENTS" | "M4ROOT" | "DCIM"
+                | "CLIP" | "SUB" | "GENERAL" | "SONY"
+        )
+    })
+}
+
+fn portable_relative(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn inventory_candidate(
+    inventory: &mut SourceInventory,
+    candidate: &Path,
+    relative: &Path,
+    root_is_package: bool,
+) {
+    let size = candidate.metadata().ok().map(|metadata| metadata.len());
+    inventory.total_file_count += 1;
+    inventory.total_bytes += size.unwrap_or(0);
+    if let Some(reason) = exclusion_reason(candidate) {
+        inventory.excluded.push(InventoryExclusion {
+            path: candidate.to_string_lossy().into(),
+            reason: reason.into(),
+            size_bytes: size,
+        });
+        return;
+    }
+    if let Err(error) = File::open(candidate) {
+        inventory.issues.push(format!(
+            "Cannot read discovered file {}: {error}",
+            candidate.display()
+        ));
+        return;
+    }
+    let mut source_relative = relative.to_path_buf();
+    if root_is_package {
+        if let Some(root_name) = candidate
+            .ancestors()
+            .nth(relative.components().count())
+            .and_then(Path::file_name)
+        {
+            source_relative = PathBuf::from(root_name).join(relative);
+        }
+    }
+    inventory.files.push(InventoryFile {
+        source_path: candidate.to_string_lossy().into(),
+        source_relative_path: portable_relative(&source_relative),
+        size_bytes: size.unwrap_or(0),
+        kind: media_kind(candidate).into(),
+        analysis_supported: analysis_supported(candidate),
+        preserve_hierarchy: root_is_package || package_component(relative),
+    });
+}
+
+fn build_source_inventory(sources: &[String]) -> SourceInventory {
+    let mut inventory = SourceInventory::default();
     for source in sources {
         let path = PathBuf::from(source);
         if path.is_file() {
-            if supported(&path) {
-                files.push(path)
-            } else {
-                unsupported.push(source.clone())
-            }
+            let relative = PathBuf::from(path.file_name().unwrap_or_default());
+            inventory_candidate(&mut inventory, &path, &relative, false);
         } else if path.is_dir() {
-            for entry in WalkDir::new(&path)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                let candidate = entry.path();
-                if entry.file_type().is_file() && !ignored(candidate) {
-                    if supported(candidate) {
-                        files.push(candidate.to_path_buf())
-                    } else {
-                        unsupported.push(candidate.to_string_lossy().to_string())
+            let root_is_package = package_component(&path);
+            for result in WalkDir::new(&path).follow_links(false) {
+                match result {
+                    Ok(entry) if entry.file_type().is_file() => {
+                        let relative = entry.path().strip_prefix(&path).unwrap_or(entry.path());
+                        inventory_candidate(
+                            &mut inventory,
+                            entry.path(),
+                            relative,
+                            root_is_package,
+                        );
                     }
+                    Ok(_) => {}
+                    Err(error) => inventory.issues.push(format!(
+                        "Cannot inventory {}: {error}",
+                        error.path().unwrap_or(&path).display()
+                    )),
                 }
             }
         } else {
-            unsupported.push(source.clone())
+            inventory
+                .issues
+                .push(format!("Source is unavailable: {}", path.display()));
         }
     }
-    files.sort();
-    files.dedup();
-    files
+    inventory.files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    inventory.files.dedup_by(|left, right| left.source_path == right.source_path);
+    let mut names = HashMap::<String, usize>::new();
+    for file in &inventory.files {
+        let name = Path::new(&file.source_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        *names.entry(name).or_default() += 1;
+    }
+    for file in &mut inventory.files {
+        let name = Path::new(&file.source_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        file.preserve_hierarchy |= names.get(&name).copied().unwrap_or(0) > 1;
+    }
+    inventory.copy_file_count = inventory.files.len();
+    inventory.copy_bytes = inventory.files.iter().map(|file| file.size_bytes).sum();
+    inventory
+}
+
+#[tauri::command]
+fn inventory_sources(sources: Vec<String>) -> SourceInventory {
+    build_source_inventory(&sources)
 }
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
@@ -965,6 +1137,7 @@ fn copy_verified(
 fn new_media(
     source: &Path,
     relative: String,
+    source_relative_path: Option<String>,
     hash: String,
     capture: Option<String>,
     provenance: String,
@@ -979,6 +1152,7 @@ fn new_media(
     Ok(MediaItem {
         id: Uuid::new_v4().to_string(),
         relative_path: relative,
+        source_relative_path,
         original_filename: source.file_name().unwrap().to_string_lossy().to_string(),
         sha256: hash,
         capture_date: capture,
@@ -1105,6 +1279,7 @@ fn commit_job_file(
     let mut item = new_media(
         &destination,
         file.relative_path.clone(),
+        Some(file.source_relative_path.clone()),
         hash,
         capture,
         provenance,
@@ -1165,7 +1340,10 @@ fn finish_job(app: &AppHandle, state: &NativeState, job_id: &str) -> Result<(), 
             .find(|job| job.id == job_id)
             .ok_or("Ingest job no longer exists")?;
         job.current_file = None;
-        job.state = if job.files.iter().all(|file| file.state == "completed") {
+        job.state = if job.inventory_issues.is_empty()
+            && !job.files.is_empty()
+            && job.files.iter().all(|file| file.state == "completed")
+        {
             "completed"
         } else if job.files.iter().any(|file| file.state == "failed") {
             "failed"
@@ -1415,13 +1593,19 @@ fn start_ingest(
 ) -> Result<IngestJob, String> {
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let mut unsupported = Vec::new();
-    let sources = source_files(&request.sources, &mut unsupported);
+    let inventory = build_source_inventory(&request.sources);
+    let unsupported = inventory
+        .files
+        .iter()
+        .filter(|file| !file.analysis_supported)
+        .map(|file| file.source_path.clone())
+        .collect();
     let batch_timestamp = Local::now();
     let reserved = active_destination_reservations(&snapshot_jobs(&app, &state)?);
     let mut planned_paths = HashSet::new();
     let mut files = Vec::new();
-    for source in sources {
+    for inventory_file in &inventory.files {
+        let source = PathBuf::from(&inventory_file.source_path);
         let (date, _, _) = destination_date(
             &settings,
             &source,
@@ -1446,7 +1630,19 @@ fn start_ingest(
         {
             return Err(format!("{} has an invalid destination filename", source.display()));
         }
-        let relative_path = format!("{date_folder}/{filename}").replace('\\', "/");
+        let destination_suffix = if inventory_file.preserve_hierarchy {
+            let source_relative = PathBuf::from(&inventory_file.source_relative_path);
+            source_relative
+                .parent()
+                .map(|parent| parent.join(&filename))
+                .unwrap_or_else(|| PathBuf::from(&filename))
+        } else {
+            PathBuf::from(&filename)
+        };
+        let relative_path = format!(
+            "{date_folder}/{}",
+            portable_relative(&destination_suffix)
+        );
         let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
         let destination_path = destination.to_string_lossy().to_string();
         let collision = reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
@@ -1454,10 +1650,11 @@ fn start_ingest(
             id: Uuid::new_v4().to_string(),
             media_id: Uuid::new_v4().to_string(),
             source_path: source.to_string_lossy().to_string(),
+            source_relative_path: inventory_file.source_relative_path.clone(),
             destination_path,
             relative_path,
             original_filename: source.file_name().unwrap().to_string_lossy().to_string(),
-            size_bytes: source.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            size_bytes: inventory_file.size_bytes,
             bytes_transferred: 0,
             state: if collision { "failed" } else { "queued" }.into(),
             error: collision.then(|| "Another queued ingest already reserves this destination".into()),
@@ -1468,7 +1665,7 @@ fn start_ingest(
     }
     let now = Utc::now().to_rfc3339();
     let job = IngestJob {
-        schema_version: 2,
+        schema_version: 3,
         id: request.job_id,
         state: if files.iter().any(|file| file.state == "queued") {
             "queued"
@@ -1487,6 +1684,10 @@ fn start_ingest(
         files,
         unsupported,
         failures: Vec::new(),
+        inventory_excluded: inventory.excluded,
+        inventory_issues: inventory.issues,
+        inventory_total_file_count: inventory.total_file_count,
+        inventory_total_bytes: inventory.total_bytes,
     };
     mutate_jobs(&app, &state, |jobs| {
         if jobs.iter().any(|existing| existing.id == job.id) {
@@ -2189,7 +2390,7 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
         } else {
             let (_, capture, provenance) =
                 destination_date(&settings, path, &None, &batch_timestamp)?;
-            let item = new_media(path, relative.clone(), hash, capture, provenance, true)?;
+            let item = new_media(path, relative.clone(), None, hash, capture, provenance, true)?;
             events.push(CatalogueEvent::MediaRegistered { media: item });
         }
         observations.verified(&relative);
@@ -2518,6 +2719,7 @@ pub fn run() {
             load_catalogue,
             catalogue_signature,
             refresh_media_availability,
+            inventory_sources,
             start_ingest,
             initialize_ingest_jobs,
             list_ingest_jobs,
@@ -2567,6 +2769,7 @@ mod tests {
                 id: "file-1".into(),
                 media_id: "media-1".into(),
                 source_path: "missing-source.mp4".into(),
+                source_relative_path: "missing-source.mp4".into(),
                 destination_path: "master/20261024/clip.mp4".into(),
                 relative_path: "20261024/clip.mp4".into(),
                 original_filename: "clip.mp4".into(),
@@ -2591,6 +2794,10 @@ mod tests {
             }],
             unsupported: Vec::new(),
             failures: vec!["previous failure".into()],
+            inventory_excluded: Vec::new(),
+            inventory_issues: Vec::new(),
+            inventory_total_file_count: 1,
+            inventory_total_bytes: 12,
             current_file: Some("clip.mp4".into()),
             bytes_total: 12,
             bytes_transferred: 5,
@@ -2607,6 +2814,7 @@ mod tests {
         let media = new_media(
             &destination,
             "20261024/clip.mp4".into(),
+            None,
             sha256(&destination).unwrap(),
             None,
             "unknown".into(),
@@ -2617,6 +2825,7 @@ mod tests {
             id: "file-1".into(),
             media_id: media.id.clone(),
             source_path: root.join("missing-card.mp4").to_string_lossy().into(),
+            source_relative_path: "missing-card.mp4".into(),
             destination_path: destination.to_string_lossy().into(),
             relative_path: media.relative_path.clone(),
             original_filename: "clip.mp4".into(),
@@ -2805,6 +3014,7 @@ mod tests {
         let media = new_media(
             &path,
             "20261024/clip.mp4".into(),
+            None,
             sha256(&path).unwrap(),
             None,
             "unknown".into(),
@@ -2843,6 +3053,7 @@ mod tests {
         let mut media = new_media(
             &path,
             "20261024/clip.mp4".into(),
+            None,
             sha256(&path).unwrap(),
             None,
             "unknown".into(),
@@ -2928,10 +3139,67 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_initial_media_extensions() {
+    fn accepts_common_production_media_extensions() {
         assert!(supported(Path::new("clip.MP4")));
+        assert!(supported(Path::new("clip.MXF")));
+        assert!(supported(Path::new("camera.MTS")));
         assert!(supported(Path::new("audio.wav")));
+        assert!(supported(Path::new("audio.BWF")));
+        assert!(supported(Path::new("still.CR3")));
         assert!(!supported(Path::new("project.prproj")));
+    }
+
+    #[test]
+    fn inventories_camera_packages_unknown_files_and_exclusions_without_silent_loss() {
+        let root = temporary("inventory-package");
+        let card = root.join("XDROOT");
+        fs::create_dir_all(card.join("Clip")).unwrap();
+        fs::create_dir_all(card.join("General").join("Sony")).unwrap();
+        fs::write(card.join("Clip").join("A001.MXF"), b"video").unwrap();
+        fs::write(card.join("General").join("Sony").join("A001.XML"), b"sidecar").unwrap();
+        fs::write(card.join("vendor.future"), b"future").unwrap();
+        fs::write(card.join(".syncthing.A002.MXF.tmp"), b"partial").unwrap();
+
+        let inventory = build_source_inventory(&[card.to_string_lossy().into()]);
+        assert_eq!(inventory.total_file_count, 4);
+        assert_eq!(inventory.copy_file_count, 3);
+        assert_eq!(inventory.excluded.len(), 1);
+        assert!(inventory.issues.is_empty());
+        assert!(inventory.files.iter().all(|file| file.preserve_hierarchy));
+        assert!(inventory
+            .files
+            .iter()
+            .any(|file| file.source_relative_path == "XDROOT/Clip/A001.MXF"));
+        assert!(inventory
+            .files
+            .iter()
+            .any(|file| file.kind == "unknown" && !file.analysis_supported));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_basenames_preserve_their_relative_paths() {
+        let root = temporary("inventory-duplicates");
+        fs::create_dir_all(root.join("card-a")).unwrap();
+        fs::create_dir_all(root.join("card-b")).unwrap();
+        fs::write(root.join("card-a").join("clip.mp4"), b"one").unwrap();
+        fs::write(root.join("card-b").join("clip.mp4"), b"two").unwrap();
+
+        let inventory = build_source_inventory(&[root.to_string_lossy().into()]);
+        assert_eq!(inventory.copy_file_count, 2);
+        assert!(inventory.files.iter().all(|file| file.preserve_hierarchy));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_sources_are_reported_as_inventory_issues() {
+        let root = temporary("inventory-missing");
+        let missing = root.join("removed-card");
+        let inventory = build_source_inventory(&[missing.to_string_lossy().into()]);
+        assert_eq!(inventory.copy_file_count, 0);
+        assert_eq!(inventory.issues.len(), 1);
+        assert!(inventory.issues[0].contains("unavailable"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3196,6 +3464,7 @@ mod tests {
         let media = new_media(
             &destination,
             "2026-10-23/clip.mp4".into(),
+            None,
             sha256(&destination).unwrap(),
             None,
             "unknown".into(),
@@ -3274,6 +3543,7 @@ mod tests {
         let mut media = new_media(
             &destination,
             "2026-10-23/clip.mp4".into(),
+            None,
             sha256(&destination).unwrap(),
             None,
             "unknown".into(),
@@ -3326,6 +3596,7 @@ mod tests {
         let media = new_media(
             &expected,
             "expected/clip.mp4".into(),
+            None,
             sha256(&expected).unwrap(),
             None,
             "unknown".into(),
@@ -3371,6 +3642,7 @@ mod tests {
         let media = new_media(
             &destination,
             "2026-10-23/clip.mp4".into(),
+            None,
             sha256(&destination).unwrap(),
             None,
             "unknown".into(),

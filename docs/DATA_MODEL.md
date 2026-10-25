@@ -27,6 +27,7 @@ The remembered ingest date mode is a device preference, not shared production me
 - Folder and project IDs: UUIDs, independent of names and paths.
 - Paths: normalized relative paths rooted at Master Bin or a project.
 - Date: ISO 8601 value plus `embedded`, `filesystem`, or `unknown` provenance; timezone retained when available.
+- Source provenance: an optional portable source-relative path records the camera-card/package location used at ingest. It never stores a device-local source root in shared metadata.
 - Manual fields include tags, project memberships, notes and favourite state. Incomplete ingest jobs retain these fields as provisional local intent; registration copies them into the media record, while later edits append normal authoritative events.
 - Manual fields and AI results are separate. AI records include model ID/version, time range, generated time, and optional confidence.
 

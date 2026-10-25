@@ -34,6 +34,8 @@ const mocks = vi.hoisted(() => ({
   revealMediaInExplorer: vi.fn(),
   openMediaFolder: vi.fn(),
   mediaToolsStatus: vi.fn(),
+  chooseFiles: vi.fn(),
+  inventorySources: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -59,7 +61,8 @@ vi.mock('./bridge', () => ({
     }),
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
-    chooseFiles: vi.fn(async () => []),
+    chooseFiles: mocks.chooseFiles,
+    inventorySources: mocks.inventorySources,
     startIngest: vi.fn(),
     cancelIngest: vi.fn(),
     updateMedia: vi.fn(),
@@ -110,6 +113,18 @@ describe('native application integration', () => {
       ffmpegAvailable: true,
       ffprobeAvailable: true,
     });
+    mocks.chooseFiles.mockReset();
+    mocks.chooseFiles.mockResolvedValue([]);
+    mocks.inventorySources.mockReset();
+    mocks.inventorySources.mockResolvedValue({
+      files: [],
+      excluded: [],
+      issues: [],
+      totalFileCount: 0,
+      totalBytes: 0,
+      copyFileCount: 0,
+      copyBytes: 0,
+    });
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -130,6 +145,47 @@ describe('native application integration', () => {
         '2 external files registered; 0 changed and 1 still awaiting stability.',
       ),
     ).toBeVisible();
+  });
+
+  it('shows a complete source inventory before enabling ingest', async () => {
+    mocks.chooseFiles.mockResolvedValue(['E:\\XDROOT\\Clip\\A001.MXF']);
+    mocks.inventorySources.mockResolvedValue({
+      files: [
+        {
+          sourcePath: 'E:\\XDROOT\\Clip\\A001.MXF',
+          sourceRelativePath: 'XDROOT/Clip/A001.MXF',
+          sizeBytes: 4096,
+          kind: 'video',
+          analysisSupported: false,
+          preserveHierarchy: true,
+        },
+      ],
+      excluded: [
+        {
+          path: 'E:\\XDROOT\\.syncthing.A002.MXF.tmp',
+          reason: 'Syncthing temporary file',
+          sizeBytes: 4,
+        },
+      ],
+      issues: [],
+      totalFileCount: 2,
+      totalBytes: 4100,
+      copyFileCount: 1,
+      copyBytes: 4096,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(screen.getByRole('button', { name: 'Choose files' }));
+    expect(
+      await screen.findByText('1 of 2 files will be copied (4 KB)'),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/Excluded:.*Syncthing temporary file/),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Start verified ingest' }),
+    ).toBeEnabled();
   });
 
   it('exposes persisted configuration rather than hard-coded paths', async () => {

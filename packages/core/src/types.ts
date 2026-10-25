@@ -36,6 +36,7 @@ export interface TechnicalMetadata {
 export interface MediaItem {
   id: string;
   relativePath: string;
+  sourceRelativePath?: string;
   originalFilename: string;
   sha256: string;
   captureDate?: string;

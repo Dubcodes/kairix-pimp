@@ -40,6 +40,9 @@ pub struct IntegrityEvidence {
 pub struct MediaItem {
     pub id: String,
     pub relative_path: String,
+    /// Original path within the selected camera card/folder, when ingested.
+    #[serde(default)]
+    pub source_relative_path: Option<String>,
     pub original_filename: String,
     pub sha256: String,
     pub capture_date: Option<String>,
@@ -1403,6 +1406,7 @@ mod tests {
         MediaItem {
             id: id.into(),
             relative_path: path.into(),
+            source_relative_path: None,
             original_filename: Path::new(path)
                 .file_name()
                 .unwrap()

@@ -20,6 +20,7 @@ export interface DeviceSettings {
 export interface MediaItem {
   id: string;
   relativePath: string;
+  sourceRelativePath?: string;
   originalFilename: string;
   sha256: string;
   captureDate?: string;
@@ -95,6 +96,28 @@ export interface IngestResult {
   failures: string[];
   cancelled: boolean;
 }
+export interface InventoryFile {
+  sourcePath: string;
+  sourceRelativePath: string;
+  sizeBytes: number;
+  kind: 'video' | 'audio' | 'image' | 'camera-support' | 'unknown';
+  analysisSupported: boolean;
+  preserveHierarchy: boolean;
+}
+export interface InventoryExclusion {
+  path: string;
+  reason: string;
+  sizeBytes?: number;
+}
+export interface SourceInventory {
+  files: InventoryFile[];
+  excluded: InventoryExclusion[];
+  issues: string[];
+  totalFileCount: number;
+  totalBytes: number;
+  copyFileCount: number;
+  copyBytes: number;
+}
 export type IngestJobState =
   | 'queued'
   | 'copying'
@@ -118,6 +141,7 @@ export interface IngestJobFile {
   id: string;
   mediaId: string;
   sourcePath: string;
+  sourceRelativePath?: string;
   destinationPath: string;
   relativePath: string;
   originalFilename: string;
@@ -140,6 +164,10 @@ export interface IngestJob {
   files: IngestJobFile[];
   unsupported: string[];
   failures: string[];
+  inventoryExcluded?: InventoryExclusion[];
+  inventoryIssues?: string[];
+  inventoryTotalFileCount?: number;
+  inventoryTotalBytes?: number;
   currentFile?: string;
   bytesTotal: number;
   bytesTransferred: number;
@@ -179,7 +207,35 @@ export const desktopBridge = {
       filters: [
         {
           name: 'Camera media',
-          extensions: ['mp4', 'mov', 'm4v', 'h264', 'h265', 'hevc', 'wav'],
+          extensions: [
+            'mp4',
+            'mov',
+            'm4v',
+            'mxf',
+            'h264',
+            'h265',
+            'hevc',
+            'mts',
+            'm2ts',
+            'avi',
+            'r3d',
+            'braw',
+            'wav',
+            'bwf',
+            'aif',
+            'aiff',
+            'mp3',
+            'm4a',
+            'jpg',
+            'jpeg',
+            'png',
+            'tif',
+            'tiff',
+            'dng',
+            'arw',
+            'cr2',
+            'cr3',
+          ],
         },
       ],
     });
@@ -189,6 +245,8 @@ export const desktopBridge = {
     const value = await open({ multiple: false, directory: true });
     return typeof value === 'string' ? value : undefined;
   },
+  inventorySources: (sources: string[]) =>
+    invoke<SourceInventory>('inventory_sources', { sources }),
   startIngest: (request: {
     jobId: string;
     sources: string[];

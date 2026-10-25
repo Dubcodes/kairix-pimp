@@ -38,7 +38,7 @@ The frontend never receives broad arbitrary-filesystem permission. A host comman
 
 The implemented single-file reference transaction:
 
-1. Snapshot source metadata and select capture date with provenance.
+1. Inventory every discovered source file, report exclusions/read failures, classify analysis support, and select capture date with provenance.
 2. Resolve a destination under `media/YYYY-MM-DD` and enforce its canonical root.
 3. Recognize an identical hash as a duplicate; reject different content at an existing path.
 4. Record the operation in a device-local journal and stream to an application-owned staging sibling outside the synchronized Master Bin.
@@ -46,7 +46,7 @@ The implemented single-file reference transaction:
 6. Append and flush `media.registered` only after successful promotion. A persistence failure leaves a verified orphan that conservative discovery can recover; it never rolls back by deleting the media.
 7. Probe and preview as separately retryable work; their failure does not invalidate the verified ingest.
 
-Long work executes outside the render thread through a device-local versioned job store. Jobs retain source inventory, destination reservations, per-file and aggregate progress, failures, and provisional tags, projects, notes and favourite state. One bounded worker processes jobs sequentially. Copying and hashing occur without the catalogue write mutex; only registration and event append use the narrow write critical section. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence.
+Long work executes outside the render thread through a device-local versioned job store. Jobs retain source inventory totals, source-relative paths, deliberate exclusions, inventory issues, destination reservations, per-file and aggregate progress, failures, and provisional tags, projects, notes and favourite state. Camera-package paths and duplicate basenames preserve hierarchy; ordinary unique selections still use the compact date/filename layout. One bounded worker processes jobs sequentially. Copying and hashing occur without the catalogue write mutex; only registration and event append use the narrow write critical section. A lifecycle journal remains through verified promotion and is removed only after catalogue persistence.
 
 Startup does not assume removable sources are present: queued, copying and verifying work becomes interrupted and waits for explicit retry. Recovery verifies promoted path, size, checksum and catalogue identity before registration, never removes a promoted destination and preserves ambiguous state for review. Completed files are checkpoints and are not copied again; an incomplete file restarts from byte zero because byte-offset resume is not implemented. Provisional metadata stays local until verified registration, then enters the authoritative event stream. This ingest job manager is the foundation for future enrichment, consolidation and cleanup jobs; those job types are not implemented.
 

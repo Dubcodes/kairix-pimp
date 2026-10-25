@@ -32,6 +32,7 @@ import {
   type IngestResult,
   type MediaToolsStatus,
   type ProvisionalMetadataPatch,
+  type SourceInventory,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
 
@@ -70,6 +71,9 @@ export function App() {
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [jobsOpen, setJobsOpen] = useState(false);
   const [startingIngest, setStartingIngest] = useState(false);
+  const [inventory, setInventory] = useState<SourceInventory>();
+  const [inventoryLoading, setInventoryLoading] = useState(false);
+  const [inventoryError, setInventoryError] = useState('');
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -112,9 +116,12 @@ export function App() {
       desktopBridge.loadSettings(),
       desktopBridge.onProgress(setProgress),
       desktopBridge.onIngestJobsChanged(receiveJobs),
-      desktopBridge.onFileDrop((paths) =>
-        setSources((current) => [...new Set([...current, ...paths])]),
-      ),
+      desktopBridge.onFileDrop((paths) => {
+        setInventory(undefined);
+        setInventoryError('');
+        setInventoryLoading(true);
+        setSources((current) => [...new Set([...current, ...paths])]);
+      }),
       desktopBridge.mediaToolsStatus(),
     ])
       .then(
@@ -156,6 +163,25 @@ export function App() {
       stopDrop?.();
     };
   }, [native]);
+
+  useEffect(() => {
+    if (!native || sources.length === 0) return;
+    let current = true;
+    void desktopBridge
+      .inventorySources(sources)
+      .then((result) => {
+        if (current) setInventory(result);
+      })
+      .catch((reason) => {
+        if (current) setInventoryError(errorText(reason));
+      })
+      .finally(() => {
+        if (current) setInventoryLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [native, sources]);
   useEffect(() => {
     if (!native || !configured) return;
     let disposed = false;
@@ -299,11 +325,21 @@ export function App() {
   };
   const addFiles = async () => {
     const chosen = await desktopBridge.chooseFiles();
-    setSources((current) => [...new Set([...current, ...chosen])]);
+    if (chosen.length) {
+      setInventory(undefined);
+      setInventoryError('');
+      setInventoryLoading(true);
+      setSources((current) => [...new Set([...current, ...chosen])]);
+    }
   };
   const addFolder = async () => {
     const path = await desktopBridge.chooseFolder();
-    if (path) setSources((current) => [...new Set([...current, path])]);
+    if (path) {
+      setInventory(undefined);
+      setInventoryError('');
+      setInventoryLoading(true);
+      setSources((current) => [...new Set([...current, path])]);
+    }
   };
   const ingest = async (renamedDestinations: Record<string, string> = {}) => {
     if (!sources.length) return;
@@ -325,6 +361,9 @@ export function App() {
       });
       setJobs((current) => [...current, job]);
       setSources([]);
+      setInventory(undefined);
+      setInventoryLoading(false);
+      setInventoryError('');
       setConflicts([]);
       setRenames({});
       setJobsOpen(true);
@@ -578,11 +617,14 @@ export function App() {
                     )}
                     {['failed', 'cancelled', 'interrupted'].includes(
                       job.state,
-                    ) && (
-                      <button onClick={() => desktopBridge.retryIngest(job.id)}>
-                        Retry
-                      </button>
-                    )}
+                    ) &&
+                      (job.inventoryIssues?.length ?? 0) === 0 && (
+                        <button
+                          onClick={() => desktopBridge.retryIngest(job.id)}
+                        >
+                          Retry
+                        </button>
+                      )}
                     {!['completed', 'cancelled'].includes(job.state) && (
                       <button
                         onClick={() => desktopBridge.cancelIngest(job.id)}
@@ -596,6 +638,19 @@ export function App() {
                   value={job.bytesTransferred}
                   max={job.bytesTotal || 1}
                 />
+                {(job.inventoryExcluded?.length ?? 0) > 0 && (
+                  <small>
+                    {job.inventoryExcluded?.length} deliberately excluded
+                    temporary or application file
+                    {job.inventoryExcluded?.length === 1 ? '' : 's'}.
+                  </small>
+                )}
+                {job.inventoryIssues?.map((issue) => (
+                  <small className="job-error" key={issue}>
+                    Inventory incomplete: {issue}. Fix the source and create a
+                    new ingest.
+                  </small>
+                ))}
                 <div className="job-files">
                   {job.files.map((file) => (
                     <div className="job-file" key={file.id}>
@@ -1092,6 +1147,9 @@ export function App() {
                     className="link"
                     onClick={() => {
                       setSources([]);
+                      setInventory(undefined);
+                      setInventoryLoading(false);
+                      setInventoryError('');
                       setConflicts([]);
                       setRenames({});
                     }}
@@ -1101,8 +1159,47 @@ export function App() {
                 </div>
               ) : (
                 <small className="pending">
-                  MP4, MOV, H.264/H.265 and WAV. Unsupported files are reported.
+                  Camera video, audio, stills, sidecars, and package support
+                  files are inventoried before copying.
                 </small>
+              )}
+              {inventoryLoading && (
+                <small className="pending">
+                  Inventorying selected sources…
+                </small>
+              )}
+              {inventory && (
+                <div className="source-list" aria-label="Source inventory">
+                  <strong>
+                    {inventory.copyFileCount} of {inventory.totalFileCount}{' '}
+                    files will be copied ({size(inventory.copyBytes)})
+                  </strong>
+                  <small>
+                    {
+                      inventory.files.filter((file) => file.preserveHierarchy)
+                        .length
+                    }{' '}
+                    preserve their camera-folder path;{' '}
+                    {
+                      inventory.files.filter((file) => !file.analysisSupported)
+                        .length
+                    }{' '}
+                    will be safely retained without technical analysis.
+                  </small>
+                  {inventory.excluded.map((item) => (
+                    <small key={item.path}>
+                      Excluded: {item.path} — {item.reason}
+                    </small>
+                  ))}
+                  {inventory.issues.map((issue) => (
+                    <small className="error" key={issue}>
+                      Inventory issue: {issue}
+                    </small>
+                  ))}
+                </div>
+              )}
+              {inventoryError && (
+                <small className="error">{inventoryError}</small>
               )}
               {progress && (
                 <progress
@@ -1177,6 +1274,9 @@ export function App() {
                 className="primary"
                 disabled={
                   startingIngest ||
+                  inventoryLoading ||
+                  !inventory ||
+                  inventory.copyFileCount === 0 ||
                   !sources.length ||
                   (dateOverride === 'choose' && !chosenDate)
                 }
