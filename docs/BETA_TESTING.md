@@ -34,6 +34,9 @@ Use newly generated MP4/WAV fixtures and empty directories. Perform this against
 the installed application, not `npm run dev`.
 
 - [ ] Fresh install and first launch create one stable device identity.
+- [ ] Launch from the installed shortcut and confirm no Command Prompt accompanies PIMP.
+- [ ] Confirm normal launch is visible, a second shortcut launch restores the same window, a tray click and **Show PIMP** restore it, and **Quit PIMP** ends the process.
+- [ ] With FFmpeg installed, trigger probing/thumbnail work and confirm no console window flashes.
 - [ ] Reinstall the same build over the first installation; confirm settings,
       device identity, catalogue and job history remain intact.
 - [ ] Configure empty **DCM Master Bin** and **Working Projects** directories.
@@ -51,7 +54,7 @@ the installed application, not `npm run dev`.
       remove tags/projects, set a description and favourite state.
 - [ ] Copy multiple CRLF-separated paths for manual Premiere import and confirm
       the right-click actions match the visible selection actions.
-- [ ] Confirm **Reveal in Explorer**, **Open date folder** and **Copy path**.
+- [ ] Confirm **Reveal in Explorer** visibly selects disposable files whose names contain spaces, commas and Unicode, including an attached WAV; repeat with an already-open Explorer window and confirm an offline file reports an error.
 - [ ] Remove FFmpeg/FFprobe from `PATH`, restart, and confirm the warning while
       verified ingest and ordinary catalogue use remain functional.
 - [ ] Confirm no source file was renamed, changed or deleted.

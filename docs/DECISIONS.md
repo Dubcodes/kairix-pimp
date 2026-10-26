@@ -236,3 +236,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Treat exactly one same-directory, case-insensitive same-stem WAV beside an MP4/MOV/M4V as the video's attached audio. The relationship remains a deterministic catalogue projection rather than a synchronized event. The Library hides the attached WAV card by default, but searches and logical operations include both physical records; a device-local setting may expose every card.
 - **Consequences:** Late Syncthing arrivals pair on the next catalogue replay without metadata mutation or duplicate records. Ambiguous or unmatched WAV files remain independent. There is no manual override yet; adding one requires a reversible, convergent representation.
+
+## ADR-031 — Windows GUI lifecycle and Shell selection
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Release Windows executables use the GUI subsystem and release-only FFmpeg/FFprobe processes use `CREATE_NO_WINDOW`; debug builds retain consoles. All application restore triggers share show, unminimize and supported focus-request behavior with diagnostic logging and taskbar-attention fallback. File reveal uses `SHOpenFolderAndSelectItems` after media-ID lookup and canonical Master Bin containment.
+- **Consequences:** Installed launches no longer require an attached console, special-character paths avoid `explorer.exe` quoting ambiguity, and foreground restrictions remain governed by Windows rather than bypassed. Installed NSIS acceptance is still required to verify actual shell behavior.

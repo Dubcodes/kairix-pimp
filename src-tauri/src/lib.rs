@@ -23,6 +23,23 @@ use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn should_suppress_child_console(is_windows: bool, debug_build: bool) -> bool {
+    is_windows && !debug_build
+}
+
+fn media_tool_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    if should_suppress_child_console(true, cfg!(debug_assertions)) {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 #[derive(Default)]
 struct NativeState {
     cancelled_jobs: Mutex<HashSet<String>>,
@@ -3152,7 +3169,7 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
         }
         let mut technical = item.technical.clone();
         if needs_probe {
-            if let Ok(output) = Command::new("ffprobe")
+            if let Ok(output) = media_tool_command("ffprobe")
                 .args([
                     "-v",
                     "quiet",
@@ -3192,7 +3209,7 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
             }
         }
         if needs_thumbnail {
-            let _ = Command::new("ffmpeg")
+            let _ = media_tool_command("ffmpeg")
                 .args(["-y", "-ss", "0.1", "-i"])
                 .arg(&source)
                 .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
@@ -3249,8 +3266,14 @@ fn resolve_catalogue_media_path(
         .iter()
         .find(|m| m.id == media_id)
         .ok_or("Unknown media item")?;
-    let path =
-        fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?;
+    let relative = fs_safe::validate_relative(&item.relative_path)?;
+    let master = Path::new(&settings.master_bin_path)
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    if !master.join(relative).is_file() {
+        return Err("This recording is not available locally yet".into());
+    }
+    let path = fs_safe::resolve_existing(&master, &item.relative_path)?;
     if !path.is_file() {
         return Err("This recording is not available locally yet".into());
     }
@@ -3265,18 +3288,85 @@ fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String
         .to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
+    use std::{ffi::c_void, iter::once, os::windows::ffi::OsStrExt, ptr};
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+        fn CoUninitialize();
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ILCreateFromPathW(path: *const u16) -> *mut c_void;
+        fn ILFree(pidl: *mut c_void);
+        fn SHOpenFolderAndSelectItems(
+            folder: *const c_void,
+            item_count: u32,
+            items: *const *const c_void,
+            flags: u32,
+        ) -> i32;
+    }
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
+
+    let wide_path = path.as_os_str().encode_wide().chain(once(0)).collect::<Vec<_>>();
+    unsafe {
+        let initialized = CoInitializeEx(
+            ptr::null_mut(),
+            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+        );
+        if initialized < 0 && initialized != RPC_E_CHANGED_MODE {
+            return Err(format!(
+                "Windows Explorer initialization failed (HRESULT 0x{:08X})",
+                initialized as u32
+            ));
+        }
+
+        let item = ILCreateFromPathW(wide_path.as_ptr());
+        if item.is_null() {
+            if initialized >= 0 {
+                CoUninitialize();
+            }
+            return Err("Windows Explorer could not resolve this recording".into());
+        }
+
+        // With item_count zero, the Shell opens the parent and selects this item.
+        // This avoids explorer.exe command-line quoting ambiguity for commas,
+        // whitespace and Unicode names and lets an existing Explorer window be reused.
+        let selected = SHOpenFolderAndSelectItems(item, 0, ptr::null(), 0);
+        ILFree(item);
+        if initialized >= 0 {
+            CoUninitialize();
+        }
+        if selected < 0 {
+            return Err(format!(
+                "Windows Explorer could not select this recording (HRESULT 0x{:08X})",
+                selected as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn reveal_media_in_explorer(app: AppHandle, media_id: String) -> Result<(), String> {
-    let settings = load_settings_file(&app)?;
-    let path = resolve_catalogue_media_path(&settings, &media_id)?;
-    #[cfg(target_os = "windows")]
-    Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.to_string_lossy()))
-        .spawn()
-        .map_err(|error| format!("Could not open Windows Explorer: {error}"))?;
-    #[cfg(not(target_os = "windows"))]
-    return Err("Reveal in Explorer is available only in the Windows build".into());
-    Ok(())
+    let result = (|| {
+        let settings = load_settings_file(&app)?;
+        let path = resolve_catalogue_media_path(&settings, &media_id)?;
+        #[cfg(target_os = "windows")]
+        reveal_path_in_explorer(&path)?;
+        #[cfg(not(target_os = "windows"))]
+        return Err("Reveal in Explorer is available only in the Windows build".into());
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        diagnostic_log(&app, "ERROR", "explorer-reveal", error);
+    }
+    result
 }
 
 #[tauri::command]
@@ -3297,7 +3387,7 @@ fn open_media_folder(app: AppHandle, media_id: String) -> Result<(), String> {
 }
 
 fn tool_version(command: &str) -> Option<String> {
-    let output = Command::new(command).arg("-version").output().ok()?;
+    let output = media_tool_command(command).arg("-version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -3448,15 +3538,42 @@ fn should_start_hidden(arguments: &[String], tray_available: bool) -> bool {
     tray_available && arguments.iter().any(|argument| argument == "--minimized")
 }
 
+fn restore_main_window(app: &AppHandle, source: &str) {
+    let Some(window) = app.get_webview_window("main") else {
+        diagnostic_log(
+            app,
+            "ERROR",
+            "window-restore",
+            &format!("{source}: main window is unavailable"),
+        );
+        return;
+    };
+    let mut failures = Vec::new();
+    if let Err(error) = window.show() {
+        failures.push(format!("show failed: {error}"));
+    }
+    if let Err(error) = window.unminimize() {
+        failures.push(format!("unminimize failed: {error}"));
+    }
+    if let Err(error) = window.set_focus() {
+        failures.push(format!("focus request failed: {error}"));
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+    if !failures.is_empty() {
+        diagnostic_log(
+            app,
+            "WARN",
+            "window-restore",
+            &format!("{source}: {}", failures.join("; ")),
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            restore_main_window(app, "second-instance launch");
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -3484,29 +3601,23 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .tooltip("Kairix PIMP Light")
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show" => restore_main_window(app, "tray menu"),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     if matches!(
                         event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            ..
+                        } |
                         TrayIconEvent::DoubleClick {
                             button: MouseButton::Left,
                             ..
                         }
                     ) {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        restore_main_window(tray.app_handle(), "tray icon");
                     }
                 });
             if let Some(icon) = app.default_window_icon() {
@@ -3548,16 +3659,16 @@ pub fn run() {
                     .unwrap();
                 if should_start_hidden(&arguments, tray_available) {
                     let _ = window.hide();
-                } else if arguments.iter().any(|argument| argument == "--minimized") {
-                    diagnostic_log(
-                        app.handle(),
-                        "WARN",
-                        "autostart",
-                        "Minimized startup was requested but no tray is available; showing the main window",
-                    );
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
+                } else {
+                    if arguments.iter().any(|argument| argument == "--minimized") {
+                        diagnostic_log(
+                            app.handle(),
+                            "WARN",
+                            "autostart",
+                            "Minimized startup was requested but no tray is available; showing the main window",
+                        );
+                    }
+                    restore_main_window(app.handle(), "initial launch");
                 }
             }
             Ok(())
@@ -4425,6 +4536,52 @@ mod tests {
         assert!(should_start_hidden(&minimized, true));
         assert!(!should_start_hidden(&minimized, false));
         assert!(!should_start_hidden(&["kairix-pimp.exe".into()], true));
+    }
+
+    #[test]
+    fn child_console_suppression_is_windows_release_only() {
+        assert!(should_suppress_child_console(true, false));
+        assert!(!should_suppress_child_console(true, true));
+        assert!(!should_suppress_child_console(false, false));
+    }
+
+    #[test]
+    fn known_media_resolution_preserves_spaces_commas_unicode_and_offline_errors() {
+        let root = temporary("explorer-special-path");
+        let master = root.join("master");
+        let path = master
+            .join("20261027")
+            .join("DJI clip, kōrero 音声.WAV");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"disposable audio").unwrap();
+        let media = new_media(
+            &path,
+            "20261027/DJI clip, kōrero 音声.WAV".into(),
+            None,
+            sha256(&path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        let media_id = media.id.clone();
+        let mut settings = DeviceSettings::default();
+        settings.master_bin_path = master.to_string_lossy().into();
+        append_events(
+            &settings,
+            vec![CatalogueEvent::MediaRegistered { media }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_catalogue_media_path(&settings, &media_id).unwrap(),
+            path.canonicalize().unwrap()
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(resolve_catalogue_media_path(&settings, &media_id)
+            .unwrap_err()
+            .contains("not available locally"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

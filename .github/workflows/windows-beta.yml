@@ -59,6 +59,19 @@ jobs:
           PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
         run: npm run tauri -- build --bundles msi,nsis
 
+      - name: Verify release executable uses the Windows GUI subsystem
+        shell: pwsh
+        run: |
+          $executable = Get-Item src-tauri/target/release/kairix-pimp.exe
+          $bytes = [System.IO.File]::ReadAllBytes($executable.FullName)
+          if ($bytes.Length -lt 256) { throw 'Release executable is unexpectedly small.' }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $optionalHeader = $peOffset + 24
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
+          if ($subsystem -ne 2) {
+            throw "Expected Windows GUI subsystem (2), found $subsystem. A console window would accompany the installed app."
+          }
+
       - name: Validate version tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh

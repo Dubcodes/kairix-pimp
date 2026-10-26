@@ -4,7 +4,7 @@ This is an unsigned Windows beta for disposable-media testing. Confirm the
 source and build/test commits in `BUILD-INFO.txt` and verify an installer with
 `SHA256SUMS.txt` before running it.
 
-This build adds startup discovery for populated Master Bins, serialized and retryable Settings persistence, tray-safe autostart, professional themes, safe support links and a fail-closed signed Beta updater foundation. A native operation gate prevents update installation from racing an ingest start, resume or retry. In-app installation remains unavailable until the protected signing configuration in `docs/UPDATES.md` is provisioned.
+This build adds startup discovery for populated Master Bins, serialized and retryable Settings persistence, tray-safe autostart, professional themes, safe support links and a fail-closed signed Beta updater foundation. Windows release builds now use the GUI subsystem, suppress media-tool consoles, centralize window restoration and use the Windows Shell API for reliable file selection. A native operation gate prevents update installation from racing an ingest start, resume or retry. In-app installation remains unavailable until the protected signing configuration in `docs/UPDATES.md` is provisioned.
 
 ## Verified by automated tests and Windows CI
 
@@ -17,12 +17,13 @@ This build adds startup discovery for populated Master Bins, serialized and retr
 - Portable append-only event replay covers offline delivery, duplicate delivery,
   concurrent additive edits and reported scalar conflicts.
 - Windows CI builds nonempty unsigned MSI and NSIS installers from the recorded
-  commit after the required TypeScript, Rust, build and audit checks pass.
+  commit after the required TypeScript, Rust, build and audit checks pass, and
+  inspects the packaged executable for the Windows GUI subsystem.
 
 ## Manual or external acceptance still required
 
 - Complete the installed-app checklist in `docs/BETA_TESTING.md`, including a
-  same-build reinstall and removable-source interruption.
+  same-build reinstall, console/focus/tray/Explorer checks and removable-source interruption.
 - Perform a real two-machine Syncthing pass before using production footage.
 - Windows signing, upgrade across versions and SmartScreen reputation are not
   verified. FFmpeg and FFprobe are optional PATH-based tools and are not bundled.

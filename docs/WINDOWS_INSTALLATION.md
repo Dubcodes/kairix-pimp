@@ -2,6 +2,8 @@
 
 The recommended beta package is the **NSIS per-user installer**. It installs without elevation under the current Windows profile and preserves PIMP's device-local settings, diagnostic logs, thumbnail cache configuration and recoverable ingest-job history across an upgrade. Shared catalogue records remain in the configured catalogue location and are not installer-owned data.
 
+The installed release executable is a Windows GUI application and should not open an accompanying Command Prompt; FFmpeg and FFprobe background work should not flash one either. If launch or window restoration fails, use the tray menu when available and inspect Settings → Diagnostics rather than closing an unrelated console window.
+
 ## Migrating from an older system-wide installation
 
 Some early beta testing installed both a per-user copy and a system-wide MSI copy. PIMP does not silently remove either installation or delete either profile's data.
