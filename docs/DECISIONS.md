@@ -221,3 +221,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. Beta builds use a numeric SemVer prerelease component (for example `0.1.1-1`) so the same version remains valid for Windows MSI packaging; the release channel remains explicitly Beta. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
 - **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.
+
+## ADR-029 — Serialized device settings and tray-gated autostart
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** The desktop serializes every accepted immediate preference write and applies a native response only when it belongs to the newest local revision. Failed latest writes remain visibly retryable, pending writes warn before ordinary WebView unload, and explicit interface reload waits for the queue. Windows `--minimized` startup hides the main window only when native tray construction succeeded.
+- **Consequences:** Rapid theme, density, tray, startup-page and update-check changes remain ordered without stale UI rollback. Configuration form values still use explicit save to avoid excessive writes. If tray creation fails during autostart, PIMP remains visible and logs the fallback instead of becoming inaccessible.

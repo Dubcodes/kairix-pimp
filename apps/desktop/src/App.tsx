@@ -46,6 +46,7 @@ import {
   installApprovedBetaUpdate,
   type AvailableUpdate,
 } from './updates';
+import { SettingsWriteQueue } from './settings-write-queue';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
 type SettingsSection =
@@ -100,6 +101,8 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [settingsWritePending, setSettingsWritePending] = useState(false);
+  const [settingsWriteFailed, setSettingsWriteFailed] = useState(false);
   const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
   const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate>();
@@ -139,11 +142,43 @@ export function App() {
     new Map<string, ProvisionalMetadataPatch>(),
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
-  const savingSettings = useRef(false);
+  const settingsRef = useRef(settings);
+  const [savingSettings] = useState(
+    () =>
+      new SettingsWriteQueue<DeviceSettings>({
+        write: (next) => desktopBridge.saveSettings(next),
+        onCommitted: (saved, successMessage) => {
+          setSettings(saved);
+          setSettingsWriteFailed(false);
+          setMessage(successMessage);
+        },
+        onFailed: (reason) => {
+          const detail = errorText(reason);
+          setSettingsWriteFailed(true);
+          setError(`Settings were not saved: ${detail}`);
+          void desktopBridge.logUiError(`Settings save failed: ${detail}`);
+        },
+        onPendingChanged: setSettingsWritePending,
+      }),
+  );
   const scanActive = useRef(false);
   const automaticUpdateCheckStarted = useRef(false);
 
   const configured = Boolean(settings.initializedCataloguePath);
+  useEffect(() => {
+    settingsRef.current = settings;
+    savingSettings.setLatest(settings);
+  }, [savingSettings, settings]);
+  useEffect(() => {
+    const preservePendingSettings = (event: BeforeUnloadEvent) => {
+      if (!savingSettings.hasUnsavedChanges()) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', preservePendingSettings);
+    return () =>
+      window.removeEventListener('beforeunload', preservePendingSettings);
+  }, [savingSettings]);
   const refresh = useCallback(async () => {
     setCatalogue(await desktopBridge.loadCatalogue());
   }, []);
@@ -244,6 +279,8 @@ export function App() {
           stopDrop = unlistenDrop;
           stopDiscovery = unlistenDiscovery;
           stopCatalogue = unlistenCatalogue;
+          settingsRef.current = loaded;
+          savingSettings.setLatest(loaded);
           setSettings(loaded);
           setMediaTools(tools);
           setApplicationInfo(loadedApplicationInfo);
@@ -274,7 +311,7 @@ export function App() {
       stopDiscovery?.();
       stopCatalogue?.();
     };
-  }, [native, refresh]);
+  }, [native, refresh, savingSettings]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -479,38 +516,36 @@ export function App() {
   }, [contextMenu]);
 
   const saveConfiguration = async () => {
-    if (savingSettings.current) return;
-    savingSettings.current = true;
     setError('');
     setBusy(true);
-    try {
-      const saved = await desktopBridge.saveSettings(settings);
-      setSettings(saved);
-      setMessage(
-        'Configuration saved. Library indexing will continue in the background.',
-      );
-    } catch (reason) {
-      const detail = errorText(reason);
-      setError(detail);
-      void desktopBridge.logUiError(`Settings save failed: ${detail}`);
-    } finally {
-      savingSettings.current = false;
-      setBusy(false);
-    }
+    await savingSettings.save(
+      settingsRef.current,
+      'Configuration saved. Library indexing will continue in the background.',
+    );
+    setBusy(false);
   };
-  const persistPreference = async (patch: Partial<DeviceSettings>) => {
-    const next = { ...settings, ...patch };
+  const persistPreference = (patch: Partial<DeviceSettings>) => {
+    const next = { ...settingsRef.current, ...patch };
+    settingsRef.current = next;
+    savingSettings.setLatest(next);
     setSettings(next);
-    if (!configured || savingSettings.current) return;
-    savingSettings.current = true;
-    try {
-      setSettings(await desktopBridge.saveSettings(next));
-      setMessage('Preference saved.');
-    } catch (reason) {
-      setError(errorText(reason));
-    } finally {
-      savingSettings.current = false;
+    if (!configured) return;
+    setError('');
+    void savingSettings.save(next, 'Preference saved.');
+  };
+  const retrySettingsSave = async () => {
+    setError('');
+    await savingSettings.retry('Settings saved after retry.');
+  };
+  const reloadInterface = async () => {
+    const saved = await savingSettings.flush();
+    if (saved === false) {
+      setError(
+        'The interface was not reloaded because device settings are still unsaved. Retry the settings save first.',
+      );
+      return;
     }
+    window.location.reload();
   };
   const chooseSettingFolder = async (
     key:
@@ -1146,6 +1181,14 @@ export function App() {
                 <div>
                   <h2>{activeSettingsSection}</h2>
                   <p>Device-local preferences for Kairix PIMP Light.</p>
+                  {settingsWritePending && (
+                    <small role="status">Saving device preferences…</small>
+                  )}
+                  {settingsWriteFailed && (
+                    <button onClick={() => void retrySettingsSave()}>
+                      Retry saving preferences
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -1631,7 +1674,7 @@ export function App() {
                     <button onClick={() => void desktopBridge.openLogsFolder()}>
                       Open logs folder
                     </button>
-                    <button onClick={() => window.location.reload()}>
+                    <button onClick={() => void reloadInterface()}>
                       Reload interface
                     </button>
                   </div>

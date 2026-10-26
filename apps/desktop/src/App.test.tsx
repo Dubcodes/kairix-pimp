@@ -2,7 +2,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Catalogue } from './bridge';
+import type { Catalogue, DeviceSettings } from './bridge';
 
 const mocks = vi.hoisted(() => ({
   native: true,
@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => ({
     checkForUpdates: true,
     theme: 'graphite' as const,
     density: 'comfortable' as const,
-  },
+  } as DeviceSettings,
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
   loadCatalogue: vi.fn(),
@@ -135,6 +135,25 @@ describe('native application integration', () => {
   });
   beforeEach(() => {
     mocks.native = true;
+    mocks.settings = {
+      deviceId: 'device-1',
+      masterBinPath: 'C:\\Master',
+      workingProjectsPath: 'C:\\Projects',
+      catalogueInMasterBin: true,
+      sharedCataloguePath: '',
+      thumbnailCachePath: 'C:\\Cache',
+      thumbnailCacheLimitBytes: 2147483648,
+      ingestDateOrganization: 'original-file-dates',
+      dateFolderPattern: 'yyyymmdd',
+      initializedCataloguePath: 'C:\\Master\\.pimp',
+      projectPaths: {},
+      startWithWindows: false,
+      closeToTray: true,
+      startupPage: 'Library',
+      checkForUpdates: true,
+      theme: 'graphite',
+      density: 'comfortable',
+    };
     mocks.saveSettings.mockReset();
     mocks.loadCatalogue.mockReset();
     mocks.loadCatalogue.mockImplementation(async () => mocks.catalogue);
@@ -310,6 +329,93 @@ describe('native application integration', () => {
     expect(mocks.saveSettings).toHaveBeenCalledWith(
       expect.objectContaining({ theme: 'midnight' }),
     );
+  });
+
+  it('serializes rapid preferences without letting an older save replace newer edits', async () => {
+    let finishFirstSave!: (value: typeof mocks.settings) => void;
+    const firstSave = new Promise<typeof mocks.settings>((resolve) => {
+      finishFirstSave = resolve;
+    });
+    mocks.saveSettings.mockImplementation(async (next) => {
+      if (mocks.saveSettings.mock.calls.length === 1) return firstSave;
+      mocks.settings = next;
+      return next;
+    });
+    const user = userEvent.setup();
+    const app = render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+
+    await user.click(
+      screen.getByRole('switch', { name: /Close to system tray/ }),
+    );
+    await user.selectOptions(
+      screen.getByLabelText('Default startup page'),
+      'Ingest',
+    );
+    await user.click(
+      screen.getByRole('switch', { name: /Check for beta updates/ }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.click(screen.getByRole('radio', { name: /Midnight/ }));
+    await user.selectOptions(
+      screen.getByLabelText('Layout density'),
+      'compact',
+    );
+
+    expect(mocks.saveSettings).toHaveBeenCalledTimes(1);
+    finishFirstSave({
+      ...mocks.settings,
+      closeToTray: false,
+    });
+    await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledTimes(5));
+    expect(mocks.saveSettings.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({
+        closeToTray: false,
+        startupPage: 'Ingest',
+        checkForUpdates: false,
+        theme: 'midnight',
+        density: 'compact',
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText('Preference saved.')).toBeVisible(),
+    );
+    expect(document.documentElement.dataset.theme).toBe('midnight');
+    expect(document.documentElement.dataset.density).toBe('compact');
+
+    app.unmount();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    expect(
+      screen.getByRole('switch', { name: /Close to system tray/ }),
+    ).not.toBeChecked();
+    expect(screen.getByLabelText('Default startup page')).toHaveValue('Ingest');
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    expect(screen.getByLabelText('Layout density')).toHaveValue('compact');
+  });
+
+  it('keeps a failed preference visible and retryable', async () => {
+    mocks.saveSettings
+      .mockRejectedValueOnce(new Error('settings file temporarily unavailable'))
+      .mockImplementationOnce(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(
+      screen.getByRole('switch', { name: /Close to system tray/ }),
+    );
+    expect(
+      await screen.findByText(
+        /Settings were not saved.*temporarily unavailable/,
+      ),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Retry saving preferences' }),
+    );
+    expect(
+      await screen.findByText('Settings saved after retry.'),
+    ).toBeVisible();
+    expect(mocks.saveSettings).toHaveBeenCalledTimes(2);
   });
 
   it('fails closed with a manual release fallback when signing is not configured', async () => {

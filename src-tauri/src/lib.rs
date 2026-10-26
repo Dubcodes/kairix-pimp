@@ -3300,6 +3300,10 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
     )))
 }
 
+fn should_start_hidden(arguments: &[String], tray_available: bool) -> bool {
+    tray_available && arguments.iter().any(|argument| argument == "--minimized")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3392,8 +3396,24 @@ pub fn run() {
                         }
                     }
                 });
-                if std::env::args().any(|argument| argument == "--minimized") {
+                let arguments = std::env::args().collect::<Vec<_>>();
+                let tray_available = *app
+                    .state::<NativeState>()
+                    .tray_available
+                    .lock()
+                    .unwrap();
+                if should_start_hidden(&arguments, tray_available) {
                     let _ = window.hide();
+                } else if arguments.iter().any(|argument| argument == "--minimized") {
+                    diagnostic_log(
+                        app.handle(),
+                        "WARN",
+                        "autostart",
+                        "Minimized startup was requested but no tray is available; showing the main window",
+                    );
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
                 }
             }
             Ok(())
@@ -4207,6 +4227,14 @@ mod tests {
         .unwrap();
         assert!(public_key.verify(b"test", &signature, false).is_ok());
         assert!(public_key.verify(b"tampered", &signature, false).is_err());
+    }
+
+    #[test]
+    fn autostart_hides_only_when_the_tray_is_available() {
+        let minimized = vec!["kairix-pimp.exe".into(), "--minimized".into()];
+        assert!(should_start_hidden(&minimized, true));
+        assert!(!should_start_hidden(&minimized, false));
+        assert!(!should_start_hidden(&["kairix-pimp.exe".into()], true));
     }
 
     #[test]
