@@ -3354,7 +3354,7 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
 
 #[tauri::command]
 fn reveal_media_in_explorer(app: AppHandle, media_id: String) -> Result<(), String> {
-    let result = (|| {
+    let result: Result<(), String> = (|| {
         let settings = load_settings_file(&app)?;
         let path = resolve_catalogue_media_path(&settings, &media_id)?;
         #[cfg(target_os = "windows")]
