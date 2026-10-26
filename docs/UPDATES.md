@@ -13,7 +13,7 @@ Updater signing is intentionally fail-closed until the release owner provisions 
 1. Generate a Tauri updater signing key with the official Tauri CLI in a secure environment.
 2. Store the complete private key only in the protected GitHub Actions secret `TAURI_SIGNING_PRIVATE_KEY` and its password in `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 3. Store the corresponding public key in the repository/environment variable `PIMP_UPDATER_PUBLIC_KEY`. It is injected into release builds; it is not secret, but it must match the protected private key.
-4. Protect the release environment and require review for version tags matching `v*-beta.*`.
+4. Protect the release environment and require review for numeric-prerelease version tags matching `v*-*` (for example `v0.1.1-1`). The numeric prerelease component is required by Windows MSI packaging; the application and manifest still identify the channel as Beta.
 5. Run a reviewed tag build. CI builds the signed NSIS updater package, creates `latest.json`, publishes the versioned prerelease, and updates only the fixed `beta-channel` manifest asset.
 
 If either key setting is absent, CI still publishes the ordinary manual installers but does not create updater artifacts or a manifest. The app reports that signed updates are not configured; it never reports “up to date” without a completed check.

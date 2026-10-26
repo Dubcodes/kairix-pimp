@@ -45,7 +45,7 @@ it('reports an approved higher beta returned by the configured updater', async (
   });
   mocks.check.mockResolvedValue({
     currentVersion: '0.1.0',
-    version: '0.1.1-beta.1',
+    version: '0.1.1-1',
     date: '2026-10-26T00:00:00Z',
     body: 'Signed beta',
     rawJson: {},
@@ -53,7 +53,7 @@ it('reports an approved higher beta returned by the configured updater', async (
   });
   await expect(checkApprovedBetaUpdate()).resolves.toEqual({
     currentVersion: '0.1.0',
-    version: '0.1.1-beta.1',
+    version: '0.1.1-1',
     date: '2026-10-26T00:00:00Z',
     notes: 'Signed beta',
     sizeBytes: undefined,
@@ -77,7 +77,7 @@ it('surfaces interrupted updater installation without reporting success', async 
   });
   mocks.check.mockResolvedValue({
     currentVersion: '0.1.0',
-    version: '0.1.1-beta.1',
+    version: '0.1.1-1',
     rawJson: {},
     close: vi.fn(),
     downloadAndInstall,

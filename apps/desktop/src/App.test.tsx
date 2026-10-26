@@ -85,7 +85,7 @@ vi.mock('./bridge', () => ({
     })),
     logUiError: vi.fn(),
     appInfo: vi.fn(async () => ({
-      version: '0.1.1-beta.1',
+      version: '0.1.1-1',
       buildCommit: 'test-commit',
       edition: 'Kairix PIMP Light',
       releaseChannel: 'Beta',

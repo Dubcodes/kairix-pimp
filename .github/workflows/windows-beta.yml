@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*-beta.*'
+      - 'v*-*'
 
 permissions:
   contents: read
@@ -81,6 +81,9 @@ jobs:
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $expectedTag = "v$version"
+          if ($version -notmatch '^\d+\.\d+\.\d+-\d+$') {
+            throw 'Windows Beta versions require a numeric prerelease identifier (for example 0.1.1-1).'
+          }
           if ('${{ github.ref_name }}' -ne $expectedTag) {
             throw "Release tag must exactly match package version: expected $expectedTag"
           }
