@@ -49,10 +49,15 @@ export async function installApprovedBetaUpdate(
   if (!pendingUpdate) {
     throw new Error('Check for a signed Beta update before installing.');
   }
-  await pendingUpdate.downloadAndInstall(onEvent, {
-    timeout: 120_000,
-    restartAfterInstall: true,
-  });
+  await desktopBridge.beginUpdateInstallation();
+  try {
+    await pendingUpdate.downloadAndInstall(onEvent, {
+      timeout: 120_000,
+      restartAfterInstall: true,
+    });
+  } finally {
+    await desktopBridge.endUpdateInstallation();
+  }
 }
 
 export async function discardPendingUpdate(): Promise<void> {

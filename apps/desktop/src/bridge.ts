@@ -360,6 +360,8 @@ export const desktopBridge = {
   appInfo: () => invoke<AppInfo>('app_info'),
   updaterConfiguration: () =>
     invoke<UpdaterConfiguration>('updater_configuration'),
+  beginUpdateInstallation: () => invoke<void>('begin_update_installation'),
+  endUpdateInstallation: () => invoke<void>('end_update_installation'),
   openSupportLink: (destination: 'github' | 'releases' | 'coffee') =>
     invoke<void>('open_support_link', { destination }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),

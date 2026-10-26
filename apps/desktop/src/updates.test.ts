@@ -3,11 +3,17 @@ import { beforeEach, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   check: vi.fn(),
   configuration: vi.fn(),
+  beginInstallation: vi.fn(),
+  endInstallation: vi.fn(),
 }));
 
 vi.mock('@tauri-apps/plugin-updater', () => ({ check: mocks.check }));
 vi.mock('./bridge', () => ({
-  desktopBridge: { updaterConfiguration: mocks.configuration },
+  desktopBridge: {
+    updaterConfiguration: mocks.configuration,
+    beginUpdateInstallation: mocks.beginInstallation,
+    endUpdateInstallation: mocks.endInstallation,
+  },
 }));
 
 import {
@@ -20,6 +26,10 @@ beforeEach(async () => {
   await discardPendingUpdate();
   mocks.check.mockReset();
   mocks.configuration.mockReset();
+  mocks.beginInstallation.mockReset();
+  mocks.beginInstallation.mockResolvedValue(undefined);
+  mocks.endInstallation.mockReset();
+  mocks.endInstallation.mockResolvedValue(undefined);
 });
 
 it('fails closed before contacting an update endpoint when no public key is configured', async () => {
@@ -66,6 +76,33 @@ it('refuses installation until an approved update has been checked', async () =>
   );
 });
 
+it('does not contact the installer when the native operation gate rejects the update', async () => {
+  const downloadAndInstall = vi.fn();
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Beta',
+    endpoint:
+      'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
+  });
+  mocks.check.mockResolvedValue({
+    currentVersion: '0.1.1-1',
+    version: '0.1.1-2',
+    rawJson: {},
+    close: vi.fn(),
+    downloadAndInstall,
+  });
+  mocks.beginInstallation.mockRejectedValue(
+    new Error('Finish every active ingest job first.'),
+  );
+  await checkApprovedBetaUpdate();
+
+  await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
+    'Finish every active ingest job first.',
+  );
+  expect(downloadAndInstall).not.toHaveBeenCalled();
+  expect(mocks.endInstallation).not.toHaveBeenCalled();
+});
+
 it('surfaces interrupted updater installation without reporting success', async () => {
   const interrupted = new Error('download interrupted');
   const downloadAndInstall = vi.fn().mockRejectedValue(interrupted);
@@ -90,4 +127,28 @@ it('surfaces interrupted updater installation without reporting success', async 
     timeout: 120_000,
     restartAfterInstall: true,
   });
+  expect(mocks.beginInstallation).toHaveBeenCalledOnce();
+  expect(mocks.endInstallation).toHaveBeenCalledOnce();
+});
+
+it('releases the native operation gate after a successful installer return', async () => {
+  const downloadAndInstall = vi.fn().mockResolvedValue(undefined);
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Beta',
+    endpoint:
+      'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
+  });
+  mocks.check.mockResolvedValue({
+    currentVersion: '0.1.1-1',
+    version: '0.1.1-2',
+    rawJson: {},
+    close: vi.fn(),
+    downloadAndInstall,
+  });
+  await checkApprovedBetaUpdate();
+
+  await installApprovedBetaUpdate(vi.fn());
+  expect(mocks.beginInstallation).toHaveBeenCalledOnce();
+  expect(mocks.endInstallation).toHaveBeenCalledOnce();
 });

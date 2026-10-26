@@ -220,6 +220,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Date:** 2026-10-26
 - **Status:** Accepted
 - **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. Beta builds use a numeric SemVer prerelease component (for example `0.1.1-1`) so the same version remains valid for Windows MSI packaging; the release channel remains explicitly Beta. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
+- **Release-candidate clarification:** The host now owns an update-installation gate. It atomically checks durable job state before installation and prevents start, resume or retry until the updater returns or restarts the process. Public-key syntax is validated in the native configuration response. Version `0.1.1-2` is the manual bootstrap candidate; it is not evidence of a completed signed upgrade.
 - **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.
 
 ## ADR-029 — Serialized device settings and tray-gated autostart

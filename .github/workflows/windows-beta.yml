@@ -15,7 +15,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -59,22 +59,6 @@ jobs:
           PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
         run: npm run tauri -- build --bundles msi,nsis
 
-      - name: Detect protected updater signing configuration
-        if: startsWith(github.ref, 'refs/tags/v')
-        id: updater-signing
-        shell: pwsh
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
-        run: |
-          $configured = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) `
-            -and -not [string]::IsNullOrWhiteSpace($env:PIMP_UPDATER_PUBLIC_KEY)
-          "configured=$($configured.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          if (-not $configured) {
-            Write-Warning 'Updater signing is not configured; publishing manual unsigned installers only.'
-          }
-
       - name: Validate version tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -87,40 +71,6 @@ jobs:
           if ('${{ github.ref_name }}' -ne $expectedTag) {
             throw "Release tag must exactly match package version: expected $expectedTag"
           }
-
-      - name: Build signed NSIS updater artifact
-        if: startsWith(github.ref, 'refs/tags/v') && steps.updater-signing.outputs.configured == 'true'
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          PIMP_BUILD_COMMIT: ${{ github.sha }}
-          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
-        run: npm run tauri -- build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":true}}'
-
-      - name: Create signed Beta update manifest
-        if: startsWith(github.ref, 'refs/tags/v') && steps.updater-signing.outputs.configured == 'true'
-        shell: pwsh
-        run: |
-          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
-          if (-not $artifact) { throw 'Signed NSIS updater artifact was not generated.' }
-          $signaturePath = "$($artifact.FullName).sig"
-          if (-not (Test-Path -LiteralPath $signaturePath)) { throw 'Updater signature was not generated.' }
-          $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
-          $encodedName = [Uri]::EscapeDataString($artifact.Name)
-          $url = "https://github.com/Dubcodes/kairix-pimp/releases/download/${{ github.ref_name }}/$encodedName"
-          $manifest = [ordered]@{
-            version = $version
-            notes = Get-Content docs/BETA_RELEASE_NOTES.md -Raw
-            pub_date = (Get-Date).ToUniversalTime().ToString('o')
-            platforms = [ordered]@{
-              'windows-x86_64-nsis' = [ordered]@{
-                signature = $signature
-                url = $url
-              }
-            }
-          }
-          $manifest | ConvertTo-Json -Depth 6 | Set-Content src-tauri/target/release/bundle/latest.json
 
       - name: Verify bundles and record build identity
         shell: pwsh
@@ -170,26 +120,126 @@ jobs:
             src-tauri/target/release/bundle/BUILD-INFO.txt
             src-tauri/target/release/bundle/SHA256SUMS.txt
 
+  publish-signed-beta:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows-beta
+    runs-on: windows-latest
+    timeout-minutes: 45
+    environment: beta-release
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download tested manual installers
+        uses: actions/download-artifact@v5
+        with:
+          pattern: Kairix-PIMP-*-unsigned-windows
+          path: release-input
+          merge-multiple: true
+
+      - name: Validate protected signing configuration and version
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'The protected TAURI_SIGNING_PRIVATE_KEY secret is required.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            throw 'The protected TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:PIMP_UPDATER_PUBLIC_KEY)) {
+            throw 'The protected PIMP_UPDATER_PUBLIC_KEY variable is required.'
+          }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($version -notmatch '^\d+\.\d+\.\d+-\d+$') {
+            throw 'Windows Beta versions require a numeric prerelease identifier.'
+          }
+          if ('${{ github.ref_name }}' -ne "v$version") {
+            throw "Release tag must exactly match package version v$version"
+          }
+          cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_beta_and_fails_closed_without_a_public_key
+
+      - name: Build signed NSIS updater artifact
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PIMP_BUILD_COMMIT: ${{ github.sha }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: npm run tauri -- build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":"v1Compatible"}}'
+
+      - name: Verify signed updater and create Beta manifest
+        shell: pwsh
+        env:
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
+          if (-not $artifact) { throw 'Signed NSIS updater artifact was not generated.' }
+          $signaturePath = "$($artifact.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw 'Updater signature was not generated.' }
+          cargo run --quiet --manifest-path src-tauri/Cargo.toml --example verify_update -- $artifact.FullName $signaturePath $env:PIMP_UPDATER_PUBLIC_KEY $version
+          $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+          $encodedName = [Uri]::EscapeDataString($artifact.Name)
+          $url = "https://github.com/Dubcodes/kairix-pimp/releases/download/${{ github.ref_name }}/$encodedName"
+          $manifest = [ordered]@{
+            version = $version
+            notes = Get-Content docs/BETA_RELEASE_NOTES.md -Raw
+            pub_date = (Get-Date).ToUniversalTime().ToString('o')
+            platforms = [ordered]@{
+              'windows-x86_64-nsis' = [ordered]@{
+                signature = $signature
+                url = $url
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content src-tauri/target/release/bundle/latest.json
+          $releaseInstallers = @(
+            Get-ChildItem release-input -Recurse -Filter *.msi -File
+            Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe -File
+          )
+          $releaseInstallers | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content release-input/SHA256SUMS.txt
+
       - name: Publish versioned beta release
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $files = @(
-            Get-ChildItem src-tauri/target/release/bundle/msi/*.msi
-            Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe
-            Get-Item src-tauri/target/release/bundle/BUILD-INFO.txt
-            Get-Item src-tauri/target/release/bundle/SHA256SUMS.txt
+            Get-ChildItem release-input -Recurse -Filter *.msi -File
+            Get-ChildItem release-input -Recurse -Filter BUILD-INFO.txt -File
+            Get-ChildItem release-input -Recurse -Filter SHA256SUMS.txt -File
+            Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe -File
+            Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip* -File
+            Get-Item src-tauri/target/release/bundle/latest.json
           )
-          $updaterFiles = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip* -File -ErrorAction SilentlyContinue)
-          $manifest = Get-Item src-tauri/target/release/bundle/latest.json -ErrorAction SilentlyContinue
-          $files += $updaterFiles
-          if ($manifest) { $files += $manifest }
-          gh release create '${{ github.ref_name }}' $files.FullName --prerelease --notes-file docs/BETA_RELEASE_NOTES.md --title "Kairix PIMP ${{ github.ref_name }} (unsigned beta)"
+          gh release create '${{ github.ref_name }}' $files.FullName --prerelease --notes-file docs/BETA_RELEASE_NOTES.md --title "Kairix PIMP ${{ github.ref_name }} (Beta)"
 
       - name: Publish approved Beta channel manifest
-        if: startsWith(github.ref, 'refs/tags/v') && steps.updater-signing.outputs.configured == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

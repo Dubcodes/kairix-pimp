@@ -2,7 +2,7 @@
 
 Use the per-user NSIS installer for normal beta acceptance. If an older system-wide MSI installation exists, follow [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md); verify the new install before explicitly removing the old application entry or shortcut.
 
-Kairix PIMP 0.1.1-1 is an unsigned release candidate for the Windows beta. It is suitable for
+Kairix PIMP 0.1.1-2 is an unsigned release candidate for the Windows beta. It is suitable for
 disposable generated media only until the real two-device Syncthing acceptance
 pass is complete. Do not make it the only copy of production footage.
 

@@ -4,9 +4,9 @@ mod fs_safe;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use catalogue::{Catalogue, CatalogueEvent, MediaItem, ProjectRecord, TechnicalMetadata};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 #[cfg(test)]
 use chrono::TimeZone;
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +35,7 @@ struct NativeState {
     worker_active: Mutex<bool>,
     availability: Mutex<HashMap<String, (String, bool)>>,
     tray_available: Mutex<bool>,
+    update_installing: Mutex<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -414,6 +415,31 @@ fn snapshot_jobs(app: &AppHandle, state: &NativeState) -> Result<Vec<IngestJob>,
     let _guard = state.job_store.lock().unwrap();
     load_jobs_unlocked(app)
 }
+
+const UPDATE_OPERATION_BLOCKED: &str =
+    "A verified update is being installed. Wait for the application to restart before starting or resuming ingest.";
+
+fn job_blocks_update(job: &IngestJob) -> bool {
+    !matches!(job.state.as_str(), "completed" | "failed" | "cancelled")
+}
+
+fn begin_update_gate(installing: &mut bool, jobs: &[IngestJob]) -> Result<(), String> {
+    if *installing {
+        return Err("A verified update installation is already in progress.".into());
+    }
+    if jobs.iter().any(job_blocks_update) {
+        return Err(
+            "Finish, cancel, or resolve every active ingest job before installing an update."
+                .into(),
+        );
+    }
+    *installing = true;
+    Ok(())
+}
+
+fn end_update_gate(update_installing: &Mutex<bool>) {
+    *update_installing.lock().unwrap() = false;
+}
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
         let backup = path.with_file_name(format!(
@@ -547,10 +573,7 @@ fn preserve_device_identity(current: &str, requested: &str) -> Result<String, St
 }
 
 #[tauri::command]
-fn save_settings(
-    app: AppHandle,
-    mut settings: DeviceSettings,
-) -> Result<DeviceSettings, String> {
+fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceSettings, String> {
     if settings.master_bin_path.trim().is_empty()
         || settings.working_projects_path.trim().is_empty()
     {
@@ -643,7 +666,12 @@ fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catal
     *state.availability.lock().unwrap() = catalogue
         .media
         .iter()
-        .map(|item| (item.id.clone(), (item.relative_path.clone(), item.available)))
+        .map(|item| {
+            (
+                item.id.clone(),
+                (item.relative_path.clone(), item.available),
+            )
+        })
         .collect();
     Ok(catalogue)
 }
@@ -683,15 +711,12 @@ fn extension(path: &Path) -> String {
 
 fn media_kind(path: &Path) -> &'static str {
     match extension(path).as_str() {
-        "mp4" | "mov" | "m4v" | "mxf" | "h264" | "h265" | "hevc" | "mts"
-        | "m2ts" | "avi" | "r3d" | "braw" => "video",
+        "mp4" | "mov" | "m4v" | "mxf" | "h264" | "h265" | "hevc" | "mts" | "m2ts" | "avi"
+        | "r3d" | "braw" => "video",
         "wav" | "bwf" | "aif" | "aiff" | "mp3" | "m4a" => "audio",
-        "jpg" | "jpeg" | "png" | "tif" | "tiff" | "dng" | "arw" | "cr2"
-        | "cr3" => "image",
-        "xml" | "xmp" | "bim" | "thm" | "cpi" | "mpl" | "bdm" | "idx"
-        | "ind" | "pro" | "dat" | "bin" | "srt" | "lrv" | "csv" | "json" => {
-            "camera-support"
-        }
+        "jpg" | "jpeg" | "png" | "tif" | "tiff" | "dng" | "arw" | "cr2" | "cr3" => "image",
+        "xml" | "xmp" | "bim" | "thm" | "cpi" | "mpl" | "bdm" | "idx" | "ind" | "pro" | "dat"
+        | "bin" | "srt" | "lrv" | "csv" | "json" => "camera-support",
         _ => "unknown",
     }
 }
@@ -699,10 +724,33 @@ fn media_kind(path: &Path) -> &'static str {
 fn supported(path: &Path) -> bool {
     matches!(
         extension(path).as_str(),
-        "mp4" | "mov" | "m4v" | "mxf" | "h264" | "h265" | "hevc" | "mts"
-            | "m2ts" | "avi" | "wav" | "bwf" | "aif" | "aiff" | "mp3" | "m4a"
-            | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "dng" | "arw" | "cr2"
-            | "cr3" | "r3d" | "braw"
+        "mp4"
+            | "mov"
+            | "m4v"
+            | "mxf"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "mts"
+            | "m2ts"
+            | "avi"
+            | "wav"
+            | "bwf"
+            | "aif"
+            | "aiff"
+            | "mp3"
+            | "m4a"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "tif"
+            | "tiff"
+            | "dng"
+            | "arw"
+            | "cr2"
+            | "cr3"
+            | "r3d"
+            | "braw"
     )
 }
 
@@ -716,7 +764,10 @@ fn exclusion_reason(path: &Path) -> Option<&'static str> {
         .and_then(|x| x.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if path.components().any(|component| component.as_os_str() == ".pimp") {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == ".pimp")
+    {
         Some("Kairix PIMP application data")
     } else if name.starts_with(".syncthing.") {
         Some("Syncthing temporary file")
@@ -741,9 +792,22 @@ fn ignored(path: &Path) -> bool {
 fn package_component(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(
-            component.as_os_str().to_string_lossy().to_ascii_uppercase().as_str(),
-            "XDROOT" | "PRIVATE" | "AVCHD" | "BPAV" | "CONTENTS" | "M4ROOT" | "DCIM"
-                | "CLIP" | "SUB" | "GENERAL" | "SONY"
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .as_str(),
+            "XDROOT"
+                | "PRIVATE"
+                | "AVCHD"
+                | "BPAV"
+                | "CONTENTS"
+                | "M4ROOT"
+                | "DCIM"
+                | "CLIP"
+                | "SUB"
+                | "GENERAL"
+                | "SONY"
         )
     })
 }
@@ -863,12 +927,21 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
                 .push(format!("Source is unavailable: {}", path.display()));
         }
     }
-    inventory.files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
-    inventory.files.dedup_by(|left, right| left.source_path == right.source_path);
+    inventory
+        .files
+        .sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    inventory
+        .files
+        .dedup_by(|left, right| left.source_path == right.source_path);
     let mut roots = inventory
         .files
         .iter()
-        .map(|file| (file.source_root_path.clone(), file.source_root_label.clone()))
+        .map(|file| {
+            (
+                file.source_root_path.clone(),
+                file.source_root_label.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     roots.sort_by(|left, right| left.0.cmp(&right.0));
     roots.dedup_by(|left, right| left.0 == right.0);
@@ -906,13 +979,13 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
                 .get(&file.source_root_path)
                 .cloned()
                 .unwrap_or_else(|| "source".into());
-            file.source_relative_path = portable_relative(
-                &PathBuf::from(label).join(&file.source_relative_path),
-            );
+            file.source_relative_path =
+                portable_relative(&PathBuf::from(label).join(&file.source_relative_path));
             file.preserve_hierarchy = true;
         }
     }
-    let mut package_representatives = HashMap::<String, (Option<std::time::SystemTime>, String)>::new();
+    let mut package_representatives =
+        HashMap::<String, (Option<std::time::SystemTime>, String)>::new();
     for file in &inventory.files {
         let Some(package_key) = &file.package_key else {
             continue;
@@ -1037,12 +1110,10 @@ fn destination_date_from_modified(
                 .map_err(|_| "Date override must use YYYY-MM-DD".to_string())?;
             (date, batch_timestamp.time())
         }
-        None if settings.ingest_date_organization == "original-file-dates" => {
-            modified
-                .as_ref()
-                .map(|value| (value.date_naive(), value.time()))
-                .unwrap_or((batch_timestamp.date_naive(), batch_timestamp.time()))
-        }
+        None if settings.ingest_date_organization == "original-file-dates" => modified
+            .as_ref()
+            .map(|value| (value.date_naive(), value.time()))
+            .unwrap_or((batch_timestamp.date_naive(), batch_timestamp.time())),
         None => (batch_timestamp.date_naive(), batch_timestamp.time()),
     };
     Ok((
@@ -1320,9 +1391,11 @@ fn recover_staging(
                 continue;
             }
             let catalogue = catalogue::load(catalogue_root)?;
-            if let Some(existing) = catalogue.media.iter().find(|item| {
-                item.id == media.id || item.relative_path == media.relative_path
-            }) {
+            if let Some(existing) = catalogue
+                .media
+                .iter()
+                .find(|item| item.id == media.id || item.relative_path == media.relative_path)
+            {
                 if existing.id != media.id
                     || existing.relative_path != media.relative_path
                     || existing.sha256 != media.sha256
@@ -1719,9 +1792,9 @@ fn validate_job_action(state: &str, action: &str) -> Result<(), String> {
         ),
         _ => false,
     };
-    allowed.then_some(()).ok_or_else(|| {
-        format!("Cannot {action} an ingest job while it is {state}")
-    })
+    allowed
+        .then_some(())
+        .ok_or_else(|| format!("Cannot {action} an ingest job while it is {state}"))
 }
 
 fn actionable_ingest_error(error: &str) -> String {
@@ -1869,15 +1942,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                 }
             }
             Err(error) if error == "__cancelled__" => {
-                update_job_progress(
-                    app,
-                    &state,
-                    job_id,
-                    &planned.id,
-                    "cancelled",
-                    0,
-                    None,
-                )?;
+                update_job_progress(app, &state, job_id, &planned.id, "cancelled", 0, None)?;
                 break;
             }
             Err(error) => {
@@ -1966,6 +2031,10 @@ fn start_ingest(
     state: State<'_, NativeState>,
     request: IngestRequest,
 ) -> Result<IngestJob, String> {
+    let update_guard = state.update_installing.lock().unwrap();
+    if *update_guard {
+        return Err(UPDATE_OPERATION_BLOCKED.into());
+    }
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
     let inventory = build_source_inventory(&request.sources);
@@ -1986,10 +2055,15 @@ fn start_ingest(
             .get(&source.to_string_lossy().to_string())
             .cloned()
             .unwrap_or_else(|| source.file_name().unwrap().to_string_lossy().to_string());
-        if Path::new(&filename).file_name().and_then(|value| value.to_str())
+        if Path::new(&filename)
+            .file_name()
+            .and_then(|value| value.to_str())
             != Some(filename.as_str())
         {
-            return Err(format!("{} has an invalid destination filename", source.display()));
+            return Err(format!(
+                "{} has an invalid destination filename",
+                source.display()
+            ));
         }
         let relative_path = planned_relative_path(
             &settings,
@@ -2001,7 +2075,8 @@ fn start_ingest(
         )?;
         let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
         let destination_path = destination.to_string_lossy().to_string();
-        let collision = reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
+        let collision =
+            reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
         files.push(IngestJobFile {
             id: Uuid::new_v4().to_string(),
             media_id: Uuid::new_v4().to_string(),
@@ -2013,7 +2088,8 @@ fn start_ingest(
             size_bytes: inventory_file.size_bytes,
             bytes_transferred: 0,
             state: if collision { "failed" } else { "queued" }.into(),
-            error: collision.then(|| "Another queued ingest already reserves this destination".into()),
+            error: collision
+                .then(|| "Another queued ingest already reserves this destination".into()),
             metadata: ProvisionalMetadata::default(),
             pending_metadata: None,
             metadata_error: None,
@@ -2052,12 +2128,16 @@ fn start_ingest(
         jobs.push(job.clone());
         Ok(())
     })?;
+    drop(update_guard);
     kick_ingest_worker(app);
     Ok(job)
 }
 
 #[tauri::command]
-fn list_ingest_jobs(app: AppHandle, state: State<'_, NativeState>) -> Result<Vec<IngestJob>, String> {
+fn list_ingest_jobs(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<Vec<IngestJob>, String> {
     snapshot_jobs(&app, &state)
 }
 
@@ -2110,14 +2190,17 @@ fn verified_completed_media(
     }
     let media = candidates[0];
     if media.id != file.media_id || media.relative_path != file.relative_path {
-        return Err("Catalogue identity or relative path disagrees with the persisted job plan".into());
+        return Err(
+            "Catalogue identity or relative path disagrees with the persisted job plan".into(),
+        );
     }
     let planned = PathBuf::from(&file.destination_path);
     if !planned.is_file() {
         return Err("The planned destination is missing or incomplete".into());
     }
-    let expected = fs_safe::resolve_existing(master, &file.relative_path)
-        .map_err(|error| format!("The planned destination is outside the configured root: {error}"))?;
+    let expected = fs_safe::resolve_existing(master, &file.relative_path).map_err(|error| {
+        format!("The planned destination is outside the configured root: {error}")
+    })?;
     let actual = planned
         .canonicalize()
         .map_err(|error| format!("Cannot resolve the planned destination: {error}"))?;
@@ -2210,10 +2293,7 @@ fn initialize_ingest_jobs(
     snapshot_jobs(&app, &state)
 }
 
-fn apply_metadata_patch(
-    metadata: &mut ProvisionalMetadata,
-    patch: &ProvisionalMetadataPatch,
-) {
+fn apply_metadata_patch(metadata: &mut ProvisionalMetadata, patch: &ProvisionalMetadataPatch) {
     if let Some(tags) = &patch.tags {
         metadata.tags = normalized(tags);
         if !metadata.edited_fields.iter().any(|value| value == "tags") {
@@ -2222,7 +2302,11 @@ fn apply_metadata_patch(
     }
     if let Some(project_ids) = &patch.project_ids {
         metadata.project_ids = normalized(project_ids);
-        if !metadata.edited_fields.iter().any(|value| value == "projectIds") {
+        if !metadata
+            .edited_fields
+            .iter()
+            .any(|value| value == "projectIds")
+        {
             metadata.edited_fields.push("projectIds".into());
         }
     }
@@ -2234,7 +2318,11 @@ fn apply_metadata_patch(
     }
     if let Some(favourite) = patch.favourite {
         metadata.favourite = favourite;
-        if !metadata.edited_fields.iter().any(|value| value == "favourite") {
+        if !metadata
+            .edited_fields
+            .iter()
+            .any(|value| value == "favourite")
+        {
             metadata.edited_fields.push("favourite".into());
         }
     }
@@ -2367,9 +2455,16 @@ fn update_ingest_file_metadata(
 }
 
 #[tauri::command]
-fn pause_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+fn pause_ingest(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+) -> Result<(), String> {
     let result = mutate_jobs(&app, &state, |jobs| {
-        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job not found")?;
         validate_job_action(&job.state, "pause")?;
         if job.state == "queued" {
             job.state = "paused".into();
@@ -2384,7 +2479,15 @@ fn pause_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -
 }
 
 #[tauri::command]
-fn resume_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+fn resume_ingest(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+) -> Result<(), String> {
+    let update_guard = state.update_installing.lock().unwrap();
+    if *update_guard {
+        return Err(UPDATE_OPERATION_BLOCKED.into());
+    }
     let current = snapshot_jobs(&app, &state)?
         .into_iter()
         .find(|job| job.id == job_id)
@@ -2392,7 +2495,10 @@ fn resume_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) 
     validate_job_action(&current.state, "resume")?;
     state.paused_jobs.lock().unwrap().remove(&job_id);
     let result = mutate_jobs(&app, &state, |jobs| {
-        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job not found")?;
         validate_job_action(&job.state, "resume")?;
         job.state = "queued".into();
         for file in &mut job.files {
@@ -2406,12 +2512,21 @@ fn resume_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) 
         state.paused_jobs.lock().unwrap().insert(job_id);
         return Err(error);
     }
+    drop(update_guard);
     kick_ingest_worker(app);
     Ok(())
 }
 
 #[tauri::command]
-fn retry_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -> Result<(), String> {
+fn retry_ingest(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+) -> Result<(), String> {
+    let update_guard = state.update_installing.lock().unwrap();
+    if *update_guard {
+        return Err(UPDATE_OPERATION_BLOCKED.into());
+    }
     let current = snapshot_jobs(&app, &state)?
         .into_iter()
         .find(|job| job.id == job_id)
@@ -2420,11 +2535,15 @@ fn retry_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -
     state.cancelled_jobs.lock().unwrap().remove(&job_id);
     state.paused_jobs.lock().unwrap().remove(&job_id);
     mutate_jobs(&app, &state, |jobs| {
-        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job not found")?;
         validate_job_action(&job.state, "retry")?;
         prepare_job_retry(job);
         Ok(())
     })?;
+    drop(update_guard);
     kick_ingest_worker(app);
     Ok(())
 }
@@ -2432,7 +2551,10 @@ fn retry_ingest(app: AppHandle, state: State<'_, NativeState>, job_id: String) -
 #[tauri::command]
 fn cancel_ingest(app: AppHandle, state: State<NativeState>, job_id: String) -> Result<(), String> {
     let result = mutate_jobs(&app, &state, |jobs| {
-        let job = jobs.iter_mut().find(|job| job.id == job_id).ok_or("Ingest job not found")?;
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job not found")?;
         validate_job_action(&job.state, "cancel")?;
         if matches!(job.state.as_str(), "queued" | "paused" | "interrupted") {
             job.state = "cancelled".into();
@@ -2869,19 +2991,15 @@ async fn rescan(
                 needs_review: hash != item.sha256,
             });
         } else {
-            let (_, capture, provenance) = match destination_date(
-                &settings,
-                path,
-                &None,
-                &batch_timestamp,
-            ) {
-                Ok(value) => value,
-                Err(_) => {
-                    result.errors += 1;
-                    status.errors = result.errors;
-                    continue;
-                }
-            };
+            let (_, capture, provenance) =
+                match destination_date(&settings, path, &None, &batch_timestamp) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        result.errors += 1;
+                        status.errors = result.errors;
+                        continue;
+                    }
+                };
             let item = match new_media(
                 path,
                 relative.clone(),
@@ -2911,9 +3029,10 @@ async fn rescan(
     let current = load_catalogue_file(&settings)
         .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     events.retain(|event| match event {
-        CatalogueEvent::MediaRegistered { media } => !current.media.iter().any(|item| {
-            item.id == media.id || item.relative_path == media.relative_path
-        }),
+        CatalogueEvent::MediaRegistered { media } => !current
+            .media
+            .iter()
+            .any(|item| item.id == media.id || item.relative_path == media.relative_path),
         CatalogueEvent::MediaEvidenceObserved { media_id, .. } => {
             current.media.iter().any(|item| item.id == *media_id)
         }
@@ -3242,21 +3361,43 @@ fn app_info(app: AppHandle) -> AppInfo {
     }
 }
 
-#[tauri::command]
-fn updater_configuration() -> UpdaterConfiguration {
+fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfiguration {
     const ENDPOINT: &str =
         "https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json";
-    let configured = option_env!("PIMP_UPDATER_PUBLIC_KEY")
-        .is_some_and(|key| !key.trim().is_empty());
+    let key = public_key.map(str::trim).filter(|key| !key.is_empty());
+    let configured = key.is_some_and(|key| {
+        BASE64
+            .decode(key)
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .is_some_and(|decoded| minisign_verify::PublicKey::decode(&decoded).is_ok())
+    });
     UpdaterConfiguration {
         configured,
         channel: "Beta".into(),
         endpoint: ENDPOINT.into(),
-        reason: (!configured).then(|| {
-            "Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases."
-                .into()
+        reason: (!configured).then(|| match key {
+            Some(_) => "The embedded updater public key is invalid. Use the reviewed NSIS installer from GitHub Releases.".into(),
+            None => "Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.".into(),
         }),
     }
+}
+
+#[tauri::command]
+fn updater_configuration() -> UpdaterConfiguration {
+    updater_configuration_for_key(option_env!("PIMP_UPDATER_PUBLIC_KEY"))
+}
+
+#[tauri::command]
+fn begin_update_installation(app: AppHandle, state: State<'_, NativeState>) -> Result<(), String> {
+    let mut installing = state.update_installing.lock().unwrap();
+    let jobs = snapshot_jobs(&app, &state)?;
+    begin_update_gate(&mut installing, &jobs)
+}
+
+#[tauri::command]
+fn end_update_installation(state: State<'_, NativeState>) {
+    end_update_gate(&state.update_installing);
 }
 
 #[tauri::command]
@@ -3443,6 +3584,8 @@ pub fn run() {
             media_tools_status,
             app_info,
             updater_configuration,
+            begin_update_installation,
+            end_update_installation,
             open_support_link,
             open_logs_folder,
             resolve_media_path,
@@ -3574,7 +3717,11 @@ mod tests {
         assert_eq!(jobs[0].bytes_transferred, 5);
         assert_eq!(jobs[0].files[0].bytes_transferred, 5);
         assert_eq!(jobs[0].files[0].metadata.notes, "Retain through restart");
-        assert!(jobs[0].files[0].error.as_deref().unwrap().contains("stopped"));
+        assert!(jobs[0].files[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("stopped"));
     }
 
     #[test]
@@ -3650,7 +3797,10 @@ mod tests {
         catalogue::append(&catalogue_root, "device-a", duplicate_events).unwrap();
         let after_duplicate = catalogue::load(&catalogue_root).unwrap();
         assert_eq!(after_duplicate.media[0], expected);
-        assert_eq!(fs::read(root.join("master/20261024/clip.mp4")).unwrap(), b"verified-media");
+        assert_eq!(
+            fs::read(root.join("master/20261024/clip.mp4")).unwrap(),
+            b"verified-media"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3828,7 +3978,10 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("saved locally"));
         assert!(file.pending_metadata.is_some());
-        assert_eq!(file.metadata_error.as_deref(), Some("simulated append failure"));
+        assert_eq!(
+            file.metadata_error.as_deref(),
+            Some("simulated append failure")
+        );
 
         let path = root.join("failed-job.json");
         write_json(&path, &file).unwrap();
@@ -3867,7 +4020,11 @@ mod tests {
         fs::create_dir_all(card.join("Clip")).unwrap();
         fs::create_dir_all(card.join("General").join("Sony")).unwrap();
         fs::write(card.join("Clip").join("A001.MXF"), b"video").unwrap();
-        fs::write(card.join("General").join("Sony").join("A001.XML"), b"sidecar").unwrap();
+        fs::write(
+            card.join("General").join("Sony").join("A001.XML"),
+            b"sidecar",
+        )
+        .unwrap();
         fs::write(card.join("vendor.future"), b"future").unwrap();
         fs::write(card.join(".syncthing.A002.MXF.tmp"), b"partial").unwrap();
 
@@ -3942,15 +4099,8 @@ mod tests {
                     .file_name()
                     .unwrap()
                     .to_string_lossy();
-                planned_relative_path(
-                    &settings,
-                    Path::new(""),
-                    file,
-                    &None,
-                    &batch,
-                    &filename,
-                )
-                .unwrap()
+                planned_relative_path(&settings, Path::new(""), file, &None, &batch, &filename)
+                    .unwrap()
             })
             .collect::<HashSet<_>>();
         assert_eq!(planned.len(), 4);
@@ -3979,12 +4129,10 @@ mod tests {
                 .write(true)
                 .open(path)
                 .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new().set_modified(
-                        std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(modified.timestamp() as u64),
-                    ),
-                )
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(modified.timestamp() as u64),
+                ))
                 .unwrap();
         }
 
@@ -4002,15 +4150,8 @@ mod tests {
                     .to_string_lossy();
                 (
                     filename.to_string(),
-                    planned_relative_path(
-                        &settings,
-                        Path::new(""),
-                        file,
-                        &None,
-                        &batch,
-                        &filename,
-                    )
-                    .unwrap(),
+                    planned_relative_path(&settings, Path::new(""), file, &None, &batch, &filename)
+                        .unwrap(),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -4097,7 +4238,11 @@ mod tests {
     fn pruning_never_discards_failed_or_cancelled_jobs_with_pending_intent() {
         let mut jobs = Vec::new();
         for index in 0..220 {
-            let state = if index % 2 == 0 { "failed" } else { "cancelled" };
+            let state = if index % 2 == 0 {
+                "failed"
+            } else {
+                "cancelled"
+            };
             let mut job = ingest_job(state, state);
             job.id = format!("recoverable-{index}");
             job.files[0].metadata.tags = vec![format!("tag-{index}")];
@@ -4169,7 +4314,9 @@ mod tests {
             preserve_device_identity(&restarted.device_id, &first.device_id).unwrap(),
             first.device_id
         );
-        assert!(preserve_device_identity(&restarted.device_id, &Uuid::new_v4().to_string()).is_err());
+        assert!(
+            preserve_device_identity(&restarted.device_id, &Uuid::new_v4().to_string()).is_err()
+        );
 
         write_json(&path, &restarted).unwrap();
         fs::remove_file(&path).unwrap();
@@ -4203,24 +4350,63 @@ mod tests {
 
     #[test]
     fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-2");
         let configuration = updater_configuration();
         assert_eq!(configuration.channel, "Beta");
         assert!(configuration.endpoint.starts_with("https://"));
         if option_env!("PIMP_UPDATER_PUBLIC_KEY").is_none() {
             assert!(!configuration.configured);
             assert!(configuration.reason.is_some());
+        } else {
+            assert!(
+                configuration.configured,
+                "release builds must reject an invalid embedded updater public key"
+            );
         }
+        assert!(!updater_configuration_for_key(Some("not-a-minisign-key")).configured);
+        let encoded_public_key = BASE64.encode(
+            "untrusted comment: minisign public key\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n",
+        );
+        assert!(updater_configuration_for_key(Some(&encoded_public_key)).configured);
+    }
+
+    #[test]
+    fn update_gate_serializes_installation_with_ingest_lifecycle() {
+        for state in ["queued", "copying", "verifying", "paused", "interrupted"] {
+            let mut installing = false;
+            assert!(begin_update_gate(&mut installing, &[ingest_job(state, state)]).is_err());
+            assert!(!installing);
+        }
+
+        for state in ["completed", "failed", "cancelled"] {
+            let mut installing = false;
+            begin_update_gate(&mut installing, &[ingest_job(state, state)]).unwrap();
+            assert!(installing);
+            assert!(begin_update_gate(&mut installing, &[]).is_err());
+            end_update_gate(&Mutex::new(installing));
+        }
+
+        let gate = Mutex::new(false);
+        {
+            let mut installing = gate.lock().unwrap();
+            begin_update_gate(&mut installing, &[]).unwrap();
+        }
+        assert_eq!(
+            *gate.lock().unwrap(),
+            true,
+            "new ingest commands observe the installation gate"
+        );
+        end_update_gate(&gate);
+        assert!(!*gate.lock().unwrap());
     }
 
     #[test]
     fn updater_signature_verification_rejects_tampered_bytes() {
         use minisign_verify::{PublicKey, Signature};
 
-        let public_key = PublicKey::from_base64(
-            "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
-        )
-        .unwrap();
+        let public_key =
+            PublicKey::from_base64("RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3")
+                .unwrap();
         let signature = Signature::decode(
             "untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1633700835\tfile:test\tprehashed\nwLMDjy9FLAuxZ3q4NlEvkgtyhrr0gtTu6KC4KBJdITbbOeAi1zBIYo0v4iTgt8jJpIidRJnp94ABQkJAgAooBQ==",
         )
@@ -4277,22 +4463,14 @@ mod tests {
         settings.date_folder_pattern = "yyyyMMdd-HHmmss".into();
         settings.ingest_date_organization = "today".into();
 
-        let today_first = destination_date_from_modified(
-            &settings,
-            Some(first.clone()),
-            &None,
-            &batch,
-        )
-        .unwrap()
-        .0;
-        let today_second = destination_date_from_modified(
-            &settings,
-            Some(second.clone()),
-            &None,
-            &batch,
-        )
-        .unwrap()
-        .0;
+        let today_first =
+            destination_date_from_modified(&settings, Some(first.clone()), &None, &batch)
+                .unwrap()
+                .0;
+        let today_second =
+            destination_date_from_modified(&settings, Some(second.clone()), &None, &batch)
+                .unwrap()
+                .0;
         assert_eq!(today_first, "20261024-123456");
         assert_eq!(today_first, today_second);
 
@@ -4607,8 +4785,7 @@ mod tests {
         )
         .unwrap();
 
-        let recovery =
-            recover_staging(&master, "device-a", Some(&master.join(".pimp"))).unwrap();
+        let recovery = recover_staging(&master, "device-a", Some(&master.join(".pimp"))).unwrap();
         assert_eq!(recovery.recovered, 0);
         assert_eq!(recovery.needs_review, 1);
         assert!(journal_path.is_file());

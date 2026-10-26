@@ -2271,11 +2271,7 @@ mod tests {
             ..Default::default()
         };
         let backup = serde_json::to_vec_pretty(&legacy).unwrap();
-        fs::write(
-            root.join("catalogue.pre-events-v1.backup.json"),
-            &backup,
-        )
-        .unwrap();
+        fs::write(root.join("catalogue.pre-events-v1.backup.json"), &backup).unwrap();
         fs::create_dir_all(event_dir(&root)).unwrap();
         let partial = br#"{"schemaVersion":2"#;
         fs::write(event_dir(&root).join("migration-v2.jsonl"), partial).unwrap();
