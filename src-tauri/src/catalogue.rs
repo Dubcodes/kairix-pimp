@@ -1944,6 +1944,97 @@ mod tests {
     }
 
     #[test]
+    fn pairing_is_case_insensitive_and_handles_missing_and_late_files_idempotently() {
+        let mut catalogue = Catalogue {
+            media: vec![
+                item("video", "DJI/CardA/DJI_0001.MP4", "mp4"),
+                item("unpaired-video", "DJI/CardA/DJI_0002.mp4", "mp4"),
+                item("unpaired-audio", "DJI/CardA/DJI_0003.wav", "wav"),
+                item("other-directory", "DJI/CardB/DJI_0001.wav", "wav"),
+            ],
+            ..Default::default()
+        };
+
+        pair_audio(&mut catalogue);
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "video")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+
+        catalogue
+            .media
+            .push(item("late-audio", "dji/carda/dji_0001.WAV", "wav"));
+        pair_audio(&mut catalogue);
+        pair_audio(&mut catalogue);
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "video")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("late-audio")
+        );
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "unpaired-video")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+    }
+
+    #[test]
+    fn derived_pairing_survives_restart_and_cross_device_event_delivery() {
+        let root = temporary("paired-restart");
+        let events = event_dir(&root);
+        fs::create_dir_all(&events).unwrap();
+        let video = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("video", "2026-10-27/DJI_0001.mp4", "mp4"),
+            },
+        );
+        let audio = envelope(
+            "laptop",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("audio", "2026-10-27/DJI_0001.wav", "wav"),
+            },
+        );
+        fs::write(
+            events.join("desktop.jsonl"),
+            format!("{}\n", serde_json::to_string(&video).unwrap()),
+        )
+        .unwrap();
+        fs::write(
+            events.join("laptop.jsonl"),
+            format!("{}\n", serde_json::to_string(&audio).unwrap()),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let catalogue = load(&root).unwrap();
+            assert_eq!(catalogue.media.len(), 2);
+            assert_eq!(
+                catalogue
+                    .media
+                    .iter()
+                    .find(|item| item.id == "video")
+                    .unwrap()
+                    .attached_audio_id
+                    .as_deref(),
+                Some("audio")
+            );
+        }
+    }
+
+    #[test]
     fn cache_references_reject_traversal_and_absolute_paths() {
         assert!(safe_cache_reference("item.jpg"));
         assert!(!safe_cache_reference("../item.jpg"));

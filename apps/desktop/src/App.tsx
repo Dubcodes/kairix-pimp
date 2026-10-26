@@ -47,6 +47,12 @@ import {
   type AvailableUpdate,
 } from './updates';
 import { SettingsWriteQueue } from './settings-write-queue';
+import {
+  associatedMedia,
+  expandLogicalMediaIds,
+  logicalMediaMatches,
+  visibleMedia,
+} from './media-grouping';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
 type SettingsSection =
@@ -441,48 +447,36 @@ export function App() {
       document.removeEventListener('contextmenu', preventDefaultContextMenu);
   }, []);
 
+  const displayedMedia = useMemo(
+    () =>
+      visibleMedia(
+        catalogue.media,
+        settings.showAttachedAudioSeparately ?? false,
+      ),
+    [catalogue.media, settings.showAttachedAudioSeparately],
+  );
   const folders = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const item of catalogue.media) {
+    for (const item of displayedMedia) {
       const name =
         item.relativePath.split('/').slice(0, -1).join('/') ||
         'Master Bin root';
       counts.set(name, (counts.get(name) ?? 0) + 1);
     }
     return [...counts.entries()].sort(([a], [b]) => b.localeCompare(a));
-  }, [catalogue.media]);
+  }, [displayedMedia]);
   const filtered = useMemo(
     () =>
-      catalogue.media.filter((item) => {
+      displayedMedia.filter((item) => {
         const itemFolder =
           item.relativePath.split('/').slice(0, -1).join('/') ||
           'Master Bin root';
-        const projects = item.projectIds.map(
-          (id) =>
-            catalogue.projects.find((project) => project.id === id)?.name ?? '',
-        );
-        const haystack = [
-          item.originalFilename,
-          item.relativePath,
-          item.notes,
-          item.captureDate,
-          item.ingestDate,
-          item.fileType,
-          item.technical.codec,
-          item.technical.width,
-          item.technical.height,
-          item.technical.frameRate,
-          ...item.tags,
-          ...projects,
-        ]
-          .join(' ')
-          .toLowerCase();
         return (
           (folder === 'All media' || folder === itemFolder) &&
-          haystack.includes(query.trim().toLowerCase())
+          logicalMediaMatches(item, query, catalogue)
         );
       }),
-    [catalogue, folder, query],
+    [catalogue, displayedMedia, folder, query],
   );
   const knownTags = useMemo(
     () => [...new Set(catalogue.media.flatMap((item) => item.tags))].sort(),
@@ -663,9 +657,8 @@ export function App() {
   }) => {
     if (!selected.length) return;
     try {
-      setCatalogue(
-        await desktopBridge.updateMedia({ mediaIds: selected, ...next }),
-      );
+      const mediaIds = expandLogicalMediaIds(selected, catalogue.media);
+      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...next }));
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -700,6 +693,10 @@ export function App() {
     selected.length === 1
       ? catalogue.media.find((item) => item.id === selected[0])
       : undefined;
+  const selectedAssociatedMedia = selectedRecording
+    ? associatedMedia(selectedRecording, catalogue.media)
+    : [];
+  const selectedPhysicalIds = expandLogicalMediaIds(selected, catalogue.media);
   const contextRecording = contextMenu
     ? catalogue.media.find((item) => item.id === contextMenu.mediaId)
     : undefined;
@@ -726,7 +723,7 @@ export function App() {
     }
   };
   const copySelectedPaths = async () => {
-    const recordings = selected
+    const recordings = selectedPhysicalIds
       .map((id) => catalogue.media.find((item) => item.id === id))
       .filter((item): item is NonNullable<typeof item> => Boolean(item));
     const available = recordings.filter((item) => item.available);
@@ -743,6 +740,20 @@ export function App() {
       );
     } catch (reason) {
       setError(errorText(reason));
+    }
+  };
+  const reEvaluateAudioPairing = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      setCatalogue(await desktopBridge.loadCatalogue());
+      setMessage(
+        'External-audio pairing re-evaluated from the current catalogue.',
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
     }
   };
   const doRescan = async () => {
@@ -1269,6 +1280,20 @@ export function App() {
                       setSettings({ ...settings, catalogueInMasterBin })
                     }
                   />
+                  <ToggleField
+                    label="Show attached audio as separate cards"
+                    description="By default, a matching WAV is grouped with its video as one logical recording."
+                    checked={settings.showAttachedAudioSeparately ?? false}
+                    onChange={(showAttachedAudioSeparately) =>
+                      void persistPreference({ showAttachedAudioSeparately })
+                    }
+                  />
+                  <button
+                    disabled={busy}
+                    onClick={() => void reEvaluateAudioPairing()}
+                  >
+                    <RefreshCw size={14} /> Re-evaluate audio pairing
+                  </button>
                   {!settings.catalogueInMasterBin && (
                     <PathField
                       label="Shared catalogue"
@@ -1717,7 +1742,7 @@ export function App() {
                 >
                   <Folder size={16} />
                   <span>
-                    All media<small>{catalogue.media.length} items</small>
+                    All media<small>{displayedMedia.length} recordings</small>
                   </span>
                 </button>
                 {folders.map(([name, count]) => (
@@ -1849,7 +1874,10 @@ export function App() {
                             </span>
                             <span>
                               {item.attachedAudioId ? (
-                                <Volume2 size={12} />
+                                <>
+                                  <Volume2 size={12} /> 2 associated files
+                                  ·{' '}
+                                </>
                               ) : item.technical.hasAudio === false ? (
                                 <VolumeX size={12} />
                               ) : null}
@@ -1965,7 +1993,7 @@ export function App() {
                     Remove favourite
                   </button>
                   <button
-                    disabled={selected.every(
+                    disabled={selectedPhysicalIds.every(
                       (id) =>
                         !catalogue.media.find((item) => item.id === id)
                           ?.available,
@@ -1976,26 +2004,67 @@ export function App() {
                   </button>
                 </div>
                 {selectedRecording && (
-                  <div className="file-actions" aria-label="Recording actions">
-                    <button
-                      disabled={!selectedRecording.available}
-                      onClick={() => void runSelectedFileAction('reveal')}
+                  <>
+                    <div
+                      className="associated-files"
+                      role="group"
+                      aria-label="Associated physical files"
                     >
-                      <LocateFixed size={13} /> Reveal in Explorer
-                    </button>
-                    <button
-                      disabled={!selectedRecording.available}
-                      onClick={() => void runSelectedFileAction('folder')}
+                      <strong>
+                        {selectedAssociatedMedia.length} associated file
+                        {selectedAssociatedMedia.length === 1 ? '' : 's'}
+                      </strong>
+                      {selectedAssociatedMedia.map((recording) => (
+                        <div className="associated-file" key={recording.id}>
+                          <div>
+                            <b>{recording.originalFilename}</b>
+                            <span>
+                              {recording.fileType.toUpperCase()} ·{' '}
+                              {size(recording.technical.sizeBytes)} ·{' '}
+                              {recording.needsReview
+                                ? 'Integrity needs review'
+                                : recording.available
+                                  ? 'Integrity verified'
+                                  : 'Unavailable locally'}
+                            </span>
+                            <code>{recording.relativePath}</code>
+                          </div>
+                          <button
+                            disabled={!recording.available}
+                            aria-label={`Reveal ${recording.originalFilename} in Explorer`}
+                            onClick={() =>
+                              void runSelectedFileAction('reveal', recording)
+                            }
+                          >
+                            <LocateFixed size={13} /> Reveal
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                    <div
+                      className="file-actions"
+                      aria-label="Recording actions"
                     >
-                      <FolderOpen size={13} /> Open date folder
-                    </button>
-                    <button
-                      disabled={!selectedRecording.available}
-                      onClick={() => void runSelectedFileAction('copy')}
-                    >
-                      <Copy size={13} /> Copy path
-                    </button>
-                  </div>
+                      <button
+                        disabled={!selectedRecording.available}
+                        onClick={() => void runSelectedFileAction('reveal')}
+                      >
+                        <LocateFixed size={13} /> Reveal in Explorer
+                      </button>
+                      <button
+                        disabled={!selectedRecording.available}
+                        onClick={() => void runSelectedFileAction('folder')}
+                      >
+                        <FolderOpen size={13} /> Open date folder
+                      </button>
+                      <button
+                        disabled={!selectedRecording.available}
+                        onClick={() => void runSelectedFileAction('copy')}
+                      >
+                        <Copy size={13} /> Copy path
+                      </button>
+                    </div>
+                  </>
                 )}
                 <button
                   className="batch-clear"

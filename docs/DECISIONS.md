@@ -229,3 +229,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** The desktop serializes every accepted immediate preference write and applies a native response only when it belongs to the newest local revision. Failed latest writes remain visibly retryable, pending writes warn before ordinary WebView unload, and explicit interface reload waits for the queue. Windows `--minimized` startup hides the main window only when native tray construction succeeded.
 - **Consequences:** Rapid theme, density, tray, startup-page and update-check changes remain ordered without stale UI rollback. Configuration form values still use explicit save to avoid excessive writes. If tray creation fails during autostart, PIMP remains visible and logs the fallback instead of becoming inaccessible.
+
+## ADR-030 — Derived external-audio grouping
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Treat exactly one same-directory, case-insensitive same-stem WAV beside an MP4/MOV/M4V as the video's attached audio. The relationship remains a deterministic catalogue projection rather than a synchronized event. The Library hides the attached WAV card by default, but searches and logical operations include both physical records; a device-local setting may expose every card.
+- **Consequences:** Late Syncthing arrivals pair on the next catalogue replay without metadata mutation or duplicate records. Ambiguous or unmatched WAV files remain independent. There is no manual override yet; adding one requires a reversible, convergent representation.

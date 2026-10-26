@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
     checkForUpdates: true,
     theme: 'graphite' as const,
     density: 'comfortable' as const,
+    showAttachedAudioSeparately: false,
   } as DeviceSettings,
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
@@ -154,6 +155,7 @@ describe('native application integration', () => {
       checkForUpdates: true,
       theme: 'graphite',
       density: 'comfortable',
+      showAttachedAudioSeparately: false,
     };
     mocks.saveSettings.mockReset();
     mocks.loadCatalogue.mockReset();
@@ -505,6 +507,117 @@ describe('native application integration', () => {
     expect(mocks.revealMediaInExplorer).toHaveBeenCalledWith('media-1');
     expect(mocks.openMediaFolder).toHaveBeenCalledWith('media-1');
     expect(writeText).toHaveBeenCalledWith('C:\\Master\\20261024\\clip.mp4');
+  });
+
+  it('presents paired video and WAV as one searchable logical recording', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'video',
+          relativePath: '20261024/DJI_0001.MP4',
+          originalFilename: 'DJI_0001.MP4',
+          sha256: 'video-hash',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 2_000, hasAudio: false },
+          attachedAudioId: 'audio',
+          available: true,
+          needsReview: false,
+        },
+        {
+          id: 'audio',
+          relativePath: '20261024/dji_0001.wav',
+          originalFilename: 'dji_0001.wav',
+          sha256: 'audio-hash',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'wav',
+          tags: ['lav'],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 1_000 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.resolveMediaPath.mockImplementation(
+      async (mediaId: string) => `C:\\Master\\${mediaId}`,
+    );
+    const user = userEvent.setup();
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<App />);
+
+    expect(await screen.findByText('DJI_0001.MP4')).toBeVisible();
+    expect(screen.queryByRole('option', { name: /dji_0001.wav/i })).toBeNull();
+    expect(screen.getByText(/2 associated files/)).toBeVisible();
+    await user.type(
+      screen.getByPlaceholderText(/Search filenames/),
+      'dji_0001.wav',
+    );
+    await user.click(screen.getByRole('option', { name: /DJI_0001.MP4/ }));
+
+    const associatedFiles = screen.getByRole('group', {
+      name: 'Associated physical files',
+    });
+    expect(associatedFiles).toHaveTextContent('dji_0001.wav');
+    expect(associatedFiles).toHaveTextContent(
+      /DJI_0001\.MP4.*Integrity verified.*dji_0001\.wav.*Integrity verified/i,
+    );
+    await user.click(screen.getByRole('button', { name: 'Favourite' }));
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['video', 'audio'],
+      favourite: true,
+    });
+    await user.click(
+      screen.getByRole('button', { name: /Copy paths for Premiere/ }),
+    );
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        'C:\\Master\\video\r\nC:\\Master\\audio',
+      ),
+    );
+    await user.click(
+      screen.getByRole('button', {
+        name: 'Reveal dji_0001.wav in Explorer',
+      }),
+    );
+    expect(mocks.revealMediaInExplorer).toHaveBeenCalledWith('audio');
+  });
+
+  it('persists the attached-audio card preference and can re-evaluate pairing', async () => {
+    mocks.saveSettings.mockImplementation(async (settings) => settings);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Library & Storage' }));
+    await user.click(
+      screen.getByRole('switch', {
+        name: /Show attached audio as separate cards/,
+      }),
+    );
+    expect(mocks.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ showAttachedAudioSeparately: true }),
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Re-evaluate audio pairing' }),
+    );
+    expect(mocks.loadCatalogue).toHaveBeenCalled();
+    expect(
+      await screen.findByText(
+        'External-audio pairing re-evaluated from the current catalogue.',
+      ),
+    ).toBeVisible();
   });
 
   it('supports desktop selection, batch favourites, multi-path copy and context actions', async () => {

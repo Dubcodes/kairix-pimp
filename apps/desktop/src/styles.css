@@ -706,6 +706,49 @@ article footer span {
   cursor: not-allowed;
   opacity: 0.45;
 }
+.associated-files {
+  flex: 1 0 100%;
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid #c2ccc4;
+}
+.associated-file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 7px 8px;
+  border-radius: 7px;
+  background: #f8fbf9;
+}
+.associated-file div,
+.associated-file b,
+.associated-file span,
+.associated-file code {
+  display: block;
+  min-width: 0;
+}
+.associated-file b {
+  font-size: 10px;
+}
+.associated-file span,
+.associated-file code {
+  margin-top: 2px;
+  color: #657168;
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+.associated-file button {
+  min-height: 32px;
+  border: 1px solid #c2ccc4;
+  border-radius: 6px;
+  background: #fff;
+  color: #253029;
+}
+.associated-file button:disabled {
+  opacity: 0.45;
+}
 .batch-heading {
   min-width: 92px;
 }

@@ -28,6 +28,7 @@ export interface DeviceSettings {
     | 'system'
     | 'high-contrast';
   density: 'comfortable' | 'compact';
+  showAttachedAudioSeparately: boolean;
 }
 export interface AppInfo {
   version: string;
@@ -234,6 +235,7 @@ export const emptySettings = (): DeviceSettings => ({
   checkForUpdates: true,
   theme: 'graphite',
   density: 'comfortable',
+  showAttachedAudioSeparately: false,
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],

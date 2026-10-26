@@ -68,6 +68,8 @@ struct DeviceSettings {
     theme: String,
     #[serde(default = "default_density")]
     density: String,
+    #[serde(default)]
+    show_attached_audio_separately: bool,
 }
 fn default_true() -> bool {
     true
@@ -107,6 +109,7 @@ impl Default for DeviceSettings {
             check_for_updates: true,
             theme: default_theme(),
             density: default_density(),
+            show_attached_audio_separately: false,
         }
     }
 }
@@ -4333,6 +4336,7 @@ mod tests {
         assert_eq!(settings.startup_page, "Library");
         assert_eq!(settings.theme, "graphite");
         assert_eq!(settings.density, "comfortable");
+        assert!(!settings.show_attached_audio_separately);
     }
 
     #[test]

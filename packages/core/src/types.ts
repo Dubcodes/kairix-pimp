@@ -14,6 +14,7 @@ export interface DeviceSettings {
   initializedCataloguePath?: string;
   projectPaths?: Record<string, string>;
   dateFolderPattern?: string;
+  showAttachedAudioSeparately?: boolean;
 }
 
 export interface SharedSettings {
