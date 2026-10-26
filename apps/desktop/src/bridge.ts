@@ -35,6 +35,12 @@ export interface AppInfo {
   edition: string;
   releaseChannel: string;
 }
+export interface UpdaterConfiguration {
+  configured: boolean;
+  channel: 'Beta';
+  endpoint: string;
+  reason?: string;
+}
 export interface MediaItem {
   id: string;
   relativePath: string;
@@ -352,6 +358,8 @@ export const desktopBridge = {
   getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
   appInfo: () => invoke<AppInfo>('app_info'),
+  updaterConfiguration: () =>
+    invoke<UpdaterConfiguration>('updater_configuration'),
   openSupportLink: (destination: 'github' | 'releases' | 'coffee') =>
     invoke<void>('open_support_link', { destination }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),

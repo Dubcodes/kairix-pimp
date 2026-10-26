@@ -295,6 +295,15 @@ struct AppInfo {
     release_channel: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdaterConfiguration {
+    configured: bool,
+    channel: String,
+    endpoint: String,
+    reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaUpdate {
@@ -3234,6 +3243,23 @@ fn app_info(app: AppHandle) -> AppInfo {
 }
 
 #[tauri::command]
+fn updater_configuration() -> UpdaterConfiguration {
+    const ENDPOINT: &str =
+        "https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json";
+    let configured = option_env!("PIMP_UPDATER_PUBLIC_KEY")
+        .is_some_and(|key| !key.trim().is_empty());
+    UpdaterConfiguration {
+        configured,
+        channel: "Beta".into(),
+        endpoint: ENDPOINT.into(),
+        reason: (!configured).then(|| {
+            "Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases."
+                .into()
+        }),
+    }
+}
+
+#[tauri::command]
 fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, String> {
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
@@ -3292,6 +3318,11 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(option_env!("PIMP_UPDATER_PUBLIC_KEY").unwrap_or(""))
+                .build(),
+        )
         .manage(NativeState::default())
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -3391,6 +3422,7 @@ pub fn run() {
             enrich_media,
             media_tools_status,
             app_info,
+            updater_configuration,
             open_support_link,
             open_logs_folder,
             resolve_media_path,
@@ -4147,6 +4179,34 @@ mod tests {
             Some("https://buymeacoffee.com/dubcodes")
         );
         assert_eq!(support_url("https://example.invalid"), None);
+    }
+
+    #[test]
+    fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-beta.1");
+        let configuration = updater_configuration();
+        assert_eq!(configuration.channel, "Beta");
+        assert!(configuration.endpoint.starts_with("https://"));
+        if option_env!("PIMP_UPDATER_PUBLIC_KEY").is_none() {
+            assert!(!configuration.configured);
+            assert!(configuration.reason.is_some());
+        }
+    }
+
+    #[test]
+    fn updater_signature_verification_rejects_tampered_bytes() {
+        use minisign_verify::{PublicKey, Signature};
+
+        let public_key = PublicKey::from_base64(
+            "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+        )
+        .unwrap();
+        let signature = Signature::decode(
+            "untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1633700835\tfile:test\tprehashed\nwLMDjy9FLAuxZ3q4NlEvkgtyhrr0gtTu6KC4KBJdITbbOeAi1zBIYo0v4iTgt8jJpIidRJnp94ABQkJAgAooBQ==",
+        )
+        .unwrap();
+        assert!(public_key.verify(b"test", &signature, false).is_ok());
+        assert!(public_key.verify(b"tampered", &signature, false).is_err());
     }
 
     #[test]

@@ -3,5 +3,10 @@
   "identifier": "main",
   "description": "Minimal shell permissions; filesystem work is exposed only through validated application commands.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "updater:default",
+    "process:allow-restart"
+  ]
 }

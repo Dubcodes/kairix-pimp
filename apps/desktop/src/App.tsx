@@ -41,6 +41,11 @@ import {
   type SourceInventory,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
+import {
+  checkApprovedBetaUpdate,
+  installApprovedBetaUpdate,
+  type AvailableUpdate,
+} from './updates';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
 type SettingsSection =
@@ -97,6 +102,15 @@ export function App() {
   const [error, setError] = useState('');
   const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate>();
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState(
+    'Not checked in this session',
+  );
+  const [updateProgress, setUpdateProgress] = useState<{
+    downloaded: number;
+    total?: number;
+  }>();
   const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus>({
     running: false,
     full: false,
@@ -127,6 +141,7 @@ export function App() {
   const selectionAnchor = useRef<string | undefined>(undefined);
   const savingSettings = useRef(false);
   const scanActive = useRef(false);
+  const automaticUpdateCheckStarted = useRef(false);
 
   const configured = Boolean(settings.initializedCataloguePath);
   const refresh = useCallback(async () => {
@@ -740,6 +755,69 @@ export function App() {
       ].join('\r\n'),
     );
     setMessage('Diagnostic summary copied without personal file paths.');
+  };
+  const checkForUpdates = useCallback(async () => {
+    setCheckingUpdate(true);
+    setError('');
+    try {
+      const update = await checkApprovedBetaUpdate();
+      const checkedAt = new Date().toLocaleString();
+      localStorage.setItem('pimp-last-update-check', checkedAt);
+      setAvailableUpdate(update ?? undefined);
+      setUpdateStatus(
+        update
+          ? `Signed Beta ${update.version} is available.`
+          : `No newer signed Beta was available at ${checkedAt}.`,
+      );
+    } catch (reason) {
+      setUpdateStatus(`Update check failed: ${errorText(reason)}`);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, []);
+  useEffect(() => {
+    if (
+      !native ||
+      !applicationInfo ||
+      settings.checkForUpdates === false ||
+      automaticUpdateCheckStarted.current
+    ) {
+      return;
+    }
+    automaticUpdateCheckStarted.current = true;
+    void checkForUpdates();
+  }, [applicationInfo, checkForUpdates, native, settings.checkForUpdates]);
+  const installUpdate = async () => {
+    if (activeJobs.length > 0) {
+      setUpdateStatus(
+        'Finish, pause or cancel active ingest jobs before installing an update.',
+      );
+      return;
+    }
+    setCheckingUpdate(true);
+    setUpdateProgress({ downloaded: 0 });
+    try {
+      await installApprovedBetaUpdate((event) => {
+        if (event.event === 'Started') {
+          setUpdateProgress({
+            downloaded: 0,
+            total: event.data.contentLength,
+          });
+        } else if (event.event === 'Progress') {
+          setUpdateProgress((current) => ({
+            downloaded: (current?.downloaded ?? 0) + event.data.chunkLength,
+            total: current?.total,
+          }));
+        } else {
+          setUpdateStatus('Signed update downloaded and verified. Installing…');
+        }
+      });
+      setUpdateStatus('Update installed. Restart PIMP if it does not reopen.');
+    } catch (reason) {
+      setUpdateStatus(`Update installation failed: ${errorText(reason)}`);
+    } finally {
+      setCheckingUpdate(false);
+    }
   };
   const createProject = async () => {
     setBusy(true);
@@ -1402,14 +1480,68 @@ export function App() {
                       Build {applicationInfo?.buildCommit ?? 'development'}
                     </span>
                   </div>
-                  <p>
-                    Signed in-app updating is configured in the next release
-                    checkpoint. Until then, use only an approved installer from
-                    GitHub Releases—not an unapproved Actions artifact.
-                  </p>
-                  <button onClick={() => void openSupport('releases')}>
-                    Open GitHub Releases
-                  </button>
+                  <div className="info-card" role="status">
+                    <strong>Update status</strong>
+                    <span>{updateStatus}</span>
+                    <small>
+                      Last successful check:{' '}
+                      {localStorage.getItem('pimp-last-update-check') ??
+                        'Never'}
+                    </small>
+                    {availableUpdate && (
+                      <>
+                        <span>
+                          {availableUpdate.version}
+                          {availableUpdate.sizeBytes
+                            ? ` · ${size(availableUpdate.sizeBytes)}`
+                            : ''}
+                        </span>
+                        {availableUpdate.notes && (
+                          <p>{availableUpdate.notes}</p>
+                        )}
+                      </>
+                    )}
+                    {updateProgress && (
+                      <span>
+                        Downloaded {size(updateProgress.downloaded)}
+                        {updateProgress.total
+                          ? ` of ${size(updateProgress.total)}`
+                          : ''}
+                      </span>
+                    )}
+                  </div>
+                  <div className="scan-actions">
+                    <button disabled={checkingUpdate} onClick={checkForUpdates}>
+                      {checkingUpdate ? 'Checking…' : 'Check for updates'}
+                    </button>
+                    <button
+                      className="primary"
+                      disabled={
+                        checkingUpdate ||
+                        !availableUpdate ||
+                        activeJobs.length > 0
+                      }
+                      title={
+                        activeJobs.length
+                          ? 'Active ingest jobs must be stopped before updating'
+                          : undefined
+                      }
+                      onClick={installUpdate}
+                    >
+                      Download, verify and install
+                    </button>
+                    <button onClick={() => void openSupport('releases')}>
+                      {availableUpdate
+                        ? 'Open release notes'
+                        : 'Open GitHub Releases'}
+                    </button>
+                  </div>
+                  <small>
+                    Only the approved Beta manifest and artifacts with a valid
+                    Tauri signature can install. If this build has no public
+                    key, the check fails closed and the reviewed NSIS installer
+                    remains available.
+                  </small>
                 </>
               )}
 

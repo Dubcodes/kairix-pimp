@@ -1,8 +1,10 @@
-# Kairix PIMP 0.1.0 beta
+# Kairix PIMP 0.1.1-beta.1
 
 This is an unsigned Windows beta for disposable-media testing. Confirm the
 source and build/test commits in `BUILD-INFO.txt` and verify an installer with
 `SHA256SUMS.txt` before running it.
+
+This build adds startup discovery for populated Master Bins, non-blocking Settings persistence, interface recovery, structured Settings, close-to-tray, professional themes, safe support links and a fail-closed signed Beta updater foundation. In-app installation remains unavailable until the protected signing configuration in `docs/UPDATES.md` is provisioned.
 
 ## Verified by automated tests and Windows CI
 

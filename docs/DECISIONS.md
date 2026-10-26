@@ -214,3 +214,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Decision:** Close-to-tray defaults on for new devices, but the close event is intercepted only after native tray creation succeeds. Show restores the existing single instance; Quit exits without deleting durable job state. Appearance, density, startup page, update-check intent and launch-at-login remain device-local settings. External support links use a fixed native destination allowlist. The supported beta installer is per-user NSIS; MSI remains a compatibility artifact and another installation scope is never silently removed.
 - **Why:** Background ingest/discovery must survive an ordinary window close without making PIMP inaccessible, synced metadata must not acquire machine preferences, web content must not gain arbitrary URL-opening authority, and upgrade cleanup must preserve user data and explicit control.
 - **Consequences:** Tray behavior still requires installed-Windows acceptance, and users with both early MSI and NSIS installations follow the documented verify-then-uninstall migration.
+
+## ADR-028 — Fail-closed signed Beta update channel
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
+- **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.

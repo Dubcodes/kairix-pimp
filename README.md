@@ -27,6 +27,8 @@ New installations use `yyyymmdd` date folders. Settings provide a live preview b
 
 Settings are organized into General, Library & Storage, Ingest & Discovery, Appearance, Updates, About & Support and Diagnostics. Graphite is the default token-based theme, with Adobe-style Dark, Light, Midnight, System and High Contrast alternatives. Close-to-tray defaults on for new devices; the native notification-area menu restores the existing single instance or explicitly quits. Safe support links are selected from a native allowlist. The recommended Windows beta package is the per-user NSIS installer; see [Windows installation and upgrades](docs/WINDOWS_INSTALLATION.md).
 
+Version `0.1.1-beta.1` includes a fail-closed official Tauri updater foundation for the approved Beta channel. Until the protected signing key/password and matching public key are provisioned, the app clearly reports updates unavailable and links to reviewed manual releases; it never installs unsigned Actions artifacts. See [Signed Beta updates](docs/UPDATES.md).
+
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 
 The native host, web frontend, unsigned MSI and NSIS installers build on Windows. Installer signing and upgrades, a notification-based filesystem watcher, safe catalogue-location relocation, folder notes, preview-frame selection and automated Premiere integration remain incomplete.

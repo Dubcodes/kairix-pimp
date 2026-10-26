@@ -92,6 +92,14 @@ vi.mock('./bridge', () => ({
     })),
     openSupportLink: vi.fn(),
     openLogsFolder: vi.fn(),
+    updaterConfiguration: vi.fn(async () => ({
+      configured: false,
+      channel: 'Beta',
+      endpoint:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
+      reason:
+        'Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.',
+    })),
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
@@ -302,6 +310,22 @@ describe('native application integration', () => {
     expect(mocks.saveSettings).toHaveBeenCalledWith(
       expect.objectContaining({ theme: 'midnight' }),
     );
+  });
+
+  it('fails closed with a manual release fallback when signing is not configured', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Updates' }));
+    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
+    expect(
+      await screen.findByText(
+        /Signed updates are not configured in this build/,
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Open GitHub Releases' }),
+    ).toBeEnabled();
   });
 
   it('offers validated Windows file actions for one locally available recording', async () => {
