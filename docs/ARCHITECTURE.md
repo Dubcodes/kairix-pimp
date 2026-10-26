@@ -113,3 +113,5 @@ Completed projects retain lightweight searchable catalogue records even when arc
 ## Cross-platform considerations
 
 Windows/WebView2 is first. Core records preserve canonical spelling while detecting case-fold hazards, never store drive letters as portable identity, and isolate file watching, removable-device discovery, process invocation, credential storage, and path rules behind adapters. Linux WebKit/FFmpeg packaging and macOS signing/notarization/sandbox behavior need later platform-specific implementations and tests; portability in design is not a verified release claim.
+
+Device-local desktop preferences include startup page, launch-at-login, close-to-tray, theme, density and update-check intent. Tauri owns notification-area lifecycle: closing hides only when both the preference and a successfully created tray icon are present, preventing an inaccessible background process. Tray Show restores the existing single-instance window and Quit uses the application exit path; durable jobs remain recoverable. External support destinations are mapped by name to a fixed native HTTPS allowlist rather than accepting a URL from the webview.

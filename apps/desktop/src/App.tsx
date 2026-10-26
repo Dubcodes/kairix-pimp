@@ -2,16 +2,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Clock3,
+  Coffee,
   Copy,
   Folder,
   FolderOpen,
   HardDrive,
+  Github,
   Inbox,
   Library,
   LocateFixed,
   RefreshCw,
   Search,
   Settings,
+  SlidersHorizontal,
   Star,
   Tag,
   UploadCloud,
@@ -26,6 +29,7 @@ import {
   emptySettings,
   nativeAvailable,
   type Catalogue,
+  type AppInfo,
   type DeviceSettings,
   type DiscoveryStatus,
   type IngestJob,
@@ -39,6 +43,14 @@ import {
 import { datePatternPreview } from './date-pattern';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
+type SettingsSection =
+  | 'General'
+  | 'Library & Storage'
+  | 'Ingest & Discovery'
+  | 'Appearance'
+  | 'Updates'
+  | 'About & Support'
+  | 'Diagnostics';
 
 const icons = {
   Ingest: Inbox,
@@ -63,6 +75,8 @@ export function App() {
   const [settings, setSettings] = useState<DeviceSettings>(emptySettings);
   const [catalogue, setCatalogue] = useState<Catalogue>(emptyCatalogue);
   const [view, setView] = useState<View>('Library');
+  const [settingsSection, setSettingsSection] =
+    useState<SettingsSection>('General');
   const [query, setQuery] = useState('');
   const [folder, setFolder] = useState('All media');
   const [selected, setSelected] = useState<string[]>([]);
@@ -82,6 +96,7 @@ export function App() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
+  const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
   const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus>({
     running: false,
     full: false,
@@ -187,6 +202,7 @@ export function App() {
         });
       }),
       desktopBridge.getDiscoveryStatus(),
+      desktopBridge.appInfo(),
     ])
       .then(
         async ([
@@ -198,6 +214,7 @@ export function App() {
           unlistenDiscovery,
           unlistenCatalogue,
           loadedDiscoveryStatus,
+          loadedApplicationInfo,
         ]) => {
           if (disposed) {
             unlistenProgress();
@@ -214,7 +231,9 @@ export function App() {
           stopCatalogue = unlistenCatalogue;
           setSettings(loaded);
           setMediaTools(tools);
+          setApplicationInfo(loadedApplicationInfo);
           setDiscoveryStatus(loadedDiscoveryStatus);
+          setView((loaded.startupPage as View | undefined) ?? 'Library');
           setJobs(await desktopBridge.initializeIngestJobs());
           if (loaded.initializedCataloguePath) {
             const before = await desktopBridge.catalogueSignature();
@@ -241,6 +260,24 @@ export function App() {
       stopCatalogue?.();
     };
   }, [native, refresh]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const selected = settings.theme ?? 'graphite';
+    const systemDark = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const apply = () => {
+      root.dataset.theme =
+        selected === 'system'
+          ? (systemDark?.matches ?? true)
+            ? 'graphite'
+            : 'light'
+          : selected;
+      root.dataset.density = settings.density ?? 'comfortable';
+    };
+    apply();
+    systemDark?.addEventListener('change', apply);
+    return () => systemDark?.removeEventListener('change', apply);
+  }, [settings.density, settings.theme]);
 
   useEffect(() => {
     if (!native || sources.length === 0) return;
@@ -444,6 +481,20 @@ export function App() {
     } finally {
       savingSettings.current = false;
       setBusy(false);
+    }
+  };
+  const persistPreference = async (patch: Partial<DeviceSettings>) => {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    if (!configured || savingSettings.current) return;
+    savingSettings.current = true;
+    try {
+      setSettings(await desktopBridge.saveSettings(next));
+      setMessage('Preference saved.');
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      savingSettings.current = false;
     }
   };
   const chooseSettingFolder = async (
@@ -662,6 +713,34 @@ export function App() {
       setBusy(false);
     }
   };
+  const openSupport = async (destination: 'github' | 'releases' | 'coffee') => {
+    try {
+      await desktopBridge.openSupportLink(destination);
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
+  const copyDiagnosticSummary = async () => {
+    const jobCounts = jobs.reduce<Record<string, number>>((counts, job) => {
+      counts[job.state] = (counts[job.state] ?? 0) + 1;
+      return counts;
+    }, {});
+    await navigator.clipboard.writeText(
+      [
+        `${applicationInfo?.edition ?? 'Kairix PIMP Light'} ${applicationInfo?.version ?? 'unknown'}`,
+        `Build: ${applicationInfo?.buildCommit ?? 'unknown'}`,
+        `Channel: ${applicationInfo?.releaseChannel ?? 'Beta'}`,
+        `Device: ${settings.deviceId}`,
+        `Catalogue items: ${catalogue.media.length}`,
+        `Last scan: ${discoveryStatus.lastCompletedAt ?? 'never'}`,
+        `Scan pending/errors: ${discoveryStatus.pending}/${discoveryStatus.errors}`,
+        `Jobs: ${JSON.stringify(jobCounts)}`,
+        `FFmpeg: ${mediaTools?.ffmpegAvailable ? 'available' : 'unavailable'}`,
+        `FFprobe: ${mediaTools?.ffprobeAvailable ? 'available' : 'unavailable'}`,
+      ].join('\r\n'),
+    );
+    setMessage('Diagnostic summary copied without personal file paths.');
+  };
   const createProject = async () => {
     setBusy(true);
     setError('');
@@ -688,6 +767,18 @@ export function App() {
     (total, job) => total + job.bytesTransferred,
     0,
   );
+  const activeSettingsSection: SettingsSection = configured
+    ? settingsSection
+    : 'Library & Storage';
+  const settingsSections: SettingsSection[] = [
+    'General',
+    'Library & Storage',
+    'Ingest & Discovery',
+    'Appearance',
+    'Updates',
+    'About & Support',
+    'Diagnostics',
+  ];
 
   return (
     <div className="app-shell">
@@ -958,195 +1049,468 @@ export function App() {
             </p>
           </section>
         ) : view === 'Settings' || !configured ? (
-          <section className="settings-form">
-            <h2>Local storage configuration</h2>
-            <p>
-              Absolute paths stay on this device. Portable catalogue records use
-              paths relative to Master Bin.
-            </p>
-            <PathField
-              label="Master Bin"
-              value={settings.masterBinPath}
-              onChange={(value) =>
-                setSettings({ ...settings, masterBinPath: value })
-              }
-              onBrowse={() => chooseSettingFolder('masterBinPath')}
-            />
-            <PathField
-              label="Working Projects"
-              value={settings.workingProjectsPath}
-              onChange={(value) =>
-                setSettings({ ...settings, workingProjectsPath: value })
-              }
-              onBrowse={() => chooseSettingFolder('workingProjectsPath')}
-            />
-            <label className="check-field">
-              <input
-                type="checkbox"
-                checked={settings.catalogueInMasterBin}
-                onChange={(event) =>
-                  setSettings({
-                    ...settings,
-                    catalogueInMasterBin: event.target.checked,
-                  })
-                }
-              />{' '}
-              Store shared catalogue inside Master Bin
-            </label>
-            {!settings.catalogueInMasterBin && (
-              <PathField
-                label="Shared catalogue"
-                value={settings.sharedCataloguePath}
-                onChange={(value) =>
-                  setSettings({ ...settings, sharedCataloguePath: value })
-                }
-                onBrowse={() => chooseSettingFolder('sharedCataloguePath')}
-              />
-            )}
-            <PathField
-              label="Thumbnail cache (device-local)"
-              value={settings.thumbnailCachePath}
-              placeholder="Automatic local cache"
-              onChange={(value) =>
-                setSettings({ ...settings, thumbnailCachePath: value })
-              }
-              onBrowse={() => chooseSettingFolder('thumbnailCachePath')}
-            />
-            {configured && (
-              <div className="scan-status" role="status">
-                <h3>Library discovery</h3>
-                <p>
-                  PIMP indexes files already in Master Bin. Syncthing transfers
-                  files independently between your devices.
-                </p>
-                <dl>
-                  <div>
-                    <dt>Last completed scan</dt>
-                    <dd>
-                      {discoveryStatus.lastCompletedAt
-                        ? new Date(
-                            discoveryStatus.lastCompletedAt,
-                          ).toLocaleString()
-                        : 'Not completed yet'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Progress</dt>
-                    <dd>
-                      {discoveryStatus.running
-                        ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
-                        : 'Idle'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Registered media</dt>
-                    <dd>{catalogue.media.length}</dd>
-                  </div>
-                  <div>
-                    <dt>Pending / unverified</dt>
-                    <dd>{discoveryStatus.pending}</dd>
-                  </div>
-                  <div>
-                    <dt>Scan errors</dt>
-                    <dd>{discoveryStatus.errors}</dd>
-                  </div>
-                </dl>
-                <div className="scan-actions">
-                  <button
-                    disabled={busy || discoveryStatus.running}
-                    onClick={doRescan}
-                  >
-                    Scan for new files
-                  </button>
-                  <button
-                    disabled={busy || discoveryStatus.running}
-                    onClick={doFullRescan}
-                  >
-                    Full library rescan / verify
-                  </button>
+          <section className="settings-layout">
+            <nav className="settings-nav" aria-label="Settings sections">
+              {settingsSections.map((section) => (
+                <button
+                  key={section}
+                  className={activeSettingsSection === section ? 'active' : ''}
+                  disabled={!configured && section !== 'Library & Storage'}
+                  onClick={() => setSettingsSection(section)}
+                >
+                  {section}
+                </button>
+              ))}
+            </nav>
+            <div className="settings-form">
+              <div className="settings-heading">
+                <SlidersHorizontal size={20} />
+                <div>
+                  <h2>{activeSettingsSection}</h2>
+                  <p>Device-local preferences for Kairix PIMP Light.</p>
                 </div>
               </div>
-            )}
-            <label>
-              Thumbnail cache limit (GB)
-              <input
-                type="number"
-                min="1"
-                value={Math.round(
-                  settings.thumbnailCacheLimitBytes / 1024 / 1024 / 1024,
-                )}
-                onChange={(event) =>
-                  setSettings({
-                    ...settings,
-                    thumbnailCacheLimitBytes:
-                      Number(event.target.value) * 1024 * 1024 * 1024,
-                  })
-                }
-              />
-            </label>
-            <fieldset>
-              <legend>Remembered date organization</legend>
-              <label>
-                <input
-                  type="radio"
-                  checked={settings.ingestDateOrganization === 'today'}
-                  onChange={() =>
-                    setSettings({
-                      ...settings,
-                      ingestDateOrganization: 'today',
-                    })
-                  }
-                />{' '}
-                Use today's date
-              </label>
-              <label>
-                <input
-                  type="radio"
-                  checked={
-                    settings.ingestDateOrganization === 'original-file-dates'
-                  }
-                  onChange={() =>
-                    setSettings({
-                      ...settings,
-                      ingestDateOrganization: 'original-file-dates',
-                    })
-                  }
-                />{' '}
-                Use original file dates
-              </label>
-            </fieldset>
-            <label>
-              Date-folder naming pattern
-              <input
-                value={settings.dateFolderPattern ?? 'yyyymmdd'}
-                onChange={(event) =>
-                  setSettings({
-                    ...settings,
-                    dateFolderPattern: event.target.value,
-                  })
-                }
-                placeholder="yyyymmdd"
-              />
-              <small>
-                Preview: {datePatternPreview(settings.dateFolderPattern)}. Use
-                MM for month, mm for minute, HH for 24-hour time, hh and a for
-                12-hour time. yyyymmdd is supported as a familiar date-only
-                alias.
-              </small>
-            </label>
-            {settings.initializedCataloguePath && (
-              <small>
-                Catalogue location is locked until a safe migration workflow is
-                implemented: {settings.initializedCataloguePath}
-              </small>
-            )}
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={saveConfiguration}
-            >
-              {busy ? 'Saving…' : 'Save configuration'}
-            </button>
+
+              {activeSettingsSection === 'General' && (
+                <>
+                  <ToggleField
+                    label="Start with Windows"
+                    description="Launch PIMP at sign-in so background ingest and discovery can resume."
+                    checked={settings.startWithWindows ?? false}
+                    onChange={(startWithWindows) =>
+                      void persistPreference({ startWithWindows })
+                    }
+                  />
+                  <ToggleField
+                    label="Close to system tray"
+                    description="Keep PIMP running in the Windows notification area when the main window closes."
+                    checked={settings.closeToTray ?? true}
+                    onChange={(closeToTray) =>
+                      void persistPreference({ closeToTray })
+                    }
+                  />
+                  <label>
+                    Default startup page
+                    <select
+                      value={settings.startupPage ?? 'Library'}
+                      onChange={(event) =>
+                        void persistPreference({
+                          startupPage: event.target
+                            .value as DeviceSettings['startupPage'],
+                        })
+                      }
+                    >
+                      {['Ingest', 'Library', 'Projects', 'Archive'].map(
+                        (page) => (
+                          <option key={page}>{page}</option>
+                        ),
+                      )}
+                    </select>
+                  </label>
+                  <ToggleField
+                    label="Check for beta updates"
+                    description="Check the approved signed Beta channel; never install PR artifacts."
+                    checked={settings.checkForUpdates ?? true}
+                    onChange={(checkForUpdates) =>
+                      void persistPreference({ checkForUpdates })
+                    }
+                  />
+                </>
+              )}
+
+              {activeSettingsSection === 'Library & Storage' && (
+                <>
+                  <p>
+                    Absolute paths stay on this device. Portable catalogue
+                    records use paths relative to Master Bin.
+                  </p>
+                  <PathField
+                    label="Master Bin"
+                    value={settings.masterBinPath}
+                    onChange={(masterBinPath) =>
+                      setSettings({ ...settings, masterBinPath })
+                    }
+                    onBrowse={() => chooseSettingFolder('masterBinPath')}
+                  />
+                  <PathField
+                    label="Working Projects"
+                    value={settings.workingProjectsPath}
+                    onChange={(workingProjectsPath) =>
+                      setSettings({ ...settings, workingProjectsPath })
+                    }
+                    onBrowse={() => chooseSettingFolder('workingProjectsPath')}
+                  />
+                  <ToggleField
+                    label="Store shared catalogue inside Master Bin"
+                    description="Recommended when Syncthing shares the Master Bin between devices."
+                    checked={settings.catalogueInMasterBin}
+                    onChange={(catalogueInMasterBin) =>
+                      setSettings({ ...settings, catalogueInMasterBin })
+                    }
+                  />
+                  {!settings.catalogueInMasterBin && (
+                    <PathField
+                      label="Shared catalogue"
+                      value={settings.sharedCataloguePath}
+                      onChange={(sharedCataloguePath) =>
+                        setSettings({ ...settings, sharedCataloguePath })
+                      }
+                      onBrowse={() =>
+                        chooseSettingFolder('sharedCataloguePath')
+                      }
+                    />
+                  )}
+                  <PathField
+                    label="Thumbnail cache (device-local)"
+                    value={settings.thumbnailCachePath}
+                    placeholder="Automatic local cache"
+                    onChange={(thumbnailCachePath) =>
+                      setSettings({ ...settings, thumbnailCachePath })
+                    }
+                    onBrowse={() => chooseSettingFolder('thumbnailCachePath')}
+                  />
+                  <label>
+                    Thumbnail cache limit (GB)
+                    <input
+                      type="number"
+                      min="1"
+                      value={Math.round(
+                        settings.thumbnailCacheLimitBytes / 1024 / 1024 / 1024,
+                      )}
+                      onChange={(event) =>
+                        setSettings({
+                          ...settings,
+                          thumbnailCacheLimitBytes:
+                            Number(event.target.value) * 1024 * 1024 * 1024,
+                        })
+                      }
+                    />
+                  </label>
+                  {configured && (
+                    <div className="scan-status" role="status">
+                      <h3>Library discovery</h3>
+                      <p>
+                        PIMP indexes existing files. Syncthing independently
+                        transfers them between devices.
+                      </p>
+                      <dl>
+                        <div>
+                          <dt>Last completed scan</dt>
+                          <dd>
+                            {discoveryStatus.lastCompletedAt
+                              ? new Date(
+                                  discoveryStatus.lastCompletedAt,
+                                ).toLocaleString()
+                              : 'Not completed yet'}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Progress</dt>
+                          <dd>
+                            {discoveryStatus.running
+                              ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                              : 'Idle'}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Registered media</dt>
+                          <dd>{catalogue.media.length}</dd>
+                        </div>
+                        <div>
+                          <dt>Pending / unverified</dt>
+                          <dd>{discoveryStatus.pending}</dd>
+                        </div>
+                        <div>
+                          <dt>Scan errors</dt>
+                          <dd>{discoveryStatus.errors}</dd>
+                        </div>
+                      </dl>
+                      <div className="scan-actions">
+                        <button
+                          disabled={busy || discoveryStatus.running}
+                          onClick={doRescan}
+                        >
+                          Scan for new files
+                        </button>
+                        <button
+                          disabled={busy || discoveryStatus.running}
+                          onClick={doFullRescan}
+                        >
+                          Full library rescan / verify
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {settings.initializedCataloguePath && (
+                    <small>
+                      Catalogue location is locked until a verified migration
+                      workflow is implemented:{' '}
+                      {settings.initializedCataloguePath}
+                    </small>
+                  )}
+                  <button
+                    className="primary"
+                    disabled={busy}
+                    onClick={saveConfiguration}
+                  >
+                    {busy ? 'Saving…' : 'Save configuration'}
+                  </button>
+                </>
+              )}
+
+              {activeSettingsSection === 'Ingest & Discovery' && (
+                <>
+                  <fieldset>
+                    <legend>Remembered date organization</legend>
+                    <label>
+                      <input
+                        type="radio"
+                        checked={settings.ingestDateOrganization === 'today'}
+                        onChange={() =>
+                          setSettings({
+                            ...settings,
+                            ingestDateOrganization: 'today',
+                          })
+                        }
+                      />{' '}
+                      Use today's date
+                    </label>
+                    <label>
+                      <input
+                        type="radio"
+                        checked={
+                          settings.ingestDateOrganization ===
+                          'original-file-dates'
+                        }
+                        onChange={() =>
+                          setSettings({
+                            ...settings,
+                            ingestDateOrganization: 'original-file-dates',
+                          })
+                        }
+                      />{' '}
+                      Use original file dates
+                    </label>
+                  </fieldset>
+                  <label>
+                    Date-folder naming pattern
+                    <input
+                      value={settings.dateFolderPattern ?? 'yyyymmdd'}
+                      onChange={(event) =>
+                        setSettings({
+                          ...settings,
+                          dateFolderPattern: event.target.value,
+                        })
+                      }
+                    />
+                    <small>
+                      Current preview:{' '}
+                      {datePatternPreview(settings.dateFolderPattern)}. MM is
+                      month; mm is minute.
+                    </small>
+                  </label>
+                  <div className="settings-explainer">
+                    New external files require repeated stable observations and
+                    SHA-256 verification. PIMP never replaces a destination on
+                    collision and never modifies source media.
+                  </div>
+                  <button
+                    className="primary"
+                    disabled={busy}
+                    onClick={saveConfiguration}
+                  >
+                    {busy ? 'Saving…' : 'Save ingest preferences'}
+                  </button>
+                </>
+              )}
+
+              {activeSettingsSection === 'Appearance' && (
+                <>
+                  <div
+                    className="theme-grid"
+                    role="radiogroup"
+                    aria-label="Theme"
+                  >
+                    {[
+                      [
+                        'graphite',
+                        'Graphite',
+                        'Neutral charcoal and cool blue',
+                      ],
+                      [
+                        'adobe-dark',
+                        'Adobe-style Dark',
+                        'Compact neutral editor greys',
+                      ],
+                      ['light', 'Light', 'Neutral off-white surfaces'],
+                      ['midnight', 'Midnight', 'Deep blue-grey surfaces'],
+                      ['system', 'System', 'Follow Windows appearance'],
+                      [
+                        'high-contrast',
+                        'High Contrast',
+                        'Maximum separation and focus',
+                      ],
+                    ].map(([id, label, description]) => (
+                      <button
+                        key={id}
+                        role="radio"
+                        aria-checked={(settings.theme ?? 'graphite') === id}
+                        className={
+                          (settings.theme ?? 'graphite') === id ? 'active' : ''
+                        }
+                        onClick={() =>
+                          void persistPreference({
+                            theme: id as DeviceSettings['theme'],
+                          })
+                        }
+                      >
+                        <span className={`theme-swatch ${id}`} />
+                        <strong>{label}</strong>
+                        <small>{description}</small>
+                      </button>
+                    ))}
+                  </div>
+                  <label>
+                    Layout density
+                    <select
+                      value={settings.density ?? 'comfortable'}
+                      onChange={(event) =>
+                        void persistPreference({
+                          density: event.target
+                            .value as DeviceSettings['density'],
+                        })
+                      }
+                    >
+                      <option value="comfortable">Comfortable</option>
+                      <option value="compact">Compact</option>
+                    </select>
+                  </label>
+                </>
+              )}
+
+              {activeSettingsSection === 'Updates' && (
+                <>
+                  <div className="info-card">
+                    <strong>
+                      {applicationInfo?.edition ?? 'Kairix PIMP Light'}
+                    </strong>
+                    <span>Version {applicationInfo?.version ?? 'unknown'}</span>
+                    <span>
+                      Channel {applicationInfo?.releaseChannel ?? 'Beta'}
+                    </span>
+                    <span>
+                      Build {applicationInfo?.buildCommit ?? 'development'}
+                    </span>
+                  </div>
+                  <p>
+                    Signed in-app updating is configured in the next release
+                    checkpoint. Until then, use only an approved installer from
+                    GitHub Releases—not an unapproved Actions artifact.
+                  </p>
+                  <button onClick={() => void openSupport('releases')}>
+                    Open GitHub Releases
+                  </button>
+                </>
+              )}
+
+              {activeSettingsSection === 'About & Support' && (
+                <>
+                  <div className="info-card">
+                    <strong>Kairix PIMP Light</strong>
+                    <span>Production Ingest &amp; Media Processor</span>
+                    <span>
+                      Version {applicationInfo?.version ?? 'unknown'} · Beta
+                    </span>
+                    <p>
+                      Complete non-AI media ingest and catalogue edition. The
+                      future Full AI edition is not included.
+                    </p>
+                  </div>
+                  <div className="support-links">
+                    <button onClick={() => void openSupport('github')}>
+                      <Github size={18} /> GitHub
+                    </button>
+                    <button onClick={() => void openSupport('coffee')}>
+                      <Coffee size={18} opacity={0.72} /> Buy Me a Coffee
+                    </button>
+                    <button
+                      disabled
+                      title="A dedicated project page is not configured yet"
+                    >
+                      Project website — coming later
+                    </button>
+                  </div>
+                  <small>
+                    Open-source acknowledgements and licence details are
+                    distributed with the repository.
+                  </small>
+                </>
+              )}
+
+              {activeSettingsSection === 'Diagnostics' && (
+                <>
+                  <dl className="diagnostic-grid">
+                    <div>
+                      <dt>FFmpeg</dt>
+                      <dd>
+                        {mediaTools?.ffmpegAvailable
+                          ? 'Available'
+                          : 'Unavailable'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>FFprobe</dt>
+                      <dd>
+                        {mediaTools?.ffprobeAvailable
+                          ? 'Available'
+                          : 'Unavailable'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Device identifier</dt>
+                      <dd>{settings.deviceId}</dd>
+                    </div>
+                    <div>
+                      <dt>Last indexing result</dt>
+                      <dd>
+                        {discoveryStatus.registered} registered ·{' '}
+                        {discoveryStatus.pending} pending ·{' '}
+                        {discoveryStatus.errors} errors
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Recoverable jobs</dt>
+                      <dd>
+                        {jobs.filter((job) => job.state !== 'completed').length}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="scan-actions">
+                    <button
+                      onClick={() =>
+                        void navigator.clipboard.writeText(settings.deviceId)
+                      }
+                    >
+                      Copy device ID
+                    </button>
+                    <button onClick={() => void copyDiagnosticSummary()}>
+                      Copy diagnostic summary
+                    </button>
+                    <button onClick={() => void desktopBridge.openLogsFolder()}>
+                      Open logs folder
+                    </button>
+                    <button onClick={() => window.location.reload()}>
+                      Reload interface
+                    </button>
+                  </div>
+                  <small>
+                    Diagnostic summaries omit configured roots and personal file
+                    lists. Reloading the interface does not alter catalogue
+                    data.
+                  </small>
+                </>
+              )}
+            </div>
           </section>
         ) : view === 'Library' ? (
           <>
@@ -1799,6 +2163,33 @@ function PathField({
         />
         <button onClick={onBrowse}>Browse…</button>
       </div>
+    </label>
+  );
+}
+
+function ToggleField({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="toggle-field">
+      <span>
+        <strong>{label}</strong>
+        <small>{description}</small>
+      </span>
+      <input
+        type="checkbox"
+        role="switch"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
     </label>
   );
 }

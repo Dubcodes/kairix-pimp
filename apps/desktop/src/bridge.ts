@@ -16,6 +16,24 @@ export interface DeviceSettings {
   dateFolderPattern: string;
   initializedCataloguePath: string;
   projectPaths: Record<string, string>;
+  startWithWindows: boolean;
+  closeToTray: boolean;
+  startupPage: 'Ingest' | 'Library' | 'Projects' | 'Archive';
+  checkForUpdates: boolean;
+  theme:
+    | 'graphite'
+    | 'adobe-dark'
+    | 'light'
+    | 'midnight'
+    | 'system'
+    | 'high-contrast';
+  density: 'comfortable' | 'compact';
+}
+export interface AppInfo {
+  version: string;
+  buildCommit: string;
+  edition: string;
+  releaseChannel: string;
 }
 export interface MediaItem {
   id: string;
@@ -204,6 +222,12 @@ export const emptySettings = (): DeviceSettings => ({
   dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
   projectPaths: {},
+  startWithWindows: false,
+  closeToTray: true,
+  startupPage: 'Library',
+  checkForUpdates: true,
+  theme: 'graphite',
+  density: 'comfortable',
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],
@@ -327,6 +351,10 @@ export const desktopBridge = {
   rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
   getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
+  appInfo: () => invoke<AppInfo>('app_info'),
+  openSupportLink: (destination: 'github' | 'releases' | 'coffee') =>
+    invoke<void>('open_support_link', { destination }),
+  openLogsFolder: () => invoke<void>('open_logs_folder'),
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),
   enrichMedia: () => invoke<number>('enrich_media'),

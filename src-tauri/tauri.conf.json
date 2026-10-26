@@ -34,6 +34,11 @@
       "icons/icon.ico"
     ],
     "category": "Video",
-    "shortDescription": "Verified media ingest and catalogue companion for Syncthing"
+    "shortDescription": "Verified media ingest and catalogue companion for Syncthing",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

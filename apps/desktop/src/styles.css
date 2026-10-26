@@ -1,8 +1,74 @@
 :root {
   font-family: 'DM Sans', sans-serif;
-  color: #edf2ee;
-  background: #090c0b;
+  --bg: #1e2023;
+  --bg-elevated: #292c30;
+  --bg-panel: #24272b;
+  --bg-control: #31353a;
+  --text: #eef1f4;
+  --text-muted: #a4abb4;
+  --border: #42474e;
+  --accent: #5b9bd5;
+  --accent-strong: #78afe0;
+  --accent-text: #07131e;
+  --danger: #ef7b72;
+  --shadow: rgb(0 0 0 / 24%);
+  color: var(--text);
+  background: var(--bg);
   font-synthesis: none;
+  color-scheme: dark;
+}
+
+:root[data-theme='adobe-dark'] {
+  --bg: #252525;
+  --bg-elevated: #323232;
+  --bg-panel: #2b2b2b;
+  --bg-control: #3b3b3b;
+  --text: #f1f1f1;
+  --text-muted: #b4b4b4;
+  --border: #505050;
+  --accent: #4da3e6;
+  --accent-strong: #72b7eb;
+}
+
+:root[data-theme='light'] {
+  --bg: #f1f2f4;
+  --bg-elevated: #ffffff;
+  --bg-panel: #e7e9ec;
+  --bg-control: #ffffff;
+  --text: #20242a;
+  --text-muted: #626b76;
+  --border: #c5c9cf;
+  --accent: #246fae;
+  --accent-strong: #155f9e;
+  --accent-text: #ffffff;
+  --shadow: rgb(25 31 38 / 14%);
+  color-scheme: light;
+}
+
+:root[data-theme='midnight'] {
+  --bg: #111722;
+  --bg-elevated: #1a2230;
+  --bg-panel: #151d29;
+  --bg-control: #222c3b;
+  --text: #edf3fb;
+  --text-muted: #9eacc0;
+  --border: #35445a;
+  --accent: #6c9ee8;
+  --accent-strong: #8bb4f0;
+}
+
+:root[data-theme='high-contrast'] {
+  --bg: #000000;
+  --bg-elevated: #0d0d0d;
+  --bg-panel: #050505;
+  --bg-control: #111111;
+  --text: #ffffff;
+  --text-muted: #ffffff;
+  --border: #ffffff;
+  --accent: #62b5ff;
+  --accent-strong: #ffffff;
+  --accent-text: #000000;
+  color-scheme: dark;
 }
 * {
   box-sizing: border-box;
@@ -1077,6 +1143,327 @@ article footer span {
 .recovery-view > * {
   max-width: 620px;
   margin: 0;
+}
+
+/* Central theme layer: legacy selectors inherit these tokens while the UI is
+   progressively consolidated without changing interaction behavior. */
+body {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.sidebar,
+.folder-panel,
+.library-panel,
+.settings-form,
+.ingest-panel,
+.projects-panel,
+.job-panel,
+.recovery-view {
+  color: var(--text);
+  background: var(--bg-panel);
+  border-color: var(--border);
+}
+
+header,
+.toolbar,
+.batch-bar,
+.notice,
+.media-card,
+.job-card,
+.inventory-preview,
+.info-card,
+.settings-explainer,
+.scan-status {
+  color: var(--text);
+  background: var(--bg-elevated);
+  border-color: var(--border);
+}
+
+button,
+input,
+textarea,
+select {
+  color: var(--text);
+  background-color: var(--bg-control);
+  border-color: var(--border);
+}
+
+button:hover:not(:disabled),
+.sidebar nav button:hover,
+.settings-nav button:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+button.primary,
+.primary,
+.progress i,
+.bar i {
+  color: var(--accent-text);
+  background: var(--accent);
+}
+
+.sidebar nav button.active,
+.settings-nav button.active,
+.folder.active,
+.theme-grid button.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-elevated));
+  box-shadow: inset 3px 0 var(--accent);
+}
+
+.brand .mark {
+  color: var(--accent-text);
+  background: var(--accent);
+  transform: none;
+}
+
+.edition i {
+  background: var(--accent);
+}
+
+small,
+.brand span,
+.edition span,
+.storage-copy,
+.storage > small,
+header p,
+.settings-form p,
+.settings-form > small,
+.scan-status dt {
+  color: var(--text-muted);
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 760px);
+  gap: 24px;
+  align-items: start;
+  padding: 28px 32px 48px;
+}
+
+.settings-nav {
+  position: sticky;
+  top: 18px;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+}
+
+.settings-nav button {
+  border: 0;
+  padding: 10px 12px;
+  text-align: left;
+  background: transparent;
+}
+
+.settings-form {
+  width: auto;
+  max-width: none;
+  margin: 0;
+  gap: 18px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 34px var(--shadow);
+}
+
+.settings-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding-bottom: 15px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-heading h2,
+.settings-heading p {
+  margin: 0;
+}
+
+.settings-heading p {
+  margin-top: 4px;
+}
+
+.settings-form select {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.toggle-field {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.toggle-field span,
+.toggle-field small {
+  display: block;
+}
+
+.toggle-field small {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.toggle-field input {
+  width: 38px;
+  height: 20px;
+  accent-color: var(--accent);
+}
+
+.settings-explainer,
+.info-card {
+  display: grid;
+  gap: 5px;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.theme-grid button {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 2px 10px;
+  padding: 12px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.theme-grid small {
+  grid-column: 2;
+  color: var(--text-muted);
+}
+
+.theme-swatch {
+  grid-row: 1 / span 2;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: #292c30;
+  box-shadow: inset 9px 0 #5b9bd5;
+}
+
+.theme-swatch.adobe-dark {
+  background: #323232;
+  box-shadow: inset 9px 0 #4da3e6;
+}
+.theme-swatch.light {
+  background: #fff;
+  box-shadow: inset 9px 0 #246fae;
+}
+.theme-swatch.midnight {
+  background: #111722;
+  box-shadow: inset 9px 0 #6c9ee8;
+}
+.theme-swatch.system {
+  background: linear-gradient(90deg, #fff 50%, #222 50%);
+}
+.theme-swatch.high-contrast {
+  background: #000;
+  box-shadow: inset 9px 0 #fff;
+}
+
+.support-links,
+.diagnostic-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.support-links {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.support-links button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.diagnostic-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.diagnostic-grid div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.diagnostic-grid dt {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.diagnostic-grid dd {
+  overflow-wrap: anywhere;
+  margin: 5px 0 0;
+}
+
+:root[data-density='compact'] .media-card,
+:root[data-density='compact'] .settings-form,
+:root[data-density='compact'] .job-card {
+  padding: 12px;
+}
+
+:root[data-density='compact'] .sidebar nav button {
+  padding-block: 7px;
+}
+
+@media (max-width: 1120px) {
+  .settings-layout {
+    grid-template-columns: 185px minmax(0, 1fr);
+    padding-inline: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
 .check-field {
   display: flex !important;

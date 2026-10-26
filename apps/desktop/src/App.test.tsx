@@ -18,6 +18,12 @@ const mocks = vi.hoisted(() => ({
     dateFolderPattern: 'yyyymmdd',
     initializedCataloguePath: 'C:\\Master\\.pimp',
     projectPaths: {},
+    startWithWindows: false,
+    closeToTray: true,
+    startupPage: 'Library' as const,
+    checkForUpdates: true,
+    theme: 'graphite' as const,
+    density: 'comfortable' as const,
   },
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
@@ -78,6 +84,14 @@ vi.mock('./bridge', () => ({
       errors: 0,
     })),
     logUiError: vi.fn(),
+    appInfo: vi.fn(async () => ({
+      version: '0.1.1-beta.1',
+      buildCommit: 'test-commit',
+      edition: 'Kairix PIMP Light',
+      releaseChannel: 'Beta',
+    })),
+    openSupportLink: vi.fn(),
+    openLogsFolder: vi.fn(),
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
@@ -244,6 +258,7 @@ describe('native application integration', () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Library & Storage' }));
     expect(screen.getByDisplayValue('C:\\Master')).toBeVisible();
     expect(screen.getByText(/Catalogue location is locked/)).toBeVisible();
   });
@@ -253,6 +268,7 @@ describe('native application integration', () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Library & Storage' }));
     await user.click(
       screen.getByRole('button', { name: 'Save configuration' }),
     );
@@ -264,6 +280,28 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('button', { name: 'Save configuration' }),
     ).toBeEnabled();
+  });
+
+  it('persists close-to-tray and applies theme preferences', async () => {
+    mocks.saveSettings.mockImplementation(async (settings) => settings);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    const closeToTray = screen.getByRole('switch', {
+      name: /Close to system tray/,
+    });
+    expect(closeToTray).toBeChecked();
+    await user.click(closeToTray);
+    expect(mocks.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ closeToTray: false }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.click(screen.getByRole('radio', { name: /Midnight/ }));
+    expect(document.documentElement.dataset.theme).toBe('midnight');
+    expect(mocks.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ theme: 'midnight' }),
+    );
   });
 
   it('offers validated Windows file actions for one locally available recording', async () => {

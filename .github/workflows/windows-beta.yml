@@ -54,6 +54,8 @@ jobs:
           cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: Build unsigned MSI and NSIS installers
+        env:
+          PIMP_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run tauri -- build --bundles msi,nsis
 
       - name: Verify bundles and record build identity

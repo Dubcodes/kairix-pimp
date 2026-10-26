@@ -18,6 +18,8 @@ use std::{
     sync::Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -32,6 +34,7 @@ struct NativeState {
     job_store: Mutex<()>,
     worker_active: Mutex<bool>,
     availability: Mutex<HashMap<String, (String, bool)>>,
+    tray_available: Mutex<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +55,30 @@ struct DeviceSettings {
     initialized_catalogue_path: String,
     #[serde(default)]
     project_paths: HashMap<String, String>,
+    #[serde(default)]
+    start_with_windows: bool,
+    #[serde(default = "default_true")]
+    close_to_tray: bool,
+    #[serde(default = "default_startup_page")]
+    startup_page: String,
+    #[serde(default = "default_true")]
+    check_for_updates: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(default = "default_density")]
+    density: String,
+}
+fn default_true() -> bool {
+    true
+}
+fn default_startup_page() -> String {
+    "Library".into()
+}
+fn default_theme() -> String {
+    "graphite".into()
+}
+fn default_density() -> String {
+    "comfortable".into()
 }
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
@@ -73,6 +100,12 @@ impl Default for DeviceSettings {
             date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
             project_paths: HashMap::new(),
+            start_with_windows: false,
+            close_to_tray: true,
+            startup_page: default_startup_page(),
+            check_for_updates: true,
+            theme: default_theme(),
+            density: default_density(),
         }
     }
 }
@@ -251,6 +284,15 @@ struct MediaToolsStatus {
     ffprobe_available: bool,
     ffmpeg_version: Option<String>,
     ffprobe_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+    version: String,
+    build_commit: String,
+    edition: String,
+    release_channel: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -510,6 +552,21 @@ fn save_settings(
         Local::now().date_naive(),
         Local::now().time(),
     )?;
+    if !matches!(
+        settings.theme.as_str(),
+        "graphite" | "adobe-dark" | "light" | "midnight" | "system" | "high-contrast"
+    ) {
+        return Err("Choose a supported appearance theme".into());
+    }
+    if !matches!(
+        settings.startup_page.as_str(),
+        "Ingest" | "Library" | "Projects" | "Archive"
+    ) {
+        return Err("Choose a supported startup page".into());
+    }
+    if !matches!(settings.density.as_str(), "comfortable" | "compact") {
+        return Err("Choose a supported layout density".into());
+    }
     fs::create_dir_all(settings.master_bin_path.trim())
         .map_err(|e| format!("Cannot create Master Bin: {e}"))?;
     fs::create_dir_all(settings.working_projects_path.trim())
@@ -537,6 +594,19 @@ fn save_settings(
         .map_err(|e| format!("Cannot create thumbnail cache: {e}"))?;
     settings.initialized_catalogue_path = next_catalogue;
     write_json(&settings_path(&app)?, &settings)?;
+    let autostart_result = if settings.start_with_windows {
+        app.autolaunch().enable()
+    } else {
+        app.autolaunch().disable()
+    };
+    if let Err(error) = autostart_result {
+        diagnostic_log(
+            &app,
+            "WARN",
+            "autostart",
+            &format!("Could not apply startup preference: {error}"),
+        );
+    }
     diagnostic_log(&app, "INFO", "settings", "Device settings saved");
     Ok(settings)
 }
@@ -3120,6 +3190,49 @@ fn media_tools_status() -> MediaToolsStatus {
     }
 }
 
+fn support_url(destination: &str) -> Option<&'static str> {
+    match destination {
+        "github" => Some("https://github.com/Dubcodes/kairix-pimp"),
+        "releases" => Some("https://github.com/Dubcodes/kairix-pimp/releases"),
+        "coffee" => Some("https://buymeacoffee.com/dubcodes"),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+fn open_support_link(app: AppHandle, destination: String) -> Result<(), String> {
+    let url = support_url(&destination).ok_or("Unknown support destination")?;
+    app.opener()
+        .open_url(url, None::<String>)
+        .map_err(|error| format!("Could not open the link: {error}"))
+}
+
+#[tauri::command]
+fn open_logs_folder(app: AppHandle) -> Result<(), String> {
+    let path = diagnostic_log_path(&app)?;
+    let folder = path.parent().ok_or("Invalid logs folder")?;
+    #[cfg(target_os = "windows")]
+    Command::new("explorer.exe")
+        .arg(folder)
+        .spawn()
+        .map_err(|error| format!("Could not open the logs folder: {error}"))?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Open logs folder is available only in the Windows build".into());
+    Ok(())
+}
+
+#[tauri::command]
+fn app_info(app: AppHandle) -> AppInfo {
+    AppInfo {
+        version: app.package_info().version.to_string(),
+        build_commit: option_env!("PIMP_BUILD_COMMIT")
+            .unwrap_or("development")
+            .to_string(),
+        edition: "Kairix PIMP Light".into(),
+        release_channel: "Beta".into(),
+    }
+}
+
 #[tauri::command]
 fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, String> {
     let settings = load_settings_file(&app)?;
@@ -3172,7 +3285,88 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args(["--minimized"])
+                .build(),
+        )
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
         .manage(NativeState::default())
+        .setup(|app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+
+            let show = MenuItem::with_id(app, "show", "Show PIMP", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit PIMP", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let mut tray = TrayIconBuilder::with_id("pimp-main")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .tooltip("Kairix PIMP Light")
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        }
+                    ) {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            match tray.build(app) {
+                Ok(_) => *app.state::<NativeState>().tray_available.lock().unwrap() = true,
+                Err(error) => diagnostic_log(
+                    app.handle(),
+                    "WARN",
+                    "tray",
+                    &format!("Tray icon is unavailable: {error}"),
+                ),
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let close_window = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        let app = close_window.app_handle();
+                        let tray_available = *app
+                            .state::<NativeState>()
+                            .tray_available
+                            .lock()
+                            .unwrap();
+                        let close_to_tray = load_settings_file(&app)
+                            .map(|settings| settings.close_to_tray)
+                            .unwrap_or(false);
+                        if tray_available && close_to_tray {
+                            api.prevent_close();
+                            let _ = close_window.hide();
+                        }
+                    }
+                });
+                if std::env::args().any(|argument| argument == "--minimized") {
+                    let _ = window.hide();
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
@@ -3196,6 +3390,9 @@ pub fn run() {
             verify_media_integrity,
             enrich_media,
             media_tools_status,
+            app_info,
+            open_support_link,
+            open_logs_folder,
             resolve_media_path,
             reveal_media_in_explorer,
             open_media_folder,
@@ -3927,6 +4124,29 @@ mod tests {
         let recovered = load_or_initialize_settings(&path).unwrap();
         assert_eq!(recovered.device_id, restarted.device_id);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_devices_default_to_recoverable_desktop_preferences() {
+        let settings = DeviceSettings::default();
+        assert!(settings.close_to_tray);
+        assert!(!settings.start_with_windows);
+        assert_eq!(settings.startup_page, "Library");
+        assert_eq!(settings.theme, "graphite");
+        assert_eq!(settings.density, "comfortable");
+    }
+
+    #[test]
+    fn external_support_destinations_are_strictly_allowlisted() {
+        assert_eq!(
+            support_url("github"),
+            Some("https://github.com/Dubcodes/kairix-pimp")
+        );
+        assert_eq!(
+            support_url("coffee"),
+            Some("https://buymeacoffee.com/dubcodes")
+        );
+        assert_eq!(support_url("https://example.invalid"), None);
     }
 
     #[test]

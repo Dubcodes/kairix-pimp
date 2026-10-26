@@ -206,3 +206,11 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Automatically bound only fully completed ingest jobs with no pending metadata or recovery evidence. Failed, cancelled, interrupted and otherwise recoverable jobs remain until a future explicit user-authorized discard operation exists. When separately selected roots would collide, retain deterministic source-root identity in the planned relative path. In original-file mode, detected camera packages use their earliest available member modification time as one package date; independent files continue to use their own times.
 - **Consequences:** Repeated failures can grow the local job store until the user has an explicit discard control, but retry intent and evidence are never silently lost. Package sidecars stay with their media, and pre-copy path previews match queued path planning.
+
+## ADR-027 — Device-local desktop shell preferences
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** Close-to-tray defaults on for new devices, but the close event is intercepted only after native tray creation succeeds. Show restores the existing single instance; Quit exits without deleting durable job state. Appearance, density, startup page, update-check intent and launch-at-login remain device-local settings. External support links use a fixed native destination allowlist. The supported beta installer is per-user NSIS; MSI remains a compatibility artifact and another installation scope is never silently removed.
+- **Why:** Background ingest/discovery must survive an ordinary window close without making PIMP inaccessible, synced metadata must not acquire machine preferences, web content must not gain arbitrary URL-opening authority, and upgrade cleanup must preserve user data and explicit control.
+- **Consequences:** Tray behavior still requires installed-Windows acceptance, and users with both early MSI and NSIS installations follow the documented verify-then-uninstall migration.
