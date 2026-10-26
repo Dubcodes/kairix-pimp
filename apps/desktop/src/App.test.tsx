@@ -45,6 +45,7 @@ const mocks = vi.hoisted(() => ({
   chooseFiles: vi.fn(),
   inventorySources: vi.fn(),
   updateMedia: vi.fn(),
+  openSupportLink: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -90,7 +91,7 @@ vi.mock('./bridge', () => ({
       edition: 'Kairix PIMP Light',
       releaseChannel: 'Beta',
     })),
-    openSupportLink: vi.fn(),
+    openSupportLink: mocks.openSupportLink,
     openLogsFolder: vi.fn(),
     updaterConfiguration: vi.fn(async () => ({
       configured: false,
@@ -199,6 +200,7 @@ describe('native application integration', () => {
     });
     mocks.updateMedia.mockReset();
     mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
+    mocks.openSupportLink.mockReset();
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -329,6 +331,35 @@ describe('native application integration', () => {
     expect(mocks.saveSettings).toHaveBeenCalledWith(
       expect.objectContaining({ theme: 'midnight' }),
     );
+  });
+
+  it('applies every supported theme and opens only named native support destinations', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    const themes = [
+      ['Graphite', 'graphite'],
+      ['Adobe-style Dark', 'adobe-dark'],
+      ['Light', 'light'],
+      ['Midnight', 'midnight'],
+      ['System', 'graphite'],
+      ['High Contrast', 'high-contrast'],
+    ];
+    for (const [label, applied] of themes) {
+      await user.click(screen.getByRole('radio', { name: new RegExp(label) }));
+      expect(document.documentElement.dataset.theme).toBe(applied);
+    }
+
+    await user.click(screen.getByRole('button', { name: 'About & Support' }));
+    await user.click(screen.getByRole('button', { name: 'GitHub' }));
+    await user.click(screen.getByRole('button', { name: 'Buy Me a Coffee' }));
+    expect(mocks.openSupportLink).toHaveBeenNthCalledWith(1, 'github');
+    expect(mocks.openSupportLink).toHaveBeenNthCalledWith(2, 'coffee');
+    expect(
+      screen.getByRole('button', { name: /Project website/ }),
+    ).toBeDisabled();
   });
 
   it('serializes rapid preferences without letting an older save replace newer edits', async () => {

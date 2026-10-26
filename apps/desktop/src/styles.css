@@ -1251,6 +1251,54 @@ select:disabled {
   cursor: not-allowed;
 }
 
+.context-menu {
+  color: var(--text);
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  box-shadow: 0 14px 40px var(--shadow);
+}
+
+.context-menu button {
+  color: var(--text);
+}
+
+.context-menu button:hover,
+.context-menu button:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-elevated));
+  outline: 2px solid var(--accent-strong);
+  outline-offset: -2px;
+}
+
+.context-menu button:disabled,
+.pending {
+  color: var(--text-muted);
+}
+
+.notice.error {
+  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 15%, var(--bg-elevated));
+  border-color: var(--danger);
+}
+
+.notice.tool-warning {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elevated));
+  border-color: var(--accent);
+}
+
+.batch-description input,
+.batch-description button,
+.batch-clear {
+  color: var(--text);
+  background: var(--bg-control);
+  border-color: var(--border);
+}
+
+.drop button {
+  color: var(--accent-text);
+  background: var(--accent);
+}
+
 .settings-layout {
   display: grid;
   grid-template-columns: 220px minmax(0, 760px);
