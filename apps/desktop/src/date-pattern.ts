@@ -1,15 +1,17 @@
-export const datePatternPreview = (input = '') => {
+export const datePatternPreview = (input = '', now = new Date()) => {
   const pattern = input === 'yyyymmdd' ? 'yyyyMMdd' : input;
+  const hour = now.getHours();
+  const pad = (value: number) => String(value).padStart(2, '0');
   const values: Record<string, string> = {
-    yyyy: '2026',
-    yy: '26',
-    MM: '10',
-    dd: '23',
-    HH: '17',
-    hh: '05',
-    mm: '42',
-    ss: '09',
-    a: 'PM',
+    yyyy: String(now.getFullYear()),
+    yy: String(now.getFullYear()).slice(-2),
+    MM: pad(now.getMonth() + 1),
+    dd: pad(now.getDate()),
+    HH: pad(hour),
+    hh: pad(hour % 12 || 12),
+    mm: pad(now.getMinutes()),
+    ss: pad(now.getSeconds()),
+    a: hour >= 12 ? 'PM' : 'AM',
   };
   return pattern.replace(
     /yyyy|yy|MM|dd|HH|hh|mm|ss|a/g,

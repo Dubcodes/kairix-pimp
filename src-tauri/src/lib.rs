@@ -27,6 +27,7 @@ struct NativeState {
     paused_jobs: Mutex<HashSet<String>>,
     catalogue_write: Mutex<()>,
     discovery_write: Mutex<()>,
+    discovery_status: Mutex<DiscoveryStatus>,
     enrichment_write: Mutex<()>,
     job_store: Mutex<()>,
     worker_active: Mutex<bool>,
@@ -216,12 +217,31 @@ struct IngestProgress {
     bytes_total: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct RescanResult {
+    scanned: usize,
     registered: usize,
     changed: usize,
     pending: usize,
+    errors: usize,
+    full: bool,
+    completed_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryStatus {
+    running: bool,
+    full: bool,
+    files_processed: usize,
+    total_files: usize,
+    registered: usize,
+    changed: usize,
+    pending: usize,
+    errors: usize,
+    started_at: Option<String>,
+    last_completed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -257,6 +277,40 @@ fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or("Invalid application configuration path")?
         .join("ingest-jobs.json"))
+}
+
+fn discovery_status_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("discovery-status.json"))
+}
+
+fn diagnostic_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("logs");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join("pimp.log"))
+}
+
+fn diagnostic_log(app: &AppHandle, level: &str, event: &str, detail: &str) {
+    let Ok(path) = diagnostic_log_path(app) else {
+        return;
+    };
+    if path.metadata().map(|metadata| metadata.len()).unwrap_or(0) > 2 * 1024 * 1024 {
+        let _ = fs::rename(&path, path.with_extension("log.previous"));
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let sanitized = detail.replace(['\r', '\n'], " ");
+        let _ = writeln!(
+            file,
+            "{} [{level}] {event}: {}",
+            Utc::now().to_rfc3339(),
+            sanitized.chars().take(2000).collect::<String>()
+        );
+    }
 }
 fn load_jobs_unlocked(app: &AppHandle) -> Result<Vec<IngestJob>, String> {
     read_json(&jobs_path(app)?)
@@ -444,7 +498,6 @@ fn preserve_device_identity(current: &str, requested: &str) -> Result<String, St
 #[tauri::command]
 fn save_settings(
     app: AppHandle,
-    state: State<'_, NativeState>,
     mut settings: DeviceSettings,
 ) -> Result<DeviceSettings, String> {
     if settings.master_bin_path.trim().is_empty()
@@ -483,10 +536,8 @@ fn save_settings(
     fs::create_dir_all(&settings.thumbnail_cache_path)
         .map_err(|e| format!("Cannot create thumbnail cache: {e}"))?;
     settings.initialized_catalogue_path = next_catalogue;
-    let _guard = state.catalogue_write.lock().unwrap();
-    let root = catalogue_dir(&settings)?;
-    catalogue::migrate_legacy_snapshot(&root, &settings.device_id)?;
     write_json(&settings_path(&app)?, &settings)?;
+    diagnostic_log(&app, "INFO", "settings", "Device settings saved");
     Ok(settings)
 }
 
@@ -2565,12 +2616,83 @@ fn create_project(
     write_project_manifest(&directory, &project, &catalogue.media)?;
     Ok(project)
 }
+fn publish_discovery_status(app: &AppHandle, state: &NativeState, status: &DiscoveryStatus) {
+    *state.discovery_status.lock().unwrap() = status.clone();
+    if let Ok(path) = discovery_status_path(app) {
+        let _ = write_json(&path, status);
+    }
+    let _ = app.emit("discovery-progress", status);
+}
+
+fn fail_discovery_scan(
+    app: &AppHandle,
+    state: &NativeState,
+    status: &mut DiscoveryStatus,
+    error: String,
+) -> String {
+    status.running = false;
+    status.errors += 1;
+    publish_discovery_status(app, state, status);
+    diagnostic_log(app, "ERROR", "library-scan", &error);
+    error
+}
+
 #[tauri::command]
-async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanResult, String> {
+fn get_discovery_status(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<DiscoveryStatus, String> {
+    let current = state.discovery_status.lock().unwrap().clone();
+    if current.running || current.last_completed_at.is_some() {
+        return Ok(current);
+    }
+    let path = discovery_status_path(&app)?;
+    if !path.exists() {
+        return Ok(current);
+    }
+    let mut persisted: DiscoveryStatus = read_json(&path)?;
+    // A process cannot resume an in-memory walk. A new scan safely starts again.
+    persisted.running = false;
+    *state.discovery_status.lock().unwrap() = persisted.clone();
+    Ok(persisted)
+}
+
+#[tauri::command]
+fn log_ui_error(app: AppHandle, message: String) {
+    diagnostic_log(&app, "ERROR", "ui", &message);
+}
+
+#[tauri::command]
+async fn rescan(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    full: Option<bool>,
+) -> Result<RescanResult, String> {
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let _discovery_guard = state.discovery_write.lock().unwrap();
-    let catalogue = load_catalogue_file(&settings)?;
+    let full = full.unwrap_or(false);
+    let _discovery_guard = state
+        .discovery_write
+        .try_lock()
+        .map_err(|_| "A library scan is already running".to_string())?;
+    let started_at = Utc::now().to_rfc3339();
+    let mut status = DiscoveryStatus {
+        running: true,
+        full,
+        started_at: Some(started_at),
+        ..get_discovery_status(app.clone(), state.clone())?
+    };
+    status.running = true;
+    status.full = full;
+    status.files_processed = 0;
+    status.total_files = 0;
+    status.registered = 0;
+    status.changed = 0;
+    status.pending = 0;
+    status.errors = 0;
+    publish_discovery_status(&app, &state, &status);
+    let catalogue = load_catalogue_file(&settings)
+        .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     let known: HashMap<_, _> = catalogue
         .media
         .iter()
@@ -2580,20 +2702,36 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
         .parent()
         .unwrap()
         .join("discovery-observations.json");
-    let mut observations = discovery::load(&discovery_path)?;
+    let mut observations = discovery::load(&discovery_path)
+        .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     let now = Utc::now().timestamp();
     let mut events = Vec::new();
-    let mut result = RescanResult::default();
+    let mut result = RescanResult {
+        full,
+        ..Default::default()
+    };
     let batch_timestamp = Local::now();
-    for entry in WalkDir::new(&master)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        if !entry.file_type().is_file() || ignored(path) || !supported(path) {
-            continue;
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(&master).follow_links(false) {
+        match entry {
+            Ok(entry)
+                if entry.file_type().is_file()
+                    && !ignored(entry.path())
+                    && supported(entry.path()) =>
+            {
+                entries.push(entry)
+            }
+            Ok(_) => {}
+            Err(_) => result.errors += 1,
         }
+    }
+    status.total_files = entries.len();
+    status.errors = result.errors;
+    publish_discovery_status(&app, &state, &status);
+    for entry in entries {
+        let path = entry.path();
+        result.scanned += 1;
+        status.files_processed = result.scanned;
         let relative = path
             .strip_prefix(&master)
             .map_err(|_| "Path escaped Master Bin")?
@@ -2601,26 +2739,46 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
             .replace('\\', "/");
         let snapshot = match fs_safe::snapshot(path) {
             Ok(snapshot) => snapshot,
-            Err(_) => continue,
+            Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
+            }
         };
         if let Some(item) = known.get(&relative) {
             let evidence = item.integrity_by_device.get(&settings.device_id);
-            if evidence.is_some_and(|evidence| {
+            let verified_snapshot = evidence.is_some_and(|evidence| {
                 evidence.observed_size == snapshot.length
                     && evidence.observed_modified_millis
                         == snapshot.modified_millis.map(|value| value as u64)
-            }) {
+            });
+            if !full && verified_snapshot {
                 observations.verified(&relative);
                 continue;
             }
-        }
-        if discovery::Decision::Wait == observations.observe(&relative, &snapshot, now) {
+            if !verified_snapshot
+                && discovery::Decision::Wait == observations.observe(&relative, &snapshot, now)
+            {
+                result.pending += 1;
+                status.pending = result.pending;
+                continue;
+            }
+        } else if discovery::Decision::Wait == observations.observe(&relative, &snapshot, now) {
             result.pending += 1;
+            status.pending = result.pending;
             continue;
         }
-        let hash = sha256(path)?;
+        let hash = match sha256(path) {
+            Ok(hash) => hash,
+            Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
+            }
+        };
         if fs_safe::snapshot(path).ok().as_ref() != Some(&snapshot) {
             result.pending += 1;
+            status.pending = result.pending;
             continue;
         }
         if let Some(item) = known.get(&relative) {
@@ -2632,16 +2790,47 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
                 needs_review: hash != item.sha256,
             });
         } else {
-            let (_, capture, provenance) =
-                destination_date(&settings, path, &None, &batch_timestamp)?;
-            let item = new_media(path, relative.clone(), None, hash, capture, provenance, true)?;
+            let (_, capture, provenance) = match destination_date(
+                &settings,
+                path,
+                &None,
+                &batch_timestamp,
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    result.errors += 1;
+                    status.errors = result.errors;
+                    continue;
+                }
+            };
+            let item = match new_media(
+                path,
+                relative.clone(),
+                None,
+                hash,
+                capture,
+                provenance,
+                true,
+            ) {
+                Ok(item) => item,
+                Err(_) => {
+                    result.errors += 1;
+                    status.errors = result.errors;
+                    continue;
+                }
+            };
             events.push(CatalogueEvent::MediaRegistered { media: item });
         }
         observations.verified(&relative);
+        if result.scanned % 25 == 0 {
+            publish_discovery_status(&app, &state, &status);
+        }
     }
-    discovery::save(&discovery_path, &observations)?;
+    discovery::save(&discovery_path, &observations)
+        .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     let _guard = state.catalogue_write.lock().unwrap();
-    let current = load_catalogue_file(&settings)?;
+    let current = load_catalogue_file(&settings)
+        .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     events.retain(|event| match event {
         CatalogueEvent::MediaRegistered { media } => !current.media.iter().any(|item| {
             item.id == media.id || item.relative_path == media.relative_path
@@ -2667,7 +2856,34 @@ async fn rescan(app: AppHandle, state: State<'_, NativeState>) -> Result<RescanR
             )
         })
         .count();
-    append_events(&settings, events)?;
+    let changed_catalogue = !events.is_empty();
+    append_events(&settings, events)
+        .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
+    result.completed_at = Utc::now().to_rfc3339();
+    status.running = false;
+    status.registered = result.registered;
+    status.changed = result.changed;
+    status.pending = result.pending;
+    status.errors = result.errors;
+    status.last_completed_at = Some(result.completed_at.clone());
+    publish_discovery_status(&app, &state, &status);
+    diagnostic_log(
+        &app,
+        "INFO",
+        "library-scan",
+        &format!(
+            "mode={} scanned={} registered={} changed={} pending={} errors={}",
+            if full { "full" } else { "quick" },
+            result.scanned,
+            result.registered,
+            result.changed,
+            result.pending,
+            result.errors
+        ),
+    );
+    if changed_catalogue {
+        let _ = app.emit("catalogue-changed", ());
+    }
     Ok(result)
 }
 
@@ -2975,6 +3191,8 @@ pub fn run() {
             update_media,
             create_project,
             rescan,
+            get_discovery_status,
+            log_ui_error,
             verify_media_integrity,
             enrich_media,
             media_tools_status,

@@ -56,7 +56,7 @@ Provisional metadata records which fields the user explicitly edited. An exact d
 
 Discovery traversal/hashing and enrichment FFprobe/FFmpeg processes run outside the catalogue write mutex. Before appending events, each operation reloads the projection and rejects registrations or enrichment results made stale by a concurrent ingest or metadata commit.
 
-FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. A native notification watcher remains pending.
+FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. It starts asynchronously for configured libraries, publishes progress, persists the last result locally and emits catalogue changes after safe registration. Full verification deliberately rehashes previously verified files; quick scans skip unchanged evidence. A native notification watcher remains pending.
 
 ## Metadata, search, and Syncthing
 

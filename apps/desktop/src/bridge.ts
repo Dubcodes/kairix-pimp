@@ -69,9 +69,25 @@ export interface Catalogue {
   issues?: Array<{ code: string; source: string; detail: string }>;
 }
 export interface RescanResult {
+  scanned: number;
   registered: number;
   changed: number;
   pending: number;
+  errors: number;
+  full: boolean;
+  completedAt: string;
+}
+export interface DiscoveryStatus {
+  running: boolean;
+  full: boolean;
+  filesProcessed: number;
+  totalFiles: number;
+  registered: number;
+  changed: number;
+  pending: number;
+  errors: number;
+  startedAt?: string;
+  lastCompletedAt?: string;
 }
 export interface MediaToolsStatus {
   ffmpegAvailable: boolean;
@@ -283,6 +299,14 @@ export const desktopBridge = {
     listen<IngestJob[]>('ingest-jobs-changed', (event) =>
       handler(event.payload),
     ),
+  onDiscoveryProgress: (
+    handler: (status: DiscoveryStatus) => void,
+  ): Promise<UnlistenFn> =>
+    listen<DiscoveryStatus>('discovery-progress', (event) =>
+      handler(event.payload),
+    ),
+  onCatalogueChanged: (handler: () => void): Promise<UnlistenFn> =>
+    listen('catalogue-changed', handler),
   onFileDrop: (handler: (paths: string[]) => void): Promise<UnlistenFn> =>
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === 'drop') handler(event.payload.paths);
@@ -300,7 +324,9 @@ export const desktopBridge = {
   }) => invoke<Catalogue>('update_media', { update }),
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
-  rescan: () => invoke<RescanResult>('rescan'),
+  rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
+  getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
+  logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),
   enrichMedia: () => invoke<number>('enrich_media'),

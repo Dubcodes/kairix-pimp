@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Clock3,
@@ -27,6 +27,7 @@ import {
   nativeAvailable,
   type Catalogue,
   type DeviceSettings,
+  type DiscoveryStatus,
   type IngestJob,
   type IngestJobFile,
   type IngestProgress,
@@ -81,6 +82,16 @@ export function App() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
+  const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus>({
+    running: false,
+    full: false,
+    filesProcessed: 0,
+    totalFiles: 0,
+    registered: 0,
+    changed: 0,
+    pending: 0,
+    errors: 0,
+  });
   const [batchTags, setBatchTags] = useState<string[]>([]);
   const [removeBatchTags, setRemoveBatchTags] = useState<string[]>([]);
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
@@ -99,9 +110,41 @@ export function App() {
     new Map<string, ProvisionalMetadataPatch>(),
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
+  const savingSettings = useRef(false);
+  const scanActive = useRef(false);
 
   const configured = Boolean(settings.initializedCataloguePath);
-  const refresh = async () => setCatalogue(await desktopBridge.loadCatalogue());
+  const refresh = useCallback(async () => {
+    setCatalogue(await desktopBridge.loadCatalogue());
+  }, []);
+  const runDiscovery = useCallback(
+    async (full = false, announce = false) => {
+      if (scanActive.current) return;
+      scanActive.current = true;
+      try {
+        const result = await desktopBridge.rescan(full);
+        if (result.registered > 0 || result.changed > 0) {
+          await refresh();
+          void desktopBridge
+            .enrichMedia()
+            .then(refresh)
+            .catch(() => undefined);
+        }
+        if (announce) {
+          setMessage(
+            `${full ? 'Full verification' : 'Scan'} complete: ${result.registered} registered, ${result.changed} changed, ${result.pending} pending, ${result.errors} errors.`,
+          );
+        }
+        return result;
+      } catch (reason) {
+        if (announce) setError(errorText(reason));
+        return undefined;
+      } finally {
+        scanActive.current = false;
+      }
+    },
+    [refresh],
+  );
   const receiveJobs = (incoming: IngestJob[]) =>
     setJobs(
       incoming.map((job) => ({
@@ -122,6 +165,8 @@ export function App() {
     let stopProgress: (() => void) | undefined;
     let stopDrop: (() => void) | undefined;
     let stopJobs: (() => void) | undefined;
+    let stopDiscovery: (() => void) | undefined;
+    let stopCatalogue: (() => void) | undefined;
     Promise.all([
       desktopBridge.loadSettings(),
       desktopBridge.onProgress(setProgress),
@@ -133,6 +178,15 @@ export function App() {
         setSources((current) => [...new Set([...current, ...paths])]);
       }),
       desktopBridge.mediaToolsStatus(),
+      desktopBridge.onDiscoveryProgress(setDiscoveryStatus),
+      desktopBridge.onCatalogueChanged(() => {
+        void refresh().catch((reason) => {
+          void desktopBridge.logUiError(
+            `Catalogue refresh event failed: ${errorText(reason)}`,
+          );
+        });
+      }),
+      desktopBridge.getDiscoveryStatus(),
     ])
       .then(
         async ([
@@ -141,18 +195,26 @@ export function App() {
           unlistenJobs,
           unlistenDrop,
           tools,
+          unlistenDiscovery,
+          unlistenCatalogue,
+          loadedDiscoveryStatus,
         ]) => {
           if (disposed) {
             unlistenProgress();
             unlistenJobs();
             unlistenDrop();
+            unlistenDiscovery();
+            unlistenCatalogue();
             return;
           }
           stopProgress = unlistenProgress;
           stopJobs = unlistenJobs;
           stopDrop = unlistenDrop;
+          stopDiscovery = unlistenDiscovery;
+          stopCatalogue = unlistenCatalogue;
           setSettings(loaded);
           setMediaTools(tools);
+          setDiscoveryStatus(loadedDiscoveryStatus);
           setJobs(await desktopBridge.initializeIngestJobs());
           if (loaded.initializedCataloguePath) {
             const before = await desktopBridge.catalogueSignature();
@@ -165,14 +227,20 @@ export function App() {
           }
         },
       )
-      .catch((reason) => setError(errorText(reason)));
+      .catch((reason) => {
+        const detail = errorText(reason);
+        setError(`Startup failed: ${detail}`);
+        void desktopBridge.logUiError(`Startup failed: ${detail}`);
+      });
     return () => {
       disposed = true;
       stopProgress?.();
       stopJobs?.();
       stopDrop?.();
+      stopDiscovery?.();
+      stopCatalogue?.();
     };
-  }, [native]);
+  }, [native, refresh]);
 
   useEffect(() => {
     if (!native || sources.length === 0) return;
@@ -253,21 +321,36 @@ export function App() {
   }, [configured, native]);
   useEffect(() => {
     if (!native || !configured) return;
+    let stabilityTimer: number | undefined;
+    const startupTimer = window.setTimeout(() => {
+      void runDiscovery().then((result) => {
+        if (result?.pending) {
+          stabilityTimer = window.setTimeout(() => {
+            void runDiscovery();
+          }, 16_000);
+        }
+      });
+    }, 0);
     const timer = window.setInterval(() => {
-      void desktopBridge
-        .rescan()
-        .then(async (result) => {
-          if (result.registered > 0 || result.changed > 0) {
-            setCatalogue(await desktopBridge.loadCatalogue());
-            void desktopBridge.enrichMedia().then(async () => {
-              setCatalogue(await desktopBridge.loadCatalogue());
-            });
-          }
-        })
-        .catch(() => undefined);
+      void runDiscovery();
     }, 30_000);
-    return () => window.clearInterval(timer);
-  }, [configured, native]);
+    return () => {
+      window.clearInterval(timer);
+      window.clearTimeout(startupTimer);
+      if (stabilityTimer !== undefined) window.clearTimeout(stabilityTimer);
+    };
+  }, [configured, native, runDiscovery]);
+
+  useEffect(() => {
+    const preventDefaultContextMenu = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, [contenteditable="true"]')) return;
+      event.preventDefault();
+    };
+    document.addEventListener('contextmenu', preventDefaultContextMenu);
+    return () =>
+      document.removeEventListener('contextmenu', preventDefaultContextMenu);
+  }, []);
 
   const folders = useMemo(() => {
     const counts = new Map<string, number>();
@@ -344,17 +427,22 @@ export function App() {
   }, [contextMenu]);
 
   const saveConfiguration = async () => {
+    if (savingSettings.current) return;
+    savingSettings.current = true;
     setError('');
     setBusy(true);
     try {
       const saved = await desktopBridge.saveSettings(settings);
       setSettings(saved);
-      await refresh();
-      setMessage('Configuration saved. The catalogue is ready.');
-      setView('Ingest');
+      setMessage(
+        'Configuration saved. Library indexing will continue in the background.',
+      );
     } catch (reason) {
-      setError(errorText(reason));
+      const detail = errorText(reason);
+      setError(detail);
+      void desktopBridge.logUiError(`Settings save failed: ${detail}`);
     } finally {
+      savingSettings.current = false;
       setBusy(false);
     }
   };
@@ -560,17 +648,16 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      const result = await desktopBridge.rescan();
-      await refresh();
-      setMessage(
-        `${result.registered} external file${result.registered === 1 ? '' : 's'} registered; ${result.changed} changed and ${result.pending} still awaiting stability.`,
-      );
-      void desktopBridge
-        .enrichMedia()
-        .then(refresh)
-        .catch(() => undefined);
-    } catch (reason) {
-      setError(errorText(reason));
+      await runDiscovery(false, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const doFullRescan = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await runDiscovery(true, true);
     } finally {
       setBusy(false);
     }
@@ -925,6 +1012,61 @@ export function App() {
               }
               onBrowse={() => chooseSettingFolder('thumbnailCachePath')}
             />
+            {configured && (
+              <div className="scan-status" role="status">
+                <h3>Library discovery</h3>
+                <p>
+                  PIMP indexes files already in Master Bin. Syncthing transfers
+                  files independently between your devices.
+                </p>
+                <dl>
+                  <div>
+                    <dt>Last completed scan</dt>
+                    <dd>
+                      {discoveryStatus.lastCompletedAt
+                        ? new Date(
+                            discoveryStatus.lastCompletedAt,
+                          ).toLocaleString()
+                        : 'Not completed yet'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Progress</dt>
+                    <dd>
+                      {discoveryStatus.running
+                        ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                        : 'Idle'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Registered media</dt>
+                    <dd>{catalogue.media.length}</dd>
+                  </div>
+                  <div>
+                    <dt>Pending / unverified</dt>
+                    <dd>{discoveryStatus.pending}</dd>
+                  </div>
+                  <div>
+                    <dt>Scan errors</dt>
+                    <dd>{discoveryStatus.errors}</dd>
+                  </div>
+                </dl>
+                <div className="scan-actions">
+                  <button
+                    disabled={busy || discoveryStatus.running}
+                    onClick={doRescan}
+                  >
+                    Scan for new files
+                  </button>
+                  <button
+                    disabled={busy || discoveryStatus.running}
+                    onClick={doFullRescan}
+                  >
+                    Full library rescan / verify
+                  </button>
+                </div>
+              </div>
+            )}
             <label>
               Thumbnail cache limit (GB)
               <input
@@ -1017,8 +1159,14 @@ export function App() {
                   placeholder="Search filenames, folders, tags, notes, projects, dates, codec…"
                 />
               </label>
-              <button disabled={busy} onClick={doRescan}>
-                <RefreshCw size={15} /> Rescan
+              <button
+                disabled={busy || discoveryStatus.running}
+                onClick={doRescan}
+              >
+                <RefreshCw size={15} />
+                {discoveryStatus.running
+                  ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
+                  : 'Scan for new files'}
               </button>
             </section>
             <section className="content-grid">

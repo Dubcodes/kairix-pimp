@@ -30,6 +30,8 @@ const mocks = vi.hoisted(() => ({
     ((jobs: import('./bridge').IngestJob[]) => void) | undefined,
   refreshMediaAvailability: vi.fn(),
   rescan: vi.fn(),
+  discoveryListener: undefined as
+    ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
   resolveMediaPath: vi.fn(),
   revealMediaInExplorer: vi.fn(),
   openMediaFolder: vi.fn(),
@@ -60,6 +62,22 @@ vi.mock('./bridge', () => ({
       mocks.jobListener = handler;
       return () => undefined;
     }),
+    onDiscoveryProgress: vi.fn(async (handler) => {
+      mocks.discoveryListener = handler;
+      return () => undefined;
+    }),
+    onCatalogueChanged: vi.fn(async () => () => undefined),
+    getDiscoveryStatus: vi.fn(async () => ({
+      running: false,
+      full: false,
+      filesProcessed: 0,
+      totalFiles: 0,
+      registered: 0,
+      changed: 0,
+      pending: 0,
+      errors: 0,
+    })),
+    logUiError: vi.fn(),
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
@@ -84,9 +102,12 @@ import { datePatternPreview } from './date-pattern';
 
 describe('native application integration', () => {
   it('previews date, 24-hour and 12-hour folder tokens', () => {
-    expect(datePatternPreview('yyyymmdd')).toBe('20261023');
-    expect(datePatternPreview('yyyy-MM-dd HH-mm')).toBe('2026-10-23 17-42');
-    expect(datePatternPreview('yyyy MM dd hh-mm a')).toBe(
+    const now = new Date(2026, 9, 23, 17, 42, 9);
+    expect(datePatternPreview('yyyymmdd', now)).toBe('20261023');
+    expect(datePatternPreview('yyyy-MM-dd HH-mm', now)).toBe(
+      '2026-10-23 17-42',
+    );
+    expect(datePatternPreview('yyyy MM dd hh-mm a', now)).toBe(
       '2026 10 23 05-42 PM',
     );
   });
@@ -105,6 +126,15 @@ describe('native application integration', () => {
     mocks.refreshMediaAvailability.mockReset();
     mocks.refreshMediaAvailability.mockResolvedValue(false);
     mocks.rescan.mockReset();
+    mocks.rescan.mockResolvedValue({
+      scanned: 0,
+      registered: 0,
+      changed: 0,
+      pending: 0,
+      errors: 0,
+      full: false,
+      completedAt: '2026-10-26T00:00:00Z',
+    });
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
     mocks.revealMediaInExplorer.mockReset();
@@ -138,16 +168,31 @@ describe('native application integration', () => {
   });
 
   it('runs an explicit manual rescan from the real library', async () => {
-    mocks.rescan.mockResolvedValue({ registered: 2, changed: 0, pending: 1 });
+    mocks.rescan.mockResolvedValue({
+      scanned: 3,
+      registered: 2,
+      changed: 0,
+      pending: 1,
+      errors: 0,
+      full: false,
+      completedAt: '2026-10-26T00:00:00Z',
+    });
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole('button', { name: /Rescan/ }));
-    expect(mocks.rescan).toHaveBeenCalledOnce();
+    await user.click(
+      await screen.findByRole('button', { name: /Scan for new files/ }),
+    );
+    expect(mocks.rescan).toHaveBeenCalledWith(false);
     expect(
       await screen.findByText(
-        '2 external files registered; 0 changed and 1 still awaiting stability.',
+        'Scan complete: 2 registered, 0 changed, 1 pending, 0 errors.',
       ),
     ).toBeVisible();
+  });
+
+  it('starts conservative discovery automatically for a configured library', async () => {
+    render(<App />);
+    await waitFor(() => expect(mocks.rescan).toHaveBeenCalledWith(false));
   });
 
   it('shows a complete source inventory before enabling ingest', async () => {
@@ -201,6 +246,24 @@ describe('native application integration', () => {
     await user.click(await screen.findByRole('button', { name: 'Settings' }));
     expect(screen.getByDisplayValue('C:\\Master')).toBeVisible();
     expect(screen.getByText(/Catalogue location is locked/)).toBeVisible();
+  });
+
+  it('finishes saving settings without waiting for catalogue indexing', async () => {
+    mocks.saveSettings.mockResolvedValue(mocks.settings);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Save configuration' }),
+    );
+    expect(
+      await screen.findByText(
+        'Configuration saved. Library indexing will continue in the background.',
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Save configuration' }),
+    ).toBeEnabled();
   });
 
   it('offers validated Windows file actions for one locally available recording', async () => {
@@ -387,7 +450,7 @@ describe('native application integration', () => {
           await vi.advanceTimersByTimeAsync(3_000);
         });
         expect(screen.getByText(visibleMetadata)).toBeVisible();
-        expect(mocks.rescan).not.toHaveBeenCalled();
+        expect(mocks.rescan).toHaveBeenCalledWith(false);
       } finally {
         vi.useRealTimers();
       }
@@ -596,7 +659,7 @@ describe('native application integration', () => {
         await vi.advanceTimersByTimeAsync(3_000);
       });
       expect(screen.getByText('arrived.mp4')).toBeVisible();
-      expect(mocks.rescan).not.toHaveBeenCalled();
+      expect(mocks.rescan).toHaveBeenCalledWith(false);
     } finally {
       vi.useRealTimers();
     }

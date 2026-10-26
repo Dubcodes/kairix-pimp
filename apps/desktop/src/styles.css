@@ -1022,6 +1022,62 @@ article footer span {
   gap: 20px;
   font-size: 11px;
 }
+
+.scan-status {
+  padding: 16px;
+  border: 1px solid #355143;
+  border-radius: 10px;
+  background: #102019;
+}
+
+.scan-status h3,
+.scan-status p {
+  margin: 0 0 10px;
+}
+
+.scan-status dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.scan-status dl div {
+  display: grid;
+  gap: 3px;
+}
+
+.scan-status dt {
+  color: #91a79b;
+  font-size: 0.75rem;
+}
+
+.scan-status dd {
+  margin: 0;
+  font-weight: 700;
+}
+
+.scan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.recovery-view {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  gap: 16px;
+  padding: 40px;
+  text-align: center;
+  background: #111713;
+  color: #edf5ef;
+}
+
+.recovery-view > * {
+  max-width: 620px;
+  margin: 0;
+}
 .check-field {
   display: flex !important;
   grid-template-columns: auto 1fr;
