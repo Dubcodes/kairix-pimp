@@ -42,7 +42,7 @@ const normalizedMediaIdentityPath = (value: string) =>
   value
     .replaceAll('\\', '/')
     .replace(/^\/+|\/+$/g, '')
-    .toLocaleLowerCase();
+    .toLowerCase();
 
 function registrationAliases(events: EventEnvelope[]) {
   const byPath = new Map<
@@ -54,7 +54,7 @@ function registrationAliases(events: EventEnvelope[]) {
     if (envelope.event.type !== 'media.registered') continue;
     const path = normalizedMediaIdentityPath(envelope.event.media.relativePath);
     const hashes = byPath.get(path) ?? new Map();
-    const hash = envelope.event.media.sha256.toLocaleLowerCase();
+    const hash = envelope.event.media.sha256.toLowerCase();
     const identities = identitiesById.get(envelope.event.media.id) ?? new Set();
     identities.add(`${path}\n${hash}`);
     identitiesById.set(envelope.event.media.id, identities);
@@ -158,8 +158,7 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         existing &&
         (normalizedMediaIdentityPath(existing.relativePath) !==
           normalizedMediaIdentityPath(event.media.relativePath) ||
-          existing.sha256.toLocaleLowerCase() !==
-            event.media.sha256.toLocaleLowerCase())
+          existing.sha256.toLowerCase() !== event.media.sha256.toLowerCase())
       )
         addConflict({
           entityId: mediaId,

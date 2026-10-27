@@ -13,6 +13,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented: native picker/drop, recursive inventory, verified copies, persisted real Library, per-ingest date overrides, explicit collision rename, projects, manual/periodic discovery, metadata/thumbnails and conservative same-stem MP4/WAV pairing
 - Implemented reliability foundation: canonical causal event replay, deterministic path-plus-hash registration aliases, duplicate/malformed/newer-record handling, legacy migration/backup, multi-device convergence tests, external staging, minimal recovery journal, no-overwrite promotion, source-change checks, conservative discovery, two-sided unambiguous folder-aware pairing, portable thumbnails, Working Projects containment and recoverable manifest projection
 - Implemented manifest reliability correction: serialized device-local reconciliation, pre-append retry intent, restart repair for a registered project's local folder mapping, failure-safe project creation ordering and no-op suppression for unchanged state/manifests
+- Implemented Library usability: persistent icon-only sidebar, six deterministic folder sort modes plus accessible custom order, logical video/WAV metadata and counts, clean thumbnail placeholders, themed batch editing and content scroll-to-top
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
 - Byte-range ingest resume and throughput history
 - Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
@@ -20,7 +21,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Contact sheets, preview player, custom thumbnails, folder rename/move journal
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
-- Rich library interaction: keyboard/multi-select batch actions, favourites, saved filters, previews and explicit review/conflict flows
+- Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
 
 ## Milestone 3 — Premiere extension
 

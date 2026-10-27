@@ -15,6 +15,16 @@ export interface DeviceSettings {
   projectPaths?: Record<string, string>;
   dateFolderPattern?: string;
   showAttachedAudioSeparately?: boolean;
+  sidebarCollapsed?: boolean;
+  libraryFolderSort?:
+    | 'newest'
+    | 'oldest'
+    | 'name-asc'
+    | 'name-desc'
+    | 'most-recordings'
+    | 'fewest-recordings'
+    | 'custom';
+  libraryFolderOrder?: string[];
 }
 
 export interface SharedSettings {

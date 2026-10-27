@@ -90,6 +90,12 @@ struct DeviceSettings {
     density: String,
     #[serde(default)]
     show_attached_audio_separately: bool,
+    #[serde(default)]
+    sidebar_collapsed: bool,
+    #[serde(default = "default_library_folder_sort")]
+    library_folder_sort: String,
+    #[serde(default)]
+    library_folder_order: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -121,6 +127,9 @@ fn default_theme() -> String {
 fn default_density() -> String {
     "comfortable".into()
 }
+fn default_library_folder_sort() -> String {
+    "newest".into()
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -148,6 +157,9 @@ impl Default for DeviceSettings {
             theme: default_theme(),
             density: default_density(),
             show_attached_audio_separately: false,
+            sidebar_collapsed: false,
+            library_folder_sort: default_library_folder_sort(),
+            library_folder_order: vec![],
         }
     }
 }
@@ -664,6 +676,18 @@ fn save_settings(
     }
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
+    }
+    if !matches!(
+        settings.library_folder_sort.as_str(),
+        "newest"
+            | "oldest"
+            | "name-asc"
+            | "name-desc"
+            | "most-recordings"
+            | "fewest-recordings"
+            | "custom"
+    ) {
+        return Err("Choose a supported Library folder ordering".into());
     }
     fs::create_dir_all(settings.master_bin_path.trim())
         .map_err(|e| format!("Cannot create Master Bin: {e}"))?;
@@ -4874,6 +4898,9 @@ mod tests {
         assert_eq!(settings.theme, "graphite");
         assert_eq!(settings.density, "comfortable");
         assert!(!settings.show_attached_audio_separately);
+        assert!(!settings.sidebar_collapsed);
+        assert_eq!(settings.library_folder_sort, "newest");
+        assert!(settings.library_folder_order.is_empty());
     }
 
     #[test]
@@ -5017,8 +5044,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("ingestDateOrganization");
+        value.as_object_mut().unwrap().remove("sidebarCollapsed");
+        value.as_object_mut().unwrap().remove("libraryFolderSort");
+        value.as_object_mut().unwrap().remove("libraryFolderOrder");
         let settings: DeviceSettings = serde_json::from_value(value).unwrap();
         assert_eq!(settings.ingest_date_organization, "original-file-dates");
+        assert!(!settings.sidebar_collapsed);
+        assert_eq!(settings.library_folder_sort, "newest");
+        assert!(settings.library_folder_order.is_empty());
     }
 
     #[test]

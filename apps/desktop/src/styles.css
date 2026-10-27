@@ -90,6 +90,10 @@ textarea {
   display: grid;
   grid-template-columns: 224px 1fr;
   min-height: 100vh;
+  transition: grid-template-columns 160ms ease;
+}
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 72px 1fr;
 }
 .sidebar {
   border-right: 1px solid #252c28;
@@ -97,6 +101,7 @@ textarea {
   padding: 25px 14px 18px;
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 .brand {
   display: flex;
@@ -127,6 +132,17 @@ textarea {
   text-transform: uppercase;
   letter-spacing: 0.8px;
 }
+.sidebar-toggle {
+  min-height: 36px;
+  margin: -18px 7px 18px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-muted);
+  background: var(--bg-control);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
 .sidebar nav {
   display: flex;
   flex-direction: column;
@@ -152,6 +168,26 @@ textarea {
   color: #eff7f0;
   background: #1b241e;
   box-shadow: inset 3px 0 #d6f85f;
+}
+.sidebar-collapsed .sidebar {
+  padding-inline: 9px;
+}
+.sidebar-collapsed .brand {
+  justify-content: center;
+  padding-inline: 0;
+}
+.sidebar-collapsed .brand > div:last-child,
+.sidebar-collapsed .sidebar nav button span,
+.sidebar-collapsed .storage,
+.sidebar-collapsed .edition {
+  display: none;
+}
+.sidebar-collapsed .sidebar-toggle {
+  margin-inline: 4px;
+}
+.sidebar-collapsed .sidebar nav button {
+  justify-content: center;
+  padding-inline: 0;
 }
 .storage {
   margin-top: auto;
@@ -431,6 +467,47 @@ header h1 {
   text-transform: uppercase;
   letter-spacing: 1px;
 }
+.folder-panel-heading {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.folder-panel-heading h3 {
+  margin-bottom: 0;
+}
+.folder-panel-heading label {
+  display: grid;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+.folder-panel-heading select {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.folder-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+}
+.folder-move {
+  display: grid;
+  grid-template-columns: repeat(2, 24px);
+  gap: 2px;
+}
+.folder-move button {
+  width: 24px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  display: grid;
+  place-items: center;
+}
 .folder {
   width: 100%;
   border: 0;
@@ -664,6 +741,9 @@ article footer span {
 }
 .library-overlays > * {
   pointer-events: auto;
+}
+.sidebar-collapsed .library-overlays {
+  left: 100px;
 }
 .batch {
   width: 100%;

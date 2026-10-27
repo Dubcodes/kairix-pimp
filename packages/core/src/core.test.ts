@@ -271,6 +271,51 @@ describe('catalogue reducer', () => {
       ]),
     );
   });
+  it('uses locale-independent Unicode case folding without guessing normalization', () => {
+    const state = rebuildCatalogue([
+      envelope(
+        {
+          type: 'media.registered',
+          media: {
+            ...media,
+            id: 'upper',
+            relativePath: 'ÅNGSTRÖM/CAFÉ.MP4',
+            sha256: 'same-hash',
+          },
+        },
+        'upper',
+        'device-a',
+      ),
+      envelope(
+        {
+          type: 'media.registered',
+          media: {
+            ...media,
+            id: 'lower',
+            relativePath: 'ångström/café.mp4',
+            sha256: 'same-hash',
+          },
+        },
+        'lower',
+        'device-b',
+      ),
+      envelope(
+        {
+          type: 'media.registered',
+          media: {
+            ...media,
+            id: 'decomposed',
+            relativePath: 'ångström/cafe\u0301.mp4',
+            sha256: 'same-hash',
+          },
+        },
+        'decomposed',
+        'device-c',
+      ),
+    ]);
+    expect(Object.keys(state.media)).toHaveLength(2);
+    expect(state.media.decomposed).toBeDefined();
+  });
   it('persists tagging and multiple project assignment', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),

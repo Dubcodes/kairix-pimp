@@ -29,6 +29,16 @@ export interface DeviceSettings {
     | 'high-contrast';
   density: 'comfortable' | 'compact';
   showAttachedAudioSeparately: boolean;
+  sidebarCollapsed?: boolean;
+  libraryFolderSort?:
+    | 'newest'
+    | 'oldest'
+    | 'name-asc'
+    | 'name-desc'
+    | 'most-recordings'
+    | 'fewest-recordings'
+    | 'custom';
+  libraryFolderOrder?: string[];
 }
 export interface AppInfo {
   version: string;
@@ -236,6 +246,9 @@ export const emptySettings = (): DeviceSettings => ({
   theme: 'graphite',
   density: 'comfortable',
   showAttachedAudioSeparately: false,
+  sidebarCollapsed: false,
+  libraryFolderSort: 'newest',
+  libraryFolderOrder: [],
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],

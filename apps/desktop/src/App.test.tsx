@@ -31,6 +31,9 @@ const mocks = vi.hoisted(() => ({
     theme: 'graphite' as const,
     density: 'comfortable' as const,
     showAttachedAudioSeparately: false,
+    sidebarCollapsed: false,
+    libraryFolderSort: 'newest' as const,
+    libraryFolderOrder: [],
   } as DeviceSettings,
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
@@ -162,6 +165,9 @@ describe('native application integration', () => {
       theme: 'graphite',
       density: 'comfortable',
       showAttachedAudioSeparately: false,
+      sidebarCollapsed: false,
+      libraryFolderSort: 'newest',
+      libraryFolderOrder: [],
     };
     mocks.saveSettings.mockReset();
     mocks.loadCatalogue.mockReset();
@@ -216,6 +222,103 @@ describe('native application integration', () => {
     render(<App />);
     expect(await screen.findByText('Your Master Bin is ready')).toBeVisible();
     expect(screen.queryByText('PIMP_MASTER_001.MP4')).not.toBeInTheDocument();
+  });
+
+  it('persists sidebar collapse and accessible logical folder ordering', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'alpha',
+          relativePath: 'Alpha/one.mp4',
+          originalFilename: 'one.mp4',
+          sha256: 'alpha',
+          captureDate: '2026-10-20T00:00:00Z',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-10-20',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+        ...['two', 'three'].map((name) => ({
+          id: name,
+          relativePath: `Zeta/${name}.mp4`,
+          originalFilename: `${name}.mp4`,
+          sha256: name,
+          captureDate: '2026-10-27T00:00:00Z',
+          captureDateProvenance: 'filesystem' as const,
+          ingestDate: '2026-10-27',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        })),
+      ],
+      projects: [],
+      updatedAt: '2026-10-27T00:00:00Z',
+    };
+    mocks.saveSettings.mockImplementation(async (settings) => settings);
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(
+      await screen.findByRole('button', { name: /^Zeta/ }),
+    ).toHaveTextContent('2 recordings');
+    const folderButtons = () =>
+      [
+        ...document.querySelectorAll<HTMLButtonElement>(
+          '.folder-row > .folder',
+        ),
+      ].map((button) => button.textContent);
+    expect(folderButtons()[0]).toContain('Zeta');
+
+    const orderSelect = screen.getByRole('combobox', {
+      name: 'Folder order',
+    });
+    for (const [order, firstFolder] of [
+      ['oldest', 'Alpha'],
+      ['name-asc', 'Alpha'],
+      ['name-desc', 'Zeta'],
+      ['most-recordings', 'Zeta'],
+      ['fewest-recordings', 'Alpha'],
+      ['newest', 'Zeta'],
+      ['name-asc', 'Alpha'],
+    ] as const) {
+      await user.selectOptions(orderSelect, order);
+      expect(folderButtons()[0]).toContain(firstFolder);
+    }
+    expect(mocks.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ libraryFolderSort: 'name-asc' }),
+    );
+
+    await user.selectOptions(orderSelect, 'custom');
+    await user.click(screen.getByRole('button', { name: 'Move Zeta up' }));
+    await waitFor(() =>
+      expect(mocks.saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          libraryFolderSort: 'custom',
+          libraryFolderOrder: ['Zeta', 'Alpha'],
+        }),
+      ),
+    );
+
+    await user.click(
+      screen.getByRole('button', { name: 'Collapse application sidebar' }),
+    );
+    expect(
+      screen.getByRole('button', { name: 'Expand application sidebar' }),
+    ).toBeVisible();
+    await waitFor(() =>
+      expect(mocks.saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sidebarCollapsed: true }),
+      ),
+    );
   });
 
   it('runs an explicit manual rescan from the real library', async () => {
@@ -543,14 +646,24 @@ describe('native application integration', () => {
           ingestDate: '2026-10-24',
           fileType: 'wav',
           tags: ['lav'],
-          projectIds: [],
+          projectIds: ['project'],
           notes: '',
           technical: { sizeBytes: 1_000 },
           available: true,
           needsReview: false,
         },
       ],
-      projects: [],
+      projects: [
+        {
+          id: 'project',
+          name: 'Sound Unit',
+          workingDirectory: '.',
+          mediaIds: ['audio'],
+          notes: '',
+          tags: [],
+          createdAt: '2026-10-24T00:00:00Z',
+        },
+      ],
       updatedAt: '2026-10-24T00:00:00Z',
     };
     mocks.resolveMediaPath.mockImplementation(
@@ -567,6 +680,8 @@ describe('native application integration', () => {
     expect(await screen.findByText('DJI_0001.MP4')).toBeVisible();
     expect(screen.queryByRole('option', { name: /dji_0001.wav/i })).toBeNull();
     expect(screen.getByText(/2 associated files/)).toBeVisible();
+    expect(screen.getByText('lav')).toBeVisible();
+    expect(screen.getByText('Sound Unit')).toBeVisible();
     await user.type(
       screen.getByPlaceholderText(/Search filenames/),
       'dji_0001.wav',
@@ -599,6 +714,8 @@ describe('native application integration', () => {
       }),
     );
     expect(mocks.revealMediaInExplorer).toHaveBeenCalledWith('audio');
+    await user.click(screen.getByRole('button', { name: 'Projects' }));
+    expect(screen.getByText('1 assigned recordings')).toBeVisible();
   });
 
   it('persists the attached-audio card preference and can re-evaluate pairing', async () => {

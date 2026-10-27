@@ -1325,12 +1325,12 @@ pub fn pair_audio(catalogue: &mut Catalogue) {
             .unwrap_or(Path::new(""))
             .to_string_lossy()
             .replace('\\', "/")
-            .to_ascii_lowercase();
+            .to_lowercase();
         let stem = path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_ascii_lowercase();
+            .to_lowercase();
         audios
             .entry((directory, stem))
             .or_default()
@@ -1348,11 +1348,11 @@ pub fn pair_audio(catalogue: &mut Catalogue) {
                 .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/")
-                .to_ascii_lowercase(),
+                .to_lowercase(),
             path.file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .to_ascii_lowercase(),
+                .to_lowercase(),
         );
         videos.entry(key).or_default().push(item.id.clone());
     }
@@ -1372,11 +1372,11 @@ pub fn pair_audio(catalogue: &mut Catalogue) {
                 .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/")
-                .to_ascii_lowercase(),
+                .to_lowercase(),
             path.file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .to_ascii_lowercase(),
+                .to_lowercase(),
         );
         item.attached_audio_id = audios
             .get(&key)
@@ -1802,6 +1802,41 @@ mod tests {
             .conflicts
             .iter()
             .any(|conflict| conflict.field == "identity-hash"));
+    }
+
+    #[test]
+    fn identity_path_case_folding_is_unicode_aware_without_guessing_normalization() {
+        let mut upper = item("upper", "ÅNGSTRÖM/CAFÉ.MP4", "mp4");
+        upper.sha256 = "same-hash".into();
+        let mut lower = item("lower", "ångström/café.mp4", "mp4");
+        lower.sha256 = "same-hash".into();
+        let mut decomposed = item("decomposed", "ångström/cafe\u{301}.mp4", "mp4");
+        decomposed.sha256 = "same-hash".into();
+        let catalogue = rebuild(EventRead {
+            events: vec![
+                envelope(
+                    "device-a",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: upper },
+                ),
+                envelope(
+                    "device-b",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: lower },
+                ),
+                envelope(
+                    "device-c",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: decomposed },
+                ),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.media.len(), 2);
+        assert!(catalogue
+            .media
+            .iter()
+            .any(|media| media.id == "decomposed"));
     }
 
     #[test]
@@ -2379,6 +2414,48 @@ mod tests {
             .media
             .iter()
             .find(|item| item.id == "unpaired-video")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+    }
+
+    #[test]
+    fn pairing_uses_locale_independent_unicode_case_folding() {
+        let mut audio = item("audio", "ångström/café.wav", "wav");
+        audio.tags = vec!["WAV-only".into()];
+        audio.project_ids = vec!["sound-project".into()];
+        let mut catalogue = Catalogue {
+            media: vec![
+                item("video", "ÅNGSTRÖM/CAFÉ.MP4", "mp4"),
+                audio,
+                item("distinct-video", "ÅNGSTRÖM/RESUMÉ.MP4", "mp4"),
+                item("distinct-audio", "ångström/resume.wav", "wav"),
+            ],
+            ..Default::default()
+        };
+        pair_audio(&mut catalogue);
+        pair_audio(&mut catalogue);
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "video")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("audio")
+        );
+        let audio = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "audio")
+            .unwrap();
+        assert_eq!(audio.tags, vec!["WAV-only".to_string()]);
+        assert_eq!(audio.project_ids, vec!["sound-project".to_string()]);
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "distinct-video")
             .unwrap()
             .attached_audio_id
             .is_none());

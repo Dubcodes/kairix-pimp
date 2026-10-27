@@ -38,6 +38,29 @@ export const expandLogicalMediaIds = (
   ];
 };
 
+export const logicalTags = (item: MediaItem, media: MediaItem[]): string[] => [
+  ...new Set(associatedMedia(item, media).flatMap((record) => record.tags)),
+];
+
+export const logicalProjectIds = (
+  item: MediaItem,
+  media: MediaItem[],
+): string[] => [
+  ...new Set(
+    associatedMedia(item, media).flatMap((record) => record.projectIds),
+  ),
+];
+
+export const logicalProjectRecordingCount = (
+  projectId: string,
+  media: MediaItem[],
+): number =>
+  visibleMedia(media, false).filter((item) =>
+    associatedMedia(item, media).some((record) =>
+      record.projectIds.includes(projectId),
+    ),
+  ).length;
+
 const searchValues = (item: MediaItem, catalogue: Catalogue) => [
   item.originalFilename,
   item.relativePath,

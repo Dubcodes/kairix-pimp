@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   ArrowUp,
+  ChevronDown,
+  ChevronUp,
   Clock3,
   Coffee,
   Copy,
@@ -12,6 +14,8 @@ import {
   Inbox,
   Library,
   LocateFixed,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Search,
   Settings,
@@ -52,6 +56,9 @@ import {
   associatedMedia,
   expandLogicalMediaIds,
   logicalMediaMatches,
+  logicalProjectIds,
+  logicalProjectRecordingCount,
+  logicalTags,
   visibleMedia,
 } from './media-grouping';
 
@@ -64,6 +71,7 @@ type SettingsSection =
   | 'Updates'
   | 'About & Support'
   | 'Diagnostics';
+type FolderSort = NonNullable<DeviceSettings['libraryFolderSort']>;
 
 const icons = {
   Ingest: Inbox,
@@ -459,15 +467,48 @@ export function App() {
     [catalogue.media, settings.showAttachedAudioSeparately],
   );
   const folders = useMemo(() => {
-    const counts = new Map<string, number>();
+    const summaries = new Map<
+      string,
+      { name: string; count: number; newest: string }
+    >();
     for (const item of displayedMedia) {
       const name =
         item.relativePath.split('/').slice(0, -1).join('/') ||
         'Master Bin root';
-      counts.set(name, (counts.get(name) ?? 0) + 1);
+      const current = summaries.get(name) ?? { name, count: 0, newest: '' };
+      current.count += 1;
+      const recordingDate = item.captureDate ?? item.ingestDate ?? '';
+      if (recordingDate > current.newest) current.newest = recordingDate;
+      summaries.set(name, current);
     }
-    return [...counts.entries()].sort(([a], [b]) => b.localeCompare(a));
-  }, [displayedMedia]);
+    const result = [...summaries.values()];
+    const byName = (left: { name: string }, right: { name: string }) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+    const sort = settings.libraryFolderSort ?? 'newest';
+    if (sort === 'custom') {
+      const positions = new Map(
+        (settings.libraryFolderOrder ?? []).map((name, index) => [name, index]),
+      );
+      return result.sort((left, right) => {
+        const leftPosition =
+          positions.get(left.name) ?? Number.MAX_SAFE_INTEGER;
+        const rightPosition =
+          positions.get(right.name) ?? Number.MAX_SAFE_INTEGER;
+        return leftPosition - rightPosition || byName(left, right);
+      });
+    }
+    return result.sort((left, right) => {
+      if (sort === 'oldest')
+        return left.newest.localeCompare(right.newest) || byName(left, right);
+      if (sort === 'name-asc') return byName(left, right);
+      if (sort === 'name-desc') return byName(right, left);
+      if (sort === 'most-recordings')
+        return right.count - left.count || byName(left, right);
+      if (sort === 'fewest-recordings')
+        return left.count - right.count || byName(left, right);
+      return right.newest.localeCompare(left.newest) || byName(left, right);
+    });
+  }, [displayedMedia, settings.libraryFolderOrder, settings.libraryFolderSort]);
   const filtered = useMemo(
     () =>
       displayedMedia.filter((item) => {
@@ -538,6 +579,22 @@ export function App() {
     if (!configured) return;
     setError('');
     void savingSettings.save(next, 'Preference saved.');
+  };
+  const setFolderOrdering = (libraryFolderSort: FolderSort) => {
+    persistPreference({
+      libraryFolderSort,
+      ...(libraryFolderSort === 'custom'
+        ? { libraryFolderOrder: folders.map(({ name }) => name) }
+        : {}),
+    });
+  };
+  const moveFolder = (name: string, offset: -1 | 1) => {
+    const order = folders.map((summary) => summary.name);
+    const index = order.indexOf(name);
+    const destination = index + offset;
+    if (index < 0 || destination < 0 || destination >= order.length) return;
+    [order[index], order[destination]] = [order[destination], order[index]];
+    persistPreference({ libraryFolderOrder: order });
   };
   const retrySettingsSave = async () => {
     setError('');
@@ -926,7 +983,9 @@ export function App() {
   ];
 
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell ${settings.sidebarCollapsed ? 'sidebar-collapsed' : ''}`}
+    >
       <aside className="sidebar">
         <div className="brand">
           <div className="mark">P</div>
@@ -939,6 +998,30 @@ export function App() {
             </span>
           </div>
         </div>
+        <button
+          type="button"
+          className="sidebar-toggle"
+          aria-label={
+            settings.sidebarCollapsed
+              ? 'Expand application sidebar'
+              : 'Collapse application sidebar'
+          }
+          aria-expanded={!settings.sidebarCollapsed}
+          title={
+            settings.sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'
+          }
+          onClick={() =>
+            persistPreference({
+              sidebarCollapsed: !settings.sidebarCollapsed,
+            })
+          }
+        >
+          {settings.sidebarCollapsed ? (
+            <PanelLeftOpen aria-hidden="true" size={18} />
+          ) : (
+            <PanelLeftClose aria-hidden="true" size={18} />
+          )}
+        </button>
         <nav>
           {(Object.keys(icons) as View[]).map((item) => {
             const Icon = icons[item];
@@ -946,10 +1029,12 @@ export function App() {
               <button
                 key={item}
                 className={view === item ? 'active' : ''}
+                aria-label={item}
+                title={settings.sidebarCollapsed ? item : undefined}
                 onClick={() => setView(item)}
               >
                 <Icon size={18} />
-                {item}
+                <span>{item}</span>
               </button>
             );
           })}
@@ -1756,7 +1841,29 @@ export function App() {
             </section>
             <section className="content-grid">
               <div className="folder-panel">
-                <h3>Folders</h3>
+                <div className="folder-panel-heading">
+                  <h3>Folders</h3>
+                  <label>
+                    <span>Order</span>
+                    <select
+                      aria-label="Folder order"
+                      value={settings.libraryFolderSort ?? 'newest'}
+                      onChange={(event) =>
+                        setFolderOrdering(event.target.value as FolderSort)
+                      }
+                    >
+                      <option value="newest">Newest first</option>
+                      <option value="oldest">Oldest first</option>
+                      <option value="name-asc">Name A–Z</option>
+                      <option value="name-desc">Name Z–A</option>
+                      <option value="most-recordings">Most recordings</option>
+                      <option value="fewest-recordings">
+                        Fewest recordings
+                      </option>
+                      <option value="custom">Custom order</option>
+                    </select>
+                  </label>
+                </div>
                 <button
                   className={`folder ${folder === 'All media' ? 'active' : ''}`}
                   onClick={() => setFolder('All media')}
@@ -1766,18 +1873,43 @@ export function App() {
                     All media<small>{displayedMedia.length} recordings</small>
                   </span>
                 </button>
-                {folders.map(([name, count]) => (
-                  <button
-                    className={`folder ${folder === name ? 'active' : ''}`}
-                    key={name}
-                    onClick={() => setFolder(name)}
-                  >
-                    <Folder size={16} />
-                    <span>
-                      {name}
-                      <small>{count} items</small>
-                    </span>
-                  </button>
+                {folders.map(({ name, count }, index) => (
+                  <div className="folder-row" key={name}>
+                    <button
+                      className={`folder ${folder === name ? 'active' : ''}`}
+                      onClick={() => setFolder(name)}
+                    >
+                      <Folder size={16} />
+                      <span>
+                        {name}
+                        <small>
+                          {count} recording{count === 1 ? '' : 's'}
+                        </small>
+                      </span>
+                    </button>
+                    {(settings.libraryFolderSort ?? 'newest') === 'custom' && (
+                      <div className="folder-move" aria-label={`Move ${name}`}>
+                        <button
+                          type="button"
+                          aria-label={`Move ${name} up`}
+                          title="Move folder up"
+                          disabled={index === 0}
+                          onClick={() => moveFolder(name, -1)}
+                        >
+                          <ChevronUp aria-hidden="true" size={13} />
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Move ${name} down`}
+                          title="Move folder down"
+                          disabled={index === folders.length - 1}
+                          onClick={() => moveFolder(name, 1)}
+                        >
+                          <ChevronDown aria-hidden="true" size={13} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 ))}
               </div>
               <div className="library-panel">
@@ -1885,18 +2017,20 @@ export function App() {
                           )}
                           <small>{item.relativePath}</small>
                           <div className="pills">
-                            {item.tags.map((tag) => (
+                            {logicalTags(item, catalogue.media).map((tag) => (
                               <em key={tag}>{tag}</em>
                             ))}
                           </div>
                           <div className="projects">
-                            {item.projectIds.map((id) => (
-                              <span key={id}>
-                                {catalogue.projects.find(
-                                  (project) => project.id === id,
-                                )?.name ?? id}
-                              </span>
-                            ))}
+                            {logicalProjectIds(item, catalogue.media).map(
+                              (id) => (
+                                <span key={id}>
+                                  {catalogue.projects.find(
+                                    (project) => project.id === id,
+                                  )?.name ?? id}
+                                </span>
+                              ),
+                            )}
                           </div>
                           <footer>
                             <span>
@@ -2419,12 +2553,8 @@ export function App() {
                   <strong>{project.name}</strong>
                   <small>{project.workingDirectory}</small>
                   <span>
-                    {
-                      catalogue.media.filter((item) =>
-                        item.projectIds.includes(project.id),
-                      ).length
-                    }{' '}
-                    assigned media
+                    {logicalProjectRecordingCount(project.id, catalogue.media)}{' '}
+                    assigned recordings
                   </span>
                 </div>
               ))}

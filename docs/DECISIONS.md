@@ -264,3 +264,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Use one narrow device-local manifest transaction mutex for Library reconciliation, metadata-driven projection and project creation. Persist retry intent before an authoritative event append, release the catalogue mutex before manifest filesystem work, and clear intent only after the manifest and retry-state replacement are durable. A pending project creation also records its authorized local directory so restart can repair a folder mapping after registration. Identical retry state and compatible manifests are not rewritten.
 - **Consequences:** Concurrent refreshes cannot replace newer retry evidence, and a crash after catalogue append leaves a replayable intent. A failed project event append creates no new manifest or folder mapping and never deletes the selected directory. Manifest I/O may briefly serialize another manifest operation, but it does not hold the catalogue write lock or block unrelated ingest copying.
+
+## ADR-035 — Keep Library organization local and logical recordings explicit
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Persist sidebar collapse, folder sort mode and custom folder order as device settings. Folder ordering is a view projection only. A hidden attached WAV contributes its tags, projects and search fields to the grouped video and logical counts, while selecting the separately displayed WAV intentionally targets only that physical record. Unicode path matching uses locale-independent lowercase conversion without silently composing or decomposing filenames.
+- **Consequences:** Users may organize large Libraries without changing Master Bin layout or synchronized events. Paired bulk operations remain explicit two-record updates, projects and folders avoid double counts, and distinct Unicode filenames are not guessed to be equivalent.

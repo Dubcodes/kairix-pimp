@@ -4,6 +4,9 @@ import {
   associatedMedia,
   expandLogicalMediaIds,
   logicalMediaMatches,
+  logicalProjectIds,
+  logicalProjectRecordingCount,
+  logicalTags,
   visibleMedia,
 } from './media-grouping';
 
@@ -65,6 +68,10 @@ describe('logical media grouping', () => {
     expect(
       expandLogicalMediaIds(['video', 'audio', 'independent'], catalogue.media),
     ).toEqual(['video', 'audio', 'independent']);
+    expect(expandLogicalMediaIds(['audio'], catalogue.media)).toEqual([
+      'audio',
+    ]);
+    expect(associatedMedia(audio, catalogue.media)).toEqual([audio]);
   });
 
   it('finds the primary card by attached WAV filename, tags, and project', () => {
@@ -72,5 +79,13 @@ describe('logical media grouping', () => {
     expect(logicalMediaMatches(video, 'boom', catalogue)).toBe(true);
     expect(logicalMediaMatches(video, 'Sound Unit', catalogue)).toBe(true);
     expect(logicalMediaMatches(video, 'missing', catalogue)).toBe(false);
+  });
+
+  it('surfaces attached WAV metadata and counts a pair once per project', () => {
+    expect(logicalTags(video, catalogue.media)).toEqual(['boom']);
+    expect(logicalProjectIds(video, catalogue.media)).toEqual(['project']);
+    expect(logicalProjectRecordingCount('project', catalogue.media)).toBe(1);
+    expect(audio.tags).toEqual(['boom']);
+    expect(audio.projectIds).toEqual(['project']);
   });
 });
