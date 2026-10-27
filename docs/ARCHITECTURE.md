@@ -77,6 +77,8 @@ Registration media IDs are UUIDs independent of hashes, names and paths. Replay 
 
 Project creation accepts only a folder canonically contained beneath the configured Working Projects root. Existing ancestors are resolved before any directory is created, so traversal, symlink and junction escapes fail before registration. Compatible existing manifests may be explicitly associated inside that root. Catalogue metadata commits precede project-manifest projection; failed manifest writes are recorded in a device-local retry store and retried on later updates and startup without duplicating authoritative events.
 
+Project-folder inventory is a read-only native adapter operation keyed by known project ID. It re-resolves the device-local authorized folder, walks without following links, records relative paths and basic filesystem metadata, and categorizes assets without hashing or parsing content. Reveal and open operations accept only that project ID plus a validated relative asset path. Premiere auto-save locations are excluded from deterministic main-project selection.
+
 Media contains `projectIds[]`, so assignments are many-to-many. Each working directory owns an atomically updated `.pimp-project.json` manifest containing portable media identities, paths, checksums, and relevant metadata without recreating or deleting existing assets. See [DATA_MODEL.md](DATA_MODEL.md).
 
 ## Optional AI boundary

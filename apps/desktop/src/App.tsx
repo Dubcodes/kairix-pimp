@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
+  ArrowLeft,
   ArrowUp,
   ChevronDown,
   ChevronUp,
   Clock3,
   Coffee,
   Copy,
+  FileText,
   Folder,
   FolderOpen,
   HardDrive,
@@ -42,6 +44,8 @@ import {
   type IngestProgress,
   type IngestResult,
   type MediaToolsStatus,
+  type ProjectInventory,
+  type ProjectRecord,
   type ProvisionalMetadataPatch,
   type SourceInventory,
 } from './bridge';
@@ -80,6 +84,16 @@ const icons = {
   Archive,
   Settings,
 };
+const projectCategoryLabels: Record<string, string> = {
+  'premiere-project': 'Premiere project',
+  'premiere-auto-save': 'Premiere auto-saves',
+  video: 'Video media',
+  'audio-music': 'Audio and music',
+  'images-graphics': 'Images and graphics',
+  exports: 'Exports',
+  'notes-documentation': 'Notes and documentation',
+  other: 'Other project assets',
+};
 const size = (bytes: number) =>
   bytes < 1024 * 1024
     ? `${Math.round(bytes / 1024)} KB`
@@ -101,6 +115,16 @@ export function App() {
   const [query, setQuery] = useState('');
   const [folder, setFolder] = useState('All media');
   const [selected, setSelected] = useState<string[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>();
+  const [projectInventory, setProjectInventory] = useState<ProjectInventory>();
+  const [projectInventoryLoading, setProjectInventoryLoading] = useState(false);
+  const [projectInventoryError, setProjectInventoryError] = useState('');
+  const [projectMediaQuery, setProjectMediaQuery] = useState('');
+  const [projectMediaSelection, setProjectMediaSelection] = useState<string[]>(
+    [],
+  );
+  const [projectNotes, setProjectNotes] = useState('');
+  const [projectTags, setProjectTags] = useState<string[]>([]);
   const [sources, setSources] = useState<string[]>([]);
   const [dateOverride, setDateOverride] = useState('default');
   const [chosenDate, setChosenDate] = useState('');
@@ -466,6 +490,39 @@ export function App() {
       ),
     [catalogue.media, settings.showAttachedAudioSeparately],
   );
+  const selectedProject = catalogue.projects.find(
+    (project) => project.id === selectedProjectId,
+  );
+  const selectedProjectSyncIssue = catalogue.issues?.find(
+    (issue) =>
+      issue.code === 'project-manifest-pending' &&
+      issue.source === selectedProjectId,
+  );
+  const projectMedia = useMemo(() => {
+    if (!selectedProjectId) return [];
+    return displayedMedia.filter((item) =>
+      logicalMediaMatches(item, projectMediaQuery, catalogue),
+    );
+  }, [catalogue, displayedMedia, projectMediaQuery, selectedProjectId]);
+  const linkedProjectMedia = useMemo(
+    () =>
+      projectMedia.filter((item) =>
+        logicalProjectIds(item, catalogue.media).includes(
+          selectedProjectId ?? '',
+        ),
+      ),
+    [catalogue.media, projectMedia, selectedProjectId],
+  );
+  const unlinkedProjectMedia = useMemo(
+    () =>
+      projectMedia.filter(
+        (item) =>
+          !logicalProjectIds(item, catalogue.media).includes(
+            selectedProjectId ?? '',
+          ),
+      ),
+    [catalogue.media, projectMedia, selectedProjectId],
+  );
   const folders = useMemo(() => {
     const summaries = new Map<
       string,
@@ -523,8 +580,14 @@ export function App() {
     [catalogue, displayedMedia, folder, query],
   );
   const knownTags = useMemo(
-    () => [...new Set(catalogue.media.flatMap((item) => item.tags))].sort(),
-    [catalogue.media],
+    () =>
+      [
+        ...new Set([
+          ...catalogue.media.flatMap((item) => item.tags),
+          ...catalogue.projects.flatMap((project) => project.tags),
+        ]),
+      ].sort(),
+    [catalogue.media, catalogue.projects],
   );
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -973,6 +1036,93 @@ export function App() {
       setError(errorText(reason));
     } finally {
       setBusy(false);
+    }
+  };
+  const refreshProjectInventory = async (projectId: string) => {
+    setProjectInventoryLoading(true);
+    setProjectInventoryError('');
+    try {
+      setProjectInventory(await desktopBridge.inventoryProject(projectId));
+    } catch (reason) {
+      setProjectInventory(undefined);
+      setProjectInventoryError(errorText(reason));
+    } finally {
+      setProjectInventoryLoading(false);
+    }
+  };
+  const openProject = (project: ProjectRecord) => {
+    setSelectedProjectId(project.id);
+    setProjectNotes(project.notes);
+    setProjectTags(project.tags);
+    setProjectMediaQuery('');
+    setProjectMediaSelection([]);
+    void refreshProjectInventory(project.id);
+  };
+  const saveProjectInformation = async () => {
+    if (!selectedProject) return;
+    setBusy(true);
+    setError('');
+    try {
+      setCatalogue(
+        await desktopBridge.updateProject({
+          projectId: selectedProject.id,
+          notes: projectNotes,
+          tags: projectTags,
+        }),
+      );
+      setMessage('Project information saved.');
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const updateProjectMediaAssignments = async (add: boolean) => {
+    if (!selectedProject || !projectMediaSelection.length) return;
+    setBusy(true);
+    setError('');
+    try {
+      const mediaIds = expandLogicalMediaIds(
+        projectMediaSelection,
+        catalogue.media,
+      );
+      const updated = await desktopBridge.updateMedia({
+        mediaIds,
+        ...(add
+          ? { addProjectIds: [selectedProject.id] }
+          : { removeProjectIds: [selectedProject.id] }),
+      });
+      setCatalogue(updated);
+      setProjectMediaSelection([]);
+      setMessage(
+        add
+          ? 'Selected recordings linked to the project.'
+          : 'Selected recordings removed from the project; no media files were changed.',
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copyProjectMediaPaths = async () => {
+    const ids = expandLogicalMediaIds(projectMediaSelection, catalogue.media);
+    const available = ids
+      .map((id) => catalogue.media.find((item) => item.id === id))
+      .filter((item): item is NonNullable<typeof item> =>
+        Boolean(item?.available),
+      );
+    if (!available.length) return;
+    try {
+      const paths = await Promise.all(
+        available.map((item) => desktopBridge.resolveMediaPath(item.id)),
+      );
+      await navigator.clipboard.writeText(paths.join('\r\n'));
+      setMessage(
+        `${paths.length} original Master Bin path${paths.length === 1 ? '' : 's'} copied for Premiere.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
     }
   };
   const activeJobs = jobs.filter(
@@ -2040,13 +2190,29 @@ export function App() {
                           </div>
                           <div className="projects">
                             {logicalProjectIds(item, catalogue.media).map(
-                              (id) => (
-                                <span key={id}>
-                                  {catalogue.projects.find(
-                                    (project) => project.id === id,
-                                  )?.name ?? id}
-                                </span>
-                              ),
+                              (id) => {
+                                const project = catalogue.projects.find(
+                                  (candidate) => candidate.id === id,
+                                );
+                                return (
+                                  <button
+                                    type="button"
+                                    key={id}
+                                    onMouseDown={(event) =>
+                                      event.stopPropagation()
+                                    }
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      if (project) {
+                                        setView('Projects');
+                                        openProject(project);
+                                      }
+                                    }}
+                                  >
+                                    {project?.name ?? id}
+                                  </button>
+                                );
+                              },
                             )}
                           </div>
                           <footer>
@@ -2535,72 +2701,399 @@ export function App() {
             </div>
           </section>
         ) : view === 'Projects' ? (
-          <section className="settings-form">
-            <h2>Working projects</h2>
-            <p>
-              Projects reference media directly from Master Bin. Existing
-              Premiere folders are left intact.
-            </p>
-            <PathField
-              label="Project working directory"
-              value={projectDirectory}
-              onChange={setProjectDirectory}
-              onBrowse={async () => {
-                const path = await desktopBridge.chooseFolder();
-                if (path) setProjectDirectory(path);
-              }}
-            />
-            <label>
-              Project name
-              <input
-                value={projectName}
-                onChange={(event) => setProjectName(event.target.value)}
-              />
-            </label>
-            <button
-              className="primary"
-              disabled={busy || !projectName || !projectDirectory}
-              onClick={createProject}
-            >
-              Create or associate project
-            </button>
-            <div className="project-list">
-              {catalogue.projects.map((project) => {
-                const syncIssue = catalogue.issues?.find(
-                  (issue) =>
-                    issue.code === 'project-manifest-pending' &&
-                    issue.source === project.id,
-                );
-                return (
-                  <div key={project.id}>
-                    <strong>{project.name}</strong>
-                    <small>{project.workingDirectory}</small>
-                    <span>
-                      {logicalProjectRecordingCount(
-                        project.id,
-                        catalogue.media,
-                      )}{' '}
-                      assigned recordings
-                    </span>
-                    {syncIssue && (
-                      <>
-                        <small role="status">{syncIssue.detail}</small>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() =>
-                            void retryProjectSynchronization(project.id)
-                          }
-                        >
-                          Retry project synchronization
-                        </button>
-                      </>
+          selectedProject ? (
+            <section className="project-workspace">
+              <header className="project-workspace-header">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedProjectId(undefined);
+                    setProjectInventory(undefined);
+                    setProjectInventoryError('');
+                  }}
+                >
+                  <ArrowLeft aria-hidden="true" size={15} /> Back to Projects
+                </button>
+                <div>
+                  <span>Working project</span>
+                  <h2>{selectedProject.name}</h2>
+                  <small>{selectedProject.workingDirectory}</small>
+                </div>
+              </header>
+
+              <div className="project-summary-grid">
+                <div>
+                  <span>Status</span>
+                  <strong>
+                    {projectInventoryError
+                      ? 'Folder unavailable'
+                      : selectedProjectSyncIssue
+                        ? 'Manifest synchronization pending'
+                        : 'Ready'}
+                  </strong>
+                </div>
+                <div>
+                  <span>Linked recordings</span>
+                  <strong>
+                    {logicalProjectRecordingCount(
+                      selectedProject.id,
+                      catalogue.media,
                     )}
+                  </strong>
+                </div>
+                <div>
+                  <span>Project files</span>
+                  <strong>{projectInventory?.itemCount ?? '—'}</strong>
+                </div>
+                <div>
+                  <span>Folder size</span>
+                  <strong>
+                    {projectInventory ? size(projectInventory.sizeBytes) : '—'}
+                  </strong>
+                </div>
+                <div>
+                  <span>Main Premiere project</span>
+                  <strong>
+                    {projectInventory?.mainPremiereProject ?? 'Not found'}
+                  </strong>
+                </div>
+                <div>
+                  <span>Last successful scan</span>
+                  <strong>
+                    {projectInventory
+                      ? new Date(projectInventory.scannedAt).toLocaleString()
+                      : 'Never'}
+                  </strong>
+                </div>
+              </div>
+
+              <div className="project-actions">
+                <button
+                  type="button"
+                  onClick={() =>
+                    void desktopBridge
+                      .openProjectFolder(selectedProject.id)
+                      .catch((reason) => setError(errorText(reason)))
+                  }
+                >
+                  <FolderOpen aria-hidden="true" size={15} /> Open project
+                  folder
+                </button>
+                <button
+                  type="button"
+                  disabled={projectInventoryLoading}
+                  onClick={() =>
+                    void refreshProjectInventory(selectedProject.id)
+                  }
+                >
+                  <RefreshCw aria-hidden="true" size={15} />{' '}
+                  {projectInventoryLoading ? 'Scanning…' : 'Refresh inventory'}
+                </button>
+                {selectedProjectSyncIssue && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      void retryProjectSynchronization(selectedProject.id)
+                    }
+                  >
+                    Retry project synchronization
+                  </button>
+                )}
+              </div>
+              {selectedProjectSyncIssue && (
+                <small role="status">{selectedProjectSyncIssue.detail}</small>
+              )}
+              {projectInventoryError && (
+                <div className="error project-local-error" role="alert">
+                  Project folder unavailable: {projectInventoryError}. The
+                  Library remains available.
+                </div>
+              )}
+
+              <section className="project-info-editor">
+                <div>
+                  <h3>Project information</h3>
+                  <p>
+                    Portable notes and tags are synchronized as catalogue
+                    events.
+                  </p>
+                </div>
+                <label>
+                  Description and notes
+                  <textarea
+                    value={projectNotes}
+                    onChange={(event) => setProjectNotes(event.target.value)}
+                  />
+                </label>
+                <SearchableComboBox
+                  label="Project tags"
+                  mode="multiple"
+                  options={knownTags.map((tag) => ({ id: tag, label: tag }))}
+                  selectedIds={projectTags}
+                  onSelectionChange={setProjectTags}
+                  onCreate={(label) => ({ id: label, label })}
+                  placeholder="Search or create project tags…"
+                />
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => void saveProjectInformation()}
+                >
+                  Save project information
+                </button>
+              </section>
+
+              <section className="project-assets">
+                <div className="section-head">
+                  <div>
+                    <h3>Project-local files</h3>
+                    <span>
+                      Read-only inventory; Premiere files are never parsed or
+                      changed
+                    </span>
                   </div>
-                );
-              })}
-            </div>
-          </section>
+                </div>
+                {projectInventory && projectInventory.items.length > 0 ? (
+                  Object.keys(projectCategoryLabels).map((category) => {
+                    const items = projectInventory.items.filter(
+                      (item) => item.category === category,
+                    );
+                    if (!items.length) return null;
+                    return (
+                      <details key={category} open>
+                        <summary>
+                          {projectCategoryLabels[category] ?? category}{' '}
+                          <span>{items.length}</span>
+                        </summary>
+                        <div className="project-asset-list">
+                          {items.map((item) => (
+                            <button
+                              type="button"
+                              key={item.relativePath}
+                              onClick={() =>
+                                void desktopBridge
+                                  .revealProjectAsset(
+                                    selectedProject.id,
+                                    item.relativePath,
+                                  )
+                                  .catch((reason) =>
+                                    setError(errorText(reason)),
+                                  )
+                              }
+                            >
+                              <FileText aria-hidden="true" size={15} />
+                              <span>
+                                <strong>{item.name}</strong>
+                                <small>{item.relativePath}</small>
+                              </span>
+                              <small>{size(item.sizeBytes)}</small>
+                            </button>
+                          ))}
+                        </div>
+                      </details>
+                    );
+                  })
+                ) : (
+                  <p className="muted">
+                    {projectInventoryLoading
+                      ? 'Inspecting the project folder…'
+                      : 'No project-local files are currently available.'}
+                  </p>
+                )}
+              </section>
+
+              <section className="project-linked-media">
+                <div className="section-head">
+                  <div>
+                    <h3>Linked Master Bin recordings</h3>
+                    <span>
+                      Assignments reference immutable originals; they do not
+                      copy files into this project
+                    </span>
+                  </div>
+                </div>
+                <label className="search">
+                  <Search aria-hidden="true" size={17} />
+                  <input
+                    value={projectMediaQuery}
+                    onChange={(event) =>
+                      setProjectMediaQuery(event.target.value)
+                    }
+                    placeholder="Search Master Bin footage to link…"
+                  />
+                </label>
+                {projectMediaSelection.length > 0 && (
+                  <div className="project-media-actions">
+                    <strong>{projectMediaSelection.length} selected</strong>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void updateProjectMediaAssignments(true)}
+                    >
+                      Add to project
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void updateProjectMediaAssignments(false)}
+                    >
+                      Remove assignment
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void copyProjectMediaPaths()}
+                    >
+                      <Copy aria-hidden="true" size={14} /> Copy original paths
+                    </button>
+                  </div>
+                )}
+                {[
+                  ['Assigned recordings', linkedProjectMedia],
+                  ['Available to add', unlinkedProjectMedia],
+                ].map(([heading, recordings]) => (
+                  <div
+                    className="project-media-section"
+                    key={heading as string}
+                  >
+                    <h4>{heading as string}</h4>
+                    <div className="project-media-list">
+                      {(recordings as typeof projectMedia).map((item) => (
+                        <label key={item.id}>
+                          <input
+                            type="checkbox"
+                            checked={projectMediaSelection.includes(item.id)}
+                            onChange={(event) =>
+                              setProjectMediaSelection((current) =>
+                                event.target.checked
+                                  ? [...new Set([...current, item.id])]
+                                  : current.filter((id) => id !== item.id),
+                              )
+                            }
+                          />
+                          <div className="project-media-thumb">
+                            <MediaThumbnail
+                              mediaId={item.id}
+                              fileType={item.fileType}
+                              available={Boolean(item.thumbnailPath)}
+                            />
+                          </div>
+                          <span>
+                            <strong>{item.originalFilename}</strong>
+                            <small>{item.relativePath}</small>
+                            <span className="pills">
+                              {logicalTags(item, catalogue.media).map((tag) => (
+                                <em key={tag}>{tag}</em>
+                              ))}
+                            </span>
+                          </span>
+                          {item.favourite && (
+                            <Star aria-label="Favourite" size={14} />
+                          )}
+                          <button
+                            type="button"
+                            disabled={!item.available}
+                            onClick={() =>
+                              void desktopBridge
+                                .revealMediaInExplorer(item.id)
+                                .catch((reason) => setError(errorText(reason)))
+                            }
+                          >
+                            Reveal
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setView('Library');
+                              setFolder('All media');
+                              setQuery('');
+                              setSelected([item.id]);
+                            }}
+                          >
+                            View in Library
+                          </button>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </section>
+            </section>
+          ) : (
+            <section className="settings-form project-index">
+              <h2>Working projects</h2>
+              <p>
+                Projects reference media directly from Master Bin. Existing
+                Premiere folders are inventoried without being modified.
+              </p>
+              <PathField
+                label="Project working directory"
+                value={projectDirectory}
+                onChange={setProjectDirectory}
+                onBrowse={async () => {
+                  const path = await desktopBridge.chooseFolder();
+                  if (path) setProjectDirectory(path);
+                }}
+              />
+              <label>
+                Project name
+                <input
+                  value={projectName}
+                  onChange={(event) => setProjectName(event.target.value)}
+                />
+              </label>
+              <button
+                className="primary"
+                disabled={busy || !projectName || !projectDirectory}
+                onClick={createProject}
+              >
+                Create or associate project
+              </button>
+              <div className="project-list">
+                {catalogue.projects.map((project) => {
+                  const syncIssue = catalogue.issues?.find(
+                    (issue) =>
+                      issue.code === 'project-manifest-pending' &&
+                      issue.source === project.id,
+                  );
+                  return (
+                    <div key={project.id}>
+                      <button
+                        type="button"
+                        className="project-card-open"
+                        onClick={() => openProject(project)}
+                      >
+                        <strong>{project.name}</strong>
+                        <small>{project.workingDirectory}</small>
+                        <span>
+                          {logicalProjectRecordingCount(
+                            project.id,
+                            catalogue.media,
+                          )}{' '}
+                          assigned recordings
+                        </span>
+                      </button>
+                      {syncIssue && (
+                        <div className="project-sync-warning">
+                          <small role="status">{syncIssue.detail}</small>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void retryProjectSynchronization(project.id)
+                            }
+                          >
+                            Retry project synchronization
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )
         ) : (
           <section className="empty">
             <h2>No destructive archive actions</h2>

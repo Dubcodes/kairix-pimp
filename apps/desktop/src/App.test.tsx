@@ -57,6 +57,10 @@ const mocks = vi.hoisted(() => ({
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
   retryProjectSynchronization: vi.fn(),
+  inventoryProject: vi.fn(),
+  updateProject: vi.fn(),
+  openProjectFolder: vi.fn(),
+  revealProjectAsset: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -119,8 +123,12 @@ vi.mock('./bridge', () => ({
     startIngest: vi.fn(),
     cancelIngest: vi.fn(),
     updateMedia: mocks.updateMedia,
+    updateProject: mocks.updateProject,
     createProject: vi.fn(),
     retryProjectSynchronization: mocks.retryProjectSynchronization,
+    inventoryProject: mocks.inventoryProject,
+    openProjectFolder: mocks.openProjectFolder,
+    revealProjectAsset: mocks.revealProjectAsset,
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
     mediaToolsStatus: mocks.mediaToolsStatus,
@@ -219,6 +227,13 @@ describe('native application integration', () => {
     mocks.openSupportLink.mockReset();
     mocks.retryProjectSynchronization.mockReset();
     mocks.retryProjectSynchronization.mockResolvedValue([]);
+    mocks.inventoryProject.mockReset();
+    mocks.updateProject.mockReset();
+    mocks.updateProject.mockImplementation(async () => mocks.catalogue);
+    mocks.openProjectFolder.mockReset();
+    mocks.openProjectFolder.mockResolvedValue(undefined);
+    mocks.revealProjectAsset.mockReset();
+    mocks.revealProjectAsset.mockResolvedValue(undefined);
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -258,6 +273,163 @@ describe('native application integration', () => {
     );
     expect(
       await screen.findByText('Project manifest synchronization completed.'),
+    ).toBeVisible();
+  });
+
+  it('opens a read-only project workspace and manages linked logical recordings', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'video',
+          relativePath: '20261028/DJI_0001.MP4',
+          originalFilename: 'DJI_0001.MP4',
+          sha256: 'video',
+          captureDate: '2026-10-28T00:00:00Z',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-10-28',
+          fileType: 'mp4',
+          tags: ['vlog'],
+          projectIds: ['project-a'],
+          notes: '',
+          favourite: true,
+          technical: { sizeBytes: 100 },
+          attachedAudioId: 'audio',
+          available: true,
+          needsReview: false,
+        },
+        {
+          id: 'audio',
+          relativePath: '20261028/DJI_0001.WAV',
+          originalFilename: 'DJI_0001.WAV',
+          sha256: 'audio',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-10-28',
+          fileType: 'wav',
+          tags: [],
+          projectIds: ['project-a'],
+          notes: '',
+          technical: { sizeBytes: 20 },
+          available: true,
+          needsReview: false,
+        },
+        {
+          id: 'graphic',
+          relativePath: '20261028/title.png',
+          originalFilename: 'title.png',
+          sha256: 'graphic',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-10-28',
+          fileType: 'png',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Simple Vlog 057',
+          workingDirectory: 'C:\\Projects\\Simple Vlog 057',
+          mediaIds: ['video'],
+          notes: 'Original notes',
+          tags: ['vlog'],
+          createdAt: '2026-10-28T00:00:00Z',
+        },
+      ],
+      updatedAt: '2026-10-28T00:00:00Z',
+    };
+    mocks.inventoryProject.mockResolvedValue({
+      projectId: 'project-a',
+      rootPath: 'C:\\Projects\\Simple Vlog 057',
+      itemCount: 3,
+      sizeBytes: 300,
+      mainPremiereProject: 'Simple Vlog 057.prproj',
+      scannedAt: '2026-10-28T01:00:00Z',
+      items: [
+        {
+          relativePath: 'Simple Vlog 057.prproj',
+          name: 'Simple Vlog 057.prproj',
+          category: 'premiere-project',
+          sizeBytes: 100,
+        },
+        {
+          relativePath: 'Adobe Premiere Pro Auto-Save/backup.prproj',
+          name: 'backup.prproj',
+          category: 'premiere-auto-save',
+          sizeBytes: 100,
+        },
+        {
+          relativePath: 'Exports/final.mp4',
+          name: 'final.mp4',
+          category: 'exports',
+          sizeBytes: 100,
+        },
+      ],
+    });
+    mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Projects' }));
+    await user.click(
+      screen.getByRole('button', { name: /Simple Vlog 057.*1 assigned/ }),
+    );
+
+    expect(
+      (await screen.findAllByText('Simple Vlog 057.prproj'))[0],
+    ).toBeVisible();
+    expect(screen.getByText('Premiere auto-saves')).toBeVisible();
+    expect(screen.getByText('Exports')).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: /Open project folder/ }),
+    );
+    expect(mocks.openProjectFolder).toHaveBeenCalledWith('project-a');
+
+    await user.click(screen.getByRole('checkbox', { name: /DJI_0001.MP4/ }));
+    await user.click(
+      screen.getByRole('button', { name: 'Copy original paths' }),
+    );
+    await waitFor(() =>
+      expect(mocks.resolveMediaPath).toHaveBeenCalledWith('audio'),
+    );
+    await user.click(screen.getByRole('button', { name: 'Remove assignment' }));
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['video', 'audio'],
+      removeProjectIds: ['project-a'],
+    });
+
+    await user.click(screen.getByRole('checkbox', { name: /title.png/ }));
+    await user.click(screen.getByRole('button', { name: 'Add to project' }));
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['graphic'],
+      addProjectIds: ['project-a'],
+    });
+
+    const notes = screen.getByRole('textbox', {
+      name: 'Description and notes',
+    });
+    await user.clear(notes);
+    await user.type(notes, 'Updated project notes');
+    await user.click(
+      screen.getByRole('button', { name: 'Save project information' }),
+    );
+    expect(mocks.updateProject).toHaveBeenCalledWith({
+      projectId: 'project-a',
+      notes: 'Updated project notes',
+      tags: ['vlog'],
+    });
+
+    await user.click(
+      screen.getAllByRole('button', { name: 'View in Library' })[0],
+    );
+    expect(
+      screen.getByRole('heading', { name: 'Media library' }),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Simple Vlog 057' }));
+    expect(
+      screen.getByRole('heading', { name: 'Simple Vlog 057' }),
     ).toBeVisible();
   });
 

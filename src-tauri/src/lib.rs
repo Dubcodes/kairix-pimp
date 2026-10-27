@@ -115,6 +115,36 @@ struct ProjectManifestSyncState {
     #[serde(default)]
     pending: BTreeMap<String, PendingProjectManifest>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ProjectAsset {
+    relative_path: String,
+    name: String,
+    category: String,
+    size_bytes: u64,
+    modified_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ProjectInventory {
+    project_id: String,
+    root_path: String,
+    item_count: usize,
+    size_bytes: u64,
+    main_premiere_project: Option<String>,
+    scanned_at: String,
+    items: Vec<ProjectAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectUpdate {
+    project_id: String,
+    notes: String,
+    tags: Vec<String>,
+}
 fn default_true() -> bool {
     true
 }
@@ -3289,6 +3319,51 @@ async fn update_media(
     next.issues.extend(manifest_issues);
     Ok(next)
 }
+
+#[tauri::command]
+fn update_project(
+    app: AppHandle,
+    state: State<NativeState>,
+    update: ProjectUpdate,
+) -> Result<Catalogue, String> {
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
+    let settings = load_settings_file(&app)?;
+    let catalogue = {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        load_catalogue_file(&settings)?
+    };
+    let mut project = catalogue
+        .projects
+        .iter()
+        .find(|project| project.id == update.project_id)
+        .cloned()
+        .ok_or("Unknown project")?;
+    project.notes = update.notes;
+    project.tags = normalized(&update.tags);
+    let directory = settings.project_paths.get(&project.id).cloned();
+    persist_project_manifest_intents(
+        &project_manifest_sync_path(&app)?,
+        [(project.id.clone(), directory)],
+    )?;
+    {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        append_events(
+            &settings,
+            vec![CatalogueEvent::ProjectUpserted {
+                project: project.clone(),
+            }],
+        )?;
+    }
+    let mut next = load_catalogue_file(&settings)?;
+    let issues = reconcile_project_manifests(
+        &app,
+        &settings,
+        &next,
+        std::iter::empty::<(String, Option<String>)>(),
+    )?;
+    next.issues.extend(issues);
+    Ok(next)
+}
 #[tauri::command]
 fn create_project(
     app: AppHandle,
@@ -3413,6 +3488,179 @@ fn retry_project_synchronization(
     }
     let directory = settings.project_paths.get(&project_id).cloned();
     reconcile_project_manifests(&app, &settings, &catalogue, [(project_id, directory)])
+}
+
+fn resolve_known_project_directory(
+    settings: &DeviceSettings,
+    project_id: &str,
+) -> Result<PathBuf, String> {
+    let configured = settings
+        .project_paths
+        .get(project_id)
+        .ok_or("This project is not associated with a local folder on this device")?;
+    fs_safe::resolve_project_directory(
+        Path::new(&settings.working_projects_path),
+        Path::new(configured),
+        false,
+    )
+}
+
+fn project_asset_category(relative_path: &Path) -> String {
+    let lower_path = relative_path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let extension = relative_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if lower_path
+        .split('/')
+        .any(|part| part.contains("auto-save") || part.contains("autosave"))
+    {
+        return "premiere-auto-save".into();
+    }
+    if extension == "prproj" {
+        return "premiere-project".into();
+    }
+    if lower_path
+        .split('/')
+        .any(|part| part == "export" || part == "exports")
+    {
+        return "exports".into();
+    }
+    if matches!(
+        extension.as_str(),
+        "mp4" | "mov" | "mxf" | "mts" | "m2ts" | "avi" | "r3d" | "braw" | "m4v"
+    ) {
+        return "video".into();
+    }
+    if matches!(
+        extension.as_str(),
+        "wav" | "bwf" | "aif" | "aiff" | "mp3" | "m4a" | "aac" | "flac" | "ogg"
+    ) {
+        return "audio-music".into();
+    }
+    if matches!(
+        extension.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "tif" | "tiff" | "bmp" | "webp" | "psd" | "ai" | "svg"
+    ) {
+        return "images-graphics".into();
+    }
+    if matches!(
+        extension.as_str(),
+        "txt" | "md" | "pdf" | "doc" | "docx" | "rtf" | "csv" | "xlsx"
+    ) {
+        return "notes-documentation".into();
+    }
+    "other".into()
+}
+
+fn inventory_project_directory(
+    project_id: &str,
+    project_name: &str,
+    directory: &Path,
+) -> Result<ProjectInventory, String> {
+    let mut items = Vec::new();
+    for entry in WalkDir::new(directory).follow_links(false).into_iter() {
+        let entry = entry.map_err(|error| format!("Project inventory failed: {error}"))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(directory)
+            .map_err(|_| "Project inventory escaped its authorized directory")?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("Cannot inspect {}: {error}", relative.display()))?;
+        items.push(ProjectAsset {
+            relative_path: relative.to_string_lossy().replace('\\', "/"),
+            name: entry.file_name().to_string_lossy().into_owned(),
+            category: project_asset_category(relative),
+            size_bytes: metadata.len(),
+            modified_at: metadata
+                .modified()
+                .ok()
+                .map(|value| DateTime::<Utc>::from(value).to_rfc3339()),
+        });
+    }
+    items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let normalized_name = project_name.trim().to_lowercase();
+    let main_premiere_project = items
+        .iter()
+        .filter(|item| item.category == "premiere-project")
+        .min_by_key(|item| {
+            let stem_matches = Path::new(&item.name)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.to_lowercase() == normalized_name);
+            (
+                !stem_matches,
+                item.relative_path.matches('/').count(),
+                item.relative_path.clone(),
+            )
+        })
+        .map(|item| item.relative_path.clone());
+    Ok(ProjectInventory {
+        project_id: project_id.into(),
+        root_path: directory.to_string_lossy().into_owned(),
+        item_count: items.len(),
+        size_bytes: items.iter().map(|item| item.size_bytes).sum(),
+        main_premiere_project,
+        scanned_at: Utc::now().to_rfc3339(),
+        items,
+    })
+}
+
+#[tauri::command]
+async fn inventory_project(app: AppHandle, project_id: String) -> Result<ProjectInventory, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let project = catalogue
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or("Unknown project")?;
+    let project_name = project.name.clone();
+    let directory = resolve_known_project_directory(&settings, &project_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        inventory_project_directory(&project_id, &project_name, &directory)
+    })
+    .await
+    .map_err(|error| format!("Project inventory task failed: {error}"))?
+}
+
+#[tauri::command]
+fn open_project_folder(app: AppHandle, project_id: String) -> Result<(), String> {
+    let settings = load_settings_file(&app)?;
+    let directory = resolve_known_project_directory(&settings, &project_id)?;
+    #[cfg(target_os = "windows")]
+    Command::new("explorer.exe")
+        .arg(&directory)
+        .spawn()
+        .map_err(|error| format!("Could not open the project folder: {error}"))?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Open project folder is available only in the Windows build".into());
+    Ok(())
+}
+
+#[tauri::command]
+fn reveal_project_asset(
+    app: AppHandle,
+    project_id: String,
+    relative_path: String,
+) -> Result<(), String> {
+    let settings = load_settings_file(&app)?;
+    let directory = resolve_known_project_directory(&settings, &project_id)?;
+    fs_safe::validate_relative(&relative_path)?;
+    let path = fs_safe::resolve_existing(&directory, &relative_path)?;
+    if !path.is_file() {
+        return Err("The selected project asset is not available locally".into());
+    }
+    #[cfg(target_os = "windows")]
+    reveal_path_in_explorer(&path)?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Reveal project asset is available only in the Windows build".into());
+    Ok(())
 }
 fn publish_discovery_status(app: &AppHandle, state: &NativeState, status: &DiscoveryStatus) {
     *state.discovery_status.lock().unwrap() = status.clone();
@@ -4266,8 +4514,12 @@ pub fn run() {
             retry_ingest,
             cancel_ingest,
             update_media,
+            update_project,
             create_project,
             retry_project_synchronization,
+            inventory_project,
+            open_project_folder,
+            reveal_project_asset,
             rescan,
             get_discovery_status,
             log_ui_error,
@@ -5847,6 +6099,79 @@ mod tests {
         assert!(!write_project_manifest(&directory, &catalogue.projects[0], &catalogue.media)
             .unwrap());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_project_inventory_is_read_only_and_categorized() {
+        let root = temporary("project-inventory");
+        let directory = root.join("projects").join("Simple Vlog 057");
+        for folder in [
+            directory.join("Adobe Premiere Pro Auto-Save"),
+            directory.join("assets").join("video"),
+            directory.join("assets").join("audio"),
+            directory.join("assets").join("graphics"),
+            directory.join("Exports"),
+        ] {
+            fs::create_dir_all(folder).unwrap();
+        }
+        let fixtures = [
+            ("Simple Vlog 057.prproj", b"project".as_slice()),
+            ("description.txt", b"notes".as_slice()),
+            ("Adobe Premiere Pro Auto-Save/backup.prproj", b"backup".as_slice()),
+            ("assets/video/b-roll.mov", b"video".as_slice()),
+            ("assets/audio/music.wav", b"audio".as_slice()),
+            ("assets/graphics/title.png", b"graphic".as_slice()),
+            ("Exports/final.mp4", b"export".as_slice()),
+            ("assets/cache.bin", b"other".as_slice()),
+        ];
+        for (relative, bytes) in fixtures {
+            fs::write(directory.join(relative), bytes).unwrap();
+        }
+
+        let inventory =
+            inventory_project_directory("project-a", "Simple Vlog 057", &directory).unwrap();
+        assert_eq!(inventory.item_count, 8);
+        assert_eq!(
+            inventory.main_premiere_project.as_deref(),
+            Some("Simple Vlog 057.prproj")
+        );
+        assert_eq!(inventory.items[0].relative_path, "Adobe Premiere Pro Auto-Save/backup.prproj");
+        assert!(inventory
+            .items
+            .iter()
+            .any(|item| item.category == "premiere-auto-save"));
+        assert!(inventory
+            .items
+            .iter()
+            .any(|item| item.category == "video"));
+        assert!(inventory
+            .items
+            .iter()
+            .any(|item| item.category == "audio-music"));
+        assert!(inventory
+            .items
+            .iter()
+            .any(|item| item.category == "images-graphics"));
+        assert!(inventory
+            .items
+            .iter()
+            .any(|item| item.category == "exports"));
+        assert!(inventory
+            .items
+            .iter()
+            .any(|item| item.category == "notes-documentation"));
+        assert!(inventory.items.iter().any(|item| item.category == "other"));
+        assert!(directory.join("Simple Vlog 057.prproj").is_file());
+        fs::write(directory.join("assets/video/new-take.mp4"), b"new").unwrap();
+        let refreshed =
+            inventory_project_directory("project-a", "Simple Vlog 057", &directory).unwrap();
+        assert_eq!(refreshed.item_count, 9);
+        assert!(refreshed
+            .items
+            .iter()
+            .any(|item| item.relative_path == "assets/video/new-take.mp4"));
+        fs::remove_dir_all(root).unwrap();
+        assert!(inventory_project_directory("project-a", "Simple Vlog 057", &directory).is_err());
     }
 
     #[test]

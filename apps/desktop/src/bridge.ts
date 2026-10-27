@@ -91,6 +91,30 @@ export interface ProjectRecord {
   tags: string[];
   createdAt: string;
 }
+export interface ProjectAsset {
+  relativePath: string;
+  name: string;
+  category:
+    | 'premiere-project'
+    | 'premiere-auto-save'
+    | 'video'
+    | 'audio-music'
+    | 'images-graphics'
+    | 'exports'
+    | 'notes-documentation'
+    | 'other';
+  sizeBytes: number;
+  modifiedAt?: string;
+}
+export interface ProjectInventory {
+  projectId: string;
+  rootPath: string;
+  itemCount: number;
+  sizeBytes: number;
+  mainPremiereProject?: string;
+  scannedAt: string;
+  items: ProjectAsset[];
+}
 export interface Catalogue {
   media: MediaItem[];
   projects: ProjectRecord[];
@@ -367,12 +391,23 @@ export const desktopBridge = {
     notes?: string;
     favourite?: boolean;
   }) => invoke<Catalogue>('update_media', { update }),
+  updateProject: (update: {
+    projectId: string;
+    notes: string;
+    tags: string[];
+  }) => invoke<Catalogue>('update_project', { update }),
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
   retryProjectSynchronization: (projectId: string) =>
     invoke<NonNullable<Catalogue['issues']>>('retry_project_synchronization', {
       projectId,
     }),
+  inventoryProject: (projectId: string) =>
+    invoke<ProjectInventory>('inventory_project', { projectId }),
+  openProjectFolder: (projectId: string) =>
+    invoke<void>('open_project_folder', { projectId }),
+  revealProjectAsset: (projectId: string, relativePath: string) =>
+    invoke<void>('reveal_project_asset', { projectId, relativePath }),
   rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
   getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),

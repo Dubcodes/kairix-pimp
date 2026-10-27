@@ -278,3 +278,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Before allocating a project UUID, compare the selected authorized directory with device-local project-path mappings, durable manifest retry records and any compatible existing manifest. Reuse the single established identity and skip a duplicate authoritative upsert when it already exists; reject multiple identities. On catalogue refresh, inspect compatible manifests for semantic drift and durably reconcile only those that differ, including media IDs canonicalized by path-plus-hash replay.
 - **Consequences:** Retrying a partially completed Create operation cannot register one folder twice. Historical event streams remain untouched, incompatible manifests remain protected, and ordinary unchanged Library refreshes perform no manifest or retry-state replacement.
+
+## ADR-037 — Inventory project folders without interpreting Premiere internals
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Inventory only files beneath the canonically authorized device-local project path, preserving relative paths and basic filesystem metadata without content hashing. Categorize by folder and extension, exclude auto-save locations from deterministic main `.prproj` selection, and expose only project-ID/relative-path reveal operations. Linked Master Bin media remains an assignment projection and is never copied or deleted by the workspace.
+- **Consequences:** Existing projects become navigable without modifying assets or relying on undocumented Premiere formats. Folder scans may still be expensive for exceptionally large projects and require installed-drive acceptance and future bounded progress/cancellation if profiling demonstrates a need.
