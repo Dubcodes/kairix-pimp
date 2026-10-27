@@ -47,6 +47,7 @@ struct NativeState {
     cancelled_jobs: Mutex<HashSet<String>>,
     paused_jobs: Mutex<HashSet<String>>,
     catalogue_write: Mutex<()>,
+    project_manifest_write: Mutex<()>,
     discovery_write: Mutex<()>,
     discovery_status: Mutex<DiscoveryStatus>,
     enrichment_write: Mutex<()>,
@@ -95,6 +96,8 @@ struct DeviceSettings {
 #[serde(rename_all = "camelCase")]
 struct PendingProjectManifest {
     project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory: Option<String>,
     attempts: u32,
     last_error: String,
     updated_at: String,
@@ -560,6 +563,19 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     }
     Ok(())
 }
+
+fn write_json_if_changed<T: Serialize>(path: &Path, value: &T) -> Result<bool, String> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    if path.is_file()
+        && fs::read(path)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?
+            == bytes
+    {
+        return Ok(false);
+    }
+    write_json(path, value)?;
+    Ok(true)
+}
 fn load_settings_file(app: &AppHandle) -> Result<DeviceSettings, String> {
     load_or_initialize_settings(&settings_path(app)?)
 }
@@ -618,7 +634,12 @@ fn preserve_device_identity(current: &str, requested: &str) -> Result<String, St
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceSettings, String> {
+fn save_settings(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    mut settings: DeviceSettings,
+) -> Result<DeviceSettings, String> {
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
     if settings.master_bin_path.trim().is_empty()
         || settings.working_projects_path.trim().is_empty()
     {
@@ -651,6 +672,7 @@ fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceS
     let next_catalogue = catalogue_dir(&settings)?.to_string_lossy().to_string();
     let current = load_settings_file(&app)?;
     settings.device_id = preserve_device_identity(&current.device_id, &settings.device_id)?;
+    settings.project_paths = current.project_paths.clone();
     if !current.initialized_catalogue_path.is_empty()
         && current.initialized_catalogue_path != next_catalogue
         && Path::new(&current.initialized_catalogue_path).exists()
@@ -690,8 +712,23 @@ fn save_settings(app: AppHandle, mut settings: DeviceSettings) -> Result<DeviceS
 
 #[tauri::command]
 fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catalogue, String> {
-    let settings = load_settings_file(&app)?;
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
+    let mut settings = load_settings_file(&app)?;
     let mut catalogue = load_catalogue_file(&settings)?;
+    let sync_path = project_manifest_sync_path(&app)?;
+    recover_pending_project_paths(
+        &sync_path,
+        &settings_path(&app)?,
+        &mut settings,
+        &catalogue,
+    )?;
+    let manifest_issues = reconcile_project_manifests(
+        &app,
+        &settings,
+        &catalogue,
+        std::iter::empty::<(String, Option<String>)>(),
+    )?;
+    drop(_manifest_guard);
     let master = PathBuf::from(&settings.master_bin_path);
     for item in &mut catalogue.media {
         item.available = fs_safe::resolve_existing(&master, &item.relative_path)
@@ -708,12 +745,6 @@ fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catal
             project.working_directory = path.clone();
         }
     }
-    let manifest_issues = reconcile_project_manifests(
-        &app,
-        &settings,
-        &catalogue,
-        std::iter::empty::<String>(),
-    )?;
     catalogue.issues.extend(manifest_issues);
     *state.availability.lock().unwrap() = catalogue
         .media
@@ -2673,7 +2704,7 @@ fn write_project_manifest(
     directory: &Path,
     project: &ProjectRecord,
     media: &[MediaItem],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let manifest_path = directory.join(".pimp-project.json");
     let mut value = if manifest_path.exists() {
         let value: serde_json::Value = read_json(&manifest_path)?;
@@ -2696,6 +2727,7 @@ fn write_project_manifest(
     } else {
         serde_json::json!({})
     };
+    let original = manifest_path.exists().then(|| value.clone());
     let references: Vec<_> = media
         .iter()
         .filter(|item| item.project_ids.contains(&project.id))
@@ -2733,60 +2765,189 @@ fn write_project_manifest(
         object.insert("mediaIds".into(), serde_json::json!(project.media_ids));
         object.insert("createdAt".into(), serde_json::json!(project.created_at));
     }
-    write_json(&manifest_path, &value)
+    if original.as_ref() == Some(&value) {
+        return Ok(false);
+    }
+    write_json(&manifest_path, &value)?;
+    Ok(true)
 }
 
-fn reconcile_project_manifests_with(
+fn persist_project_manifest_intents_with<I, W>(
+    state_path: &Path,
+    requested: I,
+    state_writer: &W,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, Option<String>)>,
+    W: Fn(&Path, &ProjectManifestSyncState) -> Result<bool, String>,
+{
+    let mut state: ProjectManifestSyncState = read_json(state_path)?;
+    let original = state.clone();
+    for (project_id, directory) in requested {
+        let pending = state
+            .pending
+            .entry(project_id.clone())
+            .or_insert_with(|| PendingProjectManifest {
+                project_id,
+                directory: directory.clone(),
+                attempts: 0,
+                last_error: "Manifest synchronization is pending".into(),
+                updated_at: Utc::now().to_rfc3339(),
+            });
+        if pending.directory.is_none() && directory.is_some() {
+            pending.directory = directory;
+            pending.updated_at = Utc::now().to_rfc3339();
+        }
+    }
+    if state != original {
+        state_writer(state_path, &state)?;
+    }
+    Ok(())
+}
+
+fn persist_project_manifest_intents(
+    state_path: &Path,
+    requested: impl IntoIterator<Item = (String, Option<String>)>,
+) -> Result<(), String> {
+    persist_project_manifest_intents_with(state_path, requested, &write_json_if_changed)
+}
+
+fn recover_pending_project_paths(
+    state_path: &Path,
+    settings_path: &Path,
+    settings: &mut DeviceSettings,
+    catalogue: &Catalogue,
+) -> Result<bool, String> {
+    let state: ProjectManifestSyncState = read_json(state_path)?;
+    let mut changed = false;
+    for pending in state.pending.values() {
+        let Some(directory) = pending.directory.as_deref() else {
+            continue;
+        };
+        if !catalogue
+            .projects
+            .iter()
+            .any(|project| project.id == pending.project_id)
+        {
+            continue;
+        }
+        let Ok(recovered) = fs_safe::resolve_project_directory(
+            Path::new(&settings.working_projects_path),
+            Path::new(directory),
+            false,
+        ) else {
+            continue;
+        };
+        if let Some(existing) = settings.project_paths.get(&pending.project_id) {
+            let Ok(existing) = fs_safe::resolve_project_directory(
+                Path::new(&settings.working_projects_path),
+                Path::new(existing),
+                false,
+            ) else {
+                continue;
+            };
+            if existing != recovered {
+                continue;
+            }
+        } else {
+            settings.project_paths.insert(
+                pending.project_id.clone(),
+                recovered.to_string_lossy().into_owned(),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        write_json_if_changed(settings_path, settings)?;
+    }
+    Ok(changed)
+}
+
+fn reconcile_project_manifests_with<I, M, W>(
     state_path: &Path,
     settings: &DeviceSettings,
     catalogue: &Catalogue,
-    requested: impl IntoIterator<Item = String>,
-    writer: impl Fn(&Path, &ProjectRecord, &[MediaItem]) -> Result<(), String>,
-) -> Result<Vec<CatalogueIssue>, String> {
+    requested: I,
+    manifest_writer: M,
+    state_writer: W,
+) -> Result<Vec<CatalogueIssue>, String>
+where
+    I: IntoIterator<Item = (String, Option<String>)>,
+    M: Fn(&Path, &ProjectRecord, &[MediaItem]) -> Result<bool, String>,
+    W: Fn(&Path, &ProjectManifestSyncState) -> Result<bool, String>,
+{
+    persist_project_manifest_intents_with(state_path, requested, &state_writer)?;
     let mut state: ProjectManifestSyncState = read_json(state_path)?;
-    let mut project_ids: BTreeSet<String> = state.pending.keys().cloned().collect();
-    project_ids.extend(requested);
+    let durable_state = state.clone();
+    let project_ids: BTreeSet<String> = state.pending.keys().cloned().collect();
     for project_id in project_ids {
         let Some(project) = catalogue.projects.iter().find(|project| project.id == project_id) else {
             state.pending.remove(&project_id);
             continue;
         };
-        let result = settings
-            .project_paths
+        let pending_directory = state
+            .pending
             .get(&project_id)
-            .ok_or_else(|| "Project is not associated with a local folder".to_string())
-            .and_then(|path| {
-                fs_safe::resolve_project_directory(
+            .and_then(|pending| pending.directory.as_deref());
+        let result = match (
+            settings.project_paths.get(&project_id).map(String::as_str),
+            pending_directory,
+        ) {
+            (Some(configured), Some(pending)) => fs_safe::resolve_project_directory(
+                Path::new(&settings.working_projects_path),
+                Path::new(configured),
+                false,
+            )
+            .and_then(|configured| {
+                let pending = fs_safe::resolve_project_directory(
                     Path::new(&settings.working_projects_path),
-                    Path::new(path),
+                    Path::new(pending),
                     false,
-                )
-            })
-            .and_then(|directory| writer(&directory, project, &catalogue.media));
+                )?;
+                if configured != pending {
+                    return Err(
+                        "Pending project path conflicts with its existing local folder association"
+                            .into(),
+                    );
+                }
+                Ok(configured)
+            }),
+            (Some(configured), None) => fs_safe::resolve_project_directory(
+                Path::new(&settings.working_projects_path),
+                Path::new(configured),
+                false,
+            ),
+            (None, Some(pending)) => fs_safe::resolve_project_directory(
+                Path::new(&settings.working_projects_path),
+                Path::new(pending),
+                false,
+            ),
+            (None, None) => Err("Project is not associated with a local folder".into()),
+        }
+        .and_then(|directory| manifest_writer(&directory, project, &catalogue.media));
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 state.pending.remove(&project_id);
             }
             Err(error) => {
-                let attempts = state
-                    .pending
-                    .get(&project_id)
-                    .map(|pending| pending.attempts)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                state.pending.insert(
-                    project_id.clone(),
+                let pending = state.pending.entry(project_id.clone()).or_insert_with(|| {
                     PendingProjectManifest {
                         project_id,
-                        attempts,
-                        last_error: error,
-                        updated_at: Utc::now().to_rfc3339(),
-                    },
-                );
+                        directory: None,
+                        attempts: 0,
+                        last_error: String::new(),
+                        updated_at: String::new(),
+                    }
+                });
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.last_error = error;
+                pending.updated_at = Utc::now().to_rfc3339();
             }
         }
     }
-    write_json(state_path, &state)?;
+    if state != durable_state {
+        state_writer(state_path, &state)?;
+    }
     Ok(state
         .pending
         .values()
@@ -2805,7 +2966,7 @@ fn reconcile_project_manifests(
     app: &AppHandle,
     settings: &DeviceSettings,
     catalogue: &Catalogue,
-    requested: impl IntoIterator<Item = String>,
+    requested: impl IntoIterator<Item = (String, Option<String>)>,
 ) -> Result<Vec<CatalogueIssue>, String> {
     reconcile_project_manifests_with(
         &project_manifest_sync_path(app)?,
@@ -2813,7 +2974,51 @@ fn reconcile_project_manifests(
         catalogue,
         requested,
         write_project_manifest,
+        write_json_if_changed,
     )
+}
+
+fn commit_project_creation_with<A, R>(
+    sync_path: &Path,
+    settings_file: &Path,
+    settings: &mut DeviceSettings,
+    project: &ProjectRecord,
+    directory: &Path,
+    append: A,
+    reconcile: R,
+) -> Result<(), String>
+where
+    A: FnOnce(&DeviceSettings) -> Result<(), String>,
+    R: FnOnce(&DeviceSettings) -> Result<Vec<CatalogueIssue>, String>,
+{
+    persist_project_manifest_intents(
+        sync_path,
+        [(
+            project.id.clone(),
+            Some(directory.to_string_lossy().into_owned()),
+        )],
+    )?;
+    append(settings).map_err(|error| {
+        format!(
+            "Project registration failed before a new manifest was created; the folder was preserved and recovery intent remains durable: {error}"
+        )
+    })?;
+    settings.project_paths.insert(
+        project.id.clone(),
+        directory.to_string_lossy().into_owned(),
+    );
+    write_json_if_changed(settings_file, settings).map_err(|error| {
+        format!(
+            "Project registration was saved, but its local folder association is pending automatic recovery: {error}"
+        )
+    })?;
+    if !reconcile(settings)?.is_empty() {
+        return Err(
+            "Project registration was saved, but its portable manifest is pending automatic retry; do not create the project again."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2822,9 +3027,28 @@ async fn update_media(
     state: State<'_, NativeState>,
     update: MediaUpdate,
 ) -> Result<Catalogue, String> {
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
     let settings = load_settings_file(&app)?;
-    let _guard = state.catalogue_write.lock().unwrap();
+    let catalogue_guard = state.catalogue_write.lock().unwrap();
     let catalogue = load_catalogue_file(&settings)?;
+    let mut requested = BTreeSet::new();
+    for item in catalogue
+        .media
+        .iter()
+        .filter(|item| update.media_ids.contains(&item.id))
+    {
+        requested.extend(item.project_ids.iter().cloned());
+    }
+    for projects in [
+        update.project_ids.as_ref(),
+        update.add_project_ids.as_ref(),
+        update.remove_project_ids.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        requested.extend(projects.iter().cloned());
+    }
     let mut events = Vec::new();
     for item in catalogue
         .media
@@ -2915,14 +3139,22 @@ async fn update_media(
         | CatalogueEvent::MediaProjectsRemoved { values, .. } => !values.is_empty(),
         _ => true,
     });
+    drop(catalogue_guard);
+    let sync_path = project_manifest_sync_path(&app)?;
+    persist_project_manifest_intents(
+        &sync_path,
+        requested.into_iter().map(|project_id| (project_id, None)),
+    )?;
+    let catalogue_guard = state.catalogue_write.lock().unwrap();
     append_events(&settings, events)?;
     let mut next = load_catalogue_file(&settings)?;
-    let requested = next
-        .projects
-        .iter()
-        .map(|project| project.id.clone())
-        .collect::<Vec<_>>();
-    let manifest_issues = reconcile_project_manifests(&app, &settings, &next, requested)
+    drop(catalogue_guard);
+    let manifest_issues = reconcile_project_manifests(
+        &app,
+        &settings,
+        &next,
+        std::iter::empty::<(String, Option<String>)>(),
+    )
         .map_err(|error| {
             format!(
                 "Catalogue changes were saved, but manifest recovery state could not be persisted: {error}"
@@ -2941,6 +3173,7 @@ fn create_project(
     if name.trim().is_empty() {
         return Err("Project name is required".into());
     }
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
     let mut settings = load_settings_file(&app)?;
     if settings.working_projects_path.trim().is_empty() {
         return Err("Configure the Working Projects root first".into());
@@ -3001,18 +3234,32 @@ fn create_project(
             ));
         }
     }
-    let catalogue = load_catalogue_file(&settings)?;
-    write_project_manifest(&directory, &project, &catalogue.media)?;
-    settings
-        .project_paths
-        .insert(project.id.clone(), directory.to_string_lossy().into_owned());
-    write_json(&settings_path(&app)?, &settings)?;
-    let _guard = state.catalogue_write.lock().unwrap();
-    append_events(
-        &settings,
-        vec![CatalogueEvent::ProjectUpserted {
-            project: project.clone(),
-        }],
+    let sync_path = project_manifest_sync_path(&app)?;
+    let settings_file = settings_path(&app)?;
+    commit_project_creation_with(
+        &sync_path,
+        &settings_file,
+        &mut settings,
+        &project,
+        &directory,
+        |current_settings| {
+            let _catalogue_guard = state.catalogue_write.lock().unwrap();
+            append_events(
+                current_settings,
+                vec![CatalogueEvent::ProjectUpserted {
+                    project: project.clone(),
+                }],
+            )
+        },
+        |current_settings| {
+            let catalogue = load_catalogue_file(current_settings)?;
+            reconcile_project_manifests(
+                &app,
+                current_settings,
+                &catalogue,
+                std::iter::empty::<(String, Option<String>)>(),
+            )
+        },
     )?;
     Ok(project)
 }
@@ -5328,11 +5575,12 @@ mod tests {
             &state_path,
             &settings,
             &catalogue,
-            vec!["project-a".into()],
+            vec![("project-a".into(), None)],
             move |_, _, _| {
                 failure_counter.fetch_add(1, Ordering::SeqCst);
                 Err("injected unavailable drive".into())
             },
+            write_json_if_changed,
         )
         .unwrap();
         assert_eq!(issues.len(), 1);
@@ -5344,8 +5592,22 @@ mod tests {
             &state_path,
             &settings,
             &catalogue,
-            std::iter::empty(),
+            std::iter::empty::<(String, Option<String>)>(),
+            |_, _, _| Err("injected unavailable drive again".into()),
+            write_json_if_changed,
+        )
+        .unwrap();
+        assert_eq!(issues.len(), 1);
+        let pending: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert_eq!(pending.pending["project-a"].attempts, 2);
+
+        let issues = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            std::iter::empty::<(String, Option<String>)>(),
             write_project_manifest,
+            write_json_if_changed,
         )
         .unwrap();
         assert!(issues.is_empty());
@@ -5353,6 +5615,313 @@ mod tests {
         let pending: ProjectManifestSyncState = read_json(&state_path).unwrap();
         assert!(pending.pending.is_empty());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_op_manifest_refresh_writes_neither_state_nor_compatible_manifest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = temporary("manifest-no-op");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        settings
+            .project_paths
+            .insert("project-a".into(), directory.to_string_lossy().into_owned());
+        let project = ProjectRecord {
+            id: "project-a".into(),
+            name: "Project A".into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-27T00:00:00Z".into(),
+        };
+        let catalogue = Catalogue {
+            projects: vec![project.clone()],
+            ..Default::default()
+        };
+        assert!(write_project_manifest(&directory, &project, &[]).unwrap());
+        assert!(!write_project_manifest(&directory, &project, &[]).unwrap());
+        assert!(!directory.join(".pimp-project.json.backup").exists());
+
+        let state_writes = AtomicUsize::new(0);
+        let manifest_calls = AtomicUsize::new(0);
+        let issues = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            std::iter::empty::<(String, Option<String>)>(),
+            |_, _, _| {
+                manifest_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            },
+            |path, state| {
+                state_writes.fetch_add(1, Ordering::SeqCst);
+                write_json_if_changed(path, state)
+            },
+        )
+        .unwrap();
+        assert!(issues.is_empty());
+        assert_eq!(manifest_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state_writes.load(Ordering::SeqCst), 0);
+        assert!(!state_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_retry_state_clear_preserves_the_durable_intent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = temporary("manifest-state-failure");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        settings
+            .project_paths
+            .insert("project-a".into(), directory.to_string_lossy().into_owned());
+        let catalogue = Catalogue {
+            projects: vec![ProjectRecord {
+                id: "project-a".into(),
+                name: "Project A".into(),
+                working_directory: ".".into(),
+                media_ids: vec![],
+                notes: String::new(),
+                tags: vec![],
+                created_at: "2026-10-27T00:00:00Z".into(),
+            }],
+            ..Default::default()
+        };
+        let writes = AtomicUsize::new(0);
+        let result = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            [("project-a".into(), None)],
+            |_, _, _| Ok(false),
+            |path, state| {
+                if writes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    write_json_if_changed(path, state)
+                } else {
+                    Err("injected retry-state replacement failure".into())
+                }
+            },
+        );
+        assert!(result.is_err());
+        let durable: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert!(durable.pending.contains_key("project-a"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_intent_persistence_stops_before_manifest_work() {
+        let root = temporary("manifest-intent-failure");
+        let state_path = root.join("manifest-sync.json");
+        let result = persist_project_manifest_intents_with(
+            &state_path,
+            [("project-a".into(), None)],
+            &|_, _| Err("injected write-ahead failure".into()),
+        );
+        assert!(result.is_err());
+        assert!(!state_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_project_path_repairs_a_crash_after_registration() {
+        let root = temporary("project-path-recovery");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let settings_file = root.join("settings.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        let project = ProjectRecord {
+            id: "project-a".into(),
+            name: "Project A".into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-27T00:00:00Z".into(),
+        };
+        let catalogue = Catalogue {
+            projects: vec![project],
+            ..Default::default()
+        };
+        persist_project_manifest_intents(
+            &state_path,
+            [(
+                "project-a".into(),
+                Some(directory.to_string_lossy().into_owned()),
+            )],
+        )
+        .unwrap();
+
+        assert!(recover_pending_project_paths(
+            &state_path,
+            &settings_file,
+            &mut settings,
+            &catalogue
+        )
+        .unwrap());
+        let expected = directory.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(settings.project_paths.get("project-a"), Some(&expected));
+        let issues = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            std::iter::empty::<(String, Option<String>)>(),
+            write_project_manifest,
+            write_json_if_changed,
+        )
+        .unwrap();
+        assert!(issues.is_empty());
+        assert!(directory.join(".pimp-project.json").is_file());
+        let durable: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert!(durable.pending.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_append_failure_creates_no_new_manifest_or_folder_mapping() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = temporary("project-append-failure");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let settings_file = root.join("settings.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        let project = ProjectRecord {
+            id: "project-a".into(),
+            name: "Project A".into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-27T00:00:00Z".into(),
+        };
+        let reconcile_called = AtomicBool::new(false);
+        let result = commit_project_creation_with(
+            &state_path,
+            &settings_file,
+            &mut settings,
+            &project,
+            &directory,
+            |_| Err("injected event append failure".into()),
+            |_| {
+                reconcile_called.store(true, Ordering::SeqCst);
+                Ok(vec![])
+            },
+        );
+        assert!(result.is_err());
+        assert!(!reconcile_called.load(Ordering::SeqCst));
+        assert!(!directory.join(".pimp-project.json").exists());
+        assert!(!settings_file.exists());
+        assert!(!settings.project_paths.contains_key("project-a"));
+        assert!(directory.is_dir());
+        let durable: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert!(durable.pending.contains_key("project-a"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_transaction_lock_serializes_refresh_with_metadata_reconciliation() {
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let root = temporary("manifest-concurrency");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        settings
+            .project_paths
+            .insert("project-a".into(), directory.to_string_lossy().into_owned());
+        let catalogue = Catalogue {
+            projects: vec![ProjectRecord {
+                id: "project-a".into(),
+                name: "Project A".into(),
+                working_directory: ".".into(),
+                media_ids: vec![],
+                notes: String::new(),
+                tags: vec![],
+                created_at: "2026-10-27T00:00:00Z".into(),
+            }],
+            ..Default::default()
+        };
+        let state = Arc::new(NativeState::default());
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_state = state.clone();
+        let first_path = state_path.clone();
+        let first_settings = settings.clone();
+        let first_catalogue = catalogue.clone();
+        let updater = thread::spawn(move || {
+            let _guard = first_state.project_manifest_write.lock().unwrap();
+            persist_project_manifest_intents(
+                &first_path,
+                [("project-a".into(), None)],
+            )
+            .unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            reconcile_project_manifests_with(
+                &first_path,
+                &first_settings,
+                &first_catalogue,
+                std::iter::empty::<(String, Option<String>)>(),
+                write_project_manifest,
+                write_json_if_changed,
+            )
+            .unwrap();
+        });
+        held_rx.recv().unwrap();
+
+        let second_state = state.clone();
+        let second_path = state_path.clone();
+        let second_settings = settings.clone();
+        let second_catalogue = catalogue.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let refresher = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = second_state.project_manifest_write.lock().unwrap();
+            let issues = reconcile_project_manifests_with(
+                &second_path,
+                &second_settings,
+                &second_catalogue,
+                std::iter::empty::<(String, Option<String>)>(),
+                write_project_manifest,
+                write_json_if_changed,
+            )
+            .unwrap();
+            finished_tx.send(issues).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(finished_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        release_tx.send(()).unwrap();
+        updater.join().unwrap();
+        assert!(finished_rx.recv().unwrap().is_empty());
+        refresher.join().unwrap();
+        let durable: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert!(durable.pending.is_empty());
+        assert!(directory.join(".pimp-project.json").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }
