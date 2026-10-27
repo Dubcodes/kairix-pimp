@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Catalogue, DeviceSettings } from './bridge';
@@ -658,6 +664,15 @@ describe('native application integration', () => {
     await user.keyboard('{/Control}');
     expect(screen.getByText('2 selected')).toBeVisible();
 
+    expect(
+      fireEvent.mouseDown(screen.getByText('two.mp4'), { shiftKey: true }),
+    ).toBe(false);
+    expect(
+      fireEvent.mouseDown(
+        screen.getByPlaceholderText(/Search filenames, folders/),
+        { shiftKey: true },
+      ),
+    ).toBe(true);
     await user.keyboard('{Shift>}');
     await user.click(screen.getByText('two.mp4'));
     await user.keyboard('{/Shift}');
@@ -694,6 +709,28 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('menu', { name: 'Recording context menu' }),
     ).toBeVisible();
+
+    const content = document.querySelector('main') as HTMLElement;
+    const scrollTo = vi.fn();
+    Object.defineProperty(content, 'scrollTop', {
+      configurable: true,
+      value: 600,
+      writable: true,
+    });
+    Object.defineProperty(content, 'scrollTo', {
+      configurable: true,
+      value: scrollTo,
+    });
+    fireEvent.scroll(content);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: true })),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: 'Scroll Library to top' }),
+    );
+    expect(scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'auto' });
+    vi.unstubAllGlobals();
   });
 
   it('explains optional feature loss when FFmpeg tools are missing', async () => {

@@ -6,7 +6,7 @@ Implemented and automated-test covered: domain types, date selection/fallback, f
 
 Implemented and tested with generated media: FFprobe metadata extraction and FFmpeg thumbnail generation for H.264 and H.265/HEVC fixtures.
 
-UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection, Light status, and the two required date mode names. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation.
+UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection without Shift text highlighting, a reduced-motion-aware content scroll control, Light status, and the two required date mode names. Thumbnail placeholders and the responsive batch editor follow theme tokens. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation.
 
 ## Milestone 2 — production ingest and advanced library (in progress)
 

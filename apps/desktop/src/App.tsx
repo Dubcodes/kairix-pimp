@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
+  ArrowUp,
   Clock3,
   Coffee,
   Copy,
@@ -135,6 +136,7 @@ export function App() {
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
   const [removeBatchProjects, setRemoveBatchProjects] = useState<string[]>([]);
   const [batchDescription, setBatchDescription] = useState('');
+  const [showScrollTop, setShowScrollTop] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     mediaId: string;
     x: number;
@@ -148,6 +150,7 @@ export function App() {
     new Map<string, ProvisionalMetadataPatch>(),
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
+  const contentRef = useRef<HTMLElement>(null);
   const settingsRef = useRef(settings);
   const [savingSettings] = useState(
     () =>
@@ -508,6 +511,15 @@ export function App() {
       window.removeEventListener('keydown', closeOnEscape);
     };
   }, [contextMenu]);
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    const updateScrollControl = () =>
+      setShowScrollTop(content.scrollTop >= 480);
+    updateScrollControl();
+    content.addEventListener('scroll', updateScrollControl, { passive: true });
+    return () => content.removeEventListener('scroll', updateScrollControl);
+  }, []);
 
   const saveConfiguration = async () => {
     setError('');
@@ -964,7 +976,7 @@ export function App() {
           </span>
         </div>
       </aside>
-      <main>
+      <main ref={contentRef}>
         <header>
           <div>
             <p>
@@ -1808,6 +1820,16 @@ export function App() {
                         role="option"
                         tabIndex={0}
                         aria-selected={selected.includes(item.id)}
+                        onMouseDown={(event) => {
+                          const target = event.target as HTMLElement;
+                          if (
+                            event.shiftKey &&
+                            !target.closest(
+                              'input, textarea, [contenteditable="true"]',
+                            )
+                          )
+                            event.preventDefault();
+                        }}
                         onClick={(event) => {
                           setContextMenu(undefined);
                           selectRecording(item.id, {
@@ -1903,194 +1925,224 @@ export function App() {
                 )}
               </div>
             </section>
-            {selected.length > 0 && (
-              <div className="batch">
-                <div className="batch-heading">
-                  <strong>{selected.length} selected</strong>
-                  <span>Changes persist immediately</span>
-                </div>
-                <div className="batch-combo">
-                  <Tag size={15} />
-                  <SearchableComboBox
-                    label="Add tags"
-                    mode="multiple"
-                    options={knownTags.map((tag) => ({ id: tag, label: tag }))}
-                    selectedIds={batchTags}
-                    onSelectionChange={(ids) => {
-                      setBatchTags(ids);
-                      void updateSelection({ addTags: ids });
-                    }}
-                    placeholder="Search or create tags…"
-                    onCreate={(label) => ({ id: label, label })}
-                  />
-                </div>
-                <div className="batch-combo">
-                  <Tag size={15} />
-                  <SearchableComboBox
-                    label="Remove tags"
-                    mode="multiple"
-                    options={knownTags.map((tag) => ({ id: tag, label: tag }))}
-                    selectedIds={removeBatchTags}
-                    onSelectionChange={(ids) => {
-                      setRemoveBatchTags(ids);
-                      void updateSelection({ removeTags: ids });
-                    }}
-                    placeholder="Remove tags…"
-                  />
-                </div>
-                <div className="batch-combo">
-                  <UsersRound size={15} />
-                  <SearchableComboBox
-                    label="Add projects"
-                    mode="multiple"
-                    options={catalogue.projects.map((project) => ({
-                      id: project.id,
-                      label: project.name,
-                    }))}
-                    selectedIds={batchProjects}
-                    onSelectionChange={(ids) => {
-                      setBatchProjects(ids);
-                      void updateSelection({ addProjectIds: ids });
-                    }}
-                    placeholder="Search projects…"
-                  />
-                </div>
-                <div className="batch-combo">
-                  <UsersRound size={15} />
-                  <SearchableComboBox
-                    label="Remove projects"
-                    mode="multiple"
-                    options={catalogue.projects.map((project) => ({
-                      id: project.id,
-                      label: project.name,
-                    }))}
-                    selectedIds={removeBatchProjects}
-                    onSelectionChange={(ids) => {
-                      setRemoveBatchProjects(ids);
-                      void updateSelection({ removeProjectIds: ids });
-                    }}
-                    placeholder="Remove projects…"
-                  />
-                </div>
-                <label className="batch-description">
-                  Description for selection
-                  <input
-                    value={batchDescription}
-                    onChange={(event) =>
-                      setBatchDescription(event.target.value)
-                    }
-                    placeholder="Replace description on selected media"
-                  />
-                  <button
-                    disabled={busy}
-                    onClick={() =>
-                      void updateSelection({ notes: batchDescription })
-                    }
-                  >
-                    Apply description
-                  </button>
-                </label>
-                <div className="file-actions" aria-label="Selection actions">
-                  <button
-                    onClick={() => void updateSelection({ favourite: true })}
-                  >
-                    <Star size={13} /> Favourite
-                  </button>
-                  <button
-                    onClick={() => void updateSelection({ favourite: false })}
-                  >
-                    Remove favourite
-                  </button>
-                  <button
-                    disabled={selectedPhysicalIds.every(
-                      (id) =>
-                        !catalogue.media.find((item) => item.id === id)
-                          ?.available,
-                    )}
-                    onClick={() => void copySelectedPaths()}
-                  >
-                    <Copy size={13} /> Copy paths for Premiere
-                  </button>
-                </div>
-                {selectedRecording && (
-                  <>
-                    <div
-                      className="associated-files"
-                      role="group"
-                      aria-label="Associated physical files"
-                    >
-                      <strong>
-                        {selectedAssociatedMedia.length} associated file
-                        {selectedAssociatedMedia.length === 1 ? '' : 's'}
-                      </strong>
-                      {selectedAssociatedMedia.map((recording) => (
-                        <div className="associated-file" key={recording.id}>
-                          <div>
-                            <b>{recording.originalFilename}</b>
-                            <span>
-                              {recording.fileType.toUpperCase()} ·{' '}
-                              {size(recording.technical.sizeBytes)} ·{' '}
-                              {recording.needsReview
-                                ? 'Integrity needs review'
-                                : recording.available
-                                  ? 'Integrity verified'
-                                  : 'Unavailable locally'}
-                            </span>
-                            <code>{recording.relativePath}</code>
-                          </div>
-                          <button
-                            disabled={!recording.available}
-                            aria-label={`Reveal ${recording.originalFilename} in Explorer`}
-                            onClick={() =>
-                              void runSelectedFileAction('reveal', recording)
-                            }
-                          >
-                            <LocateFixed size={13} /> Reveal
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                    <div
-                      className="file-actions"
-                      aria-label="Recording actions"
-                    >
-                      <button
-                        disabled={!selectedRecording.available}
-                        onClick={() => void runSelectedFileAction('reveal')}
-                      >
-                        <LocateFixed size={13} /> Reveal in Explorer
-                      </button>
-                      <button
-                        disabled={!selectedRecording.available}
-                        onClick={() => void runSelectedFileAction('folder')}
-                      >
-                        <FolderOpen size={13} /> Open date folder
-                      </button>
-                      <button
-                        disabled={!selectedRecording.available}
-                        onClick={() => void runSelectedFileAction('copy')}
-                      >
-                        <Copy size={13} /> Copy path
-                      </button>
-                    </div>
-                  </>
-                )}
+            <div className="library-overlays">
+              {showScrollTop && (
                 <button
-                  className="batch-clear"
-                  onClick={() => {
-                    setSelected([]);
-                    setBatchTags([]);
-                    setRemoveBatchTags([]);
-                    setBatchProjects([]);
-                    setRemoveBatchProjects([]);
-                    setBatchDescription('');
-                    selectionAnchor.current = undefined;
-                  }}
+                  type="button"
+                  className="scroll-top"
+                  aria-label="Scroll Library to top"
+                  title="Scroll to top"
+                  onClick={() =>
+                    contentRef.current?.scrollTo({
+                      top: 0,
+                      behavior: window.matchMedia?.(
+                        '(prefers-reduced-motion: reduce)',
+                      ).matches
+                        ? 'auto'
+                        : 'smooth',
+                    })
+                  }
                 >
-                  Clear selection
+                  <ArrowUp aria-hidden="true" size={18} />
                 </button>
-              </div>
-            )}
+              )}
+              {selected.length > 0 && (
+                <div className="batch">
+                  <div className="batch-heading">
+                    <strong>{selected.length} selected</strong>
+                    <span>Changes persist immediately</span>
+                  </div>
+                  <div className="batch-combo">
+                    <Tag size={15} />
+                    <SearchableComboBox
+                      label="Add tags"
+                      mode="multiple"
+                      options={knownTags.map((tag) => ({
+                        id: tag,
+                        label: tag,
+                      }))}
+                      selectedIds={batchTags}
+                      onSelectionChange={(ids) => {
+                        setBatchTags(ids);
+                        void updateSelection({ addTags: ids });
+                      }}
+                      placeholder="Search or create tags…"
+                      onCreate={(label) => ({ id: label, label })}
+                    />
+                  </div>
+                  <div className="batch-combo">
+                    <Tag size={15} />
+                    <SearchableComboBox
+                      label="Remove tags"
+                      mode="multiple"
+                      options={knownTags.map((tag) => ({
+                        id: tag,
+                        label: tag,
+                      }))}
+                      selectedIds={removeBatchTags}
+                      onSelectionChange={(ids) => {
+                        setRemoveBatchTags(ids);
+                        void updateSelection({ removeTags: ids });
+                      }}
+                      placeholder="Remove tags…"
+                    />
+                  </div>
+                  <div className="batch-combo">
+                    <UsersRound size={15} />
+                    <SearchableComboBox
+                      label="Add projects"
+                      mode="multiple"
+                      options={catalogue.projects.map((project) => ({
+                        id: project.id,
+                        label: project.name,
+                      }))}
+                      selectedIds={batchProjects}
+                      onSelectionChange={(ids) => {
+                        setBatchProjects(ids);
+                        void updateSelection({ addProjectIds: ids });
+                      }}
+                      placeholder="Search projects…"
+                    />
+                  </div>
+                  <div className="batch-combo">
+                    <UsersRound size={15} />
+                    <SearchableComboBox
+                      label="Remove projects"
+                      mode="multiple"
+                      options={catalogue.projects.map((project) => ({
+                        id: project.id,
+                        label: project.name,
+                      }))}
+                      selectedIds={removeBatchProjects}
+                      onSelectionChange={(ids) => {
+                        setRemoveBatchProjects(ids);
+                        void updateSelection({ removeProjectIds: ids });
+                      }}
+                      placeholder="Remove projects…"
+                    />
+                  </div>
+                  <label className="batch-description">
+                    Description for selection
+                    <input
+                      value={batchDescription}
+                      onChange={(event) =>
+                        setBatchDescription(event.target.value)
+                      }
+                      placeholder="Replace description on selected media"
+                    />
+                    <button
+                      className="batch-primary"
+                      disabled={busy}
+                      onClick={() =>
+                        void updateSelection({ notes: batchDescription })
+                      }
+                    >
+                      Apply description
+                    </button>
+                  </label>
+                  <div className="file-actions" aria-label="Selection actions">
+                    <button
+                      className="batch-primary"
+                      onClick={() => void updateSelection({ favourite: true })}
+                    >
+                      <Star size={13} /> Favourite
+                    </button>
+                    <button
+                      onClick={() => void updateSelection({ favourite: false })}
+                    >
+                      Remove favourite
+                    </button>
+                    <button
+                      disabled={selectedPhysicalIds.every(
+                        (id) =>
+                          !catalogue.media.find((item) => item.id === id)
+                            ?.available,
+                      )}
+                      onClick={() => void copySelectedPaths()}
+                    >
+                      <Copy size={13} /> Copy paths for Premiere
+                    </button>
+                  </div>
+                  {selectedRecording && (
+                    <>
+                      <div
+                        className="associated-files"
+                        role="group"
+                        aria-label="Associated physical files"
+                      >
+                        <strong>
+                          {selectedAssociatedMedia.length} associated file
+                          {selectedAssociatedMedia.length === 1 ? '' : 's'}
+                        </strong>
+                        {selectedAssociatedMedia.map((recording) => (
+                          <div className="associated-file" key={recording.id}>
+                            <div>
+                              <b>{recording.originalFilename}</b>
+                              <span>
+                                {recording.fileType.toUpperCase()} ·{' '}
+                                {size(recording.technical.sizeBytes)} ·{' '}
+                                {recording.needsReview
+                                  ? 'Integrity needs review'
+                                  : recording.available
+                                    ? 'Integrity verified'
+                                    : 'Unavailable locally'}
+                              </span>
+                              <code>{recording.relativePath}</code>
+                            </div>
+                            <button
+                              disabled={!recording.available}
+                              aria-label={`Reveal ${recording.originalFilename} in Explorer`}
+                              onClick={() =>
+                                void runSelectedFileAction('reveal', recording)
+                              }
+                            >
+                              <LocateFixed size={13} /> Reveal
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <div
+                        className="file-actions"
+                        aria-label="Recording actions"
+                      >
+                        <button
+                          disabled={!selectedRecording.available}
+                          onClick={() => void runSelectedFileAction('reveal')}
+                        >
+                          <LocateFixed size={13} /> Reveal in Explorer
+                        </button>
+                        <button
+                          disabled={!selectedRecording.available}
+                          onClick={() => void runSelectedFileAction('folder')}
+                        >
+                          <FolderOpen size={13} /> Open date folder
+                        </button>
+                        <button
+                          disabled={!selectedRecording.available}
+                          onClick={() => void runSelectedFileAction('copy')}
+                        >
+                          <Copy size={13} /> Copy path
+                        </button>
+                      </div>
+                    </>
+                  )}
+                  <button
+                    className="batch-clear"
+                    onClick={() => {
+                      setSelected([]);
+                      setBatchTags([]);
+                      setRemoveBatchTags([]);
+                      setBatchProjects([]);
+                      setRemoveBatchProjects([]);
+                      setBatchDescription('');
+                      selectionAnchor.current = undefined;
+                    }}
+                  >
+                    Clear selection
+                  </button>
+                </div>
+              )}
+            </div>
             {contextMenu && contextRecording && (
               <div
                 className="context-menu"
