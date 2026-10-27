@@ -73,7 +73,9 @@ SQLite/FTS is a disposable device-local search projection, never a synchronized 
 
 ## Identity and project architecture
 
-Stable media IDs are independent of content hashes, names and paths; SHA-256 remains integrity and duplicate evidence. Folder and project IDs are likewise path-independent. Portable records use `/`-separated relative paths. Device settings map Master Bin and Working Projects roots locally.
+Registration media IDs are UUIDs independent of hashes, names and paths. Replay derives a deterministic alias map for offline registrations only when normalized Master Bin relative path and SHA-256 both agree, then applies historic metadata events and project references to the canonical ID. Content hash alone never merges different paths, and one path with different hashes produces a visible conflict. This projection-time policy preserves append-only streams and existing IDs instead of performing a destructive migration. Folder and project IDs are likewise path-independent. Portable records use `/`-separated relative paths. Device settings map Master Bin and Working Projects roots locally.
+
+Project creation accepts only a folder canonically contained beneath the configured Working Projects root. Existing ancestors are resolved before any directory is created, so traversal, symlink and junction escapes fail before registration. Compatible existing manifests may be explicitly associated inside that root. Catalogue metadata commits precede project-manifest projection; failed manifest writes are recorded in a device-local retry store and retried on later updates and startup without duplicating authoritative events.
 
 Media contains `projectIds[]`, so assignments are many-to-many. Each working directory owns an atomically updated `.pimp-project.json` manifest containing portable media identities, paths, checksums, and relevant metadata without recreating or deleting existing assets. See [DATA_MODEL.md](DATA_MODEL.md).
 

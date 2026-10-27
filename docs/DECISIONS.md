@@ -234,7 +234,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 
 - **Date:** 2026-10-27
 - **Status:** Accepted
-- **Decision:** Treat exactly one same-directory, case-insensitive same-stem WAV beside an MP4/MOV/M4V as the video's attached audio. The relationship remains a deterministic catalogue projection rather than a synchronized event. The Library hides the attached WAV card by default, but searches and logical operations include both physical records; a device-local setting may expose every card.
+- **Decision:** Treat exactly one same-directory, case-insensitive same-stem WAV beside exactly one MP4/MOV/M4V as attached audio. Multiple video containers or multiple WAV candidates remain unpaired. The relationship remains a deterministic catalogue projection rather than a synchronized event. The Library hides the attached WAV card by default, but searches and logical operations include both physical records; a device-local setting may expose every card.
 - **Consequences:** Late Syncthing arrivals pair on the next catalogue replay without metadata mutation or duplicate records. Ambiguous or unmatched WAV files remain independent. There is no manual override yet; adding one requires a reversible, convergent representation.
 
 ## ADR-031 — Windows GUI lifecycle and Shell selection
@@ -243,3 +243,17 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Release Windows executables use the GUI subsystem and release-only FFmpeg/FFprobe processes use `CREATE_NO_WINDOW`; debug builds retain consoles. All application restore triggers share show, unminimize and supported focus-request behavior with diagnostic logging and taskbar-attention fallback. File reveal uses `SHOpenFolderAndSelectItems` after media-ID lookup and canonical Master Bin containment.
 - **Consequences:** Installed launches no longer require an attached console, special-character paths avoid `explorer.exe` quoting ambiguity, and foreground restrictions remain governed by Windows rather than bypassed. Installed NSIS acceptance is still required to verify actual shell behavior.
+
+## ADR-032 — Reconcile duplicate registrations during deterministic replay
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Keep UUID registration IDs and historic append-only events. When offline devices independently register the same normalized Master Bin relative path with the same SHA-256, deterministic causal order selects the canonical historic ID and replay aliases the others. Hash equality at different paths never merges records; path equality with different hashes produces a conflict.
+- **Consequences:** Existing metadata and project references survive without log migration, and all replicas converge. The canonical ID is not content-derived and aliases are rebuilt projections rather than new shared mutable state.
+
+## ADR-033 — Authorize project roots and retry manifest projections
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Project creation/adoption is restricted to canonically contained folders beneath the configured Working Projects root. Catalogue events remain authoritative; compatible manifest projection preserves unknown fields and failures enter a device-local durable retry queue.
+- **Consequences:** Temporary project-drive failure is reported as partial success and recovers without duplicate catalogue events. External folders require a future separate authorization workflow.

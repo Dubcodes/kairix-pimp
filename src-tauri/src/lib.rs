@@ -3,14 +3,16 @@ mod discovery;
 mod fs_safe;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use catalogue::{Catalogue, CatalogueEvent, MediaItem, ProjectRecord, TechnicalMetadata};
+use catalogue::{
+    Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
+};
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -87,6 +89,22 @@ struct DeviceSettings {
     density: String,
     #[serde(default)]
     show_attached_audio_separately: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PendingProjectManifest {
+    project_id: String,
+    attempts: u32,
+    last_error: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ProjectManifestSyncState {
+    #[serde(default)]
+    pending: BTreeMap<String, PendingProjectManifest>,
 }
 fn default_true() -> bool {
     true
@@ -356,6 +374,13 @@ fn discovery_status_path(app: &AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or("Invalid application configuration path")?
         .join("discovery-status.json"))
+}
+
+fn project_manifest_sync_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("project-manifest-sync.json"))
 }
 
 fn diagnostic_log_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -683,6 +708,13 @@ fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catal
             project.working_directory = path.clone();
         }
     }
+    let manifest_issues = reconcile_project_manifests(
+        &app,
+        &settings,
+        &catalogue,
+        std::iter::empty::<String>(),
+    )?;
+    catalogue.issues.extend(manifest_issues);
     *state.availability.lock().unwrap() = catalogue
         .media
         .iter()
@@ -2614,25 +2646,56 @@ fn contains_normalized(values: &[String], candidate: &str) -> bool {
         .any(|value| value.trim().to_lowercase() == key)
 }
 
+fn project_manifest_identity(value: &serde_json::Value) -> Result<String, String> {
+    let identities = [
+        value.get("id").and_then(serde_json::Value::as_str),
+        value
+            .get("project")
+            .and_then(|project| project.get("id"))
+            .and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let Some(first) = identities.first() else {
+        return Err("Existing .pimp-project.json has no compatible project identity".into());
+    };
+    if identities.iter().any(|identity| identity != first) {
+        return Err(
+            "Existing .pimp-project.json contains conflicting project identities and was not overwritten"
+                .into(),
+        );
+    }
+    Ok((*first).to_string())
+}
+
 fn write_project_manifest(
     directory: &Path,
     project: &ProjectRecord,
     media: &[MediaItem],
 ) -> Result<(), String> {
     let manifest_path = directory.join(".pimp-project.json");
-    if manifest_path.exists() {
+    let mut value = if manifest_path.exists() {
         let value: serde_json::Value = read_json(&manifest_path)?;
-        let existing_id = value
-            .get("id")
-            .or_else(|| value.get("project").and_then(|project| project.get("id")))
-            .and_then(serde_json::Value::as_str)
-            .ok_or("Existing .pimp-project.json has no compatible project identity")?;
+        let schema = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        if schema > catalogue::EVENT_SCHEMA_VERSION as u64 {
+            return Err(format!(
+                "Existing .pimp-project.json uses unsupported schema {schema}; it was not overwritten"
+            ));
+        }
+        let existing_id = project_manifest_identity(&value)?;
         if existing_id != project.id {
             return Err(format!(
                 "Existing .pimp-project.json belongs to project {existing_id}; it was not overwritten"
             ));
         }
-    }
+        value
+    } else {
+        serde_json::json!({})
+    };
     let references: Vec<_> = media
         .iter()
         .filter(|item| item.project_ids.contains(&project.id))
@@ -2645,18 +2708,111 @@ fn write_project_manifest(
             })
         })
         .collect();
-    write_json(
-        &manifest_path,
-        &serde_json::json!({
-            "schemaVersion": 2,
-            "id": project.id,
-            "name": project.name,
-            "workingDirectory": ".",
-            "notes": project.notes,
-            "tags": project.tags,
-            "media": references,
-            "createdAt": project.created_at
-        }),
+    let object = value
+        .as_object_mut()
+        .ok_or("Existing .pimp-project.json must contain a JSON object")?;
+    object.insert("schemaVersion".into(), serde_json::json!(2));
+    object.insert("media".into(), serde_json::json!(references));
+    if let Some(project_value) = object.get_mut("project") {
+        let project_object = project_value
+            .as_object_mut()
+            .ok_or("Existing project manifest has an incompatible project record")?;
+        project_object.insert("id".into(), serde_json::json!(project.id));
+        project_object.insert("name".into(), serde_json::json!(project.name));
+        project_object.insert("workingDirectory".into(), serde_json::json!("."));
+        project_object.insert("notes".into(), serde_json::json!(project.notes));
+        project_object.insert("tags".into(), serde_json::json!(project.tags));
+        project_object.insert("mediaIds".into(), serde_json::json!(project.media_ids));
+        project_object.insert("createdAt".into(), serde_json::json!(project.created_at));
+    } else {
+        object.insert("id".into(), serde_json::json!(project.id));
+        object.insert("name".into(), serde_json::json!(project.name));
+        object.insert("workingDirectory".into(), serde_json::json!("."));
+        object.insert("notes".into(), serde_json::json!(project.notes));
+        object.insert("tags".into(), serde_json::json!(project.tags));
+        object.insert("mediaIds".into(), serde_json::json!(project.media_ids));
+        object.insert("createdAt".into(), serde_json::json!(project.created_at));
+    }
+    write_json(&manifest_path, &value)
+}
+
+fn reconcile_project_manifests_with(
+    state_path: &Path,
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+    requested: impl IntoIterator<Item = String>,
+    writer: impl Fn(&Path, &ProjectRecord, &[MediaItem]) -> Result<(), String>,
+) -> Result<Vec<CatalogueIssue>, String> {
+    let mut state: ProjectManifestSyncState = read_json(state_path)?;
+    let mut project_ids: BTreeSet<String> = state.pending.keys().cloned().collect();
+    project_ids.extend(requested);
+    for project_id in project_ids {
+        let Some(project) = catalogue.projects.iter().find(|project| project.id == project_id) else {
+            state.pending.remove(&project_id);
+            continue;
+        };
+        let result = settings
+            .project_paths
+            .get(&project_id)
+            .ok_or_else(|| "Project is not associated with a local folder".to_string())
+            .and_then(|path| {
+                fs_safe::resolve_project_directory(
+                    Path::new(&settings.working_projects_path),
+                    Path::new(path),
+                    false,
+                )
+            })
+            .and_then(|directory| writer(&directory, project, &catalogue.media));
+        match result {
+            Ok(()) => {
+                state.pending.remove(&project_id);
+            }
+            Err(error) => {
+                let attempts = state
+                    .pending
+                    .get(&project_id)
+                    .map(|pending| pending.attempts)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                state.pending.insert(
+                    project_id.clone(),
+                    PendingProjectManifest {
+                        project_id,
+                        attempts,
+                        last_error: error,
+                        updated_at: Utc::now().to_rfc3339(),
+                    },
+                );
+            }
+        }
+    }
+    write_json(state_path, &state)?;
+    Ok(state
+        .pending
+        .values()
+        .map(|pending| CatalogueIssue {
+            code: "project-manifest-pending".into(),
+            source: pending.project_id.clone(),
+            detail: format!(
+                "Catalogue changes are saved; project manifest retry {} is pending: {}",
+                pending.attempts, pending.last_error
+            ),
+        })
+        .collect())
+}
+
+fn reconcile_project_manifests(
+    app: &AppHandle,
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+    requested: impl IntoIterator<Item = String>,
+) -> Result<Vec<CatalogueIssue>, String> {
+    reconcile_project_manifests_with(
+        &project_manifest_sync_path(app)?,
+        settings,
+        catalogue,
+        requested,
+        write_project_manifest,
     )
 }
 
@@ -2760,12 +2916,19 @@ async fn update_media(
         _ => true,
     });
     append_events(&settings, events)?;
-    let next = load_catalogue_file(&settings)?;
-    for project in &next.projects {
-        if let Some(path) = settings.project_paths.get(&project.id) {
-            write_project_manifest(Path::new(path), project, &next.media)?;
-        }
-    }
+    let mut next = load_catalogue_file(&settings)?;
+    let requested = next
+        .projects
+        .iter()
+        .map(|project| project.id.clone())
+        .collect::<Vec<_>>();
+    let manifest_issues = reconcile_project_manifests(&app, &settings, &next, requested)
+        .map_err(|error| {
+            format!(
+                "Catalogue changes were saved, but manifest recovery state could not be persisted: {error}"
+            )
+        })?;
+    next.issues.extend(manifest_issues);
     Ok(next)
 }
 #[tauri::command]
@@ -2779,18 +2942,21 @@ fn create_project(
         return Err("Project name is required".into());
     }
     let mut settings = load_settings_file(&app)?;
-    let directory = PathBuf::from(&working_directory);
-    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    if settings.working_projects_path.trim().is_empty() {
+        return Err("Configure the Working Projects root first".into());
+    }
+    let directory = fs_safe::resolve_project_directory(
+        Path::new(&settings.working_projects_path),
+        Path::new(&working_directory),
+        true,
+    )?;
     let manifest_path = directory.join(".pimp-project.json");
     let project = if manifest_path.exists() {
         let value: serde_json::Value = read_json(&manifest_path)?;
+        let id = project_manifest_identity(&value)?;
         let project_value = value.get("project").unwrap_or(&value);
-        let id = project_value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("Existing .pimp-project.json is incompatible and was not overwritten")?;
         ProjectRecord {
-            id: id.into(),
+            id,
             name: project_value
                 .get("name")
                 .and_then(serde_json::Value::as_str)
@@ -2822,9 +2988,25 @@ fn create_project(
             created_at: Utc::now().to_rfc3339(),
         }
     };
+    if let Some(existing) = settings.project_paths.get(&project.id) {
+        let existing = fs_safe::resolve_project_directory(
+            Path::new(&settings.working_projects_path),
+            Path::new(existing),
+            false,
+        )?;
+        if existing != directory {
+            return Err(format!(
+                "Project {} is already associated with a different authorized folder",
+                project.id
+            ));
+        }
+    }
+    let catalogue = load_catalogue_file(&settings)?;
+    write_project_manifest(&directory, &project, &catalogue.media)?;
     settings
         .project_paths
-        .insert(project.id.clone(), working_directory);
+        .insert(project.id.clone(), directory.to_string_lossy().into_owned());
+    write_json(&settings_path(&app)?, &settings)?;
     let _guard = state.catalogue_write.lock().unwrap();
     append_events(
         &settings,
@@ -2832,9 +3014,6 @@ fn create_project(
             project: project.clone(),
         }],
     )?;
-    write_json(&settings_path(&app)?, &settings)?;
-    let catalogue = load_catalogue_file(&settings)?;
-    write_project_manifest(&directory, &project, &catalogue.media)?;
     Ok(project)
 }
 fn publish_discovery_status(app: &AppHandle, state: &NativeState, status: &DiscoveryStatus) {
@@ -5060,6 +5239,120 @@ mod tests {
         };
         assert!(write_project_manifest(&root, &project, &[]).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compatible_project_manifest_updates_preserve_unknown_fields() {
+        let root = temporary("manifest-unknown-fields");
+        let path = root.join(".pimp-project.json");
+        write_json(
+            &path,
+            &serde_json::json!({
+                "schemaVersion": 2,
+                "customTopLevel": {"keep": true},
+                "project": {
+                    "id": "project-a",
+                    "name": "Old",
+                    "customProjectField": "keep-me"
+                },
+                "media": []
+            }),
+        )
+        .unwrap();
+        let project = ProjectRecord {
+            id: "project-a".into(),
+            name: "Updated".into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: "notes".into(),
+            tags: vec!["tag".into()],
+            created_at: "2026-10-27T00:00:00Z".into(),
+        };
+        write_project_manifest(&root, &project, &[]).unwrap();
+        let value: serde_json::Value = read_json(&path).unwrap();
+        assert_eq!(value["customTopLevel"]["keep"], true);
+        assert_eq!(value["project"]["customProjectField"], "keep-me");
+        assert_eq!(value["project"]["name"], "Updated");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_project_manifest_sync_is_durable_and_retryable_without_catalogue_events() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let root = temporary("manifest-retry");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        settings
+            .project_paths
+            .insert("project-a".into(), directory.to_string_lossy().into_owned());
+        let project = ProjectRecord {
+            id: "project-a".into(),
+            name: "Project A".into(),
+            working_directory: ".".into(),
+            media_ids: vec!["media-a".into()],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-27T00:00:00Z".into(),
+        };
+        let source = root.join("source.mp4");
+        fs::write(&source, b"synthetic").unwrap();
+        let mut media = new_media(
+            &source,
+            "20261027/source.mp4".into(),
+            None,
+            "hash".into(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        media.id = "media-a".into();
+        media.project_ids = vec!["project-a".into()];
+        let catalogue = Catalogue {
+            media: vec![media],
+            projects: vec![project],
+            ..Default::default()
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let failure_counter = attempts.clone();
+        let issues = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            vec!["project-a".into()],
+            move |_, _, _| {
+                failure_counter.fetch_add(1, Ordering::SeqCst);
+                Err("injected unavailable drive".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(issues.len(), 1);
+        let pending: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert_eq!(pending.pending["project-a"].attempts, 1);
+        assert!(!directory.join(".pimp-project.json").exists());
+
+        let issues = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            std::iter::empty(),
+            write_project_manifest,
+        )
+        .unwrap();
+        assert!(issues.is_empty());
+        assert!(directory.join(".pimp-project.json").is_file());
+        let pending: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert!(pending.pending.is_empty());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
         fs::remove_dir_all(root).unwrap();
     }
 }

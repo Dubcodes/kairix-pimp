@@ -11,7 +11,7 @@ UI implemented and component-test covered: application shell, primary navigation
 ## Milestone 2 — production ingest and advanced library (in progress)
 
 - Implemented: native picker/drop, recursive inventory, verified copies, persisted real Library, per-ingest date overrides, explicit collision rename, projects, manual/periodic discovery, metadata/thumbnails and conservative same-stem MP4/WAV pairing
-- Implemented reliability foundation: canonical causal event replay, duplicate/malformed/newer-record handling, legacy migration/backup, multi-device convergence tests, external staging, minimal recovery journal, no-overwrite promotion, source-change checks, conservative discovery, folder-aware pairing, portable thumbnails and manifest identity protection
+- Implemented reliability foundation: canonical causal event replay, deterministic path-plus-hash registration aliases, duplicate/malformed/newer-record handling, legacy migration/backup, multi-device convergence tests, external staging, minimal recovery journal, no-overwrite promotion, source-change checks, conservative discovery, two-sided unambiguous folder-aware pairing, portable thumbnails, Working Projects containment and recoverable manifest projection
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
 - Byte-range ingest resume and throughput history
 - Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow

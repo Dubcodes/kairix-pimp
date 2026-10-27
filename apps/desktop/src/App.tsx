@@ -658,7 +658,16 @@ export function App() {
     if (!selected.length) return;
     try {
       const mediaIds = expandLogicalMediaIds(selected, catalogue.media);
-      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...next }));
+      const updated = await desktopBridge.updateMedia({ mediaIds, ...next });
+      setCatalogue(updated);
+      const pendingManifests =
+        updated.issues?.filter(
+          (issue) => issue.code === 'project-manifest-pending',
+        ).length ?? 0;
+      if (pendingManifests)
+        setMessage(
+          `Catalogue changes saved. ${pendingManifests} project manifest update${pendingManifests === 1 ? ' is' : 's are'} pending automatic retry.`,
+        );
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -1159,7 +1168,7 @@ export function App() {
           <section className="notice error" role="status">
             <span>
               Metadata needs attention: {catalogue.conflicts?.length ?? 0}{' '}
-              concurrent conflict(s), {catalogue.issues?.length ?? 0} stream
+              concurrent conflict(s), {catalogue.issues?.length ?? 0} catalogue
               issue(s). Authoritative event files were left unchanged.
             </span>
           </section>

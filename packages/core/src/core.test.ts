@@ -82,6 +82,195 @@ describe('catalogue reducer', () => {
       'duplicate-event-conflict',
     );
   });
+  it('converges independent same-path registrations and aliases later metadata', () => {
+    const first: MediaItem = {
+      ...media,
+      id: 'media-a',
+      relativePath: '20261023/DJI_0001.mp4',
+      sha256: 'same-content',
+      tags: ['Camera A'],
+      projectIds: ['project-a'],
+      notes: 'note A',
+    };
+    const second: MediaItem = {
+      ...first,
+      id: 'media-b',
+      tags: ['Camera B'],
+      projectIds: ['project-b'],
+      notes: 'note B',
+      favourite: true,
+    };
+    const events: EventEnvelope[] = [
+      envelope({ type: 'media.registered', media: first }, 'a-1', 'device-a'),
+      envelope({ type: 'media.registered', media: second }, 'b-1', 'device-b'),
+      {
+        ...envelope(
+          {
+            type: 'media.notes.set',
+            mediaId: 'media-a',
+            value: 'offline A',
+          },
+          'a-2',
+          'device-a',
+        ),
+        sequence: 2,
+        observed: { 'device-a': 1 },
+      },
+      {
+        ...envelope(
+          {
+            type: 'media.notes.set',
+            mediaId: 'media-b',
+            value: 'offline B',
+          },
+          'b-2',
+          'device-b',
+        ),
+        sequence: 2,
+        observed: { 'device-b': 1 },
+      },
+      envelope(
+        {
+          type: 'media.tags.added',
+          mediaId: 'media-b',
+          values: ['Synced later'],
+        },
+        'c-1',
+        'device-c',
+      ),
+      envelope(
+        {
+          type: 'project.upserted',
+          project: {
+            id: 'project-a',
+            name: 'A',
+            workingDirectory: '.',
+            mediaIds: [],
+            createdAt: '2026-10-23T00:00:00Z',
+          },
+        },
+        'p-a',
+        'project-device-a',
+      ),
+      envelope(
+        {
+          type: 'project.upserted',
+          project: {
+            id: 'project-b',
+            name: 'B',
+            workingDirectory: '.',
+            mediaIds: [],
+            createdAt: '2026-10-23T00:00:00Z',
+          },
+        },
+        'p-b',
+        'project-device-b',
+      ),
+    ];
+    const states = [
+      rebuildCatalogue(events),
+      rebuildCatalogue(events.slice().reverse()),
+      rebuildCatalogue([
+        events[4],
+        events[1],
+        events[6],
+        events[0],
+        events[3],
+        events[5],
+        events[2],
+        events[0],
+      ]),
+    ];
+    expect(states[1]).toEqual(states[0]);
+    expect(states[2]).toEqual(states[0]);
+    expect(Object.keys(states[0].media)).toEqual(['media-a']);
+    expect(states[0].media['media-a'].tags).toEqual([
+      'Camera A',
+      'Camera B',
+      'Synced later',
+    ]);
+    expect(states[0].media['media-a'].projectIds).toEqual([
+      'project-a',
+      'project-b',
+    ]);
+    expect(states[0].media['media-a'].favourite).toBe(true);
+    expect(states[0].conflicts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ entityId: 'media-a', field: 'notes' }),
+      ]),
+    );
+    expect(states[0].projects['project-a'].mediaIds).toEqual(['media-a']);
+    expect(states[0].projects['project-b'].mediaIds).toEqual(['media-a']);
+  });
+  it('does not merge by hash alone or merge matching paths with different hashes', () => {
+    const legacy = {
+      ...envelope(
+        {
+          type: 'media.registered' as const,
+          media: {
+            ...media,
+            id: 'legacy-id',
+            relativePath: '20261023/clip.mp4',
+            sha256: 'hash-one',
+          },
+        },
+        'legacy-media-legacy-id',
+        'migration',
+      ),
+    };
+    const state = rebuildCatalogue([
+      envelope(
+        {
+          type: 'media.registered',
+          media: {
+            ...media,
+            id: 'new-id',
+            relativePath: '20261023/clip.mp4',
+            sha256: 'hash-one',
+          },
+        },
+        'new',
+        'device-b',
+      ),
+      envelope(
+        {
+          type: 'media.registered',
+          media: {
+            ...media,
+            id: 'other-path',
+            relativePath: '20261024/clip.mp4',
+            sha256: 'hash-one',
+          },
+        },
+        'other-path',
+        'device-c',
+      ),
+      envelope(
+        {
+          type: 'media.registered',
+          media: {
+            ...media,
+            id: 'other-hash',
+            relativePath: '20261023/clip.mp4',
+            sha256: 'hash-two',
+          },
+        },
+        'other-hash',
+        'device-d',
+      ),
+      legacy,
+    ]);
+    expect(Object.keys(state.media).sort()).toEqual([
+      'legacy-id',
+      'other-hash',
+      'other-path',
+    ]);
+    expect(state.conflicts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: 'identity-hash' }),
+      ]),
+    );
+  });
   it('persists tagging and multiple project assignment', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),
