@@ -369,6 +369,10 @@ export const desktopBridge = {
   }) => invoke<Catalogue>('update_media', { update }),
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
+  retryProjectSynchronization: (projectId: string) =>
+    invoke<NonNullable<Catalogue['issues']>>('retry_project_synchronization', {
+      projectId,
+    }),
   rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
   getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),

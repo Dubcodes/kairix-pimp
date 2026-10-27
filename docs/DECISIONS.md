@@ -271,3 +271,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Persist sidebar collapse, folder sort mode and custom folder order as device settings. Folder ordering is a view projection only. A hidden attached WAV contributes its tags, projects and search fields to the grouped video and logical counts, while selecting the separately displayed WAV intentionally targets only that physical record. Unicode path matching uses locale-independent lowercase conversion without silently composing or decomposing filenames.
 - **Consequences:** Users may organize large Libraries without changing Master Bin layout or synchronized events. Paired bulk operations remain explicit two-record updates, projects and folders avoid double counts, and distinct Unicode filenames are not guessed to be equivalent.
+
+## ADR-036 — Recover project identity before allocation
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Before allocating a project UUID, compare the selected authorized directory with device-local project-path mappings, durable manifest retry records and any compatible existing manifest. Reuse the single established identity and skip a duplicate authoritative upsert when it already exists; reject multiple identities. On catalogue refresh, inspect compatible manifests for semantic drift and durably reconcile only those that differ, including media IDs canonicalized by path-plus-hash replay.
+- **Consequences:** Retrying a partially completed Create operation cannot register one folder twice. Historical event streams remain untouched, incompatible manifests remain protected, and ordinary unchanged Library refreshes perform no manifest or retry-state replacement.

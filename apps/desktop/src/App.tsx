@@ -958,6 +958,23 @@ export function App() {
       setBusy(false);
     }
   };
+  const retryProjectSynchronization = async (projectId: string) => {
+    setBusy(true);
+    setError('');
+    try {
+      const issues = await desktopBridge.retryProjectSynchronization(projectId);
+      await refresh();
+      if (issues.length) {
+        setError(issues.map((issue) => issue.detail).join(' '));
+      } else {
+        setMessage('Project manifest synchronization completed.');
+      }
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
   const activeJobs = jobs.filter(
     (job) => !['completed', 'cancelled', 'failed'].includes(job.state),
   );
@@ -2548,16 +2565,40 @@ export function App() {
               Create or associate project
             </button>
             <div className="project-list">
-              {catalogue.projects.map((project) => (
-                <div key={project.id}>
-                  <strong>{project.name}</strong>
-                  <small>{project.workingDirectory}</small>
-                  <span>
-                    {logicalProjectRecordingCount(project.id, catalogue.media)}{' '}
-                    assigned recordings
-                  </span>
-                </div>
-              ))}
+              {catalogue.projects.map((project) => {
+                const syncIssue = catalogue.issues?.find(
+                  (issue) =>
+                    issue.code === 'project-manifest-pending' &&
+                    issue.source === project.id,
+                );
+                return (
+                  <div key={project.id}>
+                    <strong>{project.name}</strong>
+                    <small>{project.workingDirectory}</small>
+                    <span>
+                      {logicalProjectRecordingCount(
+                        project.id,
+                        catalogue.media,
+                      )}{' '}
+                      assigned recordings
+                    </span>
+                    {syncIssue && (
+                      <>
+                        <small role="status">{syncIssue.detail}</small>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            void retryProjectSynchronization(project.id)
+                          }
+                        >
+                          Retry project synchronization
+                        </button>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </section>
         ) : (

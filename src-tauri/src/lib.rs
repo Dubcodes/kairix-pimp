@@ -746,11 +746,12 @@ fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catal
         &mut settings,
         &catalogue,
     )?;
+    let drifted_manifests = project_manifest_drift_requests(&settings, &catalogue);
     let manifest_issues = reconcile_project_manifests(
         &app,
         &settings,
         &catalogue,
-        std::iter::empty::<(String, Option<String>)>(),
+        drifted_manifests,
     )?;
     drop(_manifest_guard);
     let master = PathBuf::from(&settings.master_bin_path);
@@ -2724,11 +2725,11 @@ fn project_manifest_identity(value: &serde_json::Value) -> Result<String, String
     Ok((*first).to_string())
 }
 
-fn write_project_manifest(
+fn prepare_project_manifest(
     directory: &Path,
     project: &ProjectRecord,
     media: &[MediaItem],
-) -> Result<bool, String> {
+) -> Result<(PathBuf, serde_json::Value, bool), String> {
     let manifest_path = directory.join(".pimp-project.json");
     let mut value = if manifest_path.exists() {
         let value: serde_json::Value = read_json(&manifest_path)?;
@@ -2789,11 +2790,44 @@ fn write_project_manifest(
         object.insert("mediaIds".into(), serde_json::json!(project.media_ids));
         object.insert("createdAt".into(), serde_json::json!(project.created_at));
     }
-    if original.as_ref() == Some(&value) {
-        return Ok(false);
+    let changed = original.as_ref() != Some(&value);
+    Ok((manifest_path, value, changed))
+}
+
+fn write_project_manifest(
+    directory: &Path,
+    project: &ProjectRecord,
+    media: &[MediaItem],
+) -> Result<bool, String> {
+    let (manifest_path, value, changed) = prepare_project_manifest(directory, project, media)?;
+    if changed {
+        write_json(&manifest_path, &value)?;
     }
-    write_json(&manifest_path, &value)?;
-    Ok(true)
+    Ok(changed)
+}
+
+fn project_manifest_drift_requests(
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+) -> Vec<(String, Option<String>)> {
+    catalogue
+        .projects
+        .iter()
+        .filter_map(|project| {
+            let configured = settings.project_paths.get(&project.id)?;
+            let requires_sync = match fs_safe::resolve_project_directory(
+                Path::new(&settings.working_projects_path),
+                Path::new(configured),
+                false,
+            ) {
+                Ok(directory) => prepare_project_manifest(&directory, project, &catalogue.media)
+                    .map(|(_, _, changed)| changed)
+                    .unwrap_or(true),
+                Err(_) => true,
+            };
+            requires_sync.then(|| (project.id.clone(), Some(configured.clone())))
+        })
+        .collect()
 }
 
 fn persist_project_manifest_intents_with<I, W>(
@@ -3045,6 +3079,74 @@ where
     Ok(())
 }
 
+fn project_identity_for_directory(
+    sync_path: &Path,
+    settings: &DeviceSettings,
+    directory: &Path,
+    manifest_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let projects_root = Path::new(&settings.working_projects_path);
+    let mut identities = BTreeSet::new();
+    for (project_id, configured) in &settings.project_paths {
+        if fs_safe::resolve_project_directory(projects_root, Path::new(configured), false)
+            .is_ok_and(|resolved| resolved == directory)
+        {
+            identities.insert(project_id.clone());
+        }
+    }
+    let pending: ProjectManifestSyncState = read_json(sync_path)?;
+    for record in pending.pending.values() {
+        let Some(configured) = record.directory.as_deref() else {
+            continue;
+        };
+        if fs_safe::resolve_project_directory(projects_root, Path::new(configured), false)
+            .is_ok_and(|resolved| resolved == directory)
+        {
+            identities.insert(record.project_id.clone());
+        }
+    }
+    if let Some(manifest_id) = manifest_id {
+        identities.insert(manifest_id.to_string());
+    }
+    if identities.len() > 1 {
+        return Err(format!(
+            "The selected folder has conflicting project identities ({}). No files or associations were changed.",
+            identities.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(identities.into_iter().next())
+}
+
+fn project_from_manifest(
+    value: &serde_json::Value,
+    fallback_name: &str,
+) -> Result<ProjectRecord, String> {
+    let id = project_manifest_identity(value)?;
+    let project_value = value.get("project").unwrap_or(value);
+    Ok(ProjectRecord {
+        id,
+        name: project_value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(fallback_name)
+            .into(),
+        working_directory: ".".into(),
+        media_ids: vec![],
+        notes: project_value
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        tags: serde_json::from_value(project_value.get("tags").cloned().unwrap_or_default())
+            .unwrap_or_default(),
+        created_at: project_value
+            .get("createdAt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("1970-01-01T00:00:00Z")
+            .into(),
+    })
+}
+
 #[tauri::command]
 async fn update_media(
     app: AppHandle,
@@ -3207,44 +3309,44 @@ fn create_project(
         Path::new(&working_directory),
         true,
     )?;
+    let catalogue = {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        load_catalogue_file(&settings)?
+    };
+    let sync_path = project_manifest_sync_path(&app)?;
     let manifest_path = directory.join(".pimp-project.json");
-    let project = if manifest_path.exists() {
-        let value: serde_json::Value = read_json(&manifest_path)?;
-        let id = project_manifest_identity(&value)?;
-        let project_value = value.get("project").unwrap_or(&value);
-        ProjectRecord {
-            id,
-            name: project_value
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(name.trim())
-                .into(),
-            working_directory: ".".into(),
-            media_ids: vec![],
-            notes: project_value
-                .get("notes")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            tags: serde_json::from_value(project_value.get("tags").cloned().unwrap_or_default())
-                .unwrap_or_default(),
-            created_at: project_value
-                .get("createdAt")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("1970-01-01T00:00:00Z")
-                .into(),
-        }
-    } else {
-        ProjectRecord {
-            id: Uuid::new_v4().to_string(),
+    let manifest_value = manifest_path
+        .exists()
+        .then(|| read_json::<serde_json::Value>(&manifest_path))
+        .transpose()?;
+    let manifest_id = manifest_value
+        .as_ref()
+        .map(project_manifest_identity)
+        .transpose()?;
+    let recovered_id = project_identity_for_directory(
+        &sync_path,
+        &settings,
+        &directory,
+        manifest_id.as_deref(),
+    )?;
+    let manifest_project = manifest_value
+        .as_ref()
+        .map(|value| project_from_manifest(value, name.trim()))
+        .transpose()?;
+    let project = recovered_id
+        .as_ref()
+        .and_then(|id| catalogue.projects.iter().find(|project| &project.id == id))
+        .cloned()
+        .or(manifest_project)
+        .unwrap_or_else(|| ProjectRecord {
+            id: recovered_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: name.trim().into(),
             working_directory: ".".into(),
             media_ids: vec![],
             notes: String::new(),
             tags: vec![],
             created_at: Utc::now().to_rfc3339(),
-        }
-    };
+        });
     if let Some(existing) = settings.project_paths.get(&project.id) {
         let existing = fs_safe::resolve_project_directory(
             Path::new(&settings.working_projects_path),
@@ -3258,7 +3360,10 @@ fn create_project(
             ));
         }
     }
-    let sync_path = project_manifest_sync_path(&app)?;
+    let already_registered = catalogue
+        .projects
+        .iter()
+        .any(|existing| existing.id == project.id);
     let settings_file = settings_path(&app)?;
     commit_project_creation_with(
         &sync_path,
@@ -3267,6 +3372,9 @@ fn create_project(
         &project,
         &directory,
         |current_settings| {
+            if already_registered {
+                return Ok(());
+            }
             let _catalogue_guard = state.catalogue_write.lock().unwrap();
             append_events(
                 current_settings,
@@ -3286,6 +3394,25 @@ fn create_project(
         },
     )?;
     Ok(project)
+}
+
+#[tauri::command]
+fn retry_project_synchronization(
+    app: AppHandle,
+    state: State<NativeState>,
+    project_id: String,
+) -> Result<Vec<CatalogueIssue>, String> {
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
+    let settings = load_settings_file(&app)?;
+    let catalogue = {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        load_catalogue_file(&settings)?
+    };
+    if !catalogue.projects.iter().any(|project| project.id == project_id) {
+        return Err("The project is not present in the authoritative catalogue".into());
+    }
+    let directory = settings.project_paths.get(&project_id).cloned();
+    reconcile_project_manifests(&app, &settings, &catalogue, [(project_id, directory)])
 }
 fn publish_discovery_status(app: &AppHandle, state: &NativeState, status: &DiscoveryStatus) {
     *state.discovery_status.lock().unwrap() = status.clone();
@@ -4140,6 +4267,7 @@ pub fn run() {
             cancel_ingest,
             update_media,
             create_project,
+            retry_project_synchronization,
             rescan,
             get_discovery_status,
             log_ui_error,
@@ -5554,6 +5682,170 @@ mod tests {
         assert_eq!(value["customTopLevel"]["keep"], true);
         assert_eq!(value["project"]["customProjectField"], "keep-me");
         assert_eq!(value["project"]["name"], "Updated");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_project_creation_reuses_pending_and_persisted_folder_identity() {
+        let root = temporary("project-identity-retry");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Project A");
+        fs::create_dir_all(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let state_path = root.join("manifest-sync.json");
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        persist_project_manifest_intents(
+            &state_path,
+            [("project-a".into(), Some(directory.to_string_lossy().into_owned()))],
+        )
+        .unwrap();
+
+        assert_eq!(
+            project_identity_for_directory(&state_path, &settings, &directory, None).unwrap(),
+            Some("project-a".into())
+        );
+        settings
+            .project_paths
+            .insert("project-a".into(), directory.to_string_lossy().into_owned());
+        assert_eq!(
+            project_identity_for_directory(&state_path, &settings, &directory, None).unwrap(),
+            Some("project-a".into())
+        );
+
+        let restarted: ProjectManifestSyncState = read_json(&state_path).unwrap();
+        assert_eq!(restarted.pending["project-a"].project_id, "project-a");
+        settings
+            .project_paths
+            .insert("project-b".into(), directory.to_string_lossy().into_owned());
+        let conflict = project_identity_for_directory(
+            &state_path,
+            &settings,
+            &directory,
+            Some("project-c"),
+        )
+        .unwrap_err();
+        assert!(conflict.contains("conflicting project identities"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_two_device_media_alias_in_manifest_reconciles_once() {
+        let root = temporary("manifest-media-alias");
+        let projects_root = root.join("projects");
+        let directory = projects_root.join("Simple Vlog 057");
+        fs::create_dir_all(&directory).unwrap();
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"synthetic").unwrap();
+        let mut first = new_media(
+            &source,
+            "20261028/clip.mp4".into(),
+            None,
+            "same-hash".into(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        first.id = "media-a".into();
+        let mut second = first.clone();
+        second.id = "media-b".into();
+        let project = ProjectRecord {
+            id: "project-a".into(),
+            name: "Simple Vlog 057".into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-28T00:00:00Z".into(),
+        };
+        let event = |device: &str, sequence: u64, event: CatalogueEvent| {
+            catalogue::EventEnvelope {
+                schema_version: catalogue::EVENT_SCHEMA_VERSION,
+                event_id: format!("{device}-{sequence}"),
+                device_id: device.into(),
+                sequence,
+                occurred_at: "2026-10-28T00:00:00Z".into(),
+                observed: BTreeMap::new(),
+                event,
+            }
+        };
+        let catalogue = catalogue::rebuild(catalogue::EventRead {
+            events: vec![
+                event(
+                    "device-a",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: first },
+                ),
+                event(
+                    "device-b",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: second },
+                ),
+                event(
+                    "device-b",
+                    2,
+                    CatalogueEvent::MediaProjectsAdded {
+                        media_id: "media-b".into(),
+                        values: vec!["project-a".into()],
+                    },
+                ),
+                event(
+                    "device-c",
+                    1,
+                    CatalogueEvent::ProjectUpserted {
+                        project: project.clone(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.media.len(), 1);
+        let canonical_id = catalogue.media[0].id.clone();
+        assert_eq!(catalogue.projects[0].media_ids, vec![canonical_id.clone()]);
+        write_json(
+            &directory.join(".pimp-project.json"),
+            &serde_json::json!({
+                "schemaVersion": 2,
+                "customField": "preserved",
+                "id": "project-a",
+                "name": "Simple Vlog 057",
+                "workingDirectory": ".",
+                "mediaIds": ["media-b"],
+                "media": [{
+                    "id": "media-b",
+                    "relativePath": "20261028/clip.mp4",
+                    "sha256": "same-hash",
+                    "tags": []
+                }]
+            }),
+        )
+        .unwrap();
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        settings
+            .project_paths
+            .insert("project-a".into(), directory.to_string_lossy().into_owned());
+        let requests = project_manifest_drift_requests(&settings, &catalogue);
+        assert_eq!(requests.len(), 1);
+        let state_path = root.join("manifest-sync.json");
+        let issues = reconcile_project_manifests_with(
+            &state_path,
+            &settings,
+            &catalogue,
+            requests,
+            write_project_manifest,
+            write_json_if_changed,
+        )
+        .unwrap();
+        assert!(issues.is_empty());
+        let manifest: serde_json::Value =
+            read_json(&directory.join(".pimp-project.json")).unwrap();
+        assert_eq!(manifest["customField"], "preserved");
+        assert_eq!(manifest["media"][0]["id"], canonical_id);
+        assert!(project_manifest_drift_requests(&settings, &catalogue).is_empty());
+        assert!(!write_project_manifest(&directory, &catalogue.projects[0], &catalogue.media)
+            .unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

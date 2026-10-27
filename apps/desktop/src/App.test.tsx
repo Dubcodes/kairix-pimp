@@ -56,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   inventorySources: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
+  retryProjectSynchronization: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -119,6 +120,7 @@ vi.mock('./bridge', () => ({
     cancelIngest: vi.fn(),
     updateMedia: mocks.updateMedia,
     createProject: vi.fn(),
+    retryProjectSynchronization: mocks.retryProjectSynchronization,
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
     mediaToolsStatus: mocks.mediaToolsStatus,
@@ -215,7 +217,48 @@ describe('native application integration', () => {
     mocks.updateMedia.mockReset();
     mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
     mocks.openSupportLink.mockReset();
+    mocks.retryProjectSynchronization.mockReset();
+    mocks.retryProjectSynchronization.mockResolvedValue([]);
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
+  });
+
+  it('offers an explicit retry for pending project manifest synchronization', async () => {
+    mocks.catalogue = {
+      media: [],
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Simple Vlog 057',
+          workingDirectory: 'C:\\Projects\\Simple Vlog 057',
+          mediaIds: [],
+          notes: '',
+          tags: [],
+          createdAt: '2026-10-28T00:00:00Z',
+        },
+      ],
+      issues: [
+        {
+          code: 'project-manifest-pending',
+          source: 'project-a',
+          detail: 'Manifest synchronization is pending.',
+        },
+      ],
+      updatedAt: '2026-10-28T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Projects' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Retry project synchronization' }),
+    );
+    await waitFor(() =>
+      expect(mocks.retryProjectSynchronization).toHaveBeenCalledWith(
+        'project-a',
+      ),
+    );
+    expect(
+      await screen.findByText('Project manifest synchronization completed.'),
+    ).toBeVisible();
   });
 
   it('shows a useful persisted empty library without demo media', async () => {
