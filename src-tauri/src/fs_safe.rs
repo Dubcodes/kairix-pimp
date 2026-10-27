@@ -128,9 +128,10 @@ pub fn resolve_project_directory(
         .canonicalize()
         .map_err(|error| format!("Cannot resolve Working Projects root: {error}"))?;
     if requested.as_os_str().is_empty()
-        || requested
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
+        || (!requested.is_absolute()
+            && requested
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)))
     {
         return Err("Project path contains traversal outside the authorized root".into());
     }
@@ -442,7 +443,14 @@ mod tests {
             nested.canonicalize().unwrap()
         );
         assert!(resolve_project_directory(&projects, Path::new("../escape"), true).is_err());
+        assert!(resolve_project_directory(
+            &projects,
+            &projects.join("..").join("absolute-escape"),
+            true
+        )
+        .is_err());
         assert!(!root.join("escape").exists());
+        assert!(!root.join("absolute-escape").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
