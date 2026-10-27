@@ -143,6 +143,16 @@ vi.mock('./bridge', () => ({
 import { App } from './App';
 import { datePatternPreview } from './date-pattern';
 
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
 describe('native application integration', () => {
   it('previews date, 24-hour and 12-hour folder tokens', () => {
     const now = new Date(2026, 9, 23, 17, 42, 9);
@@ -204,7 +214,9 @@ describe('native application integration', () => {
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
     mocks.revealMediaInExplorer.mockReset();
+    mocks.revealMediaInExplorer.mockResolvedValue(undefined);
     mocks.openMediaFolder.mockReset();
+    mocks.openMediaFolder.mockResolvedValue(undefined);
     mocks.mediaToolsStatus.mockReset();
     mocks.mediaToolsStatus.mockResolvedValue({
       ffmpegAvailable: true,
@@ -388,6 +400,25 @@ describe('native application integration', () => {
     expect(mocks.openProjectFolder).toHaveBeenCalledWith('project-a');
 
     await user.click(screen.getByRole('checkbox', { name: /DJI_0001.MP4/ }));
+    await user.click(screen.getByRole('button', { name: 'Mark favourite' }));
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['video', 'audio'],
+      favourite: true,
+    });
+    const recordingNotes = screen.getByRole('textbox', {
+      name: 'Recording description',
+    });
+    await user.type(recordingNotes, 'Primary clip note');
+    await user.click(screen.getByRole('button', { name: 'Save description' }));
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['video'],
+      notes: 'Primary clip note',
+    });
+    await user.click(screen.getAllByRole('button', { name: 'Reveal' })[0]);
+    expect(mocks.revealMediaInExplorer).toHaveBeenCalledWith('video');
+    expect(
+      screen.getByRole('checkbox', { name: /DJI_0001.MP4/ }),
+    ).toBeChecked();
     await user.click(
       screen.getByRole('button', { name: 'Copy original paths' }),
     );
@@ -421,16 +452,82 @@ describe('native application integration', () => {
       tags: ['vlog'],
     });
 
-    await user.click(
-      screen.getAllByRole('button', { name: 'View in Library' })[0],
-    );
+    screen.getAllByRole('button', { name: 'View in Library' })[0].focus();
+    await user.keyboard('{Enter}');
     expect(
       screen.getByRole('heading', { name: 'Media library' }),
     ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('option', { name: /DJI_0001.MP4/ }),
+      ).toHaveFocus(),
+    );
     await user.click(screen.getByRole('button', { name: 'Simple Vlog 057' }));
     expect(
       screen.getByRole('heading', { name: 'Simple Vlog 057' }),
     ).toBeVisible();
+  });
+
+  it('ignores superseded project inventory results and failures', async () => {
+    mocks.catalogue = {
+      media: [],
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Project A',
+          workingDirectory: 'C:\\Projects\\A',
+          mediaIds: [],
+          notes: '',
+          tags: [],
+          createdAt: '2026-10-28T00:00:00Z',
+        },
+        {
+          id: 'project-b',
+          name: 'Project B',
+          workingDirectory: 'C:\\Projects\\B',
+          mediaIds: [],
+          notes: '',
+          tags: [],
+          createdAt: '2026-10-28T00:00:00Z',
+        },
+      ],
+      updatedAt: '2026-10-28T00:00:00Z',
+    };
+    const first = deferred<import('./bridge').ProjectInventory>();
+    const second = deferred<import('./bridge').ProjectInventory>();
+    mocks.inventoryProject
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Projects' }));
+    await user.click(
+      screen.getByRole('button', { name: /Project A.*0 assigned/ }),
+    );
+    await user.click(screen.getByRole('button', { name: /Back to Projects/ }));
+    await user.click(
+      screen.getByRole('button', { name: /Project B.*0 assigned/ }),
+    );
+
+    second.resolve({
+      projectId: 'project-b',
+      rootPath: 'C:\\Projects\\B',
+      itemCount: 1,
+      sizeBytes: 10,
+      mainPremiereProject: 'Project B.prproj',
+      scannedAt: '2026-10-28T01:00:00Z',
+      items: [],
+    });
+    expect(await screen.findByText('Project B.prproj')).toBeVisible();
+    first.reject(new Error('Project A drive disappeared'));
+    await act(async () => first.promise.catch(() => undefined));
+    expect(screen.getByText('Project B.prproj')).toBeVisible();
+    expect(
+      screen.queryByText(/Project A drive disappeared/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Refresh inventory' }),
+    ).toBeEnabled();
   });
 
   it('shows a useful persisted empty library without demo media', async () => {

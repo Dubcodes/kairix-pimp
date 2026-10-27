@@ -123,6 +123,9 @@ export function App() {
   const [projectMediaSelection, setProjectMediaSelection] = useState<string[]>(
     [],
   );
+  const [projectAddTags, setProjectAddTags] = useState<string[]>([]);
+  const [projectRemoveTags, setProjectRemoveTags] = useState<string[]>([]);
+  const [projectMediaDescription, setProjectMediaDescription] = useState('');
   const [projectNotes, setProjectNotes] = useState('');
   const [projectTags, setProjectTags] = useState<string[]>([]);
   const [sources, setSources] = useState<string[]>([]);
@@ -183,6 +186,9 @@ export function App() {
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
   const contentRef = useRef<HTMLElement>(null);
+  const projectInventoryGeneration = useRef(0);
+  const libraryCardRefs = useRef(new Map<string, HTMLElement>());
+  const [libraryLocateId, setLibraryLocateId] = useState<string>();
   const settingsRef = useRef(settings);
   const [savingSettings] = useState(
     () =>
@@ -579,6 +585,22 @@ export function App() {
       }),
     [catalogue, displayedMedia, folder, query],
   );
+  useEffect(() => {
+    if (view !== 'Library' || !libraryLocateId) return;
+    const card = libraryCardRefs.current.get(libraryLocateId);
+    if (!card) {
+      setError(
+        'The selected recording is not currently available in this Library view.',
+      );
+      setLibraryLocateId(undefined);
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      card.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+      card.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [filtered, libraryLocateId, view]);
   const knownTags = useMemo(
     () =>
       [
@@ -1039,23 +1061,39 @@ export function App() {
     }
   };
   const refreshProjectInventory = async (projectId: string) => {
+    const generation = ++projectInventoryGeneration.current;
     setProjectInventoryLoading(true);
     setProjectInventoryError('');
     try {
-      setProjectInventory(await desktopBridge.inventoryProject(projectId));
+      const inventory = await desktopBridge.inventoryProject(projectId);
+      if (
+        generation !== projectInventoryGeneration.current ||
+        inventory.projectId !== projectId
+      )
+        return;
+      setProjectInventory(inventory);
     } catch (reason) {
+      if (generation !== projectInventoryGeneration.current) return;
       setProjectInventory(undefined);
       setProjectInventoryError(errorText(reason));
     } finally {
-      setProjectInventoryLoading(false);
+      if (generation === projectInventoryGeneration.current)
+        setProjectInventoryLoading(false);
     }
   };
   const openProject = (project: ProjectRecord) => {
+    projectInventoryGeneration.current += 1;
     setSelectedProjectId(project.id);
+    setProjectInventory(undefined);
+    setProjectInventoryError('');
+    setProjectInventoryLoading(false);
     setProjectNotes(project.notes);
     setProjectTags(project.tags);
     setProjectMediaQuery('');
     setProjectMediaSelection([]);
+    setProjectAddTags([]);
+    setProjectRemoveTags([]);
+    setProjectMediaDescription('');
     void refreshProjectInventory(project.id);
   };
   const saveProjectInformation = async () => {
@@ -1124,6 +1162,54 @@ export function App() {
     } catch (reason) {
       setError(errorText(reason));
     }
+  };
+  const updateProjectMedia = async (
+    patch: {
+      addTags?: string[];
+      removeTags?: string[];
+      favourite?: boolean;
+      notes?: string;
+    },
+    grouped = true,
+  ) => {
+    if (!projectMediaSelection.length) return;
+    const mediaIds = grouped
+      ? expandLogicalMediaIds(projectMediaSelection, catalogue.media)
+      : [projectMediaSelection[0]];
+    setBusy(true);
+    setError('');
+    try {
+      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...patch }));
+      setMessage('Selected project recording metadata saved.');
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const navigateProjectMediaToLibrary = (mediaId: string) => {
+    const requested = catalogue.media.find((item) => item.id === mediaId);
+    if (!requested) {
+      setError('The selected recording is no longer present in the catalogue.');
+      return;
+    }
+    const visible = displayedMedia.find((item) => item.id === mediaId);
+    const groupedParent = displayedMedia.find(
+      (item) => item.attachedAudioId === mediaId,
+    );
+    const target = visible ?? groupedParent;
+    if (!target) {
+      setError(
+        'The selected recording cannot be displayed with the current Library settings.',
+      );
+      return;
+    }
+    setView('Library');
+    setFolder('All media');
+    setQuery('');
+    setSelected([target.id]);
+    selectionAnchor.current = target.id;
+    setLibraryLocateId(target.id);
   };
   const activeJobs = jobs.filter(
     (job) => !['completed', 'cancelled', 'failed'].includes(job.state),
@@ -2114,8 +2200,13 @@ export function App() {
                   >
                     {filtered.map((item) => (
                       <article
-                        className={selected.includes(item.id) ? 'selected' : ''}
+                        className={`${selected.includes(item.id) ? 'selected' : ''} ${libraryLocateId === item.id ? 'located' : ''}`.trim()}
                         key={item.id}
+                        ref={(element) => {
+                          if (element)
+                            libraryCardRefs.current.set(item.id, element);
+                          else libraryCardRefs.current.delete(item.id);
+                        }}
                         role="option"
                         tabIndex={0}
                         aria-selected={selected.includes(item.id)}
@@ -2707,9 +2798,11 @@ export function App() {
                 <button
                   type="button"
                   onClick={() => {
+                    projectInventoryGeneration.current += 1;
                     setSelectedProjectId(undefined);
                     setProjectInventory(undefined);
                     setProjectInventoryError('');
+                    setProjectInventoryLoading(false);
                   }}
                 >
                   <ArrowLeft aria-hidden="true" size={15} /> Back to Projects
@@ -2947,6 +3040,102 @@ export function App() {
                     >
                       <Copy aria-hidden="true" size={14} /> Copy original paths
                     </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void updateProjectMedia({ favourite: true })
+                      }
+                    >
+                      Mark favourite
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void updateProjectMedia({ favourite: false })
+                      }
+                    >
+                      Remove favourite
+                    </button>
+                    <SearchableComboBox
+                      label="Tags to add to selected recordings"
+                      mode="multiple"
+                      options={knownTags.map((tag) => ({
+                        id: tag,
+                        label: tag,
+                      }))}
+                      selectedIds={projectAddTags}
+                      onSelectionChange={setProjectAddTags}
+                      onCreate={(label) => ({ id: label, label })}
+                      placeholder="Tags to add…"
+                    />
+                    <button
+                      type="button"
+                      disabled={busy || !projectAddTags.length}
+                      onClick={() =>
+                        void updateProjectMedia({ addTags: projectAddTags })
+                      }
+                    >
+                      Add selected tags
+                    </button>
+                    <SearchableComboBox
+                      label="Tags to remove from selected recordings"
+                      mode="multiple"
+                      options={[
+                        ...new Set(
+                          projectMediaSelection.flatMap((id) => {
+                            const item = catalogue.media.find(
+                              (candidate) => candidate.id === id,
+                            );
+                            return item
+                              ? logicalTags(item, catalogue.media)
+                              : [];
+                          }),
+                        ),
+                      ].map((tag) => ({ id: tag, label: tag }))}
+                      selectedIds={projectRemoveTags}
+                      onSelectionChange={setProjectRemoveTags}
+                      placeholder="Tags to remove…"
+                    />
+                    <button
+                      type="button"
+                      disabled={busy || !projectRemoveTags.length}
+                      onClick={() =>
+                        void updateProjectMedia({
+                          removeTags: projectRemoveTags,
+                        })
+                      }
+                    >
+                      Remove selected tags
+                    </button>
+                    {projectMediaSelection.length === 1 && (
+                      <div className="project-media-description">
+                        <label htmlFor="project-media-description">
+                          Recording description
+                        </label>
+                        <input
+                          id="project-media-description"
+                          value={projectMediaDescription}
+                          onChange={(event) =>
+                            setProjectMediaDescription(event.target.value)
+                          }
+                          placeholder="Description or notes"
+                        />
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            void updateProjectMedia(
+                              { notes: projectMediaDescription },
+                              false,
+                            )
+                          }
+                        >
+                          Save description
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
                 {[
@@ -2960,17 +3149,23 @@ export function App() {
                     <h4>{heading as string}</h4>
                     <div className="project-media-list">
                       {(recordings as typeof projectMedia).map((item) => (
-                        <label key={item.id}>
+                        <div className="project-media-row" key={item.id}>
                           <input
                             type="checkbox"
+                            aria-label={`Select ${item.originalFilename}`}
                             checked={projectMediaSelection.includes(item.id)}
-                            onChange={(event) =>
+                            onChange={(event) => {
                               setProjectMediaSelection((current) =>
                                 event.target.checked
                                   ? [...new Set([...current, item.id])]
                                   : current.filter((id) => id !== item.id),
-                              )
-                            }
+                              );
+                              if (event.target.checked) {
+                                setProjectMediaDescription(item.notes);
+                                setProjectAddTags([]);
+                                setProjectRemoveTags([]);
+                              }
+                            }}
                           />
                           <div className="project-media-thumb">
                             <MediaThumbnail
@@ -2994,26 +3189,25 @@ export function App() {
                           <button
                             type="button"
                             disabled={!item.available}
-                            onClick={() =>
+                            onClick={(event) => {
+                              event.stopPropagation();
                               void desktopBridge
                                 .revealMediaInExplorer(item.id)
-                                .catch((reason) => setError(errorText(reason)))
-                            }
+                                .catch((reason) => setError(errorText(reason)));
+                            }}
                           >
                             Reveal
                           </button>
                           <button
                             type="button"
-                            onClick={() => {
-                              setView('Library');
-                              setFolder('All media');
-                              setQuery('');
-                              setSelected([item.id]);
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              navigateProjectMediaToLibrary(item.id);
                             }}
                           >
                             View in Library
                           </button>
-                        </label>
+                        </div>
                       ))}
                     </div>
                   </div>

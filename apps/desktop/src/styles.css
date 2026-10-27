@@ -1928,7 +1928,7 @@ select:disabled {
 .project-media-section h4 {
   margin: 12px 0 4px;
 }
-.project-media-list > label {
+.project-media-row {
   min-width: 0;
   padding: 9px;
   border: 1px solid var(--border);
@@ -1951,12 +1951,12 @@ select:disabled {
   height: 100%;
   object-fit: cover;
 }
-.project-media-list > label > span {
+.project-media-row > span {
   min-width: 0;
   display: grid;
   gap: 2px;
 }
-.project-media-list > label small {
+.project-media-row small {
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1967,11 +1967,28 @@ select:disabled {
   color: var(--text);
   background: var(--bg-control);
 }
+.project-media-description {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 6px;
+  align-items: end;
+}
+.project-media-description input {
+  grid-column: 1;
+}
+.project-media-description button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+.cards > article.located {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
 @media (max-width: 1100px) {
   .project-summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .project-media-list > label {
+  .project-media-row {
     grid-template-columns: auto 64px minmax(0, 1fr) auto;
   }
 }

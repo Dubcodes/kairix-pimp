@@ -285,3 +285,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Inventory only files beneath the canonically authorized device-local project path, preserving relative paths and basic filesystem metadata without content hashing. Categorize by folder and extension, exclude auto-save locations from deterministic main `.prproj` selection, and expose only project-ID/relative-path reveal operations. Linked Master Bin media remains an assignment projection and is never copied or deleted by the workspace.
 - **Consequences:** Existing projects become navigable without modifying assets or relying on undocumented Premiere formats. Folder scans may still be expensive for exceptionally large projects and require installed-drive acceptance and future bounded progress/cancellation if profiling demonstrates a need.
+
+## ADR-038 — Supersede project inventory views and bound native walks
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Every project inventory request carries an in-memory UI generation and is accepted only while its project and generation remain current. Switching projects, returning to the index, or starting another refresh supersedes earlier results without claiming to cancel their underlying blocking filesystem walk. Native inventory remains read-only, does not follow links or hash assets, and fails clearly after 100,000 files or 64 hierarchy levels.
+- **Consequences:** Late successes and failures cannot replace another project's status, while an already-running OS walk may finish harmlessly in the blocking worker pool. Very large projects require narrower roots or a future cooperatively cancellable streaming inventory design.

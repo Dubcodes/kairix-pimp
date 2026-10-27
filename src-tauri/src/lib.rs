@@ -3559,11 +3559,37 @@ fn inventory_project_directory(
     project_name: &str,
     directory: &Path,
 ) -> Result<ProjectInventory, String> {
+    inventory_project_directory_with_limits(
+        project_id,
+        project_name,
+        directory,
+        100_000,
+        64,
+    )
+}
+
+fn inventory_project_directory_with_limits(
+    project_id: &str,
+    project_name: &str,
+    directory: &Path,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<ProjectInventory, String> {
     let mut items = Vec::new();
     for entry in WalkDir::new(directory).follow_links(false).into_iter() {
         let entry = entry.map_err(|error| format!("Project inventory failed: {error}"))?;
+        if entry.depth() > max_depth {
+            return Err(format!(
+                "Project inventory stopped because the folder hierarchy exceeds {max_depth} levels"
+            ));
+        }
         if !entry.file_type().is_file() {
             continue;
+        }
+        if items.len() >= max_entries {
+            return Err(format!(
+                "Project inventory stopped after {max_entries} files; narrow the project folder before scanning again"
+            ));
         }
         let path = entry.path();
         let relative = path
@@ -3600,11 +3626,16 @@ fn inventory_project_directory(
             )
         })
         .map(|item| item.relative_path.clone());
+    let size_bytes = items.iter().try_fold(0_u64, |total, item| {
+        total.checked_add(item.size_bytes).ok_or_else(|| {
+            "Project inventory size exceeds the supported range".to_string()
+        })
+    })?;
     Ok(ProjectInventory {
         project_id: project_id.into(),
         root_path: directory.to_string_lossy().into_owned(),
         item_count: items.len(),
-        size_bytes: items.iter().map(|item| item.size_bytes).sum(),
+        size_bytes,
         main_premiere_project,
         scanned_at: Utc::now().to_rfc3339(),
         items,
@@ -6172,6 +6203,32 @@ mod tests {
             .any(|item| item.relative_path == "assets/video/new-take.mp4"));
         fs::remove_dir_all(root).unwrap();
         assert!(inventory_project_directory("project-a", "Simple Vlog 057", &directory).is_err());
+    }
+
+    #[test]
+    fn project_inventory_fails_clearly_when_the_file_budget_is_exceeded() {
+        let root = temporary("project-inventory-budget");
+        let directory = root.join("project");
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..4 {
+            fs::write(
+                directory.join(format!("asset-{index}.mp4")),
+                b"media",
+            )
+            .unwrap();
+        }
+
+        let error = inventory_project_directory_with_limits(
+            "project-a",
+            "Budget Test",
+            &directory,
+            3,
+            64,
+        )
+        .unwrap_err();
+        assert!(error.contains("stopped after 3 files"));
+        assert_eq!(fs::read(directory.join("asset-0.mp4")).unwrap(), b"media");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
