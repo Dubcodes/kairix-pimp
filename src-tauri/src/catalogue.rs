@@ -876,7 +876,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                     add_conflict(
                         &mut catalogue,
                         MetadataConflict {
-                            entity_id: media_id.clone(),
+                            entity_id: media_id.to_string(),
                             field: "missing-media".into(),
                             event_ids: vec![envelope.event_id.clone()],
                             values: vec![serde_json::to_value(&envelope.event).unwrap()],
@@ -926,7 +926,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                     add_conflict(
                         &mut catalogue,
                         MetadataConflict {
-                            entity_id: media_id.clone(),
+                            entity_id: media_id.to_string(),
                             field: "missing-media".into(),
                             event_ids: vec![envelope.event_id.clone()],
                             values: vec![serde_json::to_value(&envelope.event).unwrap()],
@@ -962,7 +962,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
-                                entity_id: media_id.clone(),
+                                entity_id: media_id.to_string(),
                                 field: "notes".into(),
                                 event_ids: vec![
                                     previous.event_id.clone(),
@@ -1001,7 +1001,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
-                                entity_id: media_id.clone(),
+                                entity_id: media_id.to_string(),
                                 field: "favourite".into(),
                                 event_ids: vec![
                                     previous.event_id.clone(),
