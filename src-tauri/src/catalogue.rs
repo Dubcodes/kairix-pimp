@@ -771,7 +771,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                                 field: "registration".into(),
                                 event_ids: vec![envelope.event_id.clone()],
                                 values: vec![
-                                    serde_json::to_value(existing).unwrap(),
+                                    serde_json::to_value(&*existing).unwrap(),
                                     serde_json::to_value(item).unwrap(),
                                 ],
                             },
