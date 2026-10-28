@@ -4799,9 +4799,26 @@ fn hover_preview_cache_usage(app: AppHandle) -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn clear_hover_preview_cache(app: AppHandle) -> Result<u64, String> {
-    let settings = load_settings_file(&app)?;
-    let root = hover_preview_root(&settings)?;
+async fn clear_hover_preview_cache(app: AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let settings = load_settings_file(&app)?;
+        let root = hover_preview_root(&settings)?;
+        clear_hover_preview_cache_synchronized(&state.preview_generation, &root)
+    })
+    .await
+    .map_err(|error| format!("Hover preview cache clear task failed: {error}"))?
+}
+
+fn clear_hover_preview_cache_synchronized(
+    preview_generation: &Mutex<()>,
+    root: &Path,
+) -> Result<u64, String> {
+    let _guard = preview_generation.lock().unwrap();
+    clear_hover_preview_cache_contents(root)
+}
+
+fn clear_hover_preview_cache_contents(root: &Path) -> Result<u64, String> {
     for entry in fs::read_dir(&root)
         .map_err(|error| format!("Cannot inspect hover preview cache: {error}"))?
         .filter_map(Result::ok)
@@ -6862,6 +6879,40 @@ mod tests {
         assert!(!first.exists());
         assert!(second.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hover_preview_cache_clear_waits_for_generation_and_stays_scoped() {
+        let parent = temporary("hover-preview-clear");
+        let root = parent.join("cache");
+        let generating = root.join(".generating-active");
+        let complete = root.join("complete");
+        let unrelated_cache_directory = root.join("unrelated");
+        let master_media = parent.join("master-clip.mp4");
+        fs::create_dir_all(&generating).unwrap();
+        fs::create_dir_all(&complete).unwrap();
+        fs::create_dir_all(&unrelated_cache_directory).unwrap();
+        fs::write(generating.join("frame-001.jpg"), b"temporary").unwrap();
+        fs::write(complete.join("manifest.json"), b"{}").unwrap();
+        fs::write(master_media.clone(), b"original-media").unwrap();
+
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let generation_guard = lock.lock().unwrap();
+        let thread_lock = lock.clone();
+        let thread_root = root.clone();
+        let clear = std::thread::spawn(move || {
+            clear_hover_preview_cache_synchronized(&thread_lock, &thread_root).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(generating.exists());
+        drop(generation_guard);
+        assert_eq!(clear.join().unwrap(), 0);
+
+        assert!(!generating.exists());
+        assert!(!complete.exists());
+        assert!(unrelated_cache_directory.exists());
+        assert_eq!(fs::read(master_media).unwrap(), b"original-media");
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

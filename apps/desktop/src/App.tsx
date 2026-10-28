@@ -58,6 +58,7 @@ import {
   type AvailableUpdate,
 } from './updates';
 import { SettingsWriteQueue } from './settings-write-queue';
+import { hoverPreviewRequestCache } from './hover-preview-cache';
 import {
   associatedMedia,
   expandLogicalMediaIds,
@@ -154,6 +155,8 @@ export function App() {
     Record<string, string>
   >({});
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
+  const [previewCacheEpoch, setPreviewCacheEpoch] = useState(0);
+  const [clearingPreviewCache, setClearingPreviewCache] = useState(false);
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
   const [updaterConfiguration, setUpdaterConfiguration] =
     useState<UpdaterConfiguration>();
@@ -1026,6 +1029,22 @@ export function App() {
       ].join('\r\n'),
     );
     setMessage('Diagnostic summary copied without personal file paths.');
+  };
+  const clearPreviewCache = async () => {
+    setClearingPreviewCache(true);
+    setError('');
+    hoverPreviewRequestCache.invalidate();
+    setPreviewCacheEpoch((value) => value + 1);
+    try {
+      setPreviewCacheUsage(await desktopBridge.clearHoverPreviewCache());
+      setMessage('Device-local hover preview cache cleared.');
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      hoverPreviewRequestCache.invalidate();
+      setPreviewCacheEpoch((value) => value + 1);
+      setClearingPreviewCache(false);
+    }
   };
   const checkForUpdates = useCallback(async () => {
     if (!updaterConfiguration?.configured) {
@@ -2096,14 +2115,12 @@ export function App() {
                     </small>
                     <button
                       type="button"
-                      onClick={() =>
-                        void desktopBridge
-                          .clearHoverPreviewCache()
-                          .then(setPreviewCacheUsage)
-                          .catch((reason) => setError(errorText(reason)))
-                      }
+                      disabled={clearingPreviewCache}
+                      onClick={() => void clearPreviewCache()}
                     >
-                      Clear preview cache
+                      {clearingPreviewCache
+                        ? 'Waiting for preview generation…'
+                        : 'Clear preview cache'}
                     </button>
                     <button
                       type="button"
@@ -2502,8 +2519,10 @@ export function App() {
                             thumbnailSource={thumbnailSources[item.id]}
                             sourceAvailable={item.available}
                             previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
+                            previewCacheEpoch={previewCacheEpoch}
                             enableHoverPreview={
-                              settings.hoverPreviewsEnabled ?? true
+                              (settings.hoverPreviewsEnabled ?? true) &&
+                              !clearingPreviewCache
                             }
                           />
                           <span>
@@ -3662,7 +3681,6 @@ function jobIsClearableHistory(job: IngestJob) {
   );
 }
 
-const hoverPreviewRequests = new Map<string, Promise<HoverPreview>>();
 const previewableVideoTypes = new Set([
   'mp4',
   'mov',
@@ -3679,6 +3697,7 @@ function MediaThumbnail({
   thumbnailSource,
   sourceAvailable = false,
   previewKey,
+  previewCacheEpoch = 0,
   enableHoverPreview = false,
 }: {
   mediaId: string;
@@ -3686,6 +3705,7 @@ function MediaThumbnail({
   thumbnailSource?: string;
   sourceAvailable?: boolean;
   previewKey?: string;
+  previewCacheEpoch?: number;
   enableHoverPreview?: boolean;
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
@@ -3694,12 +3714,18 @@ function MediaThumbnail({
   );
   const [previewEntry, setPreviewEntry] = useState<{
     key: string;
+    epoch: number;
     preview: HoverPreview;
   }>();
   const [previewIndex, setPreviewIndex] = useState<number>();
   const requestGeneration = useRef(0);
+  useEffect(() => {
+    requestGeneration.current += 1;
+  }, [previewCacheEpoch]);
   const preview =
-    previewEntry && previewEntry.key === previewKey
+    previewEntry &&
+    previewEntry.key === previewKey &&
+    previewEntry.epoch === previewCacheEpoch
       ? previewEntry.preview
       : undefined;
   useEffect(() => {
@@ -3728,19 +3754,20 @@ function MediaThumbnail({
     )
       return;
     const generation = ++requestGeneration.current;
-    let request = hoverPreviewRequests.get(previewKey);
-    if (!request) {
-      request = desktopBridge.loadHoverPreview(mediaId);
-      hoverPreviewRequests.set(previewKey, request);
-      void request.catch(() => hoverPreviewRequests.delete(previewKey));
-    }
+    const request = hoverPreviewRequestCache.request(previewKey, () =>
+      desktopBridge.loadHoverPreview(mediaId),
+    );
     void request
       .then((result) => {
         if (
           generation === requestGeneration.current &&
           result.mediaId === mediaId
         )
-          setPreviewEntry({ key: previewKey, preview: result });
+          setPreviewEntry({
+            key: previewKey,
+            epoch: previewCacheEpoch,
+            preview: result,
+          });
       })
       .catch(() => undefined);
   };

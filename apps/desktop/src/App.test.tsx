@@ -709,6 +709,7 @@ describe('native application integration', () => {
         'data:image/jpeg;base64,last',
       ],
     });
+    const user = userEvent.setup();
     const { container } = render(<App />);
     await screen.findByRole('option', { name: /hover.mp4/ });
     const thumbnail = container.querySelector(
@@ -744,6 +745,23 @@ describe('native application integration', () => {
     ).not.toBeInTheDocument();
     fireEvent.pointerEnter(thumbnail);
     expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Clear preview cache' }),
+    );
+    await waitFor(() =>
+      expect(mocks.clearHoverPreviewCache).toHaveBeenCalledTimes(1),
+    );
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    const refreshedThumbnail = container.querySelector(
+      '.media-thumbnail',
+    ) as HTMLElement;
+    fireEvent.pointerEnter(refreshedThumbnail);
+    await waitFor(() =>
+      expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(2),
+    );
   });
 
   it.each([100, 700, 3000])(
