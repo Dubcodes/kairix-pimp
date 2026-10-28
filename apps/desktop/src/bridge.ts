@@ -427,8 +427,9 @@ export const desktopBridge = {
     invoke<UpdaterConfiguration>('updater_configuration'),
   beginUpdateInstallation: () => invoke<void>('begin_update_installation'),
   endUpdateInstallation: () => invoke<void>('end_update_installation'),
-  openSupportLink: (destination: 'github' | 'releases' | 'coffee') =>
-    invoke<void>('open_support_link', { destination }),
+  openSupportLink: (
+    destination: 'github' | 'releases' | 'test-builds' | 'website' | 'coffee',
+  ) => invoke<void>('open_support_link', { destination }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),

@@ -2,7 +2,7 @@
 
 Use the per-user NSIS installer for normal beta acceptance. If an older system-wide MSI installation exists, follow [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md); verify the new install before explicitly removing the old application entry or shortcut.
 
-Kairix PIMP 0.1.1-2 is an unsigned release candidate for the Windows beta. It is suitable for
+Kairix PIMP 0.1.1-3 is an unsigned release candidate for the Windows beta. It is suitable for
 disposable generated media only until the real two-device Syncthing acceptance
 pass is complete. Do not make it the only copy of production footage.
 
@@ -50,6 +50,10 @@ the installed application, not `npm run dev`.
 - [ ] Interrupt a multi-file job, reopen, reconnect its source and explicitly retry.
 - [ ] Re-ingest a duplicate and confirm existing metadata is retained.
 - [ ] Search the Library and confirm generated thumbnails when FFmpeg is present.
+- [ ] Open the reported approximately 684-record Library, record time-to-responsive
+      and confirm scrolling/navigation remains responsive while near-visible thumbnails load.
+- [ ] Hover several local videos, scrub across the frames, move the pointer away
+      and confirm the static thumbnail returns without audio or console windows.
 - [ ] Exercise click, Ctrl+click, Shift+click and Ctrl+A selection; batch add and
       remove tags/projects, set a description and favourite state.
 - [ ] Copy multiple CRLF-separated paths for manual Premiere import and confirm

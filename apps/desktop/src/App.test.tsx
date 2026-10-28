@@ -58,6 +58,9 @@ const mocks = vi.hoisted(() => ({
   inventorySources: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
+  updaterConfiguration: vi.fn(),
+  checkApprovedBetaUpdate: vi.fn(),
+  installApprovedBetaUpdate: vi.fn(),
   retryProjectSynchronization: vi.fn(),
   inventoryProject: vi.fn(),
   updateProject: vi.fn(),
@@ -115,14 +118,7 @@ vi.mock('./bridge', () => ({
     })),
     openSupportLink: mocks.openSupportLink,
     openLogsFolder: vi.fn(),
-    updaterConfiguration: vi.fn(async () => ({
-      configured: false,
-      channel: 'Beta',
-      endpoint:
-        'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
-      reason:
-        'Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.',
-    })),
+    updaterConfiguration: mocks.updaterConfiguration,
     onFileDrop: vi.fn(async () => () => undefined),
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
@@ -149,6 +145,11 @@ vi.mock('./bridge', () => ({
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
     thumbnailUrl: (path: string) => path,
   },
+}));
+
+vi.mock('./updates', () => ({
+  checkApprovedBetaUpdate: mocks.checkApprovedBetaUpdate,
+  installApprovedBetaUpdate: mocks.installApprovedBetaUpdate,
 }));
 
 import { App } from './App';
@@ -230,6 +231,17 @@ describe('native application integration', () => {
     mocks.revealMediaInExplorer.mockResolvedValue(undefined);
     mocks.openMediaFolder.mockReset();
     mocks.openMediaFolder.mockResolvedValue(undefined);
+    mocks.updaterConfiguration.mockReset();
+    mocks.updaterConfiguration.mockResolvedValue({
+      configured: false,
+      channel: 'Beta',
+      endpoint:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
+      reason:
+        'Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.',
+    });
+    mocks.checkApprovedBetaUpdate.mockReset();
+    mocks.installApprovedBetaUpdate.mockReset();
     mocks.mediaToolsStatus.mockReset();
     mocks.mediaToolsStatus.mockResolvedValue({
       ffmpegAvailable: true,
@@ -1017,11 +1029,10 @@ describe('native application integration', () => {
     await user.click(screen.getByRole('button', { name: 'About & Support' }));
     await user.click(screen.getByRole('button', { name: 'GitHub' }));
     await user.click(screen.getByRole('button', { name: 'Buy Me a Coffee' }));
+    await user.click(screen.getByRole('button', { name: 'Project website' }));
     expect(mocks.openSupportLink).toHaveBeenNthCalledWith(1, 'github');
     expect(mocks.openSupportLink).toHaveBeenNthCalledWith(2, 'coffee');
-    expect(
-      screen.getByRole('button', { name: /Project website/ }),
-    ).toBeDisabled();
+    expect(mocks.openSupportLink).toHaveBeenNthCalledWith(3, 'website');
   });
 
   it('serializes rapid preferences without letting an older save replace newer edits', async () => {
@@ -1111,20 +1122,64 @@ describe('native application integration', () => {
     expect(mocks.saveSettings).toHaveBeenCalledTimes(2);
   });
 
-  it('fails closed with a manual release fallback when signing is not configured', async () => {
+  it('shows manual build links without starting a check when signing is not configured', async () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Settings' }));
     await user.click(screen.getByRole('button', { name: 'Updates' }));
-    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      await screen.findByText(
-        /Signed updates are not configured in this build/,
-      ),
+      await screen.findByText('Automatic updates not configured'),
     ).toBeVisible();
     expect(
-      screen.getByRole('button', { name: 'Open GitHub Releases' }),
-    ).toBeEnabled();
+      screen.getByRole('button', { name: 'Check for updates' }),
+    ).toBeDisabled();
+    expect(mocks.checkApprovedBetaUpdate).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'GitHub Releases' }));
+    await user.click(
+      screen.getByRole('button', { name: 'View available test builds' }),
+    );
+    expect(mocks.openSupportLink).toHaveBeenNthCalledWith(1, 'releases');
+    expect(mocks.openSupportLink).toHaveBeenNthCalledWith(2, 'test-builds');
+  });
+
+  it('reports checking, available and up-to-date states for a configured signer', async () => {
+    mocks.updaterConfiguration.mockResolvedValue({
+      configured: true,
+      channel: 'Beta',
+      endpoint: 'https://example.invalid/latest.json',
+    });
+    mocks.settings = { ...mocks.settings, checkForUpdates: false };
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Updates' }));
+    const pending = deferred<null>();
+    mocks.checkApprovedBetaUpdate.mockReturnValueOnce(pending.promise);
+    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
+    expect(
+      screen.getByText('Checking for a signed Beta update…'),
+    ).toBeVisible();
+    await act(async () => pending.resolve(null));
+    expect(
+      await screen.findByText(/No newer signed Beta was available/),
+    ).toBeVisible();
+
+    mocks.checkApprovedBetaUpdate.mockResolvedValueOnce({
+      currentVersion: '0.1.1-2',
+      version: '0.1.1-3',
+    });
+    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
+    expect(
+      await screen.findByText('Signed Beta 0.1.1-3 is available.'),
+    ).toBeVisible();
+
+    mocks.checkApprovedBetaUpdate.mockRejectedValueOnce(
+      new Error('manifest unavailable'),
+    );
+    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
+    expect(
+      await screen.findByText('Update check failed: manifest unavailable'),
+    ).toBeVisible();
   });
 
   it('offers validated Windows file actions for one locally available recording', async () => {

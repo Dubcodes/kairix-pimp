@@ -20,6 +20,8 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented installed-app P0 corrections: responsive scroll-bounded ingest destination mapping and one validated batched thumbnail-source lookup with near-viewport lazy decoding
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
 - Implemented: normalized batch tags seed all eligible recording files while preserving later per-file tags; verified-copy source cleanup remains design-only and disabled
+- Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
+- Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history
 - Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
@@ -49,6 +51,8 @@ Retain lightweight completed-project records in catalogue search and a portable 
 Unused-footage review, cross-project protection, synchronization preflight, recoverable quarantine, multi-step explicit authorization, and delayed purge. No direct deletion from source cards.
 
 Automation is opt-in and disabled by default. Per-file protection and successful finalization verification gate eligibility; Syncthing replicas are not treated as backups.
+
+The pre-implementation state machine, overlap/source-identity gates, package completeness rules, exact removal review, durable journal and failure-injection matrix are recorded in `SOURCE_CLEANUP_DESIGN.md`. No destructive command or UI control is enabled in the beta.
 
 ## Cross-cutting — persistent background work
 

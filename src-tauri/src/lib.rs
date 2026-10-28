@@ -4317,6 +4317,10 @@ fn support_url(destination: &str) -> Option<&'static str> {
     match destination {
         "github" => Some("https://github.com/Dubcodes/kairix-pimp"),
         "releases" => Some("https://github.com/Dubcodes/kairix-pimp/releases"),
+        "test-builds" => Some(
+            "https://github.com/Dubcodes/kairix-pimp/actions/workflows/windows-beta.yml",
+        ),
+        "website" => Some("https://www.dubcodesmedia.com/kairix/kairix-pimp"),
         "coffee" => Some("https://buymeacoffee.com/dubcodes"),
         _ => None,
     }
@@ -5698,12 +5702,20 @@ mod tests {
             support_url("coffee"),
             Some("https://buymeacoffee.com/dubcodes")
         );
+        assert_eq!(
+            support_url("test-builds"),
+            Some("https://github.com/Dubcodes/kairix-pimp/actions/workflows/windows-beta.yml")
+        );
+        assert_eq!(
+            support_url("website"),
+            Some("https://www.dubcodesmedia.com/kairix/kairix-pimp")
+        );
         assert_eq!(support_url("https://example.invalid"), None);
     }
 
     #[test]
     fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-2");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-3");
         let configuration = updater_configuration();
         assert_eq!(configuration.channel, "Beta");
         assert!(configuration.endpoint.starts_with("https://"));

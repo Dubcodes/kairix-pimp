@@ -220,7 +220,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Date:** 2026-10-26
 - **Status:** Accepted
 - **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. Beta builds use a numeric SemVer prerelease component (for example `0.1.1-1`) so the same version remains valid for Windows MSI packaging; the release channel remains explicitly Beta. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
-- **Release-candidate clarification:** The host now owns an update-installation gate. It atomically checks durable job state before installation and prevents start, resume or retry until the updater returns or restarts the process. Public-key syntax is validated in the native configuration response. Version `0.1.1-2` is the manual bootstrap candidate; it is not evidence of a completed signed upgrade.
+- **Release-candidate clarification:** The host now owns an update-installation gate. It atomically checks durable job state before installation and prevents start, resume or retry until the updater returns or restarts the process. Public-key syntax is validated in the native configuration response. Version `0.1.1-3` is an installed-feedback candidate; it is not evidence of a completed signed upgrade.
 - **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.
 
 ## ADR-029 — Serialized device settings and tray-gated autostart
@@ -313,3 +313,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Accept normalized batch tags in the existing ingest request and seed them into each eligible video, audio and image file's durable provisional metadata with the existing edited-field marker. Camera support and unknown sidecar files receive no catalogue metadata. Later per-file edits submit the complete merged tag list through the existing durable metadata command.
 - **Consequences:** Batch intent survives pause, retry and restart and reaches verified video/WAV registrations without a new synchronized event type. Copy remains the only ingest mode. Source cleanup remains disabled until a separately reviewed whole-batch verification, source-revalidation, package grouping, explicit confirmation and interrupted-cleanup journal are implemented.
+
+## ADR-042 — Preflight updater availability and separate manual channels
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Load native updater configuration before automatic or manual checking. Missing or invalid signing configuration is a stable **Automatic updates not configured** state and never invokes the network updater. GitHub Actions test builds, GitHub Releases and the official project website are distinct fixed native-allowlisted destinations.
+- **Consequences:** Unconfigured builds no longer flicker through a misleading check or claim to be current. Test artifacts remain clearly separate from public releases, and signing verification is not weakened. Signed installation remains blocked until protected keys are provisioned and accepted through the existing Beta channel.

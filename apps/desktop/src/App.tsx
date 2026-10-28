@@ -49,6 +49,7 @@ import {
   type ProjectRecord,
   type ProvisionalMetadataPatch,
   type SourceInventory,
+  type UpdaterConfiguration,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
 import {
@@ -152,10 +153,12 @@ export function App() {
   >({});
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
+  const [updaterConfiguration, setUpdaterConfiguration] =
+    useState<UpdaterConfiguration>();
   const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate>();
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateStatus, setUpdateStatus] = useState(
-    'Not checked in this session',
+    'Loading update configuration…',
   );
   const [updateProgress, setUpdateProgress] = useState<{
     downloaded: number;
@@ -307,6 +310,7 @@ export function App() {
       }),
       desktopBridge.getDiscoveryStatus(),
       desktopBridge.appInfo(),
+      desktopBridge.updaterConfiguration(),
     ])
       .then(
         async ([
@@ -319,6 +323,7 @@ export function App() {
           unlistenCatalogue,
           loadedDiscoveryStatus,
           loadedApplicationInfo,
+          loadedUpdaterConfiguration,
         ]) => {
           if (disposed) {
             unlistenProgress();
@@ -338,6 +343,12 @@ export function App() {
           setSettings(loaded);
           setMediaTools(tools);
           setApplicationInfo(loadedApplicationInfo);
+          setUpdaterConfiguration(loadedUpdaterConfiguration);
+          setUpdateStatus(
+            loadedUpdaterConfiguration.configured
+              ? 'Not checked in this session'
+              : 'Automatic updates not configured',
+          );
           setDiscoveryStatus(loadedDiscoveryStatus);
           setView((loaded.startupPage as View | undefined) ?? 'Library');
           setJobs(await desktopBridge.initializeIngestJobs());
@@ -965,7 +976,9 @@ export function App() {
       setBusy(false);
     }
   };
-  const openSupport = async (destination: 'github' | 'releases' | 'coffee') => {
+  const openSupport = async (
+    destination: 'github' | 'releases' | 'test-builds' | 'website' | 'coffee',
+  ) => {
     try {
       await desktopBridge.openSupportLink(destination);
     } catch (reason) {
@@ -994,7 +1007,12 @@ export function App() {
     setMessage('Diagnostic summary copied without personal file paths.');
   };
   const checkForUpdates = useCallback(async () => {
+    if (!updaterConfiguration?.configured) {
+      setUpdateStatus('Automatic updates not configured');
+      return;
+    }
     setCheckingUpdate(true);
+    setUpdateStatus('Checking for a signed Beta update…');
     setError('');
     try {
       const update = await checkApprovedBetaUpdate();
@@ -1011,11 +1029,12 @@ export function App() {
     } finally {
       setCheckingUpdate(false);
     }
-  }, []);
+  }, [updaterConfiguration]);
   useEffect(() => {
     if (
       !native ||
       !applicationInfo ||
+      !updaterConfiguration?.configured ||
       settings.checkForUpdates === false ||
       automaticUpdateCheckStarted.current
     ) {
@@ -1023,7 +1042,13 @@ export function App() {
     }
     automaticUpdateCheckStarted.current = true;
     void checkForUpdates();
-  }, [applicationInfo, checkForUpdates, native, settings.checkForUpdates]);
+  }, [
+    applicationInfo,
+    checkForUpdates,
+    native,
+    settings.checkForUpdates,
+    updaterConfiguration,
+  ]);
   const installUpdate = async () => {
     if (activeJobs.length > 0) {
       setUpdateStatus(
@@ -2029,7 +2054,17 @@ export function App() {
                     )}
                   </div>
                   <div className="scan-actions">
-                    <button disabled={checkingUpdate} onClick={checkForUpdates}>
+                    <button
+                      disabled={
+                        checkingUpdate || !updaterConfiguration?.configured
+                      }
+                      title={
+                        updaterConfiguration?.configured === false
+                          ? 'This build has no configured update-signing key'
+                          : undefined
+                      }
+                      onClick={checkForUpdates}
+                    >
                       {checkingUpdate ? 'Checking…' : 'Check for updates'}
                     </button>
                     <button
@@ -2049,17 +2084,25 @@ export function App() {
                       Download, verify and install
                     </button>
                     <button onClick={() => void openSupport('releases')}>
-                      {availableUpdate
-                        ? 'Open release notes'
-                        : 'Open GitHub Releases'}
+                      GitHub Releases
+                    </button>
+                    <button onClick={() => void openSupport('test-builds')}>
+                      View available test builds
                     </button>
                   </div>
-                  <small>
-                    Only the approved Beta manifest and artifacts with a valid
-                    Tauri signature can install. If this build has no public
-                    key, the check fails closed and the reviewed NSIS installer
-                    remains available.
-                  </small>
+                  {updaterConfiguration?.configured ? (
+                    <small>
+                      Only the approved Beta manifest and artifacts with a valid
+                      Tauri signature can install.
+                    </small>
+                  ) : (
+                    <small>
+                      Automatic updates are unavailable in this build. Upgrade
+                      manually using a reviewed installer from the test-build
+                      workflow or GitHub Releases. Test builds are unsigned and
+                      do not imply that a public release exists.
+                    </small>
+                  )}
                 </>
               )}
 
@@ -2083,11 +2126,8 @@ export function App() {
                     <button onClick={() => void openSupport('coffee')}>
                       <Coffee size={18} opacity={0.72} /> Buy Me a Coffee
                     </button>
-                    <button
-                      disabled
-                      title="A dedicated project page is not configured yet"
-                    >
-                      Project website — coming later
+                    <button onClick={() => void openSupport('website')}>
+                      Project website
                     </button>
                   </div>
                   <small>
