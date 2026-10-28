@@ -162,7 +162,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 
 - **Date:** 2026-10-23
 - **Status:** Accepted
-- **Decision:** Future ingest jobs may carry tags, project assignments, descriptions and favourites. Queued/incomplete intent is persisted independently and survives retry; it becomes catalogue metadata only after verified promotion. Do not impose a rigid tag-count cap.
+- **Decision:** Ingest jobs may carry tags, project assignments, descriptions and favourites. Queued/incomplete intent is persisted independently and survives retry; it becomes catalogue metadata only after verified promotion. Do not impose a rigid tag-count cap.
 - **Consequences:** The persistent job schema needs versioned intent fields and must not expose an incomplete item as committed media.
 
 ## ADR-021 — Direct Premiere layout and explicit project collection
@@ -183,5 +183,12 @@ Known early decisions predate this log; their original dates were not recorded. 
 
 - **Date:** 2026-10-23
 - **Status:** Accepted
-- **Decision:** Keep completed projects as lightweight searchable catalogue records and give each portable local archive its stable project identity and media manifest. Public-link and YouTube metadata remain deferred. Long-running work will use a persistent startup-resumed job manager.
+- **Decision:** Keep completed projects as lightweight searchable catalogue records and give each portable local archive its stable project identity and media manifest. Public-link and YouTube metadata remain deferred. Long-running work uses a persistent job-manager pattern, implemented first for ingest.
 - **Consequences:** Project history remains usable when archive media is offline; job persistence must distinguish intent, progress, committed effects and retryable enrichment.
+
+## ADR-024 — Device-local persistent ingest queue
+
+- **Date:** 2026-10-24
+- **Status:** Accepted
+- **Decision:** Native ingest is coordinated by a versioned device-local job store and a bounded single worker. Jobs persist stable source/destination plans, progress, errors and provisional metadata. Copying, hashing and probing occur outside the catalogue write mutex; only verified registration and authoritative event persistence use it. Pause is supported between files. Startup marks active work interrupted and requires explicit retry rather than assuming removable media is present.
+- **Consequences:** Completed files form safe retry checkpoints, but partial-file byte offsets are not resumed. Operation journals remain the ownership and crash-recovery record for staging and promotion. Queue state and file availability are not synchronized through Syncthing.

@@ -54,6 +54,8 @@ pub struct MediaItem {
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
+    pub favourite: bool,
+    #[serde(default)]
     pub technical: TechnicalMetadata,
     /// A cache-relative filename, never an absolute filesystem path.
     #[serde(default, alias = "thumbnailRef")]
@@ -181,6 +183,12 @@ pub enum CatalogueEvent {
         #[serde(rename = "mediaId")]
         media_id: String,
         value: String,
+    },
+    #[serde(rename = "media.favourite.set")]
+    MediaFavouriteSet {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        value: bool,
     },
     #[serde(rename = "media.enriched")]
     MediaEnriched {
@@ -858,6 +866,44 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 }
                 scalar_versions.insert(key, (envelope.clone(), Value::String(value.clone())));
             }
+            CatalogueEvent::MediaFavouriteSet { media_id, value } => {
+                let Some(item) = media.get_mut(media_id) else {
+                    continue;
+                };
+                let key = format!("{media_id}:favourite");
+                if let Some((previous, previous_value)) = scalar_versions.get(&key) {
+                    if !happens_before(previous, &envelope) {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: media_id.clone(),
+                                field: "favourite".into(),
+                                event_ids: vec![
+                                    previous.event_id.clone(),
+                                    envelope.event_id.clone(),
+                                ],
+                                values: vec![previous_value.clone(), Value::Bool(value.clone())],
+                            },
+                        );
+                        let prior_key = format!(
+                            "{}:{:020}:{}",
+                            previous.device_id, previous.sequence, previous.event_id
+                        );
+                        let next_key = format!(
+                            "{}:{:020}:{}",
+                            envelope.device_id, envelope.sequence, envelope.event_id
+                        );
+                        if next_key > prior_key {
+                            item.favourite = *value;
+                        }
+                    } else {
+                        item.favourite = *value;
+                    }
+                } else {
+                    item.favourite = *value;
+                }
+                scalar_versions.insert(key, (envelope.clone(), Value::Bool(*value)));
+            }
             CatalogueEvent::MediaEnriched {
                 media_id,
                 technical,
@@ -1370,6 +1416,7 @@ mod tests {
             tags: vec![],
             project_ids: vec![],
             notes: String::new(),
+            favourite: false,
             technical: TechnicalMetadata {
                 size_bytes: 1,
                 ..Default::default()

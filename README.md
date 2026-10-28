@@ -16,11 +16,11 @@ Full-edition AI processing is planned and is not implemented in this milestone.
 
 ## Milestone status
 
-The Windows vertical slice now connects the React interface to a restricted Tauri 2 host. Versioned per-device append-only event streams are authoritative; the Library is rebuilt by deterministic topological replay and no synchronized mutable database is operational state. The host accepts native file/folder pickers and drops, recursively ingests supported camera media, independently verifies staged copies and promotes them without overwrite, and reports progress, duplicates, unsupported inputs and actionable filename conflicts. A single-instance guard prevents two desktop processes from writing the same device stream.
+The Windows vertical slice now connects the React interface to a restricted Tauri 2 host. Versioned per-device append-only event streams are authoritative; the Library is rebuilt by deterministic topological replay and no synchronized mutable database is operational state. The host accepts native file/folder pickers and drops and queues recursive ingest as durable device-local background jobs. A bounded single worker independently verifies staged copies and promotes them without overwrite while the Library remains usable. The compact job view reports overall and per-file progress, failures and verification state, and provides between-file pause, resume, cancellation and retry controls. A single-instance guard prevents two desktop processes from writing the same device stream.
 
-The Library displays genuine persisted records, availability, technical metadata and FFmpeg thumbnails. Search, convergent additive tags, many-to-many project assignment, folder-aware MP4/WAV pairing, manual rescan and conservative multi-observation reconciliation survive restarts. A lightweight event-file signature refreshes tag, project and conflict metadata received through Syncthing without running a media rescan. Concurrent scalar edits are retained as visible conflicts. New installs show setup guidance and an empty library instead of synthetic media.
+The Library displays genuine persisted records, device-local availability, technical metadata and FFmpeg thumbnails. Search, convergent additive tags, many-to-many project assignment, folder-aware MP4/WAV pairing, manual rescan and conservative multi-observation reconciliation survive restarts. Lightweight polling refreshes shared event metadata and separately notices when an already-catalogued path arrives through Syncthing, without publishing availability as shared truth or running a discovery scan. Concurrent scalar edits are retained as visible conflicts. New installs show setup guidance and an empty library instead of synthetic media.
 
-Legacy `catalogue.json`, v1 TypeScript events, v1 Rust events and compatible project manifests have explicit compatibility paths. Migration preserves the original snapshot plus a recoverable backup and is idempotent. Ingest uses a device-owned same-filesystem staging directory outside Master Bin, durable minimal operation records, source-change detection and atomic no-overwrite promotion.
+Legacy `catalogue.json`, v1 TypeScript events, v1 Rust events and compatible project manifests have explicit compatibility paths. Migration preserves the original snapshot plus a recoverable backup and is idempotent. Ingest uses a device-owned same-filesystem staging directory outside Master Bin, durable operation journals plus a versioned local job store, source-change detection and atomic no-overwrite promotion. Tags, project assignments, notes and favourite intent may be edited while copying and are committed only after successful media registration.
 
 New installations use `yyyymmdd` date folders. Settings provide a live preview and support `yyyy`, `MM`, `dd`, `HH`, `hh`, `mm`, `ss`, and `a`; older settings retain their existing dashed pattern until explicitly changed. Today and explicit-date batches use one batch timestamp, while original-file mode uses each source's modified date and time.
 
@@ -61,7 +61,7 @@ npm run tauri dev
 
 ## Planned work
 
-- Resumable ingest retries and a notification-based watcher
+- Byte-range ingest resume, throughput history and a notification-based watcher
 - Virtualized browsing, saved compound filters, contact sheets, and previews
 - A tested Adobe Premiere UXP extension and import reconciliation
 - Optional, offline local media intelligence in PIMP Full
@@ -76,7 +76,7 @@ See the [project brief](docs/PROJECT_BRIEF.md), [development roadmap](docs/DEVEL
 - Event replay and convergence are simulated in automated tests, but actual multi-device Syncthing conflict behavior still needs an external two-device acceptance pass.
 - Automatic discovery polls every 30 seconds and requires multiple observations over at least 15 seconds; a native watcher and positive transfer-completion signal are not yet wired.
 - Catalogue relocation is deliberately locked after initialization until safe migration is implemented.
-- The minimal ingest journal safely recovers abandoned staging files but does not yet resume an interrupted copy from its prior byte offset.
+- Interrupted jobs retain intent and verified completed files, but an incomplete current file restarts from byte zero when explicitly retried; jobs are not automatically resumed when removable source media may be absent.
 - Metadata conflicts are reported as a count; field-level conflict resolution UI remains planned.
 - Thumbnail cache references are portable and root-validated, but configured-budget eviction remains deferred.
 - No Premiere integration, AI processing, project consolidation, or cleanup is functional yet.

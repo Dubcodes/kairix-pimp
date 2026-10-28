@@ -47,6 +47,7 @@ export interface MediaItem {
   projectIds: string[];
   technical: TechnicalMetadata;
   notes?: string;
+  favourite?: boolean;
   thumbnailPath?: string;
   attachedAudioId?: string;
   available?: boolean;
@@ -92,6 +93,7 @@ export type CatalogueEvent =
   | { type: 'media.projects.replaced'; mediaId: string; values: string[] }
   | { type: 'media.legacy-snapshot-replaced'; media: MediaItem }
   | { type: 'media.notes.set'; mediaId: string; value: string }
+  | { type: 'media.favourite.set'; mediaId: string; value: boolean }
   | {
       type: 'media.enriched';
       mediaId: string;
