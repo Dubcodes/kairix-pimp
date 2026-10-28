@@ -2,6 +2,7 @@ import type {
   CatalogueIssue,
   CatalogueState,
   EventEnvelope,
+  MediaItem,
   MetadataConflict,
 } from './types';
 
@@ -37,6 +38,68 @@ const normalized = (values: string[]) => {
   );
 };
 
+const normalizedMediaIdentityPath = (value: string) =>
+  value
+    .replaceAll('\\', '/')
+    .replace(/^\/+|\/+$/g, '')
+    .toLowerCase();
+
+function registrationAliases(events: EventEnvelope[]) {
+  const byPath = new Map<
+    string,
+    Map<string, Array<{ envelope: EventEnvelope; media: MediaItem }>>
+  >();
+  const identitiesById = new Map<string, Set<string>>();
+  for (const envelope of events) {
+    if (envelope.event.type !== 'media.registered') continue;
+    const path = normalizedMediaIdentityPath(envelope.event.media.relativePath);
+    const hashes = byPath.get(path) ?? new Map();
+    const hash = envelope.event.media.sha256.toLowerCase();
+    const identities = identitiesById.get(envelope.event.media.id) ?? new Set();
+    identities.add(`${path}\n${hash}`);
+    identitiesById.set(envelope.event.media.id, identities);
+    const registrations = hashes.get(hash) ?? [];
+    registrations.push({ envelope, media: envelope.event.media });
+    hashes.set(hash, registrations);
+    byPath.set(path, hashes);
+  }
+
+  const aliases = new Map<string, string>();
+  const conflicts: MetadataConflict[] = [];
+  const conflictingIds = new Set(
+    [...identitiesById]
+      .filter(([, identities]) => identities.size > 1)
+      .map(([id]) => id),
+  );
+  for (const [path, hashes] of byPath) {
+    if (hashes.size > 1) {
+      const registrations = [...hashes.values()]
+        .flat()
+        .sort((a, b) => concurrentOrder(a.envelope, b.envelope));
+      conflicts.push({
+        entityId: path,
+        field: 'identity-hash',
+        eventIds: registrations.map(({ envelope }) => envelope.eventId),
+        values: registrations.map(({ media }) => ({
+          id: media.id,
+          relativePath: media.relativePath,
+          sha256: media.sha256,
+        })),
+      });
+    }
+    for (const registrations of hashes.values()) {
+      const canonical = registrations
+        .filter(({ media }) => !conflictingIds.has(media.id))
+        .slice()
+        .sort((a, b) => concurrentOrder(a.envelope, b.envelope))[0]?.media.id;
+      for (const { media } of registrations)
+        if (conflictingIds.has(media.id)) aliases.set(media.id, media.id);
+        else if (canonical) aliases.set(media.id, canonical);
+    }
+  }
+  return { aliases, conflicts };
+}
+
 export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
   const state = emptyCatalogue();
   const seen = new Set<string>();
@@ -49,6 +112,10 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
     Map<string, { value: string; envelope: EventEnvelope }>
   >();
   const ordered = causalOrder(events, state.issues);
+  const identity = registrationAliases(ordered);
+  state.conflicts.push(...identity.conflicts);
+  const canonicalMediaId = (mediaId: string) =>
+    identity.aliases.get(mediaId) ?? mediaId;
 
   const happensBefore = (a: EventEnvelope, b: EventEnvelope) =>
     (a.deviceId === b.deviceId && a.sequence < b.sequence) ||
@@ -85,40 +152,65 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
     state.appliedEventIds.push(envelope.eventId);
     const event = envelope.event;
     if (event.type === 'media.registered') {
-      const existing = state.media[event.media.id];
-      if (existing && JSON.stringify(existing) !== JSON.stringify(event.media))
+      const mediaId = canonicalMediaId(event.media.id);
+      const existing = state.media[mediaId];
+      if (
+        existing &&
+        (normalizedMediaIdentityPath(existing.relativePath) !==
+          normalizedMediaIdentityPath(event.media.relativePath) ||
+          existing.sha256.toLowerCase() !== event.media.sha256.toLowerCase())
+      )
         addConflict({
-          entityId: event.media.id,
+          entityId: mediaId,
           field: 'registration',
           eventIds: [envelope.eventId],
           values: [existing, event.media],
         });
-      state.media[event.media.id] ??= {
-        ...event.media,
-        tags: normalized(event.media.tags),
-        projectIds: normalized(event.media.projectIds),
-      };
+      if (existing) {
+        if ((existing.notes ?? '') !== (event.media.notes ?? ''))
+          addConflict({
+            entityId: mediaId,
+            field: 'notes',
+            eventIds: [envelope.eventId],
+            values: [existing.notes ?? '', event.media.notes ?? ''],
+          });
+        existing.favourite =
+          Boolean(existing.favourite) || Boolean(event.media.favourite);
+        existing.integrityByDevice = {
+          ...event.media.integrityByDevice,
+          ...existing.integrityByDevice,
+        };
+      } else {
+        state.media[mediaId] = {
+          ...event.media,
+          id: mediaId,
+          tags: [],
+          projectIds: [],
+        };
+      }
       for (const [field, values] of [
         ['tags', event.media.tags],
         ['projectIds', event.media.projectIds],
       ] as const) {
-        const adds = setAdds.get(`${event.media.id}:${field}`) ?? new Map();
+        const adds = setAdds.get(`${mediaId}:${field}`) ?? new Map();
         for (const value of values)
           adds.set(`${envelope.eventId}:${value}`, { value, envelope });
-        setAdds.set(`${event.media.id}:${field}`, adds);
-        updateSet(event.media.id, field);
+        setAdds.set(`${mediaId}:${field}`, adds);
+        updateSet(mediaId, field);
       }
     } else if (event.type === 'media.legacy-snapshot-replaced') {
-      const existing = state.media[event.media.id];
+      const mediaId = canonicalMediaId(event.media.id);
+      const existing = state.media[mediaId];
       if (existing && JSON.stringify(existing) !== JSON.stringify(event.media))
         addConflict({
-          entityId: event.media.id,
+          entityId: mediaId,
           field: 'legacy-snapshot',
           eventIds: [envelope.eventId],
           values: [existing, event.media],
         });
-      state.media[event.media.id] = {
+      state.media[mediaId] = {
         ...event.media,
+        id: mediaId,
         tags: normalized(event.media.tags),
         projectIds: normalized(event.media.projectIds),
       };
@@ -132,8 +224,8 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         >();
         for (const value of normalized(values))
           adds.set(`${envelope.eventId}:${value}`, { value, envelope });
-        setAdds.set(`${event.media.id}:${field}`, adds);
-        updateSet(event.media.id, field);
+        setAdds.set(`${mediaId}:${field}`, adds);
+        updateSet(mediaId, field);
       }
     } else if (
       event.type === 'media.tags.added' ||
@@ -143,10 +235,11 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
       event.type === 'media.tags.replaced' ||
       event.type === 'media.projects.replaced'
     ) {
-      const item = state.media[event.mediaId];
+      const mediaId = canonicalMediaId(event.mediaId);
+      const item = state.media[mediaId];
       if (!item) {
         addConflict({
-          entityId: event.mediaId,
+          entityId: mediaId,
           field: 'missing-media',
           eventIds: [envelope.eventId],
           values: [event],
@@ -154,7 +247,7 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         continue;
       }
       const field = event.type.startsWith('media.tags') ? 'tags' : 'projectIds';
-      const key = `${event.mediaId}:${field}`;
+      const key = `${mediaId}:${field}`;
       const adds = setAdds.get(key) ?? new Map();
       if (event.type.endsWith('.added')) {
         for (const value of normalized(event.values))
@@ -174,15 +267,16 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
           adds.set(`${envelope.eventId}:${value}`, { value, envelope });
       }
       setAdds.set(key, adds);
-      updateSet(event.mediaId, field);
+      updateSet(mediaId, field);
     } else if (event.type === 'media.notes.set') {
-      const item = state.media[event.mediaId];
+      const mediaId = canonicalMediaId(event.mediaId);
+      const item = state.media[mediaId];
       if (!item) continue;
-      const key = `${event.mediaId}:notes`;
+      const key = `${mediaId}:notes`;
       const previous = fieldVersions.get(key);
       if (previous && !happensBefore(previous.envelope, envelope)) {
         addConflict({
-          entityId: event.mediaId,
+          entityId: mediaId,
           field: 'notes',
           eventIds: [previous.envelope.eventId, envelope.eventId],
           values: [previous.value, event.value],
@@ -195,13 +289,14 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
       }
       fieldVersions.set(key, { envelope, value: event.value });
     } else if (event.type === 'media.favourite.set') {
-      const item = state.media[event.mediaId];
+      const mediaId = canonicalMediaId(event.mediaId);
+      const item = state.media[mediaId];
       if (!item) continue;
-      const key = `${event.mediaId}:favourite`;
+      const key = `${mediaId}:favourite`;
       const previous = fieldVersions.get(key);
       if (previous && !happensBefore(previous.envelope, envelope)) {
         addConflict({
-          entityId: event.mediaId,
+          entityId: mediaId,
           field: 'favourite',
           eventIds: [previous.envelope.eventId, envelope.eventId],
           values: [previous.value, event.value],
@@ -214,12 +309,12 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
       }
       fieldVersions.set(key, { envelope, value: event.value });
     } else if (event.type === 'media.enriched') {
-      const item = state.media[event.mediaId];
+      const item = state.media[canonicalMediaId(event.mediaId)];
       if (!item) continue;
       item.technical = event.technical;
       item.thumbnailPath = event.thumbnailRef;
     } else if (event.type === 'media.evidence-observed') {
-      const item = state.media[event.mediaId];
+      const item = state.media[canonicalMediaId(event.mediaId)];
       if (!item) continue;
       item.observedSize = event.observedSize;
       item.observedModifiedMillis = event.observedModifiedMillis;
@@ -293,14 +388,19 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
       fieldVersions.set(key, { envelope, value: event.project });
     }
   }
+  for (const project of Object.values(state.projects))
+    project.mediaIds = Object.values(state.media)
+      .filter((media) => media.projectIds.includes(project.id))
+      .map((media) => media.id)
+      .sort(compareCodePoints);
   return state;
 }
 
 const concurrentOrder = (a: EventEnvelope, b: EventEnvelope) =>
   eventPriority(a) - eventPriority(b) ||
-  a.deviceId.localeCompare(b.deviceId) ||
+  compareCodePoints(a.deviceId, b.deviceId) ||
   a.sequence - b.sequence ||
-  a.eventId.localeCompare(b.eventId);
+  compareCodePoints(a.eventId, b.eventId);
 
 const eventPriority = (event: EventEnvelope) => {
   if (event.event.type === 'media.registered')

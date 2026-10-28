@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Kairix PIMP",
-  "version": "0.1.0",
+  "version": "0.1.1-5",
   "identifier": "com.kairix.pimp",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -23,6 +23,15 @@
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost"
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json"
+      ],
+      "pubkey": "",
+      "requireSignedVersion": true
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
@@ -34,6 +43,11 @@
       "icons/icon.ico"
     ],
     "category": "Video",
-    "shortDescription": "Verified media ingest and catalogue companion for Syncthing"
+    "shortDescription": "Verified media ingest and catalogue companion for Syncthing",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

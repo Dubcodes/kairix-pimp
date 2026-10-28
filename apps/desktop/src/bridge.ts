@@ -1,4 +1,4 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -12,14 +12,52 @@ export interface DeviceSettings {
   sharedCataloguePath: string;
   thumbnailCachePath: string;
   thumbnailCacheLimitBytes: number;
+  hoverPreviewsEnabled: boolean;
+  previewCacheLimitBytes: number;
   ingestDateOrganization: DateMode;
   dateFolderPattern: string;
   initializedCataloguePath: string;
   projectPaths: Record<string, string>;
+  startWithWindows: boolean;
+  closeToTray: boolean;
+  startupPage: 'Ingest' | 'Library' | 'Projects' | 'Archive';
+  checkForUpdates: boolean;
+  theme:
+    | 'graphite'
+    | 'adobe-dark'
+    | 'light'
+    | 'midnight'
+    | 'system'
+    | 'high-contrast';
+  density: 'comfortable' | 'compact';
+  showAttachedAudioSeparately: boolean;
+  sidebarCollapsed?: boolean;
+  libraryFolderSort?:
+    | 'newest'
+    | 'oldest'
+    | 'name-asc'
+    | 'name-desc'
+    | 'most-recordings'
+    | 'fewest-recordings'
+    | 'custom';
+  libraryFolderOrder?: string[];
+}
+export interface AppInfo {
+  version: string;
+  buildCommit: string;
+  edition: string;
+  releaseChannel: string;
+}
+export interface UpdaterConfiguration {
+  configured: boolean;
+  channel: 'Beta';
+  endpoint: string;
+  reason?: string;
 }
 export interface MediaItem {
   id: string;
   relativePath: string;
+  sourceRelativePath?: string;
   originalFilename: string;
   sha256: string;
   captureDate?: string;
@@ -55,6 +93,36 @@ export interface ProjectRecord {
   tags: string[];
   createdAt: string;
 }
+export interface ProjectAsset {
+  relativePath: string;
+  name: string;
+  category:
+    | 'premiere-project'
+    | 'premiere-auto-save'
+    | 'video'
+    | 'audio-music'
+    | 'images-graphics'
+    | 'exports'
+    | 'notes-documentation'
+    | 'other';
+  sizeBytes: number;
+  modifiedAt?: string;
+}
+export interface ProjectInventory {
+  projectId: string;
+  rootPath: string;
+  itemCount: number;
+  sizeBytes: number;
+  mainPremiereProject?: string;
+  scannedAt: string;
+  items: ProjectAsset[];
+}
+export interface HoverPreview {
+  mediaId: string;
+  durationSeconds: number;
+  frameTimes: number[];
+  frames: string[];
+}
 export interface Catalogue {
   media: MediaItem[];
   projects: ProjectRecord[];
@@ -68,9 +136,31 @@ export interface Catalogue {
   issues?: Array<{ code: string; source: string; detail: string }>;
 }
 export interface RescanResult {
+  scanned: number;
   registered: number;
   changed: number;
   pending: number;
+  errors: number;
+  full: boolean;
+  completedAt: string;
+}
+export interface DiscoveryStatus {
+  running: boolean;
+  full: boolean;
+  filesProcessed: number;
+  totalFiles: number;
+  registered: number;
+  changed: number;
+  pending: number;
+  errors: number;
+  startedAt?: string;
+  lastCompletedAt?: string;
+}
+export interface MediaToolsStatus {
+  ffmpegAvailable: boolean;
+  ffprobeAvailable: boolean;
+  ffmpegVersion?: string;
+  ffprobeVersion?: string;
 }
 export interface IngestProgress {
   jobId: string;
@@ -88,6 +178,29 @@ export interface IngestResult {
   unsupported: string[];
   failures: string[];
   cancelled: boolean;
+}
+export interface InventoryFile {
+  sourcePath: string;
+  sourceRelativePath: string;
+  plannedRelativePath: string;
+  sizeBytes: number;
+  kind: 'video' | 'audio' | 'image' | 'camera-support' | 'unknown';
+  analysisSupported: boolean;
+  preserveHierarchy: boolean;
+}
+export interface InventoryExclusion {
+  path: string;
+  reason: string;
+  sizeBytes?: number;
+}
+export interface SourceInventory {
+  files: InventoryFile[];
+  excluded: InventoryExclusion[];
+  issues: string[];
+  totalFileCount: number;
+  totalBytes: number;
+  copyFileCount: number;
+  copyBytes: number;
 }
 export type IngestJobState =
   | 'queued'
@@ -112,6 +225,7 @@ export interface IngestJobFile {
   id: string;
   mediaId: string;
   sourcePath: string;
+  sourceRelativePath?: string;
   destinationPath: string;
   relativePath: string;
   originalFilename: string;
@@ -134,6 +248,10 @@ export interface IngestJob {
   files: IngestJobFile[];
   unsupported: string[];
   failures: string[];
+  inventoryExcluded?: InventoryExclusion[];
+  inventoryIssues?: string[];
+  inventoryTotalFileCount?: number;
+  inventoryTotalBytes?: number;
   currentFile?: string;
   bytesTotal: number;
   bytesTransferred: number;
@@ -149,10 +267,22 @@ export const emptySettings = (): DeviceSettings => ({
   sharedCataloguePath: '',
   thumbnailCachePath: '',
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
-  ingestDateOrganization: 'original-file-dates',
+  hoverPreviewsEnabled: true,
+  previewCacheLimitBytes: 512 * 1024 * 1024,
+  ingestDateOrganization: 'today',
   dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
   projectPaths: {},
+  startWithWindows: false,
+  closeToTray: true,
+  startupPage: 'Library',
+  checkForUpdates: true,
+  theme: 'graphite',
+  density: 'comfortable',
+  showAttachedAudioSeparately: false,
+  sidebarCollapsed: false,
+  libraryFolderSort: 'newest',
+  libraryFolderOrder: [],
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],
@@ -173,7 +303,35 @@ export const desktopBridge = {
       filters: [
         {
           name: 'Camera media',
-          extensions: ['mp4', 'mov', 'm4v', 'h264', 'h265', 'hevc', 'wav'],
+          extensions: [
+            'mp4',
+            'mov',
+            'm4v',
+            'mxf',
+            'h264',
+            'h265',
+            'hevc',
+            'mts',
+            'm2ts',
+            'avi',
+            'r3d',
+            'braw',
+            'wav',
+            'bwf',
+            'aif',
+            'aiff',
+            'mp3',
+            'm4a',
+            'jpg',
+            'jpeg',
+            'png',
+            'tif',
+            'tiff',
+            'dng',
+            'arw',
+            'cr2',
+            'cr3',
+          ],
         },
       ],
     });
@@ -183,14 +341,19 @@ export const desktopBridge = {
     const value = await open({ multiple: false, directory: true });
     return typeof value === 'string' ? value : undefined;
   },
+  inventorySources: (sources: string[], dateOverride?: string) =>
+    invoke<SourceInventory>('inventory_sources', { sources, dateOverride }),
   startIngest: (request: {
     jobId: string;
     sources: string[];
     dateOverride?: string;
     renamedDestinations?: Record<string, string>;
+    batchTags?: string[];
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
+  clearCompletedIngestJobs: (jobId?: string) =>
+    invoke<IngestJob[]>('clear_completed_ingest_jobs', { jobId }),
   updateIngestFileMetadata: (
     jobId: string,
     fileId: string,
@@ -218,6 +381,14 @@ export const desktopBridge = {
     listen<IngestJob[]>('ingest-jobs-changed', (event) =>
       handler(event.payload),
     ),
+  onDiscoveryProgress: (
+    handler: (status: DiscoveryStatus) => void,
+  ): Promise<UnlistenFn> =>
+    listen<DiscoveryStatus>('discovery-progress', (event) =>
+      handler(event.payload),
+    ),
+  onCatalogueChanged: (handler: () => void): Promise<UnlistenFn> =>
+    listen('catalogue-changed', handler),
   onFileDrop: (handler: (paths: string[]) => void): Promise<UnlistenFn> =>
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === 'drop') handler(event.payload.paths);
@@ -228,14 +399,66 @@ export const desktopBridge = {
     projectIds?: string[];
     addTags?: string[];
     addProjectIds?: string[];
+    removeTags?: string[];
+    removeProjectIds?: string[];
     notes?: string;
+    favourite?: boolean;
   }) => invoke<Catalogue>('update_media', { update }),
+  updateProject: (update: {
+    projectId: string;
+    notes: string;
+    tags: string[];
+  }) => invoke<Catalogue>('update_project', { update }),
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
-  rescan: () => invoke<RescanResult>('rescan'),
+  retryProjectSynchronization: (projectId: string) =>
+    invoke<NonNullable<Catalogue['issues']>>('retry_project_synchronization', {
+      projectId,
+    }),
+  inventoryProject: (projectId: string) =>
+    invoke<ProjectInventory>('inventory_project', { projectId }),
+  openProjectFolder: (projectId: string) =>
+    invoke<void>('open_project_folder', { projectId }),
+  revealProjectAsset: (projectId: string, relativePath: string) =>
+    invoke<void>('reveal_project_asset', { projectId, relativePath }),
+  rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
+  getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
+  logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
+  appInfo: () => invoke<AppInfo>('app_info'),
+  updaterConfiguration: () =>
+    invoke<UpdaterConfiguration>('updater_configuration'),
+  beginUpdateInstallation: () => invoke<void>('begin_update_installation'),
+  endUpdateInstallation: () => invoke<void>('end_update_installation'),
+  openSupportLink: (
+    destination: 'github' | 'releases' | 'test-builds' | 'website' | 'coffee',
+  ) => invoke<void>('open_support_link', { destination }),
+  openLogsFolder: () => invoke<void>('open_logs_folder'),
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),
   enrichMedia: () => invoke<number>('enrich_media'),
+  mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
+  resolveMediaPath: (mediaId: string) =>
+    invoke<string>('resolve_media_path', { mediaId }),
+  revealMediaInExplorer: (mediaId: string) =>
+    invoke<void>('reveal_media_in_explorer', { mediaId }),
+  openMediaFolder: (mediaId: string) =>
+    invoke<void>('open_media_folder', { mediaId }),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),
+  loadThumbnailSources: async (mediaIds: string[]) => {
+    const sources = await invoke<Record<string, string>>(
+      'load_thumbnail_sources',
+      { mediaIds },
+    );
+    return Object.fromEntries(
+      Object.entries(sources).map(([mediaId, path]) => [
+        mediaId,
+        convertFileSrc(path),
+      ]),
+    );
+  },
+  loadHoverPreview: (mediaId: string) =>
+    invoke<HoverPreview>('load_hover_preview', { mediaId }),
+  hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
+  clearHoverPreviewCache: () => invoke<number>('clear_hover_preview_cache'),
 };

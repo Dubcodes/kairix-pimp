@@ -1,0 +1,125 @@
+name: Publish signed automatic beta update
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing reviewed public prerelease tag (for example v0.1.1-6)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish-signed-update:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    environment: beta-release
+    steps:
+      - name: Check out the authorized release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Authorize source, release assets and signing configuration
+        id: identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw 'TAURI_SIGNING_PRIVATE_KEY is required.' }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { throw 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required.' }
+          if ([string]::IsNullOrWhiteSpace($env:PIMP_UPDATER_PUBLIC_KEY)) { throw 'PIMP_UPDATER_PUBLIC_KEY repository variable is required.' }
+          git fetch origin main --tags
+          $sha = (git rev-parse HEAD).Trim()
+          git merge-base --is-ancestor $sha origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release commit is not reachable from approved main.' }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ('${{ inputs.release_tag }}' -ne "v$version") { throw 'Tag and package version disagree.' }
+          cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_beta_and_fails_closed_without_a_public_key
+          if ($LASTEXITCODE -ne 0) { throw 'Updater public key is invalid.' }
+          $assets = gh release view '${{ inputs.release_tag }}' --json isPrerelease,assets | ConvertFrom-Json
+          if (-not $assets.isPrerelease) { throw 'Automatic beta updates require an existing prerelease.' }
+          $setup = @($assets.assets | Where-Object { $_.name -like '*Setup-Unsigned.exe' -and $_.size -gt 0 })
+          $checksums = @($assets.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' -and $_.size -gt 0 })
+          if ($setup.Count -ne 1 -or $checksums.Count -ne 1) { throw 'Required public release assets are missing or empty.' }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build signed NSIS updater payload
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PIMP_BUILD_COMMIT: ${{ steps.identity.outputs.sha }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: npm run tauri -- build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":"v1Compatible"}}'
+
+      - name: Verify signature and construct manifest
+        shell: pwsh
+        env:
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
+          if (-not $artifact -or $artifact.Length -eq 0) { throw 'Signed updater payload is missing or empty.' }
+          $signaturePath = "$($artifact.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw 'Updater signature is missing.' }
+          cargo run --quiet --manifest-path src-tauri/Cargo.toml --example verify_update -- $artifact.FullName $signaturePath $env:PIMP_UPDATER_PUBLIC_KEY '${{ steps.identity.outputs.version }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Independent signature verification failed.' }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+          "$hash  $($artifact.Name)" | Set-Content src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt
+          $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+          $url = "https://github.com/Dubcodes/kairix-pimp/releases/download/${{ inputs.release_tag }}/$([Uri]::EscapeDataString($artifact.Name))"
+          $manifest = [ordered]@{
+            version = '${{ steps.identity.outputs.version }}'
+            notes = Get-Content docs/BETA_RELEASE_NOTES.md -Raw
+            pub_date = (Get-Date).ToUniversalTime().ToString('o')
+            platforms = [ordered]@{
+              'windows-x86_64-nsis' = [ordered]@{ signature = $signature; url = $url }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content src-tauri/target/release/bundle/latest.json
+
+      - name: Publish versioned signed assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
+          gh release upload '${{ inputs.release_tag }}' $artifact.FullName "$($artifact.FullName).sig" src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt --clobber
+          $remote = gh release view '${{ inputs.release_tag }}' --json assets --jq ".assets[] | select(.name == `"$($artifact.Name)`") | .size"
+          if (-not $remote -or [long]$remote -ne $artifact.Length) { throw 'Published updater payload size does not match.' }
+
+      - name: Publish approved channel manifest last
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $manifest = 'src-tauri/target/release/bundle/latest.json'
+          gh release view beta-channel *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload beta-channel $manifest --clobber
+          } else {
+            gh release create beta-channel $manifest --prerelease --latest=false --title 'Kairix PIMP approved Beta channel' --notes 'Machine-readable signed Beta update channel.'
+          }

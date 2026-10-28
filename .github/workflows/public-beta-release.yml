@@ -1,0 +1,138 @@
+name: Publish public Windows beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_version:
+        description: Exact package version to publish (for example 0.1.1-5)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish-manual-beta:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 50
+    environment: public-beta-release
+    steps:
+      - name: Check out reviewed main source
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install FFmpeg for acceptance tests
+        run: choco install ffmpeg --no-progress --yes
+
+      - name: Validate reviewed source and version metadata
+        id: identity
+        shell: pwsh
+        run: |
+          git fetch origin main --no-tags
+          $head = (git rev-parse HEAD).Trim()
+          $approvedMain = (git rev-parse origin/main).Trim()
+          if ($head -ne $approvedMain) { throw 'The checked-out commit is not current approved main.' }
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+          $desktop = Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json
+          $tauri = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $version = $package.version
+          if ($version -ne '${{ inputs.confirm_version }}') { throw 'Confirmation does not match package.json.' }
+          if ($version -notmatch '^\d+\.\d+\.\d+-\d+$') { throw 'Beta version must use a numeric prerelease.' }
+          if ($desktop.version -ne $version -or $tauri.version -ne $version -or $cargoVersion -ne $version) {
+            throw 'Version metadata disagrees across package, Cargo and Tauri.'
+          }
+          $tag = "v$version"
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists." }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "short_sha=$($head.Substring(0,12))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Run complete verification
+        run: |
+          npm test
+          npm run lint
+          npm run format
+          npm run build
+          npm audit --audit-level=high
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Validate optional automatic-update bootstrap key
+        shell: pwsh
+        env:
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PIMP_UPDATER_PUBLIC_KEY)) {
+            'UPDATER_STATUS=Automatic updates disabled; no public key was embedded.' | Out-File $env:GITHUB_ENV -Append
+          } else {
+            cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_beta_and_fails_closed_without_a_public_key
+            if ($LASTEXITCODE -ne 0) { throw 'The configured updater public key is invalid.' }
+            'UPDATER_STATUS=Automatic updates configured with the validated repository public key.' | Out-File $env:GITHUB_ENV -Append
+          }
+
+      - name: Build public unsigned MSI and NSIS installers
+        env:
+          PIMP_BUILD_COMMIT: ${{ steps.identity.outputs.sha }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: npm run tauri -- build --bundles msi,nsis
+
+      - name: Verify and stage public assets
+        shell: pwsh
+        run: |
+          $version = '${{ steps.identity.outputs.version }}'
+          $stage = New-Item -ItemType Directory -Force release-assets
+          $nsis = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe -File | Select-Object -First 1
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi -File | Select-Object -First 1
+          if (-not $nsis -or -not $msi -or $nsis.Length -eq 0 -or $msi.Length -eq 0) { throw 'Both nonempty bundles are required.' }
+          $recommended = Join-Path $stage "Kairix-PIMP-Light-$version-Windows-x64-Setup-Unsigned.exe"
+          $alternative = Join-Path $stage "Kairix-PIMP-Light-$version-Windows-x64-Unsigned.msi"
+          Copy-Item $nsis.FullName $recommended
+          Copy-Item $msi.FullName $alternative
+          Get-ChildItem $stage -File | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content (Join-Path $stage 'SHA256SUMS.txt')
+          @(
+            'Kairix PIMP Light — Windows Beta'
+            "Version: $version"
+            "Source commit: ${{ steps.identity.outputs.sha }}"
+            'Authenticode signed: no'
+            $env:UPDATER_STATUS
+          ) | Set-Content (Join-Path $stage 'BUILD-INFO.txt')
+          $bytes = [System.IO.File]::ReadAllBytes('src-tauri/target/release/kairix-pimp.exe')
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68) -ne 2) { throw 'Release executable is not a Windows GUI application.' }
+
+      - name: Create permanent public prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.identity.outputs.tag }}'
+          git tag $tag '${{ steps.identity.outputs.sha }}'
+          git push origin "refs/tags/$tag"
+          $assets = Get-ChildItem release-assets -File
+          gh release create $tag $assets.FullName --verify-tag --prerelease --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title 'Kairix PIMP Light — Windows Beta'

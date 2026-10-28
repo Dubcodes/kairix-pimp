@@ -192,3 +192,159 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Native ingest is coordinated by a versioned device-local job store and a bounded single worker. Jobs persist stable source/destination plans, progress, errors and provisional metadata. Copying, hashing and probing occur outside the catalogue write mutex; only verified registration and authoritative event persistence use it. Pause is supported between files. Startup marks active work interrupted and requires explicit retry rather than assuming removable media is present.
 - **Consequences:** Completed files form safe retry checkpoints, but partial-file byte offsets are not resumed. Operation journals remain the ownership and crash-recovery record for staging and promotion. Queue state and file availability are not synchronized through Syncthing.
+
+## ADR-025 — Unsigned beta packaging and constrained Windows file actions
+
+- **Date:** 2026-10-25
+- **Status:** Accepted
+- **Decision:** CI builds unsigned MSI and NSIS artifacts identified by version and commit. Versioned beta tags may publish prereleases only after review and merge. FFmpeg/FFprobe remain optional PATH-based tools for this beta. Reveal/open/copy UI actions accept only catalogue media IDs and resolve an existing path canonically beneath Master Bin in the native host.
+- **Consequences:** SmartScreen warnings and optional-media-tool limitations are explicit. The UI receives no arbitrary shell or filesystem capability. Signing, installer upgrades and bundled third-party media binaries remain later release work.
+
+## ADR-026 — Recovery-safe job retention and package-coherent planning
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** Automatically bound only fully completed ingest jobs with no pending metadata or recovery evidence. Failed, cancelled, interrupted and otherwise recoverable jobs remain until a future explicit user-authorized discard operation exists. When separately selected roots would collide, retain deterministic source-root identity in the planned relative path. In original-file mode, detected camera packages use their earliest available member modification time as one package date; independent files continue to use their own times.
+- **Consequences:** Repeated failures can grow the local job store until the user has an explicit discard control, but retry intent and evidence are never silently lost. Package sidecars stay with their media, and pre-copy path previews match queued path planning.
+
+## ADR-027 — Device-local desktop shell preferences
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** Close-to-tray defaults on for new devices, but the close event is intercepted only after native tray creation succeeds. Show restores the existing single instance; Quit exits without deleting durable job state. Appearance, density, startup page, update-check intent and launch-at-login remain device-local settings. External support links use a fixed native destination allowlist. The supported beta installer is per-user NSIS; MSI remains a compatibility artifact and another installation scope is never silently removed.
+- **Why:** Background ingest/discovery must survive an ordinary window close without making PIMP inaccessible, synced metadata must not acquire machine preferences, web content must not gain arbitrary URL-opening authority, and upgrade cleanup must preserve user data and explicit control.
+- **Consequences:** Tray behavior still requires installed-Windows acceptance, and users with both early MSI and NSIS installations follow the documented verify-then-uninstall migration.
+
+## ADR-028 — Fail-closed signed Beta update channel
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. Beta builds use a numeric SemVer prerelease component (for example `0.1.1-1`) so the same version remains valid for Windows MSI packaging; the release channel remains explicitly Beta. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
+- **Release-candidate clarification:** The host now owns an update-installation gate. It atomically checks durable job state before installation and prevents start, resume or retry until the updater returns or restarts the process. Public-key syntax is validated in the native configuration response. Version `0.1.1-4` is a completed-ingest and preview-cache correction candidate; it is not evidence of a completed signed upgrade.
+- **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.
+
+## ADR-029 — Serialized device settings and tray-gated autostart
+
+- **Date:** 2026-10-26
+- **Status:** Accepted
+- **Decision:** The desktop serializes every accepted immediate preference write and applies a native response only when it belongs to the newest local revision. Failed latest writes remain visibly retryable, pending writes warn before ordinary WebView unload, and explicit interface reload waits for the queue. Windows `--minimized` startup hides the main window only when native tray construction succeeded.
+- **Consequences:** Rapid theme, density, tray, startup-page and update-check changes remain ordered without stale UI rollback. Configuration form values still use explicit save to avoid excessive writes. If tray creation fails during autostart, PIMP remains visible and logs the fallback instead of becoming inaccessible.
+
+## ADR-030 — Derived external-audio grouping
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Treat exactly one same-directory, case-insensitive same-stem WAV beside exactly one MP4/MOV/M4V as attached audio. Multiple video containers or multiple WAV candidates remain unpaired. The relationship remains a deterministic catalogue projection rather than a synchronized event. The Library hides the attached WAV card by default, but searches and logical operations include both physical records; a device-local setting may expose every card.
+- **Consequences:** Late Syncthing arrivals pair on the next catalogue replay without metadata mutation or duplicate records. Ambiguous or unmatched WAV files remain independent. There is no manual override yet; adding one requires a reversible, convergent representation.
+
+## ADR-031 — Windows GUI lifecycle and Shell selection
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Release Windows executables use the GUI subsystem and release-only FFmpeg/FFprobe processes use `CREATE_NO_WINDOW`; debug builds retain consoles. All application restore triggers share show, unminimize and supported focus-request behavior with diagnostic logging and taskbar-attention fallback. File reveal uses `SHOpenFolderAndSelectItems` after media-ID lookup and canonical Master Bin containment.
+- **Consequences:** Installed launches no longer require an attached console, special-character paths avoid `explorer.exe` quoting ambiguity, and foreground restrictions remain governed by Windows rather than bypassed. Installed NSIS acceptance is still required to verify actual shell behavior.
+
+## ADR-032 — Reconcile duplicate registrations during deterministic replay
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Keep UUID registration IDs and historic append-only events. When offline devices independently register the same normalized Master Bin relative path with the same SHA-256, deterministic causal order selects the canonical historic ID and replay aliases the others. Hash equality at different paths never merges records; path equality with different hashes produces a conflict.
+- **Consequences:** Existing metadata and project references survive without log migration, and all replicas converge. The canonical ID is not content-derived and aliases are rebuilt projections rather than new shared mutable state.
+
+## ADR-033 — Authorize project roots and retry manifest projections
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Project creation/adoption is restricted to canonically contained folders beneath the configured Working Projects root. Catalogue events remain authoritative; compatible manifest projection preserves unknown fields and failures enter a device-local durable retry queue.
+- **Consequences:** Temporary project-drive failure is reported as partial success and recovers without duplicate catalogue events. External folders require a future separate authorization workflow.
+
+## ADR-034 — Serialize and write-ahead project-manifest projection
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Use one narrow device-local manifest transaction mutex for Library reconciliation, metadata-driven projection and project creation. Persist retry intent before an authoritative event append, release the catalogue mutex before manifest filesystem work, and clear intent only after the manifest and retry-state replacement are durable. A pending project creation also records its authorized local directory so restart can repair a folder mapping after registration. Identical retry state and compatible manifests are not rewritten.
+- **Consequences:** Concurrent refreshes cannot replace newer retry evidence, and a crash after catalogue append leaves a replayable intent. A failed project event append creates no new manifest or folder mapping and never deletes the selected directory. Manifest I/O may briefly serialize another manifest operation, but it does not hold the catalogue write lock or block unrelated ingest copying.
+
+## ADR-035 — Keep Library organization local and logical recordings explicit
+
+- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Decision:** Persist sidebar collapse, folder sort mode and custom folder order as device settings. Folder ordering is a view projection only. A hidden attached WAV contributes its tags, projects and search fields to the grouped video and logical counts, while selecting the separately displayed WAV intentionally targets only that physical record. Unicode path matching uses locale-independent lowercase conversion without silently composing or decomposing filenames.
+- **Consequences:** Users may organize large Libraries without changing Master Bin layout or synchronized events. Paired bulk operations remain explicit two-record updates, projects and folders avoid double counts, and distinct Unicode filenames are not guessed to be equivalent.
+
+## ADR-036 — Recover project identity before allocation
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Before allocating a project UUID, compare the selected authorized directory with device-local project-path mappings, durable manifest retry records and any compatible existing manifest. Reuse the single established identity and skip a duplicate authoritative upsert when it already exists; reject multiple identities. On catalogue refresh, inspect compatible manifests for semantic drift and durably reconcile only those that differ, including media IDs canonicalized by path-plus-hash replay.
+- **Consequences:** Retrying a partially completed Create operation cannot register one folder twice. Historical event streams remain untouched, incompatible manifests remain protected, and ordinary unchanged Library refreshes perform no manifest or retry-state replacement.
+
+## ADR-037 — Inventory project folders without interpreting Premiere internals
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Inventory only files beneath the canonically authorized device-local project path, preserving relative paths and basic filesystem metadata without content hashing. Categorize by folder and extension, exclude auto-save locations from deterministic main `.prproj` selection, and expose only project-ID/relative-path reveal operations. Linked Master Bin media remains an assignment projection and is never copied or deleted by the workspace.
+- **Consequences:** Existing projects become navigable without modifying assets or relying on undocumented Premiere formats. Folder scans may still be expensive for exceptionally large projects and require installed-drive acceptance and future bounded progress/cancellation if profiling demonstrates a need.
+
+## ADR-038 — Supersede project inventory views and bound native walks
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Every project inventory request carries an in-memory UI generation and is accepted only while its project and generation remain current. Switching projects, returning to the index, or starting another refresh supersedes earlier results without claiming to cancel their underlying blocking filesystem walk. Native inventory remains read-only, does not follow links or hash assets, and fails clearly after 100,000 files or 64 hierarchy levels.
+- **Consequences:** Late successes and failures cannot replace another project's status, while an already-running OS walk may finish harmlessly in the blocking worker pool. Very large projects require narrower roots or a future cooperatively cancellable streaming inventory design.
+
+## ADR-039 — Lazy fingerprinted hover previews in the device-local cache
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Generate 1–16 low-resolution JPEG samples only after an eligible local video thumbnail is hovered. One native mutex bounds FFmpeg generation to a single job, while pointer movement selects already-decoded frame images without spawning processes. Cache identity includes media ID, authoritative SHA-256 and current local size/modified evidence; entries live below the configured device-local thumbnail cache, are validated before loading and are evicted oldest-first to a separate configurable preview budget.
+- **Consequences:** Preview frames persist across restarts and regenerate after source-evidence changes without touching Master Bin or synchronized journals. Reduced-motion users receive the static thumbnail. A failed, offline or unsupported source leaves the static thumbnail, and preview generation never runs for the whole Library at startup.
+
+## ADR-040 — Batch validated thumbnail sources and defer image decoding
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card.
+- **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Cards outside the viewport retain placeholders until near view. The grid itself is still not virtualized; the 3,000-card component measurement remains a baseline for the planned large-library virtualization milestone.
+
+## ADR-041 — Seed durable ingest metadata without replacing file edits
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Accept normalized batch tags in the existing ingest request and seed them into each eligible video, audio and image file's durable provisional metadata with the existing edited-field marker. Camera support and unknown sidecar files receive no catalogue metadata. Later per-file edits submit the complete merged tag list through the existing durable metadata command.
+- **Consequences:** Batch intent survives pause, retry and restart and reaches verified video/WAV registrations without a new synchronized event type. Copy remains the only ingest mode. Source cleanup remains disabled until a separately reviewed whole-batch verification, source-revalidation, package grouping, explicit confirmation and interrupted-cleanup journal are implemented.
+
+## ADR-042 — Preflight updater availability and separate manual channels
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Load native updater configuration before automatic or manual checking. Missing or invalid signing configuration is a stable **Automatic updates not configured** state and never invokes the network updater. GitHub Actions test builds, GitHub Releases and the official project website are distinct fixed native-allowlisted destinations.
+- **Consequences:** Unconfigured builds no longer flicker through a misleading check or claim to be current. Test artifacts remain clearly separate from public releases, and signing verification is not weakened. Signed installation remains blocked until protected keys are provisioned and accepted through the existing Beta channel.
+
+## ADR-043 — Clear only revalidated finalized ingest history
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Present queued/copying/verifying jobs as Active, fully finalized jobs as collapsed Completed history, and every paused/interrupted/failed/cancelled or unresolved-completed job as Needs attention. Individual and bulk clear operations re-read the durable store under its mutex and reject inventory issues, failures, incomplete/error files, pending metadata and matching recovery journals.
+- **Consequences:** The header no longer calls retained history active work. Clearing removes only eligible device-local JSON history and emits the updated list; media, catalogue events, source files and staging evidence are outside the operation. Automatic bounded pruning uses the same conservative finalization predicate.
+
+## ADR-044 — Bound preview requests and serialize cache clearing
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Retain at most eight in-flight or completed preview requests in a frontend LRU, deduplicate identical keys, reject additional work while all slots are pending, and invalidate every promise/result with a generation epoch when clearing. Native cache clearing takes the same mutex as generation before inspecting or removing cache-owned directories.
+- **Consequences:** Base64 frames cannot accumulate without bound, rapid card movement cannot enqueue unlimited FFmpeg work, and active temporary directories are never deleted underneath FFmpeg. Clearing may wait for current generation and the UI communicates that wait; Master Bin paths are never part of cache removal.
+
+## ADR-045 — Separate development, manual release and signed-update trust boundaries
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Pull requests produce keyless, unsigned, short-lived Windows artifacts. A protected manual-release workflow may publish permanent unsigned prereleases from current reviewed `main` without private credentials and embeds the validated repository-level updater public key only when configured. A separate `beta-release` workflow receives the private key, accepts only an existing prerelease whose commit is reachable from `main`, independently verifies the Tauri signature and publishes the fixed channel manifest only after its versioned payload exists.
+- **Consequences:** Missing signing secrets no longer block public downloads, untrusted changes cannot publish an approved update, and the bootstrap installer and subsequent updater payload share one explicit public key. Tauri payload signing does not claim Authenticode signing. Automatic updates remain unverified until a real installed higher-version upgrade succeeds.
+
+## ADR-046 — Use emitted preview timestamps and release card-owned frames
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Keep bounded FPS sampling, append FFmpeg `showinfo`, and store each emitted frame's reported PTS in a version-2 preview manifest. Library cards release their preview object when hover ends or they leave the active viewport; the shared eight-entry request cache and size-limited disk cache remain the reuse layers.
+- **Consequences:** Timecodes follow actual output cadence, including non-zero PTS, and old manifests with assumed positions regenerate safely under a new fingerprint. Sequentially hovering mounted cards no longer leaves an unbounded Base64 collection in component state, while revisiting a valid disk entry does not rerun FFmpeg.

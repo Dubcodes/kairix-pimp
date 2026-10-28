@@ -6,20 +6,32 @@ Implemented and automated-test covered: domain types, date selection/fallback, f
 
 Implemented and tested with generated media: FFprobe metadata extraction and FFmpeg thumbnail generation for H.264 and H.265/HEVC fixtures.
 
-UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection, Light status, and the two required date mode names. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation.
+UI implemented and component-test covered: application shell, primary navigation, library grid, folder/date presentation, search, multi-selection without Shift text highlighting, a reduced-motion-aware content scroll control, Light status, and the two required date mode names. Thumbnail placeholders and the responsive batch editor follow theme tokens. Batch tagging and many-to-many project assignment use the shared accessible searchable combo box with stable IDs and explicit tag creation.
 
 ## Milestone 2 — production ingest and advanced library (in progress)
 
 - Implemented: native picker/drop, recursive inventory, verified copies, persisted real Library, per-ingest date overrides, explicit collision rename, projects, manual/periodic discovery, metadata/thumbnails and conservative same-stem MP4/WAV pairing
-- Implemented reliability foundation: canonical causal event replay, duplicate/malformed/newer-record handling, legacy migration/backup, multi-device convergence tests, external staging, minimal recovery journal, no-overwrite promotion, source-change checks, conservative discovery, folder-aware pairing, portable thumbnails and manifest identity protection
+- Implemented reliability foundation: canonical causal event replay, deterministic path-plus-hash registration aliases, duplicate/malformed/newer-record handling, legacy migration/backup, multi-device convergence tests, external staging, minimal recovery journal, no-overwrite promotion, source-change checks, conservative discovery, two-sided unambiguous folder-aware pairing, portable thumbnails, Working Projects containment and recoverable manifest projection
+- Implemented manifest reliability correction: serialized device-local reconciliation, pre-append retry intent, restart repair for a registered project's local folder mapping, failure-safe project creation ordering and no-op suppression for unchanged state/manifests
+- Implemented project recovery correction: folder-first identity reuse across pending/settings/manifest evidence, explicit synchronization retry, conflict rejection and stale media-alias reconciliation after catalogue convergence
+- Implemented Projects workspace: navigable project details, read-only categorized folder inventory, local status/size/main-project evidence, portable notes/tags, linked logical recordings and Library/Explorer navigation
+- Implemented Projects workspace resilience: stale-request suppression, bounded read-only inventory, independent accessible row controls, grouped recording metadata actions and focus-preserving Library location
+- Implemented Library usability: persistent icon-only sidebar, six deterministic folder sort modes plus accessible custom order, logical video/WAV metadata and counts, clean thumbnail placeholders, themed batch editing and content scroll-to-top
+- Implemented installed-app P0 corrections: responsive scroll-bounded ingest destination mapping and one validated batched thumbnail-source lookup with near-viewport lazy decoding
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
+- Implemented: active/completed/attention job separation with collapsed summaries and native-revalidated individual/all completed-history clearing
+- Implemented: normalized batch tags seed all eligible recording files while preserving later per-file tags; verified-copy source cleanup remains design-only and disabled
+- Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
+- Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history
 - Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
-- Contact sheets, preview player, custom thumbnails, folder rename/move journal
+- Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
+- Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
+- Implemented: mounted cards release large preview frames after hover/out-of-viewport, and timecodes use actual FFmpeg `showinfo` sample timestamps rather than planned positions
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
-- Rich library interaction: keyboard/multi-select batch actions, favourites, saved filters, previews and explicit review/conflict flows
+- Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
 
 ## Milestone 3 — Premiere extension
 
@@ -43,10 +55,12 @@ Unused-footage review, cross-project protection, synchronization preflight, reco
 
 Automation is opt-in and disabled by default. Per-file protection and successful finalization verification gate eligibility; Syncthing replicas are not treated as backups.
 
+The pre-implementation state machine, overlap/source-identity gates, package completeness rules, exact removal review, durable journal and failure-injection matrix are recorded in `SOURCE_CLEANUP_DESIGN.md`. No destructive command or UI control is enabled in the beta.
+
 ## Cross-cutting — persistent background work
 
 The versioned background job foundation is implemented for ingest: it persists intent and completed-file checkpoints, distinguishes incomplete from committed records, and reconciles safely at startup. Extend the same bounded, device-local pattern to enrichment, consolidation and cleanup without treating those future job types as implemented.
 
 ## Milestone 7 — packaging and additional platforms
 
-Produce separate Windows Light and Full installers from the same codebase, verify binary dependency contents, sign, test upgrade/rollback, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.
+Implemented for the public Light beta: keyless PR installer artifacts, a protected permanent manual-prerelease workflow, a separately protected signed-update workflow that publishes the channel manifest last, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: provision the updater key pair and protected environments, complete a real signed installed upgrade, complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, add Authenticode signing, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.

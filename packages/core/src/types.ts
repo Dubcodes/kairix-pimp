@@ -14,6 +14,17 @@ export interface DeviceSettings {
   initializedCataloguePath?: string;
   projectPaths?: Record<string, string>;
   dateFolderPattern?: string;
+  showAttachedAudioSeparately?: boolean;
+  sidebarCollapsed?: boolean;
+  libraryFolderSort?:
+    | 'newest'
+    | 'oldest'
+    | 'name-asc'
+    | 'name-desc'
+    | 'most-recordings'
+    | 'fewest-recordings'
+    | 'custom';
+  libraryFolderOrder?: string[];
 }
 
 export interface SharedSettings {
@@ -36,6 +47,7 @@ export interface TechnicalMetadata {
 export interface MediaItem {
   id: string;
   relativePath: string;
+  sourceRelativePath?: string;
   originalFilename: string;
   sha256: string;
   captureDate?: string;

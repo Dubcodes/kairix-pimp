@@ -103,7 +103,7 @@ pub fn validate_relative(relative: &str) -> Result<PathBuf, String> {
     Ok(clean)
 }
 
-fn within(root: &Path, candidate: &Path) -> bool {
+pub(crate) fn within(root: &Path, candidate: &Path) -> bool {
     #[cfg(windows)]
     {
         let root = root.to_string_lossy().to_lowercase();
@@ -117,6 +117,95 @@ fn within(root: &Path, candidate: &Path) -> bool {
     {
         candidate.starts_with(root)
     }
+}
+
+pub fn resolve_project_directory(
+    root: &Path,
+    requested: &Path,
+    create_missing: bool,
+) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve Working Projects root: {error}"))?;
+    if requested.as_os_str().is_empty()
+        || (!requested.is_absolute()
+            && requested
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)))
+    {
+        return Err("Project path contains traversal outside the authorized root".into());
+    }
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(validate_relative(&requested.to_string_lossy())?)
+    };
+
+    let mut existing = candidate.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .ok_or("Project path has no existing authorized ancestor")?;
+                missing.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or("Project path has no existing authorized ancestor")?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect project path {}: {error}",
+                    existing.display()
+                ))
+            }
+        }
+    }
+    missing.reverse();
+    for component in &missing {
+        validate_relative(
+            component
+                .to_str()
+                .ok_or("Project path components must be valid Unicode")?,
+        )?;
+    }
+
+    let mut current = existing
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve project path ancestor: {error}"))?;
+    if !within(&root, &current) {
+        return Err("Project path escapes the configured Working Projects root".into());
+    }
+    if !current.is_dir() {
+        return Err(format!(
+            "Project path ancestor is not a directory: {}",
+            current.display()
+        ));
+    }
+    if !missing.is_empty() && !create_missing {
+        return Err("The authorized project folder is not available locally".into());
+    }
+    for component in missing {
+        let next = current.join(component);
+        fs::create_dir(&next).map_err(|error| {
+            format!("Cannot create project directory {}: {error}", next.display())
+        })?;
+        current = next
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve created project directory: {error}"))?;
+        if !within(&root, &current) {
+            return Err("Created project directory escaped the authorized root".into());
+        }
+    }
+    if current == root {
+        return Err("Choose a project folder inside the Working Projects root".into());
+    }
+    if !current.is_dir() {
+        return Err("Authorized project path is not a directory".into());
+    }
+    Ok(current)
 }
 
 pub fn resolve_existing(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -334,6 +423,60 @@ mod tests {
         let result = resolve_for_create(&master, "escape/new/clip.mp4");
         assert!(result.is_err());
         assert!(!outside.join("new").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_directory_authorization_handles_existing_missing_and_nested_paths() {
+        let root = temporary("project-directory");
+        let projects = root.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let existing = projects.join("Existing");
+        fs::create_dir(&existing).unwrap();
+        assert_eq!(
+            resolve_project_directory(&projects, &existing, true).unwrap(),
+            existing.canonicalize().unwrap()
+        );
+        let nested = projects.join("Series").join("Episode 1");
+        assert_eq!(
+            resolve_project_directory(&projects, &nested, true).unwrap(),
+            nested.canonicalize().unwrap()
+        );
+        assert!(resolve_project_directory(&projects, Path::new("../escape"), true).is_err());
+        assert!(resolve_project_directory(
+            &projects,
+            &projects.join("..").join("absolute-escape"),
+            true
+        )
+        .is_err());
+        assert!(!root.join("escape").exists());
+        assert!(!root.join("absolute-escape").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_directory_authorization_rejects_link_and_junction_escapes() {
+        let root = temporary("project-directory-link");
+        let projects = root.join("projects");
+        let outside = root.join("outside");
+        fs::create_dir(&projects).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let link = projects.join("linked");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link);
+        if let Err(error) = linked {
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                eprintln!("directory-link creation is unavailable in this test environment");
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("cannot create project directory link: {error}");
+        }
+        assert!(resolve_project_directory(&projects, &link.join("Project"), true).is_err());
+        assert!(!outside.join("Project").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,0 +1,130 @@
+name: Windows beta installer
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-beta:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install FFmpeg for acceptance tests
+        run: choco install ffmpeg --no-progress --yes
+
+      - name: Run TypeScript and web checks
+        run: |
+          npm test
+          npm run lint
+          npm run format
+          npm run build
+          npm audit --audit-level=high
+
+      - name: Run native checks
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build unsigned keyless MSI and NSIS installers
+        env:
+          PIMP_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: npm run tauri -- build --bundles msi,nsis
+
+      - name: Verify release executable uses the Windows GUI subsystem
+        shell: pwsh
+        run: |
+          $executable = Get-Item src-tauri/target/release/kairix-pimp.exe
+          $bytes = [System.IO.File]::ReadAllBytes($executable.FullName)
+          if ($bytes.Length -lt 256) { throw 'Release executable is unexpectedly small.' }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $optionalHeader = $peOffset + 24
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
+          if ($subsystem -ne 2) {
+            throw "Expected Windows GUI subsystem (2), found $subsystem. A console window would accompany the installed app."
+          }
+
+      - name: Validate version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $expectedTag = "v$version"
+          if ($version -notmatch '^\d+\.\d+\.\d+-\d+$') {
+            throw 'Windows Beta versions require a numeric prerelease identifier (for example 0.1.1-1).'
+          }
+          if ('${{ github.ref_name }}' -ne $expectedTag) {
+            throw "Release tag must exactly match package version: expected $expectedTag"
+          }
+
+      - name: Verify bundles and record build identity
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $sourceSha = '${{ github.event.pull_request.head.sha || github.sha }}'
+          $buildSha = '${{ github.sha }}'
+          $shortSha = $sourceSha.Substring(0, 12)
+          $bundleRoot = (Resolve-Path src-tauri/target/release/bundle).Path
+          $installers = @(
+            Get-ChildItem src-tauri/target/release/bundle/msi/*.msi
+            Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe
+          )
+          if ($installers.Count -lt 2) {
+            throw "Expected both MSI and NSIS installers, found $($installers.Count)"
+          }
+          $empty = @($installers | Where-Object { $_.Length -eq 0 })
+          if ($empty.Count -gt 0) {
+            throw "Installer output is empty: $($empty.FullName -join ', ')"
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHORT_SHA=$shortSha" | Out-File -FilePath $env:GITHUB_ENV -Append
+          @(
+            "Kairix PIMP Windows beta"
+            "Version: $version"
+            "Source commit: $sourceSha"
+            "Build/test commit: $buildSha"
+            "Unsigned: yes"
+            "FFmpeg/FFprobe: optional PATH-based tools; not bundled"
+            "Windows may display a SmartScreen warning because this internal beta is not code-signed."
+          ) | Set-Content src-tauri/target/release/bundle/BUILD-INFO.txt
+          $installers | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            $relativePath = [System.IO.Path]::GetRelativePath($bundleRoot, $_.FullName).Replace('\', '/')
+            "$hash  $relativePath"
+          } | Set-Content src-tauri/target/release/bundle/SHA256SUMS.txt
+
+      - name: Upload unsigned Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kairix-PIMP-${{ env.APP_VERSION }}-${{ env.SHORT_SHA }}-unsigned-windows
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/BUILD-INFO.txt
+            src-tauri/target/release/bundle/SHA256SUMS.txt

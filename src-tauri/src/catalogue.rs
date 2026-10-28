@@ -40,6 +40,9 @@ pub struct IntegrityEvidence {
 pub struct MediaItem {
     pub id: String,
     pub relative_path: String,
+    /// Original path within the selected camera card/folder, when ingested.
+    #[serde(default)]
+    pub source_relative_path: Option<String>,
     pub original_filename: String,
     pub sha256: String,
     pub capture_date: Option<String>,
@@ -655,9 +658,93 @@ fn add_conflict(catalogue: &mut Catalogue, conflict: MetadataConflict) {
     }
 }
 
+fn normalized_media_identity_path(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_lowercase()
+}
+
+fn registration_aliases(
+    events: &[EventEnvelope],
+) -> (HashMap<String, String>, Vec<MetadataConflict>) {
+    let mut by_path = BTreeMap::<String, BTreeMap<String, Vec<(&EventEnvelope, &MediaItem)>>>::new();
+    let mut identities_by_id = HashMap::<String, HashSet<(String, String)>>::new();
+    for envelope in events {
+        let CatalogueEvent::MediaRegistered { media } = &envelope.event else {
+            continue;
+        };
+        let path = normalized_media_identity_path(&media.relative_path);
+        let hash = media.sha256.to_lowercase();
+        identities_by_id
+            .entry(media.id.clone())
+            .or_default()
+            .insert((path.clone(), hash.clone()));
+        by_path
+            .entry(path)
+            .or_default()
+            .entry(hash)
+            .or_default()
+            .push((envelope, media));
+    }
+
+    let mut aliases = HashMap::new();
+    let mut conflicts = Vec::new();
+    let conflicting_ids = identities_by_id
+        .iter()
+        .filter(|(_, identities)| identities.len() > 1)
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    for (path, hashes) in by_path {
+        if hashes.len() > 1 {
+            let mut registrations = hashes.values().flatten().collect::<Vec<_>>();
+            registrations.sort_by_key(|(envelope, _)| concurrent_key(envelope));
+            conflicts.push(MetadataConflict {
+                entity_id: path.clone(),
+                field: "identity-hash".into(),
+                event_ids: registrations
+                    .iter()
+                    .map(|(envelope, _)| envelope.event_id.clone())
+                    .collect(),
+                values: registrations
+                    .iter()
+                    .map(|(_, media)| {
+                        serde_json::json!({
+                            "id": media.id,
+                            "relativePath": media.relative_path,
+                            "sha256": media.sha256
+                        })
+                    })
+                    .collect(),
+            });
+        }
+        for registrations in hashes.values() {
+            let canonical = registrations
+                .iter()
+                .filter(|(_, media)| !conflicting_ids.contains(&media.id))
+                .min_by_key(|(envelope, _)| concurrent_key(envelope))
+                .map(|(_, media)| media.id.clone());
+            for (_, media) in registrations {
+                if conflicting_ids.contains(&media.id) {
+                    aliases.insert(media.id.clone(), media.id.clone());
+                } else if let Some(canonical) = &canonical {
+                    aliases.insert(media.id.clone(), canonical.clone());
+                }
+            }
+        }
+    }
+    (aliases, conflicts)
+}
+
+fn canonical_media_id<'a>(aliases: &'a HashMap<String, String>, media_id: &'a str) -> &'a str {
+    aliases.get(media_id).map(String::as_str).unwrap_or(media_id)
+}
+
 pub fn rebuild(mut read: EventRead) -> Catalogue {
     let events = causal_order(std::mem::take(&mut read.events), &mut read.issues);
+    let (media_aliases, identity_conflicts) = registration_aliases(&events);
     let mut catalogue = Catalogue::default();
+    catalogue.conflicts.extend(identity_conflicts);
     let mut seen = HashSet::new();
     let mut media = HashMap::<String, MediaItem>::new();
     let mut projects = HashMap::<String, ProjectRecord>::new();
@@ -671,36 +758,68 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
         }
         match &envelope.event {
             CatalogueEvent::MediaRegistered { media: item } => {
-                if let Some(existing) = media.get(&item.id) {
-                    if existing != item {
+                let canonical_id = canonical_media_id(&media_aliases, &item.id).to_string();
+                if let Some(existing) = media.get_mut(&canonical_id) {
+                    if normalized_media_identity_path(&existing.relative_path)
+                        != normalized_media_identity_path(&item.relative_path)
+                        || !existing.sha256.eq_ignore_ascii_case(&item.sha256)
+                    {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
-                                entity_id: item.id.clone(),
+                                entity_id: canonical_id.clone(),
                                 field: "registration".into(),
                                 event_ids: vec![envelope.event_id.clone()],
                                 values: vec![
-                                    serde_json::to_value(existing).unwrap(),
+                                    serde_json::to_value(&*existing).unwrap(),
                                     serde_json::to_value(item).unwrap(),
                                 ],
                             },
                         );
                     }
-                    continue;
+                    if existing.notes != item.notes {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: canonical_id.clone(),
+                                field: "notes".into(),
+                                event_ids: vec![envelope.event_id.clone()],
+                                values: vec![
+                                    Value::String(existing.notes.clone()),
+                                    Value::String(item.notes.clone()),
+                                ],
+                            },
+                        );
+                    }
+                    existing.favourite |= item.favourite;
+                    for (device, evidence) in &item.integrity_by_device {
+                        existing
+                            .integrity_by_device
+                            .entry(device.clone())
+                            .or_insert_with(|| evidence.clone());
+                    }
+                } else {
+                    let mut stored = item.clone();
+                    stored.id = canonical_id.clone();
+                    if stored
+                        .thumbnail_path
+                        .as_deref()
+                        .is_some_and(|value| Path::new(value).is_absolute())
+                    {
+                        stored.thumbnail_path = Some(format!("{}.jpg", stored.id));
+                    }
+                    stored.tags.clear();
+                    stored.project_ids.clear();
+                    media.insert(canonical_id.clone(), stored);
                 }
-                let mut item = item.clone();
-                if item
-                    .thumbnail_path
-                    .as_deref()
-                    .is_some_and(|value| Path::new(value).is_absolute())
+                for (field, values) in [
+                    ("tags", item.tags.clone()),
+                    ("projectIds", item.project_ids.clone()),
+                ]
                 {
-                    item.thumbnail_path = Some(format!("{}.jpg", item.id));
-                }
-                let original_tags = std::mem::take(&mut item.tags);
-                let original_projects = std::mem::take(&mut item.project_ids);
-                for (field, values) in [("tags", original_tags), ("projectIds", original_projects)]
-                {
-                    let set = additions.entry(format!("{}:{field}", item.id)).or_default();
+                    let set = additions
+                        .entry(format!("{canonical_id}:{field}"))
+                        .or_default();
                     for value in normalized(&values) {
                         set.insert(
                             format!("{}:{value}", envelope.event_id),
@@ -711,15 +830,15 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                         );
                     }
                 }
-                media.insert(item.id.clone(), item);
             }
             CatalogueEvent::MediaLegacySnapshotReplaced { media: item } => {
-                if let Some(existing) = media.get(&item.id) {
+                let canonical_id = canonical_media_id(&media_aliases, &item.id).to_string();
+                if let Some(existing) = media.get(&canonical_id) {
                     if existing != item {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
-                                entity_id: item.id.clone(),
+                                entity_id: canonical_id.clone(),
                                 field: "legacy-snapshot".into(),
                                 event_ids: vec![envelope.event_id.clone()],
                                 values: vec![
@@ -731,6 +850,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                     }
                 }
                 let mut item = item.clone();
+                item.id = canonical_id.clone();
                 let original_tags = std::mem::take(&mut item.tags);
                 let original_projects = std::mem::take(&mut item.project_ids);
                 for (field, values) in [("tags", original_tags), ("projectIds", original_projects)]
@@ -745,17 +865,18 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                             },
                         );
                     }
-                    additions.insert(format!("{}:{field}", item.id), set);
+                    additions.insert(format!("{canonical_id}:{field}"), set);
                 }
-                media.insert(item.id.clone(), item);
+                media.insert(canonical_id, item);
             }
             CatalogueEvent::MediaTagsAdded { media_id, values }
             | CatalogueEvent::MediaProjectsAdded { media_id, values } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 if !media.contains_key(media_id) {
                     add_conflict(
                         &mut catalogue,
                         MetadataConflict {
-                            entity_id: media_id.clone(),
+                            entity_id: media_id.to_string(),
                             field: "missing-media".into(),
                             event_ids: vec![envelope.event_id.clone()],
                             values: vec![serde_json::to_value(&envelope.event).unwrap()],
@@ -781,6 +902,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
             }
             CatalogueEvent::MediaTagsRemoved { media_id, values }
             | CatalogueEvent::MediaProjectsRemoved { media_id, values } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 let field = if matches!(envelope.event, CatalogueEvent::MediaTagsRemoved { .. }) {
                     "tags"
                 } else {
@@ -799,11 +921,12 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
             }
             CatalogueEvent::MediaTagsReplaced { media_id, values }
             | CatalogueEvent::MediaProjectsReplaced { media_id, values } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 if !media.contains_key(media_id) {
                     add_conflict(
                         &mut catalogue,
                         MetadataConflict {
-                            entity_id: media_id.clone(),
+                            entity_id: media_id.to_string(),
                             field: "missing-media".into(),
                             event_ids: vec![envelope.event_id.clone()],
                             values: vec![serde_json::to_value(&envelope.event).unwrap()],
@@ -829,6 +952,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 }
             }
             CatalogueEvent::MediaNotesSet { media_id, value } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 let Some(item) = media.get_mut(media_id) else {
                     continue;
                 };
@@ -838,7 +962,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
-                                entity_id: media_id.clone(),
+                                entity_id: media_id.to_string(),
                                 field: "notes".into(),
                                 event_ids: vec![
                                     previous.event_id.clone(),
@@ -867,6 +991,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 scalar_versions.insert(key, (envelope.clone(), Value::String(value.clone())));
             }
             CatalogueEvent::MediaFavouriteSet { media_id, value } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 let Some(item) = media.get_mut(media_id) else {
                     continue;
                 };
@@ -876,7 +1001,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                         add_conflict(
                             &mut catalogue,
                             MetadataConflict {
-                                entity_id: media_id.clone(),
+                                entity_id: media_id.to_string(),
                                 field: "favourite".into(),
                                 event_ids: vec![
                                     previous.event_id.clone(),
@@ -909,6 +1034,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 technical,
                 thumbnail_ref,
             } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 if let Some(item) = media.get_mut(media_id) {
                     item.technical = technical.clone();
                     item.thumbnail_path = thumbnail_ref
@@ -924,6 +1050,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 observed_sha256,
                 needs_review,
             } => {
+                let media_id = canonical_media_id(&media_aliases, media_id);
                 if let Some(item) = media.get_mut(media_id) {
                     item.observed_size = Some(*observed_size);
                     item.observed_modified_millis = *observed_modified_millis;
@@ -1070,13 +1197,15 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
     catalogue.media = media.into_values().collect();
     catalogue
         .media
-        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path).then_with(|| a.id.cmp(&b.id)));
     catalogue.projects = projects.into_values().collect();
-    catalogue.projects.sort_by(|a, b| a.name.cmp(&b.name));
+    catalogue
+        .projects
+        .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     catalogue.folders = folders.into_values().collect();
     catalogue
         .folders
-        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path).then_with(|| a.id.cmp(&b.id)));
     catalogue.issues.extend(read.issues);
     catalogue.updated_at = Utc::now().to_rfc3339();
     pair_audio(&mut catalogue);
@@ -1184,10 +1313,11 @@ pub fn safe_cache_reference(value: &str) -> bool {
 
 pub fn pair_audio(catalogue: &mut Catalogue) {
     let mut audios = HashMap::<(String, String), Vec<String>>::new();
+    let mut videos = HashMap::<(String, String), Vec<String>>::new();
     for item in catalogue
         .media
         .iter()
-        .filter(|item| item.file_type == "wav")
+        .filter(|item| item.file_type.eq_ignore_ascii_case("wav"))
     {
         let path = Path::new(&item.relative_path);
         let directory = path
@@ -1195,21 +1325,46 @@ pub fn pair_audio(catalogue: &mut Catalogue) {
             .unwrap_or(Path::new(""))
             .to_string_lossy()
             .replace('\\', "/")
-            .to_ascii_lowercase();
+            .to_lowercase();
         let stem = path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_ascii_lowercase();
+            .to_lowercase();
         audios
             .entry((directory, stem))
             .or_default()
             .push(item.id.clone());
     }
+    for item in catalogue.media.iter().filter(|item| {
+        matches!(
+            item.file_type.to_ascii_lowercase().as_str(),
+            "mp4" | "mov" | "m4v"
+        )
+    }) {
+        let path = Path::new(&item.relative_path);
+        let key = (
+            path.parent()
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase(),
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+        );
+        videos.entry(key).or_default().push(item.id.clone());
+    }
     for item in catalogue
         .media
         .iter_mut()
-        .filter(|item| matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v"))
+        .filter(|item| {
+            matches!(
+                item.file_type.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "m4v"
+            )
+        })
     {
         let path = Path::new(&item.relative_path);
         let key = (
@@ -1217,15 +1372,17 @@ pub fn pair_audio(catalogue: &mut Catalogue) {
                 .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/")
-                .to_ascii_lowercase(),
+                .to_lowercase(),
             path.file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .to_ascii_lowercase(),
+                .to_lowercase(),
         );
         item.attached_audio_id = audios
             .get(&key)
-            .filter(|matches| matches.len() == 1)
+            .filter(|matches| {
+                matches.len() == 1 && videos.get(&key).is_some_and(|videos| videos.len() == 1)
+            })
             .map(|matches| matches[0].clone());
     }
 }
@@ -1403,6 +1560,7 @@ mod tests {
         MediaItem {
             id: id.into(),
             relative_path: path.into(),
+            source_relative_path: None,
             original_filename: Path::new(path)
                 .file_name()
                 .unwrap()
@@ -1441,6 +1599,244 @@ mod tests {
             observed: BTreeMap::from([(device.into(), sequence.saturating_sub(1))]),
             event,
         }
+    }
+
+    fn converged_identity_view(catalogue: &Catalogue) -> Value {
+        serde_json::json!({
+            "media": catalogue.media,
+            "projects": catalogue.projects,
+            "conflicts": catalogue.conflicts,
+            "issues": catalogue.issues,
+        })
+    }
+
+    #[test]
+    fn concurrent_duplicate_registrations_converge_without_losing_metadata_or_references() {
+        let mut first = item("media-a", "20261023/DJI_0001.mp4", "mp4");
+        first.sha256 = "same-content".into();
+        first.tags = vec!["Camera A".into()];
+        first.project_ids = vec!["project-a".into()];
+        first.notes = "note from A".into();
+        let mut second = item("media-b", "20261023/DJI_0001.mp4", "mp4");
+        second.sha256 = "same-content".into();
+        second.tags = vec!["Camera B".into()];
+        second.project_ids = vec!["project-b".into()];
+        second.notes = "note from B".into();
+        second.favourite = true;
+        let mut audio = item("audio", "20261023/dji_0001.WAV", "WAV");
+        audio.sha256 = "audio-content".into();
+        let project = |id: &str| ProjectRecord {
+            id: id.into(),
+            name: id.into(),
+            working_directory: ".".into(),
+            media_ids: vec![],
+            notes: String::new(),
+            tags: vec![],
+            created_at: "2026-10-23T00:00:00Z".into(),
+        };
+        let events = vec![
+            envelope(
+                "device-a",
+                1,
+                CatalogueEvent::MediaRegistered { media: first },
+            ),
+            envelope(
+                "device-b",
+                1,
+                CatalogueEvent::MediaRegistered { media: second },
+            ),
+            envelope(
+                "device-c",
+                1,
+                CatalogueEvent::MediaRegistered { media: audio },
+            ),
+            envelope(
+                "device-a",
+                2,
+                CatalogueEvent::MediaNotesSet {
+                    media_id: "media-a".into(),
+                    value: "offline A".into(),
+                },
+            ),
+            envelope(
+                "device-b",
+                2,
+                CatalogueEvent::MediaNotesSet {
+                    media_id: "media-b".into(),
+                    value: "offline B".into(),
+                },
+            ),
+            envelope(
+                "device-c",
+                2,
+                CatalogueEvent::MediaTagsAdded {
+                    media_id: "media-b".into(),
+                    values: vec!["Synced later".into()],
+                },
+            ),
+            envelope(
+                "project-a-device",
+                1,
+                CatalogueEvent::ProjectUpserted {
+                    project: project("project-a"),
+                },
+            ),
+            envelope(
+                "project-b-device",
+                1,
+                CatalogueEvent::ProjectUpserted {
+                    project: project("project-b"),
+                },
+            ),
+        ];
+        let permutations = [
+            events.clone(),
+            events.iter().cloned().rev().collect(),
+            vec![
+                events[5].clone(),
+                events[2].clone(),
+                events[0].clone(),
+                events[7].clone(),
+                events[3].clone(),
+                events[1].clone(),
+                events[6].clone(),
+                events[4].clone(),
+                events[0].clone(),
+            ],
+        ];
+        let catalogues = permutations
+            .into_iter()
+            .map(|events| {
+                rebuild(EventRead {
+                    events,
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        for catalogue in &catalogues[1..] {
+            assert_eq!(
+                converged_identity_view(&catalogues[0]),
+                converged_identity_view(catalogue)
+            );
+        }
+        let catalogue = &catalogues[0];
+        assert_eq!(catalogue.media.len(), 2);
+        let video = catalogue
+            .media
+            .iter()
+            .find(|media| media.file_type.eq_ignore_ascii_case("mp4"))
+            .unwrap();
+        assert_eq!(video.id, "media-a");
+        assert_eq!(
+            video.tags,
+            vec!["Camera A", "Camera B", "Synced later"]
+        );
+        assert_eq!(video.project_ids, vec!["project-a", "project-b"]);
+        assert!(video.favourite);
+        assert_eq!(video.attached_audio_id.as_deref(), Some("audio"));
+        assert!(catalogue
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.entity_id == "media-a" && conflict.field == "notes"));
+        assert!(catalogue
+            .projects
+            .iter()
+            .all(|project| project.media_ids == vec!["media-a"]));
+
+        let restarted = rebuild(EventRead {
+            events: events.clone(),
+            ..Default::default()
+        });
+        assert_eq!(
+            converged_identity_view(catalogue),
+            converged_identity_view(&restarted)
+        );
+    }
+
+    #[test]
+    fn identity_reconciliation_requires_both_path_and_hash_and_preserves_legacy_id() {
+        let mut legacy = item("legacy-id", "20261023/clip.mp4", "mp4");
+        legacy.sha256 = "hash-one".into();
+        let mut duplicate = item("new-id", "20261023/clip.mp4", "mp4");
+        duplicate.sha256 = "hash-one".into();
+        let mut same_hash_other_path = item("other-path", "20261024/clip.mp4", "mp4");
+        same_hash_other_path.sha256 = "hash-one".into();
+        let mut same_path_other_hash = item("other-hash", "20261023/clip.mp4", "mp4");
+        same_path_other_hash.sha256 = "hash-two".into();
+        let mut legacy_event = envelope(
+            "migration",
+            1,
+            CatalogueEvent::MediaRegistered { media: legacy },
+        );
+        legacy_event.event_id = "legacy-media-legacy-id".into();
+        let catalogue = rebuild(EventRead {
+            events: vec![
+                envelope(
+                    "device-b",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: duplicate },
+                ),
+                envelope(
+                    "device-c",
+                    1,
+                    CatalogueEvent::MediaRegistered {
+                        media: same_hash_other_path,
+                    },
+                ),
+                envelope(
+                    "device-d",
+                    1,
+                    CatalogueEvent::MediaRegistered {
+                        media: same_path_other_hash,
+                    },
+                ),
+                legacy_event,
+            ],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.media.len(), 3);
+        assert!(catalogue.media.iter().any(|media| media.id == "legacy-id"));
+        assert!(catalogue.media.iter().any(|media| media.id == "other-path"));
+        assert!(catalogue.media.iter().any(|media| media.id == "other-hash"));
+        assert!(catalogue
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.field == "identity-hash"));
+    }
+
+    #[test]
+    fn identity_path_case_folding_is_unicode_aware_without_guessing_normalization() {
+        let mut upper = item("upper", "ÅNGSTRÖM/CAFÉ.MP4", "mp4");
+        upper.sha256 = "same-hash".into();
+        let mut lower = item("lower", "ångström/café.mp4", "mp4");
+        lower.sha256 = "same-hash".into();
+        let mut decomposed = item("decomposed", "ångström/cafe\u{301}.mp4", "mp4");
+        decomposed.sha256 = "same-hash".into();
+        let catalogue = rebuild(EventRead {
+            events: vec![
+                envelope(
+                    "device-a",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: upper },
+                ),
+                envelope(
+                    "device-b",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: lower },
+                ),
+                envelope(
+                    "device-c",
+                    1,
+                    CatalogueEvent::MediaRegistered { media: decomposed },
+                ),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(catalogue.media.len(), 2);
+        assert!(catalogue
+            .media
+            .iter()
+            .any(|media| media.id == "decomposed"));
     }
 
     #[test]
@@ -1940,6 +2336,178 @@ mod tests {
     }
 
     #[test]
+    fn pairing_requires_exactly_one_video_candidate_as_well_as_one_wav() {
+        let mut catalogue = Catalogue {
+            media: vec![
+                item("mp4", "Card/DCIM/DJI_0042.MP4", "MP4"),
+                item("mov", "card/dcim/dji_0042.mov", "mov"),
+                item("wav", "CARD/DCIM/DJI_0042.wav", "WAV"),
+                item("single-mov", "Card/DCIM/DJI_0043.MOV", "MOV"),
+                item("single-wav", "Card/DCIM/dji_0043.WAV", "wav"),
+            ],
+            ..Default::default()
+        };
+        pair_audio(&mut catalogue);
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "mp4")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "mov")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "single-mov")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("single-wav")
+        );
+    }
+
+    #[test]
+    fn pairing_is_case_insensitive_and_handles_missing_and_late_files_idempotently() {
+        let mut catalogue = Catalogue {
+            media: vec![
+                item("video", "DJI/CardA/DJI_0001.MP4", "mp4"),
+                item("unpaired-video", "DJI/CardA/DJI_0002.mp4", "mp4"),
+                item("unpaired-audio", "DJI/CardA/DJI_0003.wav", "wav"),
+                item("other-directory", "DJI/CardB/DJI_0001.wav", "wav"),
+            ],
+            ..Default::default()
+        };
+
+        pair_audio(&mut catalogue);
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "video")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+
+        catalogue
+            .media
+            .push(item("late-audio", "dji/carda/dji_0001.WAV", "wav"));
+        pair_audio(&mut catalogue);
+        pair_audio(&mut catalogue);
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "video")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("late-audio")
+        );
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "unpaired-video")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+    }
+
+    #[test]
+    fn pairing_uses_locale_independent_unicode_case_folding() {
+        let mut audio = item("audio", "ångström/café.wav", "wav");
+        audio.tags = vec!["WAV-only".into()];
+        audio.project_ids = vec!["sound-project".into()];
+        let mut catalogue = Catalogue {
+            media: vec![
+                item("video", "ÅNGSTRÖM/CAFÉ.MP4", "mp4"),
+                audio,
+                item("distinct-video", "ÅNGSTRÖM/RESUMÉ.MP4", "mp4"),
+                item("distinct-audio", "ångström/resume.wav", "wav"),
+            ],
+            ..Default::default()
+        };
+        pair_audio(&mut catalogue);
+        pair_audio(&mut catalogue);
+        assert_eq!(
+            catalogue
+                .media
+                .iter()
+                .find(|item| item.id == "video")
+                .unwrap()
+                .attached_audio_id
+                .as_deref(),
+            Some("audio")
+        );
+        let audio = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "audio")
+            .unwrap();
+        assert_eq!(audio.tags, vec!["WAV-only".to_string()]);
+        assert_eq!(audio.project_ids, vec!["sound-project".to_string()]);
+        assert!(catalogue
+            .media
+            .iter()
+            .find(|item| item.id == "distinct-video")
+            .unwrap()
+            .attached_audio_id
+            .is_none());
+    }
+
+    #[test]
+    fn derived_pairing_survives_restart_and_cross_device_event_delivery() {
+        let root = temporary("paired-restart");
+        let events = event_dir(&root);
+        fs::create_dir_all(&events).unwrap();
+        let video = envelope(
+            "desktop",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("video", "2026-10-27/DJI_0001.mp4", "mp4"),
+            },
+        );
+        let audio = envelope(
+            "laptop",
+            1,
+            CatalogueEvent::MediaRegistered {
+                media: item("audio", "2026-10-27/DJI_0001.wav", "wav"),
+            },
+        );
+        fs::write(
+            events.join("desktop.jsonl"),
+            format!("{}\n", serde_json::to_string(&video).unwrap()),
+        )
+        .unwrap();
+        fs::write(
+            events.join("laptop.jsonl"),
+            format!("{}\n", serde_json::to_string(&audio).unwrap()),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let catalogue = load(&root).unwrap();
+            assert_eq!(catalogue.media.len(), 2);
+            assert_eq!(
+                catalogue
+                    .media
+                    .iter()
+                    .find(|item| item.id == "video")
+                    .unwrap()
+                    .attached_audio_id
+                    .as_deref(),
+                Some("audio")
+            );
+        }
+    }
+
+    #[test]
     fn cache_references_reject_traversal_and_absolute_paths() {
         assert!(safe_cache_reference("item.jpg"));
         assert!(!safe_cache_reference("../item.jpg"));
@@ -2267,11 +2835,7 @@ mod tests {
             ..Default::default()
         };
         let backup = serde_json::to_vec_pretty(&legacy).unwrap();
-        fs::write(
-            root.join("catalogue.pre-events-v1.backup.json"),
-            &backup,
-        )
-        .unwrap();
+        fs::write(root.join("catalogue.pre-events-v1.backup.json"), &backup).unwrap();
         fs::create_dir_all(event_dir(&root)).unwrap();
         let partial = br#"{"schemaVersion":2"#;
         fs::write(event_dir(&root).join("migration-v2.jsonl"), partial).unwrap();

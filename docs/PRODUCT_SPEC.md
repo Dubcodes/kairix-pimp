@@ -13,7 +13,7 @@ PIMP gives editors a trustworthy path from removable camera media to an organize
 1. Configure device-local Master Bin and Working Projects roots.
 2. Ingest files/folders with exactly **Use today's date** or **Use original file dates**.
 3. Copy to a temporary destination, independently hash source and destination, then atomically promote.
-4. Catalogue using a content-derived stable media ID. Preserve real ingest time, capture date, provenance, and timezone when known.
+4. Catalogue using a stable registration ID while storing relative path and SHA-256 as separate identity evidence. Replay deterministically reconciles independent registrations only when both normalized synchronized path and hash agree; it retains aliases for historic references without rewriting logs. Preserve real ingest time, capture date, provenance, and timezone when known.
 5. Browse folders/media; tag folders and multi-selected media; assign any clip to multiple projects through stable-ID searchable selectors.
 6. Generate a project-local portable manifest without disturbing existing project assets.
 7. Rebuild the local search view from synchronized authoritative metadata.
