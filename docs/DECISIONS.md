@@ -334,3 +334,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Retain at most eight in-flight or completed preview requests in a frontend LRU, deduplicate identical keys, reject additional work while all slots are pending, and invalidate every promise/result with a generation epoch when clearing. Native cache clearing takes the same mutex as generation before inspecting or removing cache-owned directories.
 - **Consequences:** Base64 frames cannot accumulate without bound, rapid card movement cannot enqueue unlimited FFmpeg work, and active temporary directories are never deleted underneath FFmpeg. Clearing may wait for current generation and the UI communicates that wait; Master Bin paths are never part of cache removal.
+
+## ADR-045 — Separate development, manual release and signed-update trust boundaries
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Pull requests produce keyless, unsigned, short-lived Windows artifacts. A protected manual-release workflow may publish permanent unsigned prereleases from current reviewed `main` without private credentials and embeds the validated repository-level updater public key only when configured. A separate `beta-release` workflow receives the private key, accepts only an existing prerelease whose commit is reachable from `main`, independently verifies the Tauri signature and publishes the fixed channel manifest only after its versioned payload exists.
+- **Consequences:** Missing signing secrets no longer block public downloads, untrusted changes cannot publish an approved update, and the bootstrap installer and subsequent updater payload share one explicit public key. Tauri payload signing does not claim Authenticode signing. Automatic updates remain unverified until a real installed higher-version upgrade succeeds.
