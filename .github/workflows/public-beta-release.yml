@@ -63,8 +63,8 @@ jobs:
             throw 'Version metadata disagrees across package, Cargo and Tauri.'
           }
           $tag = "v$version"
-          git ls-remote --exit-code --tags origin "refs/tags/$tag" *> $null
-          if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists." }
+          $remoteTag = git ls-remote --tags origin "refs/tags/$tag"
+          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) { throw "Tag $tag already exists." }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
