@@ -176,6 +176,7 @@ export function App() {
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
   const [removeBatchProjects, setRemoveBatchProjects] = useState<string[]>([]);
   const [batchDescription, setBatchDescription] = useState('');
+  const [ingestBatchTags, setIngestBatchTags] = useState<string[]>([]);
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     mediaId: string;
@@ -765,6 +766,7 @@ export function App() {
               ? chosenDate
               : dateOverride,
         renamedDestinations,
+        batchTags: ingestBatchTags,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -773,6 +775,7 @@ export function App() {
       setInventoryError('');
       setConflicts([]);
       setRenames({});
+      setIngestBatchTags([]);
       setJobsOpen(true);
       setMessage(
         `Ingest queued with ${job.files.length} file${job.files.length === 1 ? '' : 's'}. You can keep browsing and edit metadata now.`,
@@ -2862,6 +2865,20 @@ export function App() {
                   onChange={(event) => setChosenDate(event.target.value)}
                 />
               )}
+              <SearchableComboBox
+                label="Tags for all files in this ingest"
+                mode="multiple"
+                options={knownTags.map((tag) => ({ id: tag, label: tag }))}
+                selectedIds={ingestBatchTags}
+                onSelectionChange={setIngestBatchTags}
+                onCreate={(label) => ({ id: label, label })}
+                placeholder="Search or create batch tags…"
+              />
+              <small>
+                These tags are added to eligible video, audio and image
+                recordings. You can still add file-specific tags while the job
+                is running.
+              </small>
               {conflicts.length > 0 && (
                 <div className="conflict-list">
                   <strong>Resolve filename conflicts</strong>

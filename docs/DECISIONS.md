@@ -306,3 +306,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card.
 - **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Cards outside the viewport retain placeholders until near view. The grid itself is still not virtualized; the 3,000-card component measurement remains a baseline for the planned large-library virtualization milestone.
+
+## ADR-041 — Seed durable ingest metadata without replacing file edits
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Accept normalized batch tags in the existing ingest request and seed them into each eligible video, audio and image file's durable provisional metadata with the existing edited-field marker. Camera support and unknown sidecar files receive no catalogue metadata. Later per-file edits submit the complete merged tag list through the existing durable metadata command.
+- **Consequences:** Batch intent survives pause, retry and restart and reaches verified video/WAV registrations without a new synchronized event type. Copy remains the only ingest mode. Source cleanup remains disabled until a separately reviewed whole-batch verification, source-revalidation, package grouping, explicit confirmation and interrupted-cleanup journal are implemented.

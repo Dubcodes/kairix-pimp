@@ -67,6 +67,7 @@ const mocks = vi.hoisted(() => ({
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
+  startIngest: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -126,7 +127,7 @@ vi.mock('./bridge', () => ({
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
     inventorySources: mocks.inventorySources,
-    startIngest: vi.fn(),
+    startIngest: mocks.startIngest,
     cancelIngest: vi.fn(),
     updateMedia: mocks.updateMedia,
     updateProject: mocks.updateProject,
@@ -265,6 +266,21 @@ describe('native application integration', () => {
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.loadThumbnailSources.mockReset();
     mocks.loadThumbnailSources.mockResolvedValue({});
+    mocks.startIngest.mockReset();
+    mocks.startIngest.mockResolvedValue({
+      schemaVersion: 3,
+      id: 'job-batch-tags',
+      state: 'queued',
+      createdAt: '2026-10-28T00:00:00Z',
+      updatedAt: '2026-10-28T00:00:00Z',
+      batchTimestamp: '2026-10-28T00:00:00Z',
+      files: [],
+      unsupported: [],
+      failures: [],
+      bytesTotal: 0,
+      bytesTransferred: 0,
+      filesCompleted: 0,
+    });
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -889,6 +905,44 @@ describe('native application integration', () => {
     expect(
       screen.getByTitle(files[62].plannedRelativePath),
     ).toBeInTheDocument();
+  });
+
+  it('persists newly created batch tags in the ingest request', async () => {
+    mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
+    mocks.inventorySources.mockResolvedValue({
+      files: [
+        {
+          sourcePath: 'E:\\DCIM\\clip.mp4',
+          sourceRelativePath: 'DCIM/clip.mp4',
+          plannedRelativePath: '20261028/DCIM/clip.mp4',
+          sizeBytes: 100,
+          kind: 'video',
+          analysisSupported: true,
+          preserveHierarchy: true,
+        },
+      ],
+      excluded: [],
+      issues: [],
+      totalFileCount: 1,
+      totalBytes: 100,
+      copyFileCount: 1,
+      copyBytes: 100,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(screen.getByRole('button', { name: 'Choose files' }));
+    const tags = screen.getByRole('combobox', {
+      name: 'Tags for all files in this ingest',
+    });
+    await user.type(tags, 'Race Day');
+    await user.click(await screen.findByText('Create “Race Day”'));
+    await user.click(
+      screen.getByRole('button', { name: 'Start verified ingest' }),
+    );
+    expect(mocks.startIngest).toHaveBeenCalledWith(
+      expect.objectContaining({ batchTags: ['Race Day'] }),
+    );
   });
 
   it('exposes persisted configuration rather than hard-coded paths', async () => {

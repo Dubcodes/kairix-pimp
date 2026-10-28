@@ -348,6 +348,7 @@ export const desktopBridge = {
     sources: string[];
     dateOverride?: string;
     renamedDestinations?: Record<string, string>;
+    batchTags?: string[];
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),

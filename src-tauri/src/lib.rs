@@ -233,6 +233,8 @@ struct IngestRequest {
     date_override: Option<String>,
     #[serde(default)]
     renamed_destinations: HashMap<String, String>,
+    #[serde(default)]
+    batch_tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -2194,6 +2196,18 @@ fn active_destination_reservations(jobs: &[IngestJob]) -> HashSet<String> {
         .collect()
 }
 
+fn initial_batch_metadata(kind: &str, batch_tags: &[String]) -> ProvisionalMetadata {
+    if matches!(kind, "video" | "audio" | "image") && !batch_tags.is_empty() {
+        ProvisionalMetadata {
+            tags: batch_tags.to_vec(),
+            edited_fields: vec!["tags".into()],
+            ..Default::default()
+        }
+    } else {
+        ProvisionalMetadata::default()
+    }
+}
+
 #[tauri::command]
 fn start_ingest(
     app: AppHandle,
@@ -2217,6 +2231,7 @@ fn start_ingest(
     let reserved = active_destination_reservations(&snapshot_jobs(&app, &state)?);
     let mut planned_paths = HashSet::new();
     let mut files = Vec::new();
+    let batch_tags = normalized(&request.batch_tags);
     for inventory_file in &inventory.files {
         let source = PathBuf::from(&inventory_file.source_path);
         let filename = request
@@ -2259,7 +2274,7 @@ fn start_ingest(
             state: if collision { "failed" } else { "queued" }.into(),
             error: collision
                 .then(|| "Another queued ingest already reserves this destination".into()),
-            metadata: ProvisionalMetadata::default(),
+            metadata: initial_batch_metadata(&inventory_file.kind, &batch_tags),
             pending_metadata: None,
             metadata_error: None,
         });
@@ -5014,6 +5029,32 @@ mod tests {
         write_json(&path, &jobs).unwrap();
         assert_eq!(read_json::<Vec<IngestJob>>(&path).unwrap(), jobs);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_tags_apply_only_to_catalogued_media_and_survive_file_edits() {
+        let tags = normalized(&[" Race Day ".into(), "race day".into(), "Vlog".into()]);
+        for kind in ["video", "audio", "image"] {
+            let mut metadata = initial_batch_metadata(kind, &tags);
+            assert_eq!(metadata.tags, vec!["Race Day", "Vlog"]);
+            assert_eq!(metadata.edited_fields, vec!["tags"]);
+            apply_metadata_patch(
+                &mut metadata,
+                &ProvisionalMetadataPatch {
+                    tags: Some(vec!["Race Day".into(), "Vlog".into(), "Interview".into()]),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(metadata.tags, vec!["Interview", "Race Day", "Vlog"]);
+        }
+        assert_eq!(
+            initial_batch_metadata("camera-support", &tags),
+            ProvisionalMetadata::default()
+        );
+        assert_eq!(
+            initial_batch_metadata("unknown", &tags),
+            ProvisionalMetadata::default()
+        );
     }
 
     #[test]
