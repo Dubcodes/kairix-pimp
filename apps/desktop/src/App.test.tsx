@@ -66,6 +66,7 @@ const mocks = vi.hoisted(() => ({
   loadHoverPreview: vi.fn(),
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
+  loadThumbnailSources: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -141,6 +142,7 @@ vi.mock('./bridge', () => ({
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
+    loadThumbnailSources: mocks.loadThumbnailSources,
     loadHoverPreview: mocks.loadHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
@@ -261,6 +263,8 @@ describe('native application integration', () => {
     mocks.hoverPreviewCacheUsage.mockResolvedValue(0);
     mocks.clearHoverPreviewCache.mockReset();
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
+    mocks.loadThumbnailSources.mockReset();
+    mocks.loadThumbnailSources.mockResolvedValue({});
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -623,6 +627,48 @@ describe('native application integration', () => {
     expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1);
   });
 
+  it.each([100, 700, 3000])(
+    'batches thumbnail source lookup once for %i recordings',
+    async (count) => {
+      mocks.catalogue = {
+        media: Array.from({ length: count }, (_, index) => ({
+          id: `media-${count}-${index}`,
+          relativePath: `20261028/clip-${index}.mp4`,
+          originalFilename: `clip-${index}.mp4`,
+          sha256: `sha-${index}`,
+          captureDateProvenance: 'filesystem' as const,
+          ingestDate: '2026-10-28',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100 },
+          thumbnailPath: `media-${count}-${index}.jpg`,
+          available: true,
+          needsReview: false,
+        })),
+        projects: [],
+        updatedAt: '2026-10-28T00:00:00Z',
+      };
+      render(<App />);
+      await waitFor(
+        () =>
+          expect(
+            mocks.loadThumbnailSources.mock.calls.some(
+              ([mediaIds]) => mediaIds.length === count,
+            ),
+          ).toBe(true),
+        { timeout: 10_000 },
+      );
+      expect(
+        mocks.loadThumbnailSources.mock.calls.filter(
+          ([mediaIds]) => mediaIds.length === count,
+        ),
+      ).toHaveLength(1);
+    },
+    15_000,
+  );
+
   it('persists sidebar collapse and accessible logical folder ordering', async () => {
     mocks.catalogue = {
       media: [
@@ -785,12 +831,64 @@ describe('native application integration', () => {
     expect(
       screen.getByText(/Excluded:.*Syncthing temporary file/),
     ).toBeVisible();
-    expect(
-      screen.getByText('XDROOT/Clip/A001.MXF → 20261026/XDROOT/Clip/A001.MXF'),
-    ).toBeInTheDocument();
+    await user.click(screen.getByText('Review 1 planned destination path'));
+    expect(screen.getByTitle('XDROOT/Clip/A001.MXF')).toBeVisible();
+    expect(screen.getByTitle('20261026/XDROOT/Clip/A001.MXF')).toBeVisible();
     expect(
       screen.getByRole('button', { name: 'Start verified ingest' }),
     ).toBeEnabled();
+  });
+
+  it('renders 63 long planned paths as bounded semantic rows', async () => {
+    const files = Array.from({ length: 63 }, (_, index) => {
+      const name = `DJI_20261028_${String(index).padStart(4, '0')}_VERY_LONG_CAMERA_RECORDING_NAME.MP4`;
+      const sourceRelativePath = `DCIM/100MEDIA/NESTED/CAMERA/PACKAGE/${name}`;
+      return {
+        sourcePath: `E:\\DCIM\\100MEDIA\\NESTED\\CAMERA\\PACKAGE\\${name}`,
+        sourceRelativePath,
+        plannedRelativePath: `20261028/Card-E/DCIM/100MEDIA/NESTED/CAMERA/PACKAGE/${name}`,
+        sizeBytes: 4096,
+        kind: 'video' as const,
+        analysisSupported: true,
+        preserveHierarchy: true,
+      };
+    });
+    mocks.chooseFiles.mockResolvedValue(files.map((file) => file.sourcePath));
+    mocks.inventorySources.mockResolvedValue({
+      files,
+      excluded: [
+        {
+          path: 'E:\\DCIM\\.DS_Store',
+          reason: 'temporary metadata',
+          sizeBytes: 1,
+        },
+      ],
+      issues: ['One unreadable sidecar was retained for review'],
+      totalFileCount: 64,
+      totalBytes: 63 * 4096 + 1,
+      copyFileCount: 63,
+      copyBytes: 63 * 4096,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(screen.getByRole('button', { name: 'Choose files' }));
+    await user.click(
+      await screen.findByText('Review 63 planned destination paths'),
+    );
+    const table = screen.getByRole('table', {
+      name: 'Planned ingest destination paths',
+    });
+    expect(table).toHaveClass('planned-paths');
+    expect(screen.getAllByRole('row')).toHaveLength(64);
+    expect(screen.getByText(/63 of 64 files will be copied/)).toBeVisible();
+    expect(screen.getByText(/Excluded:.*temporary metadata/)).toBeVisible();
+    expect(
+      screen.getByText(/Inventory issue:.*unreadable sidecar/),
+    ).toBeVisible();
+    expect(
+      screen.getByTitle(files[62].plannedRelativePath),
+    ).toBeInTheDocument();
   });
 
   it('exposes persisted configuration rather than hard-coded paths', async () => {

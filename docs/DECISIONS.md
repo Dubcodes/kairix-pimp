@@ -299,3 +299,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Generate 1–16 low-resolution JPEG samples only after an eligible local video thumbnail is hovered. One native mutex bounds FFmpeg generation to a single job, while pointer movement selects already-decoded frame images without spawning processes. Cache identity includes media ID, authoritative SHA-256 and current local size/modified evidence; entries live below the configured device-local thumbnail cache, are validated before loading and are evicted oldest-first to a separate configurable preview budget.
 - **Consequences:** Preview frames persist across restarts and regenerate after source-evidence changes without touching Master Bin or synchronized journals. Reduced-motion users receive the static thumbnail. A failed, offline or unsupported source leaves the static thumbnail, and preview generation never runs for the whole Library at startup.
+
+## ADR-040 — Batch validated thumbnail sources and defer image decoding
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card.
+- **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Cards outside the viewport retain placeholders until near view. The grid itself is still not virtualized; the 3,000-card component measurement remains a baseline for the planned large-library virtualization milestone.

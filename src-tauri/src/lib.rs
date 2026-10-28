@@ -4421,6 +4421,45 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
     )))
 }
 
+#[tauri::command]
+fn load_thumbnail_sources(
+    app: AppHandle,
+    media_ids: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    if media_ids.len() > 10_000 {
+        return Err("Thumbnail source request exceeds the 10,000 item safety limit".into());
+    }
+    let requested = media_ids.into_iter().collect::<HashSet<_>>();
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let cache = PathBuf::from(&settings.thumbnail_cache_path);
+    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+    let cache = cache
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
+    let mut sources = HashMap::new();
+    for item in catalogue
+        .media
+        .iter()
+        .filter(|item| requested.contains(&item.id))
+    {
+        let Some(reference) = &item.thumbnail_path else {
+            continue;
+        };
+        if !catalogue::safe_cache_reference(reference) || reference != &format!("{}.jpg", item.id) {
+            continue;
+        }
+        let path = cache.join(reference);
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        if path.starts_with(&cache) && path.is_file() {
+            sources.insert(item.id.clone(), path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(sources)
+}
+
 fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
     let root = PathBuf::from(&settings.thumbnail_cache_path).join("hover-previews");
     fs::create_dir_all(&root)
@@ -4857,6 +4896,7 @@ pub fn run() {
             reveal_media_in_explorer,
             open_media_folder,
             load_thumbnail,
+            load_thumbnail_sources,
             load_hover_preview,
             hover_preview_cache_usage,
             clear_hover_preview_cache

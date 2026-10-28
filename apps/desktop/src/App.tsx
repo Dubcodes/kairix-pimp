@@ -147,6 +147,9 @@ export function App() {
   const [settingsWritePending, setSettingsWritePending] = useState(false);
   const [settingsWriteFailed, setSettingsWriteFailed] = useState(false);
   const [mediaTools, setMediaTools] = useState<MediaToolsStatus>();
+  const [thumbnailSources, setThumbnailSources] = useState<
+    Record<string, string>
+  >({});
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
   const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate>();
@@ -189,6 +192,7 @@ export function App() {
   const selectionAnchor = useRef<string | undefined>(undefined);
   const contentRef = useRef<HTMLElement>(null);
   const projectInventoryGeneration = useRef(0);
+  const thumbnailSourceGeneration = useRef(0);
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
   const [libraryLocateId, setLibraryLocateId] = useState<string>();
   const settingsRef = useRef(settings);
@@ -498,6 +502,25 @@ export function App() {
       ),
     [catalogue.media, settings.showAttachedAudioSeparately],
   );
+  useEffect(() => {
+    if (!native) return;
+    const generation = ++thumbnailSourceGeneration.current;
+    const mediaIds = catalogue.media
+      .filter((item) => item.thumbnailPath)
+      .map((item) => item.id);
+    void desktopBridge
+      .loadThumbnailSources(mediaIds)
+      .then((sources) => {
+        if (generation === thumbnailSourceGeneration.current)
+          setThumbnailSources(sources);
+      })
+      .catch((reason) => {
+        if (generation === thumbnailSourceGeneration.current)
+          void desktopBridge.logUiError(
+            `Thumbnail source loading failed: ${errorText(reason)}`,
+          );
+      });
+  }, [catalogue.media, native]);
   const selectedProject = catalogue.projects.find(
     (project) => project.id === selectedProjectId,
   );
@@ -2322,7 +2345,7 @@ export function App() {
                           <MediaThumbnail
                             mediaId={item.id}
                             fileType={item.fileType}
-                            available={Boolean(item.thumbnailPath)}
+                            thumbnailSource={thumbnailSources[item.id]}
                             sourceAvailable={item.available}
                             previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
                             enableHoverPreview={
@@ -2744,12 +2767,40 @@ export function App() {
                     will be safely retained without technical analysis.
                   </small>
                   <details>
-                    <summary>Review planned destination paths</summary>
-                    {inventory.files.map((file) => (
-                      <small key={file.sourcePath}>
-                        {file.sourceRelativePath} → {file.plannedRelativePath}
-                      </small>
-                    ))}
+                    <summary>
+                      Review {inventory.copyFileCount} planned destination path
+                      {inventory.copyFileCount === 1 ? '' : 's'}
+                    </summary>
+                    <div
+                      className="planned-paths"
+                      role="table"
+                      aria-label="Planned ingest destination paths"
+                    >
+                      <div className="planned-paths-head" role="row">
+                        <strong role="columnheader">Source</strong>
+                        <strong role="columnheader">Destination</strong>
+                      </div>
+                      {inventory.files.map((file) => (
+                        <div
+                          className="planned-path-row"
+                          role="row"
+                          key={file.sourcePath}
+                        >
+                          <span role="cell">
+                            <b>Source</b>
+                            <code title={file.sourceRelativePath}>
+                              {file.sourceRelativePath}
+                            </code>
+                          </span>
+                          <span role="cell">
+                            <b>Destination</b>
+                            <code title={file.plannedRelativePath}>
+                              {file.plannedRelativePath}
+                            </code>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   </details>
                   {inventory.excluded.map((item) => (
                     <small key={item.path}>
@@ -3241,7 +3292,7 @@ export function App() {
                             <MediaThumbnail
                               mediaId={item.id}
                               fileType={item.fileType}
-                              available={Boolean(item.thumbnailPath)}
+                              thumbnailSource={thumbnailSources[item.id]}
                             />
                           </div>
                           <span>
@@ -3441,19 +3492,22 @@ const previewableVideoTypes = new Set([
 function MediaThumbnail({
   mediaId,
   fileType,
-  available,
+  thumbnailSource,
   sourceAvailable = false,
   previewKey,
   enableHoverPreview = false,
 }: {
   mediaId: string;
   fileType: string;
-  available: boolean;
+  thumbnailSource?: string;
   sourceAvailable?: boolean;
   previewKey?: string;
   enableHoverPreview?: boolean;
 }) {
-  const [url, setUrl] = useState<string | null>(null);
+  const thumbnailRef = useRef<HTMLDivElement>(null);
+  const [showThumbnail, setShowThumbnail] = useState(
+    () => typeof IntersectionObserver === 'undefined',
+  );
   const [previewEntry, setPreviewEntry] = useState<{
     key: string;
     preview: HoverPreview;
@@ -3465,15 +3519,20 @@ function MediaThumbnail({
       ? previewEntry.preview
       : undefined;
   useEffect(() => {
-    if (!available) return;
-    let active = true;
-    void desktopBridge.loadThumbnail(mediaId).then((value) => {
-      if (active) setUrl(value);
-    });
-    return () => {
-      active = false;
-    };
-  }, [available, mediaId]);
+    const element = thumbnailRef.current;
+    if (!element || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setShowThumbnail(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '400px' },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
   const requestPreview = () => {
     if (
       preview ||
@@ -3505,6 +3564,7 @@ function MediaThumbnail({
     previewIndex == null ? undefined : preview?.frames[previewIndex];
   return (
     <div
+      ref={thumbnailRef}
       className="media-thumbnail"
       onPointerEnter={requestPreview}
       onPointerMove={(event) => {
@@ -3528,8 +3588,13 @@ function MediaThumbnail({
         preview ? 'Move horizontally to preview video frames' : undefined
       }
     >
-      {displayedFrame || url ? (
-        <img src={displayedFrame ?? url ?? undefined} alt="" />
+      {displayedFrame || (showThumbnail && thumbnailSource) ? (
+        <img
+          src={displayedFrame ?? thumbnailSource}
+          alt=""
+          loading="lazy"
+          decoding="async"
+        />
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>
       )}

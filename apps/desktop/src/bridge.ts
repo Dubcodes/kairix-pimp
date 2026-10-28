@@ -1,4 +1,4 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -441,6 +441,18 @@ export const desktopBridge = {
     invoke<void>('open_media_folder', { mediaId }),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),
+  loadThumbnailSources: async (mediaIds: string[]) => {
+    const sources = await invoke<Record<string, string>>(
+      'load_thumbnail_sources',
+      { mediaIds },
+    );
+    return Object.fromEntries(
+      Object.entries(sources).map(([mediaId, path]) => [
+        mediaId,
+        convertFileSrc(path),
+      ]),
+    );
+  },
   loadHoverPreview: (mediaId: string) =>
     invoke<HoverPreview>('load_hover_preview', { mediaId }),
   hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
