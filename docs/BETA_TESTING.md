@@ -2,7 +2,7 @@
 
 Use the per-user NSIS installer for normal beta acceptance. If an older system-wide MSI installation exists, follow [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md); verify the new install before explicitly removing the old application entry or shortcut.
 
-Kairix PIMP 0.1.1-3 is an unsigned release candidate for the Windows beta. It is suitable for
+Kairix PIMP 0.1.1-4 is an unsigned release candidate for the Windows beta. It is suitable for
 disposable generated media only until the real two-device Syncthing acceptance
 pass is complete. Do not make it the only copy of production footage.
 
@@ -67,6 +67,46 @@ the installed application, not `npm run dev`.
 
 Record the Windows version, installer filename, commit SHA, FFmpeg version and
 result of every item. A browser test is not evidence for a native checklist item.
+
+## Approximately 700-record responsiveness measurement
+
+This pass is intentionally manual because jsdom timings do not measure WebView2,
+native IPC, FFmpeg, Windows scheduling or installed-process memory. Do not point
+the test build at a production Master Bin. Use an empty disposable Master Bin,
+Working Projects folder and generated media beneath a clearly named test root;
+retain the generated source until the pass is complete.
+
+1. Install the exact CI artifact under test and record Windows version, CPU,
+   installed RAM, storage type, installer name, commit and FFmpeg version.
+2. Populate the disposable catalogue by ingesting approximately 700 generated
+   short video fixtures. Wait for discovery/enrichment to settle, quit from the
+   tray, and reopen from the installed shortcut.
+3. Start a stopwatch with the shortcut launch. Record time until the main window
+   accepts a Settings click and time until the Library responds to a scroll.
+4. Open **Settings → Diagnostics** after the catalogue stabilizes. Record
+   **Thumbnail source batches**; one catalogue revision should require one batch,
+   not one native request per card.
+5. In Task Manager, record PIMP CPU and working set at settled idle, peak startup,
+   after scrolling through the Library, and after hovering at least 20 different
+   videos. Memory may fluctuate but must plateau rather than retain every Base64
+   preview; FFmpeg preview generation remains serialized.
+6. Start a separate disposable ingest of at least 63 files. While SHA-256 copy and
+   verification are active, repeatedly scroll, search, open Settings, return to
+   Library and hover local videos. Record the longest observed input stall, CPU
+   peak and working-set peak. Confirm ingest progress continues and no source is
+   changed.
+7. While a preview is generating, choose **Clear preview cache**. Confirm the UI
+   reports that it is waiting, completes without an error, restores static
+   thumbnails and regenerates only when a video is hovered again.
+8. After ingest completion, confirm the header says **All ingests complete**,
+   completed history is collapsed, and **Clear Completed** removes the indicator.
+   Restart and confirm active/attention history and catalogue media remain intact.
+
+Record raw timings and memory/CPU observations rather than “fast” or “responsive.”
+Treat input stalls longer than two seconds, thumbnail batch counts growing per
+card, unbounded memory growth, stalled ingest, or FFmpeg/cache-clear errors as a
+failed acceptance item. This procedure remains outstanding until run against the
+installed `0.1.1-4` artifact.
 
 ## Syncthing acceptance
 

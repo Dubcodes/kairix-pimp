@@ -1275,11 +1275,11 @@ describe('native application integration', () => {
 
     mocks.checkApprovedBetaUpdate.mockResolvedValueOnce({
       currentVersion: '0.1.1-2',
-      version: '0.1.1-3',
+      version: '0.1.1-4',
     });
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      await screen.findByText('Signed Beta 0.1.1-3 is available.'),
+      await screen.findByText('Signed Beta 0.1.1-4 is available.'),
     ).toBeVisible();
 
     mocks.checkApprovedBetaUpdate.mockRejectedValueOnce(

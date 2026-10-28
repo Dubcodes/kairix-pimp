@@ -1,10 +1,10 @@
-# Kairix PIMP 0.1.1-3 (Beta release candidate)
+# Kairix PIMP 0.1.1-4 (Beta release candidate)
 
 This is an unsigned Windows beta for disposable-media testing. Confirm the
 source and build/test commits in `BUILD-INFO.txt` and verify an installer with
 `SHA256SUMS.txt` before running it.
 
-This build incorporates installed-app feedback: planned ingest paths use a responsive bounded table; thumbnail startup resolves validated cache paths once per catalogue revision and lazily decodes near-visible images; hover previews use a bounded fingerprinted local cache; project inventory/navigation rejects stale results; and batch tags persist with ingest jobs. Unconfigured automatic updates now remain in an explicit unavailable state without a network check, with test builds, Releases and the official website exposed as separate fixed links. In-app installation remains unavailable until the protected signing configuration in `docs/UPDATES.md` is provisioned.
+This build adds conservative completed-ingest history management and bounds the in-memory hover-preview lifecycle. Active, completed and attention-needed jobs are counted separately; only native-revalidated finalized history can be cleared, without touching media, metadata events or recovery evidence. Preview requests use an eight-entry LRU/in-flight bound, concurrent deduplication and clear epochs, while native cache clearing waits for FFmpeg generation to release the cache mutex.
 
 ## Verified by automated tests and Windows CI
 
@@ -12,10 +12,14 @@ This build incorporates installed-app feedback: planned ingest paths use a respo
   sidecars and unknown package files while reporting exclusions and failures.
 - Durable background ingest stages outside Master Bin, independently verifies
   SHA-256, prevents overwrite and retains metadata through retry and restart.
+- Completed history can be cleared individually or together only after native
+  checks reject pending metadata, inventory errors, file failures and recovery journals.
 - Batch tags seed eligible video, audio and image metadata without replacing
   later file-specific edits or creating records for camera sidecars.
 - The 100-, 700- and 3,000-record thumbnail harness performs one native source
   request per catalogue revision; installed 684-record timing remains to be repeated.
+- Preview request tests cover concurrent deduplication, bounded pending and
+  completed entries, source-key invalidation, and cache clearing during generation.
 - The Library supports search, desktop-style multiple selection, batch metadata
   changes, Explorer actions and multi-path clipboard handoff to Premiere Pro.
 - Portable append-only event replay covers offline delivery, duplicate delivery,

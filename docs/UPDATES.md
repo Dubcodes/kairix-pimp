@@ -26,7 +26,7 @@ Private signing material must never be committed, written to build logs, attache
 An installed build without the embedded public key cannot authenticate a newly published update and cannot be upgraded merely by adding a GitHub Release. Bootstrap automatic updates as follows:
 
 1. Provision and validate the protected configuration above.
-2. Publish the reviewed `0.1.1-3` per-user NSIS installer manually; it must contain the matching public key.
+2. Publish the reviewed `0.1.1-4` per-user NSIS installer manually; it must contain the matching public key.
 3. Verify its SHA-256 checksum, install it over the earlier per-user copy, launch it and confirm Settings reports the Beta channel configured.
 4. Publish a subsequently higher numeric-prerelease version through the protected signed-update job.
 5. On a disposable Windows profile, exercise check, download, install and restart, then confirm the device identity, paths, catalogue, preferences, thumbnail cache and recoverable jobs survived.

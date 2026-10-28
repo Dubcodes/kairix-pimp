@@ -154,6 +154,8 @@ export function App() {
   const [thumbnailSources, setThumbnailSources] = useState<
     Record<string, string>
   >({});
+  const [thumbnailSourceRequestCount, setThumbnailSourceRequestCount] =
+    useState(0);
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
   const [previewCacheEpoch, setPreviewCacheEpoch] = useState(0);
   const [clearingPreviewCache, setClearingPreviewCache] = useState(false);
@@ -532,10 +534,12 @@ export function App() {
     void desktopBridge
       .loadThumbnailSources(mediaIds)
       .then((sources) => {
+        setThumbnailSourceRequestCount((count) => count + 1);
         if (generation === thumbnailSourceGeneration.current)
           setThumbnailSources(sources);
       })
       .catch((reason) => {
+        setThumbnailSourceRequestCount((count) => count + 1);
         if (generation === thumbnailSourceGeneration.current)
           void desktopBridge.logUiError(
             `Thumbnail source loading failed: ${errorText(reason)}`,
@@ -1026,6 +1030,7 @@ export function App() {
         `Jobs: ${JSON.stringify(jobCounts)}`,
         `FFmpeg: ${mediaTools?.ffmpegAvailable ? 'available' : 'unavailable'}`,
         `FFprobe: ${mediaTools?.ffprobeAvailable ? 'available' : 'unavailable'}`,
+        `Thumbnail source batches: ${thumbnailSourceRequestCount}`,
       ].join('\r\n'),
     );
     setMessage('Diagnostic summary copied without personal file paths.');
@@ -2301,6 +2306,10 @@ export function App() {
                       <dd>
                         {jobs.filter((job) => job.state !== 'completed').length}
                       </dd>
+                    </div>
+                    <div>
+                      <dt>Thumbnail source batches</dt>
+                      <dd>{thumbnailSourceRequestCount}</dd>
                     </div>
                   </dl>
                   <div className="scan-actions">

@@ -19,6 +19,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented Library usability: persistent icon-only sidebar, six deterministic folder sort modes plus accessible custom order, logical video/WAV metadata and counts, clean thumbnail placeholders, themed batch editing and content scroll-to-top
 - Implemented installed-app P0 corrections: responsive scroll-bounded ingest destination mapping and one validated batched thumbnail-source lookup with near-viewport lazy decoding
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
+- Implemented: active/completed/attention job separation with collapsed summaries and native-revalidated individual/all completed-history clearing
 - Implemented: normalized batch tags seed all eligible recording files while preserving later per-file tags; verified-copy source cleanup remains design-only and disabled
 - Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
 - Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
@@ -26,6 +27,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
+- Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
