@@ -352,6 +352,8 @@ export const desktopBridge = {
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
+  clearCompletedIngestJobs: (jobId?: string) =>
+    invoke<IngestJob[]>('clear_completed_ingest_jobs', { jobId }),
   updateIngestFileMetadata: (
     jobId: string,
     fileId: string,

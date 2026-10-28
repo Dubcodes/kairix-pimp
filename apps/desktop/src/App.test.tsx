@@ -8,7 +8,7 @@ import {
 } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Catalogue, DeviceSettings } from './bridge';
+import type { Catalogue, DeviceSettings, IngestJob } from './bridge';
 
 const mocks = vi.hoisted(() => ({
   native: true,
@@ -43,6 +43,7 @@ const mocks = vi.hoisted(() => ({
   catalogueSignature: vi.fn(),
   jobs: [] as import('./bridge').IngestJob[],
   initializeIngestJobs: vi.fn(),
+  clearCompletedIngestJobs: vi.fn(),
   updateIngestFileMetadata: vi.fn(),
   jobListener: undefined as
     ((jobs: import('./bridge').IngestJob[]) => void) | undefined,
@@ -85,6 +86,7 @@ vi.mock('./bridge', () => ({
     refreshMediaAvailability: mocks.refreshMediaAvailability,
     initializeIngestJobs: mocks.initializeIngestJobs,
     listIngestJobs: vi.fn(async () => []),
+    clearCompletedIngestJobs: mocks.clearCompletedIngestJobs,
     updateIngestFileMetadata: mocks.updateIngestFileMetadata,
     pauseIngest: vi.fn(),
     resumeIngest: vi.fn(),
@@ -165,6 +167,34 @@ const deferred = <T,>() => {
   return { promise, resolve, reject };
 };
 
+const testJob = (id: string, state: IngestJob['state']): IngestJob => ({
+  schemaVersion: 3,
+  id,
+  state,
+  createdAt: '2026-10-28T00:00:00Z',
+  updatedAt: '2026-10-28T01:00:00Z',
+  batchTimestamp: '2026-10-28T00:00:00Z',
+  files: [
+    {
+      id: `${id}-file`,
+      mediaId: `${id}-media`,
+      sourcePath: `C:\\Card\\${id}.mp4`,
+      destinationPath: `C:\\Master\\${id}.mp4`,
+      relativePath: `${id}.mp4`,
+      originalFilename: `${id}.mp4`,
+      sizeBytes: 1024,
+      bytesTransferred: state === 'completed' ? 1024 : 256,
+      state,
+      metadata: { tags: [], projectIds: [], notes: '', favourite: false },
+    },
+  ],
+  unsupported: [],
+  failures: state === 'failed' ? ['Copy failed'] : [],
+  bytesTotal: 1024,
+  bytesTransferred: state === 'completed' ? 1024 : 256,
+  filesCompleted: state === 'completed' ? 1 : 0,
+});
+
 describe('native application integration', () => {
   it('previews date, 24-hour and 12-hour folder tokens', () => {
     const now = new Date(2026, 9, 23, 17, 42, 9);
@@ -211,6 +241,15 @@ describe('native application integration', () => {
     mocks.jobs = [];
     mocks.initializeIngestJobs.mockReset();
     mocks.initializeIngestJobs.mockImplementation(async () => mocks.jobs);
+    mocks.clearCompletedIngestJobs.mockReset();
+    mocks.clearCompletedIngestJobs.mockImplementation(
+      async (jobId?: string) => {
+        mocks.jobs = mocks.jobs.filter(
+          (job) => job.state !== 'completed' || (jobId && job.id !== jobId),
+        );
+        return mocks.jobs;
+      },
+    );
     mocks.updateIngestFileMetadata.mockReset();
     mocks.jobListener = undefined;
     mocks.refreshMediaAvailability.mockReset();
@@ -294,6 +333,58 @@ describe('native application integration', () => {
       filesCompleted: 0,
     });
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
+  });
+
+  it('separates active, completed and attention jobs and clears one completed entry', async () => {
+    mocks.jobs = [
+      testJob('active', 'copying'),
+      testJob('complete', 'completed'),
+      testJob('failed', 'failed'),
+    ];
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole('button', { name: /1 active · 25%/ }),
+    );
+    expect(screen.getByText('Active 1')).toBeVisible();
+    expect(screen.getByText('Completed 1')).toBeVisible();
+    expect(screen.getByText('Needs attention 1')).toBeVisible();
+    expect(screen.queryByText(/copied and verified/)).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole('button', { name: 'Completed history (1)' }),
+    );
+    expect(screen.getByText(/1 file copied and verified/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Clear' }));
+    await waitFor(() =>
+      expect(mocks.clearCompletedIngestJobs).toHaveBeenCalledWith('complete'),
+    );
+    expect(screen.queryByText('Completed 1')).not.toBeInTheDocument();
+    expect(screen.getByText('Completed 0')).toBeVisible();
+    expect(screen.getByText('Needs attention 1')).toBeVisible();
+  });
+
+  it('shows all ingests complete and removes the indicator after clearing history', async () => {
+    mocks.jobs = [
+      testJob('complete-1', 'completed'),
+      testJob('complete-2', 'completed'),
+    ];
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole('button', { name: 'All ingests complete' }),
+    );
+    expect(screen.getByText('Completed 2')).toBeVisible();
+    expect(screen.getAllByText('All ingests complete')).toHaveLength(2);
+    await user.click(screen.getByRole('button', { name: 'Clear Completed' }));
+    await waitFor(() =>
+      expect(mocks.clearCompletedIngestJobs).toHaveBeenCalledWith(undefined),
+    );
+    expect(
+      screen.queryByRole('button', { name: 'All ingests complete' }),
+    ).not.toBeInTheDocument();
   });
 
   it('offers an explicit retry for pending project manifest synchronization', async () => {

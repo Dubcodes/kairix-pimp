@@ -521,6 +521,70 @@ fn prune_terminal_jobs(jobs: &mut Vec<IngestJob>) {
     });
 }
 
+fn clear_finalized_jobs(
+    jobs: &mut Vec<IngestJob>,
+    job_id: Option<&str>,
+    recovery_job_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    if let Some(job_id) = job_id {
+        let job = jobs
+            .iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest history entry no longer exists")?;
+        if !job_is_fully_finalized(job) || recovery_job_ids.contains(job_id) {
+            return Err(
+                "This ingest still contains recovery, error, inventory, or metadata evidence and cannot be cleared"
+                    .into(),
+            );
+        }
+    }
+    let before = jobs.len();
+    jobs.retain(|job| {
+        let selected = job_id.map_or(true, |job_id| job.id == job_id);
+        !(selected
+            && job_is_fully_finalized(job)
+            && !recovery_job_ids.contains(job.id.as_str()))
+    });
+    Ok(before - jobs.len())
+}
+
+fn recovery_job_ids(settings: &DeviceSettings) -> Result<HashSet<String>, String> {
+    if settings.master_bin_path.trim().is_empty() {
+        return Ok(HashSet::new());
+    }
+    let root = fs_safe::staging_root(
+        Path::new(&settings.master_bin_path),
+        &settings.device_id,
+    )?;
+    let directory = root.join("jobs");
+    if !directory.exists() {
+        return Ok(HashSet::new());
+    }
+    let mut job_ids = HashSet::new();
+    for entry in fs::read_dir(&directory)
+        .map_err(|error| format!("Cannot inspect ingest recovery records: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Cannot inspect recovery record: {error}"))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| format!("Cannot inspect recovery record type: {error}"))?
+            .is_file()
+            || !matches!(path.extension().and_then(|value| value.to_str()), Some("json") | Some("backup"))
+        {
+            continue;
+        }
+        let journal: IngestJournal = read_json(&path).map_err(|error| {
+            format!(
+                "Cannot safely clear ingest history while recovery record {} is unreadable: {error}",
+                path.display()
+            )
+        })?;
+        job_ids.insert(journal.job_id);
+    }
+    Ok(job_ids)
+}
+
 fn mutate_jobs<T>(
     app: &AppHandle,
     state: &NativeState,
@@ -2323,6 +2387,22 @@ fn list_ingest_jobs(
     state: State<'_, NativeState>,
 ) -> Result<Vec<IngestJob>, String> {
     snapshot_jobs(&app, &state)
+}
+
+#[tauri::command]
+fn clear_completed_ingest_jobs(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: Option<String>,
+) -> Result<Vec<IngestJob>, String> {
+    let _guard = state.job_store.lock().unwrap();
+    let settings = load_settings_file(&app)?;
+    let recovery_job_ids = recovery_job_ids(&settings)?;
+    let mut jobs = load_jobs_unlocked(&app)?;
+    clear_finalized_jobs(&mut jobs, job_id.as_deref(), &recovery_job_ids)?;
+    write_json(&jobs_path(&app)?, &jobs)?;
+    let _ = app.emit("ingest-jobs-changed", &jobs);
+    Ok(jobs)
 }
 
 fn mark_active_jobs_interrupted(jobs: &mut [IngestJob]) {
@@ -4887,6 +4967,7 @@ pub fn run() {
             start_ingest,
             initialize_ingest_jobs,
             list_ingest_jobs,
+            clear_completed_ingest_jobs,
             update_ingest_file_metadata,
             pause_ingest,
             resume_ingest,
@@ -5625,6 +5706,121 @@ mod tests {
                 && job.files[0].pending_metadata.is_some()
                 && job.files[0].metadata_error.is_some()
         }));
+    }
+
+    #[test]
+    fn completed_history_can_be_cleared_individually_or_together() {
+        let mut jobs = (0..3)
+            .map(|index| {
+                let mut job = ingest_job("completed", "completed");
+                job.id = format!("completed-{index}");
+                job.failures.clear();
+                job
+            })
+            .collect::<Vec<_>>();
+        let recovery = HashSet::new();
+
+        assert_eq!(
+            clear_finalized_jobs(&mut jobs, Some("completed-1"), &recovery).unwrap(),
+            1
+        );
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.id != "completed-1"));
+        assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 2);
+        assert!(jobs.is_empty());
+        assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 0);
+    }
+
+    #[test]
+    fn clearing_history_preserves_every_recoverable_or_unresolved_job() {
+        let mut finalized = ingest_job("completed", "completed");
+        finalized.id = "safe-completed".into();
+        finalized.failures.clear();
+
+        let mut pending_metadata = ingest_job("completed", "completed");
+        pending_metadata.id = "pending-metadata".into();
+        pending_metadata.failures.clear();
+        pending_metadata.files[0].pending_metadata = Some(ProvisionalMetadata {
+            notes: "must survive".into(),
+            ..Default::default()
+        });
+
+        let mut failed = ingest_job("failed", "failed");
+        failed.id = "failed".into();
+        let mut cancelled = ingest_job("cancelled", "cancelled");
+        cancelled.id = "cancelled-retryable".into();
+        cancelled.files[0].pending_metadata = Some(ProvisionalMetadata {
+            tags: vec!["retry".into()],
+            ..Default::default()
+        });
+        let mut interrupted = ingest_job("interrupted", "interrupted");
+        interrupted.id = "interrupted-with-journal".into();
+        let mut active = ingest_job("copying", "copying");
+        active.id = "active".into();
+        let mut recovery = HashSet::new();
+        recovery.insert(interrupted.id.clone());
+        let mut jobs = vec![
+            finalized,
+            pending_metadata,
+            failed,
+            cancelled,
+            interrupted,
+            active,
+        ];
+
+        assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 1);
+        assert_eq!(jobs.len(), 5);
+        assert!(jobs.iter().any(|job| job.id == "pending-metadata"));
+        assert!(jobs.iter().any(|job| job.id == "failed"));
+        assert!(jobs.iter().any(|job| job.id == "cancelled-retryable"));
+        assert!(jobs
+            .iter()
+            .any(|job| job.id == "interrupted-with-journal"));
+        assert!(jobs.iter().any(|job| job.id == "active"));
+    }
+
+    #[test]
+    fn clearing_rechecks_eligibility_and_persists_the_remaining_store() {
+        let root = temporary("clear-completed-history");
+        let store = root.join("ingest-jobs.json");
+        let mut completing = ingest_job("verifying", "verifying");
+        completing.id = "race".into();
+        let mut completed = ingest_job("completed", "completed");
+        completed.id = "complete".into();
+        completed.failures.clear();
+        let mut jobs = vec![completing.clone(), completed];
+        let recovery = HashSet::new();
+
+        assert!(clear_finalized_jobs(&mut jobs, Some("race"), &recovery).is_err());
+        assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 1);
+        completing.state = "completed".into();
+        completing.files[0].state = "completed".into();
+        completing.failures.clear();
+        jobs[0] = completing;
+        assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 1);
+        write_json(&store, &jobs).unwrap();
+
+        let restarted: Vec<IngestJob> = read_json(&store).unwrap();
+        assert!(restarted.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_evidence_blocks_an_otherwise_completed_job() {
+        let mut completed = ingest_job("completed", "completed");
+        completed.id = "completed-with-journal".into();
+        completed.failures.clear();
+        let mut jobs = vec![completed];
+        let recovery = HashSet::from(["completed-with-journal".to_string()]);
+
+        assert!(clear_finalized_jobs(
+            &mut jobs,
+            Some("completed-with-journal"),
+            &recovery
+        )
+        .is_err());
+        assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 0);
+        assert_eq!(jobs.len(), 1);
     }
 
     #[test]

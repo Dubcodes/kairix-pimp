@@ -136,6 +136,8 @@ export function App() {
   const [progress, setProgress] = useState<IngestProgress>();
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [jobsOpen, setJobsOpen] = useState(false);
+  const [completedJobsOpen, setCompletedJobsOpen] = useState(false);
+  const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   const [startingIngest, setStartingIngest] = useState(false);
   const [inventory, setInventory] = useState<SourceInventory>();
   const [inventoryLoading, setInventoryLoading] = useState(false);
@@ -276,7 +278,11 @@ export function App() {
             `${job.id}:${file.id}`,
           );
           return pending
-            ? { ...file, metadata: { ...file.metadata, ...pending } }
+            ? {
+                ...file,
+                metadata: { ...file.metadata, ...pending },
+                pendingMetadata: { ...file.metadata, ...pending },
+              }
             : file;
         }),
       })),
@@ -814,7 +820,7 @@ export function App() {
               ...candidate,
               files: candidate.files.map((candidateFile) =>
                 candidateFile.id === fileId
-                  ? { ...candidateFile, metadata }
+                  ? { ...candidateFile, metadata, pendingMetadata: metadata }
                   : candidateFile,
               ),
             },
@@ -830,8 +836,23 @@ export function App() {
       .catch(() => undefined)
       .then(() => desktopBridge.updateIngestFileMetadata(jobId, fileId, update))
       .then(() => {
-        if (metadataWrites.current.get(key) === next)
+        if (metadataWrites.current.get(key) === next) {
           pendingMetadataPatches.current.delete(key);
+          setJobs((current) =>
+            current.map((candidate) =>
+              candidate.id !== jobId
+                ? candidate
+                : {
+                    ...candidate,
+                    files: candidate.files.map((candidateFile) =>
+                      candidateFile.id === fileId
+                        ? { ...candidateFile, pendingMetadata: undefined }
+                        : candidateFile,
+                    ),
+                  },
+            ),
+          );
+        }
       })
       .catch((reason) => setError(errorText(reason)));
     metadataWrites.current.set(key, next);
@@ -1050,7 +1071,7 @@ export function App() {
     updaterConfiguration,
   ]);
   const installUpdate = async () => {
-    if (activeJobs.length > 0) {
+    if (updateBlockingJobs.length > 0) {
       setUpdateStatus(
         'Finish, pause or cancel active ingest jobs before installing an update.',
       );
@@ -1264,8 +1285,16 @@ export function App() {
     selectionAnchor.current = target.id;
     setLibraryLocateId(target.id);
   };
-  const activeJobs = jobs.filter(
-    (job) => !['completed', 'cancelled', 'failed'].includes(job.state),
+  const activeJobs = jobs.filter((job) =>
+    ['queued', 'copying', 'verifying'].includes(job.state),
+  );
+  const completedJobs = jobs.filter(jobIsClearableHistory);
+  const needsAttentionJobs = jobs.filter(
+    (job) => !activeJobs.includes(job) && !completedJobs.includes(job),
+  );
+  const workJobs = [...activeJobs, ...needsAttentionJobs];
+  const updateBlockingJobs = jobs.filter(
+    (job) => !['completed', 'failed', 'cancelled'].includes(job.state),
   );
   const totalJobBytes = activeJobs.reduce(
     (total, job) => total + job.bytesTotal,
@@ -1275,6 +1304,24 @@ export function App() {
     (total, job) => total + job.bytesTransferred,
     0,
   );
+  const clearCompletedJobs = async (jobId?: string) => {
+    setClearingCompletedJobs(true);
+    setError('');
+    try {
+      const remaining = await desktopBridge.clearCompletedIngestJobs(jobId);
+      setJobs(remaining);
+      if (!remaining.some(jobIsClearableHistory)) setCompletedJobsOpen(false);
+      setMessage(
+        jobId
+          ? 'Completed ingest history entry cleared. Media and metadata were left unchanged.'
+          : 'Safely completed ingest history cleared. Media and metadata were left unchanged.',
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setClearingCompletedJobs(false);
+    }
+  };
   const activeSettingsSection: SettingsSection = configured
     ? settingsSection
     : 'Library & Storage';
@@ -1386,7 +1433,9 @@ export function App() {
                   ? `${activeJobs.length} active · ${Math.round(
                       (transferredJobBytes / Math.max(totalJobBytes, 1)) * 100,
                     )}%`
-                  : `${jobs.length} ingest job${jobs.length === 1 ? '' : 's'}`}
+                  : needsAttentionJobs.length > 0
+                    ? `${needsAttentionJobs.length} need${needsAttentionJobs.length === 1 ? 's' : ''} attention`
+                    : 'All ingests complete'}
               </button>
             )}
             <div className="sync">
@@ -1404,7 +1453,15 @@ export function App() {
               </div>
               <button onClick={() => setJobsOpen(false)}>Close</button>
             </div>
-            {jobs.map((job) => (
+            <div className="job-counts" role="status">
+              <span>Active {activeJobs.length}</span>
+              <span>Completed {completedJobs.length}</span>
+              <span>Needs attention {needsAttentionJobs.length}</span>
+            </div>
+            {activeJobs.length === 0 && needsAttentionJobs.length === 0 && (
+              <p className="job-complete-status">All ingests complete</p>
+            )}
+            {workJobs.map((job) => (
               <article className="job-card" key={job.id}>
                 <header>
                   <div>
@@ -1536,6 +1593,60 @@ export function App() {
                 </div>
               </article>
             ))}
+            {completedJobs.length > 0 && (
+              <section className="completed-job-history">
+                <div className="completed-job-heading">
+                  <button
+                    type="button"
+                    aria-expanded={completedJobsOpen}
+                    onClick={() => setCompletedJobsOpen((open) => !open)}
+                  >
+                    Completed history ({completedJobs.length})
+                  </button>
+                  <button
+                    type="button"
+                    disabled={clearingCompletedJobs}
+                    onClick={() => void clearCompletedJobs()}
+                  >
+                    Clear Completed
+                  </button>
+                </div>
+                {completedJobsOpen && (
+                  <div className="completed-job-list">
+                    {completedJobs.map((job) => {
+                      const exceptions =
+                        job.unsupported.length +
+                        (job.inventoryExcluded?.length ?? 0);
+                      return (
+                        <article className="job-card completed" key={job.id}>
+                          <div>
+                            <strong>
+                              {job.filesCompleted} file
+                              {job.filesCompleted === 1 ? '' : 's'} copied and
+                              verified
+                            </strong>
+                            <small>
+                              {size(job.bytesTotal)} ·{' '}
+                              {new Date(job.updatedAt).toLocaleString()} ·{' '}
+                              {exceptions === 0
+                                ? 'No exceptions'
+                                : `${exceptions} reported exception${exceptions === 1 ? '' : 's'}`}
+                            </small>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={clearingCompletedJobs}
+                            onClick={() => void clearCompletedJobs(job.id)}
+                          >
+                            Clear
+                          </button>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
           </section>
         )}
         {(message || error) && (
@@ -2072,10 +2183,10 @@ export function App() {
                       disabled={
                         checkingUpdate ||
                         !availableUpdate ||
-                        activeJobs.length > 0
+                        updateBlockingJobs.length > 0
                       }
                       title={
-                        activeJobs.length
+                        updateBlockingJobs.length
                           ? 'Active ingest jobs must be stopped before updating'
                           : undefined
                       }
@@ -3532,6 +3643,22 @@ function ToggleField({
         onChange={(event) => onChange(event.target.checked)}
       />
     </label>
+  );
+}
+
+function jobIsClearableHistory(job: IngestJob) {
+  return (
+    job.state === 'completed' &&
+    job.files.length > 0 &&
+    job.failures.length === 0 &&
+    (job.inventoryIssues?.length ?? 0) === 0 &&
+    job.files.every(
+      (file) =>
+        file.state === 'completed' &&
+        !file.pendingMetadata &&
+        !file.metadataError &&
+        !file.error,
+    )
   );
 }
 

@@ -318,6 +318,40 @@ header h1 {
   color: #78857c;
   margin-top: 3px;
 }
+.job-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 12px;
+}
+.job-counts span,
+.job-complete-status {
+  border: 1px solid #28312b;
+  border-radius: 7px;
+  padding: 8px;
+  color: #a9b5ac;
+  font-size: 11px;
+  text-align: center;
+}
+.completed-job-history {
+  margin-top: 12px;
+  border-top: 1px solid #28312b;
+  padding-top: 12px;
+}
+.completed-job-heading,
+.job-card.completed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.completed-job-list {
+  display: grid;
+  gap: 7px;
+}
+.job-card.completed {
+  margin-top: 7px;
+}
 .job-panel button,
 .job-file input,
 .job-file textarea {
