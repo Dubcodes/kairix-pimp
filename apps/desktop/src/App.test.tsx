@@ -743,7 +743,11 @@ describe('native application integration', () => {
     expect(
       container.querySelector('.preview-timecode'),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText('Move horizontally to preview video frames'),
+    ).not.toBeInTheDocument();
     fireEvent.pointerEnter(thumbnail);
+    await screen.findByLabelText('Move horizontally to preview video frames');
     expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByRole('button', { name: 'Settings' }));

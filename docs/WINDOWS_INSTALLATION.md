@@ -1,6 +1,8 @@
 # Windows beta installation and upgrades
 
-The recommended beta package is the **NSIS per-user installer**. It installs without elevation under the current Windows profile and preserves PIMP's device-local settings, diagnostic logs, thumbnail cache configuration and recoverable ingest-job history across an upgrade. Shared catalogue records remain in the configured catalogue location and are not installer-owned data.
+Download the public beta from the [Kairix PIMP Light 0.1.1-5 GitHub Release](https://github.com/Dubcodes/kairix-pimp/releases/tag/v0.1.1-5). The recommended package is the plainly named **NSIS per-user Setup executable**. It installs without elevation under the current Windows profile and preserves PIMP's device-local settings, diagnostic logs, thumbnail cache configuration and recoverable ingest-job history across an upgrade. Shared catalogue records remain in the configured catalogue location and are not installer-owned data. Verify the file against `SHA256SUMS.txt` before running it.
+
+The beta installers are not Authenticode signed. Windows may show a SmartScreen warning; confirm the publisher warning, version, checksum and GitHub Release source rather than downloading a copy from elsewhere.
 
 The installed release executable is a Windows GUI application and should not open an accompanying Command Prompt; FFmpeg and FFprobe background work should not flash one either. If launch or window restoration fails, use the tray menu when available and inspect Settings → Diagnostics rather than closing an unrelated console window.
 
@@ -16,3 +18,7 @@ Some early beta testing installed both a per-user copy and a system-wide MSI cop
 6. Only after the per-user build has preserved the device identity, Master Bin and catalogue paths, ingest-job history, preferences, thumbnails and diagnostics, explicitly uninstall the older system-wide MSI entry from Windows Settings. Unpin or delete only the shortcut whose target points to that removed MSI. Do not remove either application-data directory or the Master Bin.
 
 The installers do not silently uninstall another scope because that could require elevation, target the wrong Windows account or remove the user's only working fallback. MSI remains a CI compatibility artifact during beta; NSIS per-user is the supported acceptance-test path.
+
+## Automatic-update bootstrap
+
+Older builds without the approved updater public key cannot authenticate an update. Install a reviewed public-key-enabled NSIS release manually once. Settings → Updates must then identify the signed Beta channel as configured before a later higher-version signed update can be offered. Never use an unsigned Actions artifact as an automatic-update payload. See [Windows beta distribution and signed updates](UPDATES.md).

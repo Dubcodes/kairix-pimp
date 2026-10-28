@@ -2,19 +2,19 @@
 
 Use the per-user NSIS installer for normal beta acceptance. If an older system-wide MSI installation exists, follow [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md); verify the new install before explicitly removing the old application entry or shortcut.
 
-Kairix PIMP 0.1.1-4 is an unsigned release candidate for the Windows beta. It is suitable for
+Kairix PIMP 0.1.1-5 is an unsigned public prerelease candidate for Windows. It is suitable for
 disposable generated media only until the real two-device Syncthing acceptance
 pass is complete. Do not make it the only copy of production footage.
 
 ## Install
 
-1. Open the successful **Windows beta installer** workflow run for the tested
-   commit and download its `Kairix-PIMP-...-unsigned-windows` artifact.
-2. Extract the artifact and run either the NSIS `setup.exe` or MSI installer.
-3. Windows SmartScreen may warn because the beta is not code-signed. Confirm
-   the artifact's source and build/test commits in `BUILD-INFO.txt`, then verify
-   the installer against its relative path in `SHA256SUMS.txt` before choosing
-   **Run anyway**.
+1. Open the permanent public GitHub prerelease for the tested version. Download
+   `SHA256SUMS.txt` and the plainly named NSIS Setup executable; use the MSI only
+   when specifically testing that alternative.
+2. Verify the installer's SHA-256, record the release tag and source commit, then
+   run it. Expect a SmartScreen warning because the beta is not Authenticode signed.
+3. Confirm the release's `BUILD-INFO.txt` describes the same version and commit
+   before choosing **Run anyway**.
 4. WebView2 is included with current supported Windows versions. If Windows
    reports that it is missing, install the Microsoft WebView2 Evergreen runtime.
 5. FFmpeg is optional. For thumbnails and FFprobe technical metadata, install
@@ -106,7 +106,26 @@ Record raw timings and memory/CPU observations rather than “fast” or “resp
 Treat input stalls longer than two seconds, thumbnail batch counts growing per
 card, unbounded memory growth, stalled ingest, or FFmpeg/cache-clear errors as a
 failed acceptance item. This procedure remains outstanding until run against the
-installed `0.1.1-4` artifact.
+installed `0.1.1-5` release.
+
+## Signed automatic-update acceptance
+
+Do not mark automatic updates operational from unit tests or a successful signing
+workflow alone. First manually install a reviewed bootstrap release containing the
+approved updater public key and confirm Settings → Updates identifies the signed
+Beta channel as configured. Publish a higher numeric-prerelease from reviewed
+`main`, then use a disposable Windows profile to record:
+
+- no-update and newer-update checks, displayed release notes and last-check time;
+- download progress, valid-signature acceptance and invalid-signature rejection;
+- interrupted download, failed installation, retry, restart and the new version;
+- preserved device identity, Master Bin/Working Projects roots, catalogue,
+  preferences, completed history and recoverable ingest jobs;
+- refusal to install while any ingest is active or recoverable.
+
+Download the versioned payload, signature and `latest.json` separately and verify
+their version, URL, size, SHA-256 and minisign signature. This acceptance remains
+blocked until the repository owner provisions the protected signing configuration.
 
 ## Syncthing acceptance
 

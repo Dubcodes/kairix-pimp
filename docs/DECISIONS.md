@@ -341,3 +341,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Pull requests produce keyless, unsigned, short-lived Windows artifacts. A protected manual-release workflow may publish permanent unsigned prereleases from current reviewed `main` without private credentials and embeds the validated repository-level updater public key only when configured. A separate `beta-release` workflow receives the private key, accepts only an existing prerelease whose commit is reachable from `main`, independently verifies the Tauri signature and publishes the fixed channel manifest only after its versioned payload exists.
 - **Consequences:** Missing signing secrets no longer block public downloads, untrusted changes cannot publish an approved update, and the bootstrap installer and subsequent updater payload share one explicit public key. Tauri payload signing does not claim Authenticode signing. Automatic updates remain unverified until a real installed higher-version upgrade succeeds.
+
+## ADR-046 — Use emitted preview timestamps and release card-owned frames
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Keep bounded FPS sampling, append FFmpeg `showinfo`, and store each emitted frame's reported PTS in a version-2 preview manifest. Library cards release their preview object when hover ends or they leave the active viewport; the shared eight-entry request cache and size-limited disk cache remain the reuse layers.
+- **Consequences:** Timecodes follow actual output cadence, including non-zero PTS, and old manifests with assumed positions regenerate safely under a new fingerprint. Sequentially hovering mounted cards no longer leaves an unbounded Base64 collection in component state, while revisiting a valid disk entry does not rerun FFmpeg.

@@ -1,10 +1,11 @@
-# Kairix PIMP 0.1.1-4 (Beta release candidate)
+# Kairix PIMP Light 0.1.1-5 — Windows Beta
 
-This is an unsigned Windows beta for disposable-media testing. Confirm the
-source and build/test commits in `BUILD-INFO.txt` and verify an installer with
-`SHA256SUMS.txt` before running it.
+This is a public prerelease for Windows x64. Download the plainly named per-user
+NSIS Setup executable from the GitHub Release; the MSI is an alternative. Both
+installers are unsigned, so Windows may display a SmartScreen warning. Confirm
+the source commit in `BUILD-INFO.txt` and verify `SHA256SUMS.txt` before running it.
 
-This build adds conservative completed-ingest history management and bounds the in-memory hover-preview lifecycle. Active, completed and attention-needed jobs are counted separately; only native-revalidated finalized history can be cleared, without touching media, metadata events or recovery evidence. Preview requests use an eight-entry LRU/in-flight bound, concurrent deduplication and clear epochs, while native cache clearing waits for FFmpeg generation to release the cache mutex.
+This build adds conservative completed-ingest history management and bounds the in-memory hover-preview lifecycle. Active, completed and attention-needed jobs are counted separately; only native-revalidated finalized history can be cleared, without touching media, metadata events or recovery evidence. Preview requests use an eight-entry LRU/in-flight bound, mounted cards release frame collections after hover or when leaving the viewport, and displayed timecodes come from FFmpeg's actual sampled timestamps. Native cache clearing waits for FFmpeg generation to release the cache mutex.
 
 ## Verified by automated tests and Windows CI
 
@@ -33,9 +34,15 @@ This build adds conservative completed-ingest history management and bounds the 
 - Complete the installed-app checklist in `docs/BETA_TESTING.md`, including a
   same-build reinstall, console/focus/tray/Explorer checks and removable-source interruption.
 - Perform a real two-machine Syncthing pass before using production footage.
-- Windows signing, upgrade across versions and SmartScreen reputation are not
-  verified. FFmpeg and FFprobe are optional PATH-based tools and are not bundled.
+- Authenticode signing, upgrade across versions and SmartScreen reputation are
+  not verified. Automatic updates require a one-time manual bootstrap containing
+  the approved updater public key and remain non-operational until a real signed
+  higher-version upgrade passes. FFmpeg and FFprobe are optional PATH-based tools and are not bundled.
+- Production-media and real two-device Syncthing acceptance remain incomplete.
+- Windows x64 is the only published platform for this beta.
 - Premiere handoff is manual; automated Premiere integration is not included.
 - AI processing, archive consolidation, cloud upload and source cleanup are not
   implemented. PIMP never authorizes deletion of original media; the required
   cleanup safety state machine is design-only in `docs/SOURCE_CLEANUP_DESIGN.md`.
+
+Official website: https://www.dubcodesmedia.com/kairix/kairix-pimp

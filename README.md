@@ -1,8 +1,8 @@
-# Kairix PIMP
+# Kairix PIMP Light
 
-> **Unsigned internal beta:** Windows installer artifacts are produced for
-> disposable-media testing. PIMP is not yet approved for production media while
-> real two-device Syncthing acceptance, signing and upgrade testing remain open.
+> **Public Windows beta:** [Download Kairix PIMP Light 0.1.1-5 for Windows x64](https://github.com/Dubcodes/kairix-pimp/releases/tag/v0.1.1-5). The recommended package is the plainly named per-user NSIS Setup executable. It is not Authenticode signed, so Windows may show a SmartScreen warning.
+
+Kairix PIMP remains a beta and is not declared production-stable. Use disposable or independently backed-up media while installed-app, production-media and real two-device Syncthing acceptance remain incomplete. See [Windows installation](docs/WINDOWS_INSTALLATION.md), [all releases](https://github.com/Dubcodes/kairix-pimp/releases), the [official website](https://www.dubcodesmedia.com/kairix/kairix-pimp), or [report a problem](https://github.com/Dubcodes/kairix-pimp/issues).
 
 Kairix PIMP (Production Ingest & Media Processor) is a desktop companion for Syncthing that safely ingests, catalogues, searches, and assigns production media. Syncthing remains the synchronization engine; PIMP owns media workflow and portable metadata.
 
@@ -10,7 +10,7 @@ PIMP does not replace Syncthing or implement another synchronization service. A 
 
 ## Editions
 
-- **PIMP Light** is the complete non-AI application: verified ingest, catalogue and search, metadata, project assignment, Premiere integration, and archiving workflows. It can read AI metadata generated elsewhere but will not ship AI models or inference runtimes.
+- **PIMP Light** is the current non-AI Windows beta: verified ingest, catalogue and search, metadata, project assignment, project inventory, and manual Premiere path handoff. It can read compatible AI metadata generated elsewhere but does not ship AI models or inference runtimes. Destructive cleanup and archive consolidation are not implemented.
 - **PIMP Full** will use the same catalogue and application, with optional local workers for transcription, timestamped search, scene and activity descriptions, sound recognition, and suggested tags.
 
 Full-edition AI processing is planned and is not implemented in this milestone.
@@ -35,20 +35,24 @@ New installations use `yyyymmdd` date folders. Settings provide a live preview b
 
 Settings are organized into General, Library & Storage, Ingest & Discovery, Appearance, Updates, About & Support and Diagnostics. Graphite is the default token-based theme, with Adobe-style Dark, Light, Midnight, System and High Contrast alternatives. Immediate preference writes are serialized and retryable so rapid edits cannot be lost or rolled back by an older response. Release Windows builds use the GUI subsystem and suppress consoles for FFmpeg/FFprobe, while debug builds retain console diagnostics. Normal launch, a second shortcut launch, a tray click and **Show PIMP** share one logged show/unminimize/focus path; minimized autostart hides only after tray creation. Explorer reveal uses the Windows Shell selection API after media-ID lookup and canonical Master Bin validation. Safe support links are selected from a native allowlist. The recommended Windows beta package is the per-user NSIS installer; see [Windows installation and upgrades](docs/WINDOWS_INSTALLATION.md).
 
-Version `0.1.1-4` is the completed-ingest and preview-cache correction candidate. It retains all `0.1.1-3` installed-feedback work and adds safe finalized-history clearing plus bounded preview memory/cache coordination. The numeric prerelease identifier keeps the shared SemVer compatible with Windows MSI packaging; Beta remains the explicit channel. Until the protected signing key/password and matching public key are provisioned, the app reports **Automatic updates not configured** without making an update request and separates unsigned test builds from GitHub Releases; it never installs unsigned Actions artifacts. See [Signed Beta updates](docs/UPDATES.md).
+Version `0.1.1-5` is the first public Windows beta candidate. It retains safe finalized-history clearing, bounds preview data in both the shared cache and mounted cards, and labels hover frames with FFmpeg's actual sampled timestamps. Public manual installers are permanent GitHub Release assets; automatic updates remain fail-closed until the protected signing key/password and matching repository public key are provisioned and a real installed upgrade passes. See [Windows beta distribution and signed updates](docs/UPDATES.md).
 
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 
 The native host, web frontend, unsigned MSI and NSIS installers build on Windows. Installer signing and upgrades, a notification-based filesystem watcher, safe catalogue-location relocation, folder notes, preview-frame selection and automated Premiere integration remain incomplete.
 
-Successful **Windows beta installer** workflow runs publish a downloadable MSI
-and NSIS installer artifact identified by version, commit and unsigned status,
-with SHA-256 checksums for both installers.
+The public prerelease publishes a recommended NSIS Setup executable, an optional
+MSI, build identity and SHA-256 checksums. Pull-request workflow artifacts remain
+short-lived development builds and are not approved releases.
 See the [Windows beta installation and acceptance guide](docs/BETA_TESTING.md).
 FFmpeg/FFprobe are optional PATH-based tools: missing tools disable thumbnails
 and technical probing but do not block verified ingest or catalogue work.
 
 Windows is the first release target. The core and adapter boundaries are designed for future Linux and macOS support, but neither platform is currently verified.
+
+## Licensing
+
+No software license has been selected. Public source visibility does not grant an open-source license; the repository owner must make that decision before describing Kairix PIMP as open source.
 
 ## Development
 

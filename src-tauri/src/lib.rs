@@ -607,7 +607,7 @@ const UPDATE_OPERATION_BLOCKED: &str =
     "A verified update is being installed. Wait for the application to restart before starting or resuming ingest.";
 
 fn job_blocks_update(job: &IngestJob) -> bool {
-    !matches!(job.state.as_str(), "completed" | "failed" | "cancelled")
+    !job_is_fully_finalized(job)
 }
 
 fn begin_update_gate(installing: &mut bool, jobs: &[IngestJob]) -> Result<(), String> {
@@ -616,7 +616,7 @@ fn begin_update_gate(installing: &mut bool, jobs: &[IngestJob]) -> Result<(), St
     }
     if jobs.iter().any(job_blocks_update) {
         return Err(
-            "Finish, cancel, or resolve every active ingest job before installing an update."
+            "Resolve every active or recoverable ingest job before installing an update."
                 .into(),
         );
     }
@@ -4569,7 +4569,7 @@ fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
 
 fn hover_preview_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"pimp-hover-preview-v1\0");
+    digest.update(b"pimp-hover-preview-v2\0");
     digest.update(item.id.as_bytes());
     digest.update(b"\0");
     digest.update(item.sha256.as_bytes());
@@ -4577,6 +4577,20 @@ fn hover_preview_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot)
     digest.update(snapshot.length.to_le_bytes());
     digest.update(snapshot.modified_millis.unwrap_or_default().to_le_bytes());
     format!("{:x}", digest.finalize())
+}
+
+fn parse_hover_preview_frame_times(stderr: &[u8]) -> Vec<f64> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| line.contains("Parsed_showinfo"))
+        .filter_map(|line| {
+            let value = line.split("pts_time:").nth(1)?.split_whitespace().next()?;
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|timestamp| timestamp.is_finite())
+        })
+        .collect()
 }
 
 fn hover_preview_frame_times(duration_seconds: f64) -> Result<Vec<f64>, String> {
@@ -4599,7 +4613,7 @@ fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<Ho
             .map_err(|error| format!("Cannot read hover preview manifest: {error}"))?,
     )
     .map_err(|error| format!("Invalid hover preview manifest: {error}"))?;
-    if manifest.version != 1 || manifest.fingerprint != expected_fingerprint {
+    if manifest.version != 2 || manifest.fingerprint != expected_fingerprint {
         return Err("Hover preview cache fingerprint does not match the source".into());
     }
     if manifest.frame_files.len() != manifest.frame_times.len() || manifest.frame_files.is_empty() {
@@ -4702,11 +4716,11 @@ fn generate_hover_preview(
         .map_err(|error| format!("Cannot stage hover preview: {error}"))?;
     let output_pattern = temporary.join("frame-%03d.jpg");
     let filter = format!(
-        "fps={}/{duration_seconds},scale=320:-2:force_original_aspect_ratio=decrease",
+        "fps={}/{duration_seconds},scale=320:-2:force_original_aspect_ratio=decrease,showinfo",
         frame_times.len()
     );
     let output = media_tool_command("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
+        .args(["-v", "info", "-nostdin", "-i"])
         .arg(source)
         .args(["-an", "-vf", &filter, "-frames:v"])
         .arg(frame_times.len().to_string())
@@ -4728,6 +4742,11 @@ fn generate_hover_preview(
             return Err(error);
         }
     };
+    let actual_frame_times = parse_hover_preview_frame_times(&output.stderr);
+    if actual_frame_times.len() != frame_times.len() {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err("FFmpeg did not report every sampled hover-preview timestamp".into());
+    }
     drop(output);
     if fs_safe::snapshot(source)? != before {
         let _ = fs::remove_dir_all(&temporary);
@@ -4745,11 +4764,11 @@ fn generate_hover_preview(
         return Err("FFmpeg produced an incomplete hover preview".into());
     }
     let manifest = HoverPreviewManifest {
-        version: 1,
+        version: 2,
         media_id: item.id.clone(),
         fingerprint: fingerprint.clone(),
         duration_seconds,
-        frame_times,
+        frame_times: actual_frame_times,
         frame_files,
         generated_at: Utc::now().to_rfc3339(),
     };
@@ -5928,7 +5947,7 @@ mod tests {
 
     #[test]
     fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-4");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-5");
         let configuration = updater_configuration();
         assert_eq!(configuration.channel, "Beta");
         assert!(configuration.endpoint.starts_with("https://"));
@@ -5956,13 +5975,19 @@ mod tests {
             assert!(!installing);
         }
 
-        for state in ["completed", "failed", "cancelled"] {
+        for state in ["failed", "cancelled"] {
             let mut installing = false;
-            begin_update_gate(&mut installing, &[ingest_job(state, state)]).unwrap();
-            assert!(installing);
-            assert!(begin_update_gate(&mut installing, &[]).is_err());
-            end_update_gate(&Mutex::new(installing));
+            assert!(begin_update_gate(&mut installing, &[ingest_job(state, state)]).is_err());
+            assert!(!installing);
         }
+
+        let mut completed = ingest_job("completed", "completed");
+        completed.failures.clear();
+        let mut installing = false;
+        begin_update_gate(&mut installing, &[completed]).unwrap();
+        assert!(installing);
+        assert!(begin_update_gate(&mut installing, &[]).is_err());
+        end_update_gate(&Mutex::new(installing));
 
         let gate = Mutex::new(false);
         {
@@ -6842,6 +6867,23 @@ mod tests {
     }
 
     #[test]
+    fn hover_preview_uses_actual_ffmpeg_sample_timestamps() {
+        let stderr = br#"
+[Parsed_showinfo_2] n:   0 pts: 1001 pts_time:10.0100 duration: 1001
+[Parsed_showinfo_2] n:   1 pts: 4338 pts_time:43.3804 duration: 1001
+[Parsed_showinfo_2] n:   2 pts: 7675 pts_time:76.7508 duration: 1001
+"#;
+        assert_eq!(
+            parse_hover_preview_frame_times(stderr),
+            vec![10.01, 43.3804, 76.7508]
+        );
+        assert!(parse_hover_preview_frame_times(
+            b"[Parsed_showinfo_2] pts_time:not-a-number"
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn hover_preview_cache_is_fingerprinted_validated_and_budgeted() {
         let root = temporary("hover-preview-cache");
         let first = root.join("first");
@@ -6849,7 +6891,7 @@ mod tests {
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
         let manifest = HoverPreviewManifest {
-            version: 1,
+            version: 2,
             media_id: "media-a".into(),
             fingerprint: "fingerprint-a".into(),
             duration_seconds: 5.0,

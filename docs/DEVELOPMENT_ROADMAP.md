@@ -28,6 +28,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
+- Implemented: mounted cards release large preview frames after hover/out-of-viewport, and timecodes use actual FFmpeg `showinfo` sample timestamps rather than planned positions
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
@@ -62,4 +63,4 @@ The versioned background job foundation is implemented for ingest: it persists i
 
 ## Milestone 7 — packaging and additional platforms
 
-Implemented for internal Light beta testing: repeatable Windows CI builds of unsigned MSI and NSIS installers, artifact identity metadata, prerelease publishing from versioned beta tags, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, sign, test upgrade/rollback, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.
+Implemented for the public Light beta: keyless PR installer artifacts, a protected permanent manual-prerelease workflow, a separately protected signed-update workflow that publishes the channel manifest last, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: provision the updater key pair and protected environments, complete a real signed installed upgrade, complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, add Authenticode signing, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.

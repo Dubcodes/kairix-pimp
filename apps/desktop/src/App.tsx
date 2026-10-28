@@ -1073,6 +1073,7 @@ export function App() {
       setUpdateStatus(`Update check failed: ${errorText(reason)}`);
     } finally {
       setCheckingUpdate(false);
+      setUpdateProgress(undefined);
     }
   }, [updaterConfiguration]);
   useEffect(() => {
@@ -1097,15 +1098,17 @@ export function App() {
   const installUpdate = async () => {
     if (updateBlockingJobs.length > 0) {
       setUpdateStatus(
-        'Finish, pause or cancel active ingest jobs before installing an update.',
+        'Resolve every active or recoverable ingest job before installing an update.',
       );
       return;
     }
     setCheckingUpdate(true);
     setUpdateProgress({ downloaded: 0 });
+    setUpdateStatus('Preparing signed update download…');
     try {
       await installApprovedBetaUpdate((event) => {
         if (event.event === 'Started') {
+          setUpdateStatus('Downloading signed update…');
           setUpdateProgress({
             downloaded: 0,
             total: event.data.contentLength,
@@ -1116,14 +1119,17 @@ export function App() {
             total: current?.total,
           }));
         } else {
-          setUpdateStatus('Signed update downloaded and verified. Installing…');
+          setUpdateStatus('Download complete. Verifying and installing…');
         }
       });
-      setUpdateStatus('Update installed. Restart PIMP if it does not reopen.');
+      setUpdateStatus(
+        'Update installed. Restart required if PIMP does not reopen.',
+      );
     } catch (reason) {
       setUpdateStatus(`Update installation failed: ${errorText(reason)}`);
     } finally {
       setCheckingUpdate(false);
+      setUpdateProgress(undefined);
     }
   };
   const createProject = async () => {
@@ -1317,9 +1323,7 @@ export function App() {
     (job) => !activeJobs.includes(job) && !completedJobs.includes(job),
   );
   const workJobs = [...activeJobs, ...needsAttentionJobs];
-  const updateBlockingJobs = jobs.filter(
-    (job) => !['completed', 'failed', 'cancelled'].includes(job.state),
-  );
+  const updateBlockingJobs = jobs.filter((job) => !jobIsClearableHistory(job));
   const totalJobBytes = activeJobs.reduce(
     (total, job) => total + job.bytesTotal,
     0,
@@ -2186,6 +2190,17 @@ export function App() {
                       </span>
                     )}
                   </div>
+                  <div className="info-card">
+                    <strong>Latest manually downloadable beta</strong>
+                    <span>
+                      Check the permanent public GitHub Releases page.
+                    </span>
+                    <small>
+                      Public installers are separate from signed
+                      automatic-update payloads and may show a Windows
+                      SmartScreen warning.
+                    </small>
+                  </div>
                   <div className="scan-actions">
                     <button
                       disabled={
@@ -2198,7 +2213,11 @@ export function App() {
                       }
                       onClick={checkForUpdates}
                     >
-                      {checkingUpdate ? 'Checking…' : 'Check for updates'}
+                      {updateProgress
+                        ? 'Update in progress…'
+                        : checkingUpdate
+                          ? 'Checking…'
+                          : 'Check for updates'}
                     </button>
                     <button
                       className="primary"
@@ -2209,7 +2228,7 @@ export function App() {
                       }
                       title={
                         updateBlockingJobs.length
-                          ? 'Active ingest jobs must be stopped before updating'
+                          ? 'Active or recoverable ingest jobs must be resolved before updating'
                           : undefined
                       }
                       onClick={installUpdate}
@@ -2231,9 +2250,9 @@ export function App() {
                   ) : (
                     <small>
                       Automatic updates are unavailable in this build. Upgrade
-                      manually using a reviewed installer from the test-build
-                      workflow or GitHub Releases. Test builds are unsigned and
-                      do not imply that a public release exists.
+                      manually using a reviewed installer from GitHub Releases.
+                      Pull-request test builds are unsigned development
+                      artifacts and are not approved updates.
                     </small>
                   )}
                 </>
@@ -3728,6 +3747,11 @@ function MediaThumbnail({
   }>();
   const [previewIndex, setPreviewIndex] = useState<number>();
   const requestGeneration = useRef(0);
+  const releasePreview = useCallback(() => {
+    requestGeneration.current += 1;
+    setPreviewIndex(undefined);
+    setPreviewEntry(undefined);
+  }, []);
   useEffect(() => {
     requestGeneration.current += 1;
   }, [previewCacheEpoch]);
@@ -3752,6 +3776,18 @@ function MediaThumbnail({
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+  useEffect(() => {
+    const element = thumbnailRef.current;
+    if (!element || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) releasePreview();
+      },
+      { rootMargin: '100px' },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [releasePreview]);
   const requestPreview = () => {
     if (
       preview ||
@@ -3803,7 +3839,7 @@ function MediaThumbnail({
           ),
         );
       }}
-      onPointerLeave={() => setPreviewIndex(undefined)}
+      onPointerLeave={releasePreview}
       aria-label={
         preview ? 'Move horizontally to preview video frames' : undefined
       }
