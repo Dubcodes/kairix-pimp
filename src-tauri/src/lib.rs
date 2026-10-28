@@ -56,6 +56,7 @@ struct NativeState {
     availability: Mutex<HashMap<String, (String, bool)>>,
     tray_available: Mutex<bool>,
     update_installing: Mutex<bool>,
+    preview_generation: Mutex<()>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +69,10 @@ struct DeviceSettings {
     shared_catalogue_path: String,
     thumbnail_cache_path: String,
     thumbnail_cache_limit_bytes: u64,
+    #[serde(default = "default_true")]
+    hover_previews_enabled: bool,
+    #[serde(default = "default_preview_cache_limit_bytes")]
+    preview_cache_limit_bytes: u64,
     #[serde(default = "legacy_date_mode")]
     ingest_date_organization: String,
     #[serde(default = "legacy_date_folder_pattern")]
@@ -138,6 +143,27 @@ struct ProjectInventory {
     items: Vec<ProjectAsset>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct HoverPreview {
+    media_id: String,
+    duration_seconds: f64,
+    frame_times: Vec<f64>,
+    frames: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct HoverPreviewManifest {
+    version: u32,
+    media_id: String,
+    fingerprint: String,
+    duration_seconds: f64,
+    frame_times: Vec<f64>,
+    frame_files: Vec<String>,
+    generated_at: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectUpdate {
@@ -160,6 +186,9 @@ fn default_density() -> String {
 fn default_library_folder_sort() -> String {
     "newest".into()
 }
+fn default_preview_cache_limit_bytes() -> u64 {
+    512 * 1024 * 1024
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -176,6 +205,8 @@ impl Default for DeviceSettings {
             shared_catalogue_path: String::new(),
             thumbnail_cache_path: String::new(),
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
+            hover_previews_enabled: true,
+            preview_cache_limit_bytes: default_preview_cache_limit_bytes(),
             ingest_date_organization: "today".into(),
             date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
@@ -4390,6 +4421,265 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
     )))
 }
 
+fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
+    let root = PathBuf::from(&settings.thumbnail_cache_path).join("hover-previews");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Cannot create hover preview cache: {error}"))?;
+    root.canonicalize()
+        .map_err(|error| format!("Cannot resolve hover preview cache: {error}"))
+}
+
+fn hover_preview_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pimp-hover-preview-v1\0");
+    digest.update(item.id.as_bytes());
+    digest.update(b"\0");
+    digest.update(item.sha256.as_bytes());
+    digest.update(b"\0");
+    digest.update(snapshot.length.to_le_bytes());
+    digest.update(snapshot.modified_millis.unwrap_or_default().to_le_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn hover_preview_frame_times(duration_seconds: f64) -> Result<Vec<f64>, String> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return Err("Hover preview requires a known positive duration".into());
+    }
+    let count = ((duration_seconds * 2.0).floor() as usize).clamp(1, 16);
+    if count == 1 {
+        return Ok(vec![duration_seconds / 2.0]);
+    }
+    Ok((0..count)
+        .map(|index| duration_seconds * index as f64 / (count - 1) as f64)
+        .collect())
+}
+
+fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<HoverPreview, String> {
+    let manifest_path = directory.join("manifest.json");
+    let manifest: HoverPreviewManifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| format!("Cannot read hover preview manifest: {error}"))?,
+    )
+    .map_err(|error| format!("Invalid hover preview manifest: {error}"))?;
+    if manifest.version != 1 || manifest.fingerprint != expected_fingerprint {
+        return Err("Hover preview cache fingerprint does not match the source".into());
+    }
+    if manifest.frame_files.len() != manifest.frame_times.len() || manifest.frame_files.is_empty() {
+        return Err("Hover preview manifest has an invalid frame list".into());
+    }
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve hover preview directory: {error}"))?;
+    let mut frames = Vec::with_capacity(manifest.frame_files.len());
+    let mut total_bytes = 0_u64;
+    for reference in &manifest.frame_files {
+        if reference.contains('/') || reference.contains('\\') || !reference.ends_with(".jpg") {
+            return Err("Hover preview manifest contains an unsafe frame reference".into());
+        }
+        let path = canonical_directory.join(reference);
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve hover preview frame: {error}"))?;
+        if !path.starts_with(&canonical_directory) || !path.is_file() {
+            return Err("Hover preview frame resolved outside its cache entry".into());
+        }
+        let bytes = fs::read(path).map_err(|error| format!("Cannot read hover preview frame: {error}"))?;
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        if total_bytes > 32 * 1024 * 1024 {
+            return Err("Hover preview exceeds the 32 MB safety limit".into());
+        }
+        frames.push(format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)));
+    }
+    Ok(HoverPreview {
+        media_id: manifest.media_id,
+        duration_seconds: manifest.duration_seconds,
+        frame_times: manifest.frame_times,
+        frames,
+    })
+}
+
+fn preview_cache_usage(root: &Path) -> u64 {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+        .sum()
+}
+
+fn evict_hover_preview_cache(root: &Path, budget: u64, keep: &Path) -> Result<(), String> {
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| format!("Cannot inspect hover preview cache: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let manifest = path.join("manifest.json");
+            let generated = fs::metadata(&manifest).ok()?.modified().ok()?;
+            Some((generated, path))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.0);
+    let mut usage = preview_cache_usage(root);
+    for (_, path) in entries {
+        if usage <= budget {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        let entry_size = preview_cache_usage(&path);
+        fs::remove_dir_all(&path)
+            .map_err(|error| format!("Cannot evict hover preview cache entry: {error}"))?;
+        usage = usage.saturating_sub(entry_size);
+    }
+    Ok(())
+}
+
+fn generate_hover_preview(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+    source: &Path,
+) -> Result<HoverPreview, String> {
+    let duration_seconds = item
+        .technical
+        .duration_seconds
+        .ok_or("Hover preview requires media duration metadata")?;
+    let frame_times = hover_preview_frame_times(duration_seconds)?;
+    let before = fs_safe::snapshot(source)?;
+    let fingerprint = hover_preview_fingerprint(item, &before);
+    let root = hover_preview_root(settings)?;
+    let final_directory = root.join(&fingerprint);
+    if final_directory.is_dir() {
+        if let Ok(preview) = read_hover_preview(&final_directory, &fingerprint) {
+            return Ok(preview);
+        }
+        fs::remove_dir_all(&final_directory)
+            .map_err(|error| format!("Cannot replace invalid hover preview cache: {error}"))?;
+    }
+
+    let temporary = root.join(format!(".generating-{}", Uuid::new_v4()));
+    fs::create_dir(&temporary)
+        .map_err(|error| format!("Cannot stage hover preview: {error}"))?;
+    let output_pattern = temporary.join("frame-%03d.jpg");
+    let filter = format!(
+        "fps={}/{duration_seconds},scale=320:-2:force_original_aspect_ratio=decrease",
+        frame_times.len()
+    );
+    let output = media_tool_command("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(source)
+        .args(["-an", "-vf", &filter, "-frames:v"])
+        .arg(frame_times.len().to_string())
+        .args(["-q:v", "7"])
+        .arg(&output_pattern)
+        .output()
+        .map_err(|error| format!("FFmpeg is unavailable for hover previews: {error}"));
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(format!(
+                "FFmpeg could not generate a hover preview: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    };
+    drop(output);
+    if fs_safe::snapshot(source)? != before {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err("Source changed while generating its hover preview".into());
+    }
+    let mut frame_files = fs::read_dir(&temporary)
+        .map_err(|error| format!("Cannot inspect generated hover preview: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|value| value == "jpg"))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    frame_files.sort();
+    if frame_files.len() != frame_times.len() {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err("FFmpeg produced an incomplete hover preview".into());
+    }
+    let manifest = HoverPreviewManifest {
+        version: 1,
+        media_id: item.id.clone(),
+        fingerprint: fingerprint.clone(),
+        duration_seconds,
+        frame_times,
+        frame_files,
+        generated_at: Utc::now().to_rfc3339(),
+    };
+    fs::write(
+        temporary.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("Cannot write hover preview manifest: {error}"))?;
+    fs::rename(&temporary, &final_directory)
+        .map_err(|error| format!("Cannot commit hover preview cache entry: {error}"))?;
+    evict_hover_preview_cache(&root, settings.preview_cache_limit_bytes, &final_directory)?;
+    read_hover_preview(&final_directory, &fingerprint)
+}
+
+#[tauri::command]
+async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _guard = state.preview_generation.lock().unwrap();
+        let settings = load_settings_file(&app)?;
+        if !settings.hover_previews_enabled {
+            return Err("Hover previews are disabled in Settings".into());
+        }
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or("Unknown media item")?;
+        if !matches!(
+            item.file_type.to_ascii_lowercase().as_str(),
+            "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
+        ) {
+            return Err("Hover previews are available only for supported video files".into());
+        }
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        generate_hover_preview(&settings, item, &source)
+    })
+    .await
+    .map_err(|error| format!("Hover preview task failed: {error}"))?
+}
+
+#[tauri::command]
+fn hover_preview_cache_usage(app: AppHandle) -> Result<u64, String> {
+    let settings = load_settings_file(&app)?;
+    Ok(preview_cache_usage(&hover_preview_root(&settings)?))
+}
+
+#[tauri::command]
+fn clear_hover_preview_cache(app: AppHandle) -> Result<u64, String> {
+    let settings = load_settings_file(&app)?;
+    let root = hover_preview_root(&settings)?;
+    for entry in fs::read_dir(&root)
+        .map_err(|error| format!("Cannot inspect hover preview cache: {error}"))?
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && (path.join("manifest.json").is_file()
+                || entry.file_name().to_string_lossy().starts_with(".generating-"))
+        {
+            fs::remove_dir_all(path)
+                .map_err(|error| format!("Cannot clear hover preview cache: {error}"))?;
+        }
+    }
+    Ok(preview_cache_usage(&root))
+}
+
 fn should_start_hidden(arguments: &[String], tray_available: bool) -> bool {
     tray_available && arguments.iter().any(|argument| argument == "--minimized")
 }
@@ -4566,7 +4856,10 @@ pub fn run() {
             resolve_media_path,
             reveal_media_in_explorer,
             open_media_folder,
-            load_thumbnail
+            load_thumbnail,
+            load_hover_preview,
+            hover_preview_cache_usage,
+            clear_hover_preview_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kairix PIMP");
@@ -6228,6 +6521,57 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("stopped after 3 files"));
         assert_eq!(fs::read(directory.join("asset-0.mp4")).unwrap(), b"media");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hover_preview_sampling_is_bounded_and_avoids_short_clip_duplicates() {
+        assert_eq!(hover_preview_frame_times(0.4).unwrap().len(), 1);
+        assert_eq!(hover_preview_frame_times(3.0).unwrap().len(), 6);
+        let long = hover_preview_frame_times(600.0).unwrap();
+        assert_eq!(long.len(), 16);
+        assert_eq!(long.first().copied(), Some(0.0));
+        assert_eq!(long.last().copied(), Some(600.0));
+        assert!(hover_preview_frame_times(0.0).is_err());
+    }
+
+    #[test]
+    fn hover_preview_cache_is_fingerprinted_validated_and_budgeted() {
+        let root = temporary("hover-preview-cache");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let manifest = HoverPreviewManifest {
+            version: 1,
+            media_id: "media-a".into(),
+            fingerprint: "fingerprint-a".into(),
+            duration_seconds: 5.0,
+            frame_times: vec![0.0],
+            frame_files: vec!["frame-001.jpg".into()],
+            generated_at: Utc::now().to_rfc3339(),
+        };
+        fs::write(first.join("frame-001.jpg"), b"frame-a").unwrap();
+        fs::write(
+            first.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let preview = read_hover_preview(&first, "fingerprint-a").unwrap();
+        assert_eq!(preview.media_id, "media-a");
+        assert!(read_hover_preview(&first, "changed-source").is_err());
+
+        let mut second_manifest = manifest.clone();
+        second_manifest.fingerprint = "fingerprint-b".into();
+        fs::write(second.join("frame-001.jpg"), b"frame-b").unwrap();
+        fs::write(
+            second.join("manifest.json"),
+            serde_json::to_vec(&second_manifest).unwrap(),
+        )
+        .unwrap();
+        evict_hover_preview_cache(&root, 0, &second).unwrap();
+        assert!(!first.exists());
+        assert!(second.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

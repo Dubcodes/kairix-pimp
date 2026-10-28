@@ -20,6 +20,8 @@ const mocks = vi.hoisted(() => ({
     sharedCataloguePath: '',
     thumbnailCachePath: 'C:\\Cache',
     thumbnailCacheLimitBytes: 2147483648,
+    hoverPreviewsEnabled: true,
+    previewCacheLimitBytes: 536870912,
     ingestDateOrganization: 'original-file-dates' as const,
     dateFolderPattern: 'yyyymmdd',
     initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -61,6 +63,9 @@ const mocks = vi.hoisted(() => ({
   updateProject: vi.fn(),
   openProjectFolder: vi.fn(),
   revealProjectAsset: vi.fn(),
+  loadHoverPreview: vi.fn(),
+  hoverPreviewCacheUsage: vi.fn(),
+  clearHoverPreviewCache: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -136,6 +141,9 @@ vi.mock('./bridge', () => ({
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
+    loadHoverPreview: mocks.loadHoverPreview,
+    hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
+    clearHoverPreviewCache: mocks.clearHoverPreviewCache,
     thumbnailUrl: (path: string) => path,
   },
 }));
@@ -174,6 +182,8 @@ describe('native application integration', () => {
       sharedCataloguePath: '',
       thumbnailCachePath: 'C:\\Cache',
       thumbnailCacheLimitBytes: 2147483648,
+      hoverPreviewsEnabled: true,
+      previewCacheLimitBytes: 536870912,
       ingestDateOrganization: 'original-file-dates',
       dateFolderPattern: 'yyyymmdd',
       initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -246,6 +256,11 @@ describe('native application integration', () => {
     mocks.openProjectFolder.mockResolvedValue(undefined);
     mocks.revealProjectAsset.mockReset();
     mocks.revealProjectAsset.mockResolvedValue(undefined);
+    mocks.loadHoverPreview.mockReset();
+    mocks.hoverPreviewCacheUsage.mockReset();
+    mocks.hoverPreviewCacheUsage.mockResolvedValue(0);
+    mocks.clearHoverPreviewCache.mockReset();
+    mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
   });
 
@@ -534,6 +549,78 @@ describe('native application integration', () => {
     render(<App />);
     expect(await screen.findByText('Your Master Bin is ready')).toBeVisible();
     expect(screen.queryByText('PIMP_MASTER_001.MP4')).not.toBeInTheDocument();
+  });
+
+  it('scrubs cached hover frames locally and restores the normal thumbnail', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'hover-video',
+          relativePath: '20261028/hover.mp4',
+          originalFilename: 'hover.mp4',
+          sha256: 'hover-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-10-28',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100, durationSeconds: 100 },
+          thumbnailPath: 'hover-video.jpg',
+          available: true,
+          needsReview: false,
+          observedSize: 100,
+          observedModifiedMillis: 123,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-28T00:00:00Z',
+    };
+    mocks.loadHoverPreview.mockResolvedValue({
+      mediaId: 'hover-video',
+      durationSeconds: 100,
+      frameTimes: [0, 50, 100],
+      frames: [
+        'data:image/jpeg;base64,first',
+        'data:image/jpeg;base64,middle',
+        'data:image/jpeg;base64,last',
+      ],
+    });
+    const { container } = render(<App />);
+    await screen.findByRole('option', { name: /hover.mp4/ });
+    const thumbnail = container.querySelector(
+      '.media-thumbnail',
+    ) as HTMLElement;
+    vi.spyOn(thumbnail, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      width: 100,
+      top: 0,
+      right: 100,
+      bottom: 60,
+      height: 60,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    fireEvent.pointerEnter(thumbnail);
+    await waitFor(() =>
+      expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1),
+    );
+    await screen.findByLabelText('Move horizontally to preview video frames');
+    fireEvent.pointerMove(thumbnail, { clientX: 99 });
+    expect(container.querySelector('.media-thumbnail img')).toHaveAttribute(
+      'src',
+      'data:image/jpeg;base64,last',
+    );
+    expect(container.querySelector('.preview-timecode')).toHaveTextContent(
+      '1:40',
+    );
+    fireEvent.pointerLeave(thumbnail);
+    expect(
+      container.querySelector('.preview-timecode'),
+    ).not.toBeInTheDocument();
+    fireEvent.pointerEnter(thumbnail);
+    expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1);
   });
 
   it('persists sidebar collapse and accessible logical folder ordering', async () => {

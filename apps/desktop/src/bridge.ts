@@ -12,6 +12,8 @@ export interface DeviceSettings {
   sharedCataloguePath: string;
   thumbnailCachePath: string;
   thumbnailCacheLimitBytes: number;
+  hoverPreviewsEnabled: boolean;
+  previewCacheLimitBytes: number;
   ingestDateOrganization: DateMode;
   dateFolderPattern: string;
   initializedCataloguePath: string;
@@ -114,6 +116,12 @@ export interface ProjectInventory {
   mainPremiereProject?: string;
   scannedAt: string;
   items: ProjectAsset[];
+}
+export interface HoverPreview {
+  mediaId: string;
+  durationSeconds: number;
+  frameTimes: number[];
+  frames: string[];
 }
 export interface Catalogue {
   media: MediaItem[];
@@ -259,6 +267,8 @@ export const emptySettings = (): DeviceSettings => ({
   sharedCataloguePath: '',
   thumbnailCachePath: '',
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
+  hoverPreviewsEnabled: true,
+  previewCacheLimitBytes: 512 * 1024 * 1024,
   ingestDateOrganization: 'today',
   dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
@@ -431,4 +441,8 @@ export const desktopBridge = {
     invoke<void>('open_media_folder', { mediaId }),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),
+  loadHoverPreview: (mediaId: string) =>
+    invoke<HoverPreview>('load_hover_preview', { mediaId }),
+  hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
+  clearHoverPreviewCache: () => invoke<number>('clear_hover_preview_cache'),
 };

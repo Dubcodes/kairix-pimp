@@ -292,3 +292,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Every project inventory request carries an in-memory UI generation and is accepted only while its project and generation remain current. Switching projects, returning to the index, or starting another refresh supersedes earlier results without claiming to cancel their underlying blocking filesystem walk. Native inventory remains read-only, does not follow links or hash assets, and fails clearly after 100,000 files or 64 hierarchy levels.
 - **Consequences:** Late successes and failures cannot replace another project's status, while an already-running OS walk may finish harmlessly in the blocking worker pool. Very large projects require narrower roots or a future cooperatively cancellable streaming inventory design.
+
+## ADR-039 — Lazy fingerprinted hover previews in the device-local cache
+
+- **Date:** 2026-10-28
+- **Status:** Accepted
+- **Decision:** Generate 1–16 low-resolution JPEG samples only after an eligible local video thumbnail is hovered. One native mutex bounds FFmpeg generation to a single job, while pointer movement selects already-decoded frame images without spawning processes. Cache identity includes media ID, authoritative SHA-256 and current local size/modified evidence; entries live below the configured device-local thumbnail cache, are validated before loading and are evicted oldest-first to a separate configurable preview budget.
+- **Consequences:** Preview frames persist across restarts and regenerate after source-evidence changes without touching Master Bin or synchronized journals. Reduced-motion users receive the static thumbnail. A failed, offline or unsupported source leaves the static thumbnail, and preview generation never runs for the whole Library at startup.

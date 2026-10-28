@@ -21,7 +21,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Byte-range ingest resume and throughput history
 - Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
-- Contact sheets, preview player, custom thumbnails, folder rename/move journal
+- Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
