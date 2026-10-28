@@ -13,6 +13,7 @@ export interface DeviceSettings {
   thumbnailCachePath: string;
   thumbnailCacheLimitBytes: number;
   ingestDateOrganization: DateMode;
+  dateFolderPattern: string;
   initializedCataloguePath: string;
   projectPaths: Record<string, string>;
 }
@@ -98,6 +99,7 @@ export const emptySettings = (): DeviceSettings => ({
   thumbnailCachePath: '',
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   ingestDateOrganization: 'original-file-dates',
+  dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
   projectPaths: {},
 });
@@ -112,6 +114,7 @@ export const desktopBridge = {
   saveSettings: (settings: DeviceSettings) =>
     invoke<DeviceSettings>('save_settings', { settings }),
   loadCatalogue: () => invoke<Catalogue>('load_catalogue'),
+  catalogueSignature: () => invoke<string>('catalogue_signature'),
   chooseFiles: async () => {
     const value = await open({
       multiple: true,
@@ -157,6 +160,8 @@ export const desktopBridge = {
   createProject: (name: string, workingDirectory: string) =>
     invoke<ProjectRecord>('create_project', { name, workingDirectory }),
   rescan: () => invoke<RescanResult>('rescan'),
+  verifyMediaIntegrity: (mediaId: string) =>
+    invoke<boolean>('verify_media_integrity', { mediaId }),
   enrichMedia: () => invoke<number>('enrich_media'),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),

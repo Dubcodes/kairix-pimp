@@ -61,6 +61,27 @@ describe('catalogue reducer', () => {
     const event = envelope({ type: 'media.registered', media });
     expect(Object.keys(rebuildCatalogue([event, event]).media)).toEqual(['m1']);
   });
+  it('selects divergent duplicate event IDs deterministically and reports them', () => {
+    const first = envelope(
+      { type: 'media.registered', media: { ...media, notes: 'A' } },
+      'duplicate-id',
+      'device-a',
+    );
+    const second = envelope(
+      { type: 'media.registered', media: { ...media, notes: 'B' } },
+      'duplicate-id',
+      'device-b',
+    );
+    const forward = rebuildCatalogue([first, second]);
+    const reverse = rebuildCatalogue([second, first]);
+    expect(forward.media).toEqual(reverse.media);
+    expect(forward.issues.map((issue) => issue.code)).toContain(
+      'duplicate-event-conflict',
+    );
+    expect(reverse.issues.map((issue) => issue.code)).toContain(
+      'duplicate-event-conflict',
+    );
+  });
   it('persists tagging and multiple project assignment', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),
@@ -80,6 +101,82 @@ describe('catalogue reducer', () => {
     expect(state.media.m1.tags).toEqual(['Workshop']);
     expect(state.media.m1.projectIds).toEqual(['p1', 'p2']);
   });
+  it('normalizes case, whitespace and Unicode identically in every delivery order', () => {
+    const registered = envelope({ type: 'media.registered', media }, 'n1', 'n');
+    const variants = {
+      ...envelope(
+        {
+          type: 'media.tags.added' as const,
+          mediaId: 'm1',
+          values: [' Race ', 'race', 'Ångström'],
+        },
+        'n2',
+        'n',
+      ),
+      sequence: 2,
+      observed: { n: 1 },
+    };
+    const moreVariants = {
+      ...envelope(
+        {
+          type: 'media.tags.added' as const,
+          mediaId: 'm1',
+          values: ['RACE', ' ångström ', 'Race'],
+        },
+        'n3',
+        'n',
+      ),
+      sequence: 3,
+      observed: { n: 2 },
+    };
+    const forward = rebuildCatalogue([
+      registered,
+      variants,
+      moreVariants,
+      moreVariants,
+    ]);
+    const reverse = rebuildCatalogue([
+      moreVariants,
+      variants,
+      registered,
+      moreVariants,
+    ]);
+    expect(forward.media.m1.tags).toEqual(['RACE', 'Ångström']);
+    expect(reverse.media.m1.tags).toEqual(forward.media.m1.tags);
+  });
+  it('matches case-insensitive removals without dropping unrelated Unicode tags', () => {
+    const removed = {
+      ...envelope(
+        {
+          type: 'media.tags.removed' as const,
+          mediaId: 'm1',
+          values: ['race'],
+        },
+        'n3',
+        'n',
+      ),
+      sequence: 3,
+      observed: { n: 2 },
+    };
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media }, 'n1', 'n'),
+      {
+        ...envelope(
+          {
+            type: 'media.tags.added' as const,
+            mediaId: 'm1',
+            values: ['Race', 'Ångström'],
+          },
+          'n2',
+          'n',
+        ),
+        sequence: 2,
+        observed: { n: 1 },
+      },
+      removed,
+    ]);
+    expect(state.media.m1.tags).toEqual(['Ångström']);
+  });
   it('merges simultaneous independent set additions', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),
@@ -96,6 +193,67 @@ describe('catalogue reducer', () => {
     ]);
     expect(state.media.m1.tags).toEqual(['A', 'B']);
     expect(state.conflicts).toHaveLength(0);
+  });
+  it('topologically replays three-device causality for every delivery order', () => {
+    const z = {
+      ...envelope({ type: 'media.registered', media }, 'z1', 'z-device'),
+      sequence: 1,
+      observed: { 'z-device': 0 },
+    };
+    const a = {
+      ...envelope(
+        { type: 'media.tags.added', mediaId: 'm1', values: ['Observed Z'] },
+        'a1',
+        'a-device',
+      ),
+      observed: { 'a-device': 0, 'z-device': 1 },
+    };
+    const b = {
+      ...envelope(
+        { type: 'media.tags.added', mediaId: 'm1', values: ['Concurrent B'] },
+        'b1',
+        'b-device',
+      ),
+      observed: { 'b-device': 0 },
+    };
+    const permutations = [
+      [z, a, b],
+      [z, b, a],
+      [a, z, b],
+      [a, b, z],
+      [b, z, a],
+      [b, a, z],
+    ];
+    const projections = permutations.map((events) => rebuildCatalogue(events));
+    for (const state of projections) {
+      expect(state.media.m1.tags).toEqual(['Concurrent B', 'Observed Z']);
+      expect(state.appliedEventIds.indexOf('z1')).toBeLessThan(
+        state.appliedEventIds.indexOf('a1'),
+      );
+      expect(state.issues).toEqual([]);
+    }
+    expect(
+      projections.map(({ media, conflicts, appliedEventIds }) => ({
+        media,
+        conflicts,
+        appliedEventIds,
+      })),
+    ).toEqual(
+      Array.from({ length: 6 }, () => ({
+        media: projections[0].media,
+        conflicts: projections[0].conflicts,
+        appliedEventIds: projections[0].appliedEventIds,
+      })),
+    );
+  });
+  it('reports unavailable causal dependencies while retaining valid events', () => {
+    const dependent = {
+      ...envelope({ type: 'media.registered', media }, 'a1', 'a-device'),
+      observed: { 'a-device': 0, 'z-device': 3 },
+    };
+    const state = rebuildCatalogue([dependent]);
+    expect(state.media.m1).toBeDefined();
+    expect(state.issues[0].code).toBe('missing-causal-dependency');
   });
   it('retains concurrent scalar values as a conflict despite clock skew', () => {
     const registered = envelope({ type: 'media.registered', media });
@@ -145,6 +303,52 @@ describe('catalogue reducer', () => {
         .tags,
     ).toEqual(['Night']);
   });
+  it('replays legacy replacement events with exact set and record semantics', () => {
+    const registered = envelope({
+      type: 'media.registered',
+      media: { ...media, tags: ['old', 'keep'], projectIds: ['old-project'] },
+    });
+    const tags = {
+      ...envelope(
+        { type: 'media.tags.replaced', mediaId: 'm1', values: ['keep'] },
+        'e2',
+      ),
+      sequence: 2,
+      observed: { a: 1 },
+    };
+    const projects = {
+      ...envelope(
+        { type: 'media.projects.replaced', mediaId: 'm1', values: [] },
+        'e3',
+      ),
+      sequence: 3,
+      observed: { a: 2 },
+    };
+    const snapshot = {
+      ...envelope(
+        {
+          type: 'media.legacy-snapshot-replaced',
+          media: {
+            ...media,
+            relativePath: 'final.mp4',
+            tags: ['keep'],
+            projectIds: [],
+            notes: 'final note',
+          },
+        },
+        'e4',
+      ),
+      sequence: 4,
+      observed: { a: 3 },
+    };
+    const state = rebuildCatalogue([snapshot, projects, registered, tags]);
+    expect(state.media.m1).toMatchObject({
+      relativePath: 'final.mp4',
+      tags: ['keep'],
+      projectIds: [],
+      notes: 'final note',
+    });
+  });
   it('replays enrichment and changed-file evidence from the canonical contract', () => {
     const state = rebuildCatalogue([
       envelope({ type: 'media.registered', media }),
@@ -174,6 +378,57 @@ describe('catalogue reducer', () => {
       observedSize: 3,
       observedModifiedMillis: 42,
       needsReview: true,
+    });
+  });
+  it('does not clear an integrity warning during ordinary metadata edits', () => {
+    const state = rebuildCatalogue([
+      envelope({
+        type: 'media.registered',
+        media: { ...media, needsReview: true },
+      }),
+      envelope(
+        { type: 'media.tags.added', mediaId: 'm1', values: ['Track'] },
+        'e2',
+      ),
+      envelope(
+        { type: 'media.notes.set', mediaId: 'm1', value: 'Keep warning' },
+        'e3',
+      ),
+    ]);
+    expect(state.media.m1.needsReview).toBe(true);
+    expect(state.media.m1.tags).toEqual(['Track']);
+    expect(state.media.m1.notes).toBe('Keep warning');
+  });
+  it('retains integrity evidence independently for each device', () => {
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media }),
+      envelope(
+        {
+          type: 'media.evidence-observed',
+          mediaId: 'm1',
+          observedSize: 3,
+          observedSha256: 'changed',
+          needsReview: true,
+        },
+        'desktop-evidence',
+        'desktop',
+      ),
+      envelope(
+        {
+          type: 'media.evidence-observed',
+          mediaId: 'm1',
+          observedSize: 2,
+          observedSha256: 'abc',
+          needsReview: false,
+        },
+        'laptop-evidence',
+        'laptop',
+      ),
+    ]);
+    expect(state.media.m1.integrityByDevice?.desktop.needsReview).toBe(true);
+    expect(state.media.m1.integrityByDevice?.laptop).toMatchObject({
+      observedSha256: 'abc',
+      needsReview: false,
     });
   });
   it('surfaces concurrent project record changes', () => {
