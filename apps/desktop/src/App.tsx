@@ -60,6 +60,11 @@ import {
 import { SettingsWriteQueue } from './settings-write-queue';
 import { hoverPreviewRequestCache } from './hover-preview-cache';
 import {
+  previewWorkQueue,
+  type PreviewPriority,
+  type PreviewQueueStatus,
+} from './preview-work-queue';
+import {
   holdFrameIndex,
   readLastHoveredRatio,
   writeLastHoveredRatio,
@@ -162,6 +167,9 @@ export function App() {
   const [thumbnailSourceRequestCount, setThumbnailSourceRequestCount] =
     useState(0);
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
+  const [previewMemoryUsage, setPreviewMemoryUsage] = useState(0);
+  const [previewQueueStatus, setPreviewQueueStatus] =
+    useState<PreviewQueueStatus>(previewWorkQueue.status);
   const [previewCacheEpoch, setPreviewCacheEpoch] = useState(0);
   const [clearingPreviewCache, setClearingPreviewCache] = useState(false);
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
@@ -238,6 +246,28 @@ export function App() {
     settingsRef.current = settings;
     savingSettings.setLatest(settings);
   }, [savingSettings, settings]);
+  useEffect(
+    () =>
+      previewWorkQueue.subscribe((status) => {
+        setPreviewQueueStatus(status);
+        setPreviewMemoryUsage(hoverPreviewRequestCache.usageBytes);
+      }),
+    [],
+  );
+  useEffect(() => {
+    const configuredLimit = settings.previewRamCacheLimitBytes ?? 0;
+    hoverPreviewRequestCache.configure(
+      configuredLimit > 0 ? configuredLimit : 128 * 1024 * 1024,
+    );
+  }, [settings.previewRamCacheLimitBytes]);
+  useEffect(() => {
+    if (!native || view !== 'Settings' || settingsSection !== 'Appearance')
+      return;
+    void desktopBridge
+      .hoverPreviewCacheUsage()
+      .then(setPreviewCacheUsage)
+      .catch(() => undefined);
+  }, [native, settingsSection, view]);
   useEffect(() => {
     const preservePendingSettings = (event: BeforeUnloadEvent) => {
       if (!savingSettings.hasUnsavedChanges()) return;
@@ -1043,7 +1073,9 @@ export function App() {
   const clearPreviewCache = async () => {
     setClearingPreviewCache(true);
     setError('');
+    previewWorkQueue.clearQueued();
     hoverPreviewRequestCache.invalidate();
+    setPreviewMemoryUsage(0);
     setPreviewCacheEpoch((value) => value + 1);
     try {
       setPreviewCacheUsage(await desktopBridge.clearHoverPreviewCache());
@@ -1052,6 +1084,7 @@ export function App() {
       setError(errorText(reason));
     } finally {
       hoverPreviewRequestCache.invalidate();
+      setPreviewMemoryUsage(0);
       setPreviewCacheEpoch((value) => value + 1);
       setClearingPreviewCache(false);
     }
@@ -2088,7 +2121,7 @@ export function App() {
                     </select>
                   </label>
                   <ToggleField
-                    label="Enable hover previews"
+                    label="Enable hover preview"
                     description="Generate low-resolution video frames locally when a Library thumbnail is hovered. No audio is played."
                     checked={settings.hoverPreviewsEnabled ?? true}
                     onChange={(hoverPreviewsEnabled) =>
@@ -2125,6 +2158,50 @@ export function App() {
                     </small>
                   </fieldset>
                   <label>
+                    Preview preloading
+                    <select
+                      value={settings.previewPreloading ?? 'visible-nearby'}
+                      onChange={(event) =>
+                        void persistPreference({
+                          previewPreloading: event.target
+                            .value as DeviceSettings['previewPreloading'],
+                        })
+                      }
+                    >
+                      <option value="hovered">Only when hovered</option>
+                      <option value="visible-nearby">
+                        Visible and nearby recordings (recommended)
+                      </option>
+                      <option value="idle">
+                        Prepare additional recordings when idle
+                      </option>
+                    </select>
+                  </label>
+                  <label>
+                    RAM preview-cache allowance
+                    <select
+                      value={settings.previewRamCacheLimitBytes ?? 0}
+                      onChange={(event) => {
+                        const previewRamCacheLimitBytes = Number(
+                          event.target.value,
+                        );
+                        hoverPreviewRequestCache.configure(
+                          previewRamCacheLimitBytes || 128 * 1024 * 1024,
+                        );
+                        setPreviewMemoryUsage(
+                          hoverPreviewRequestCache.usageBytes,
+                        );
+                        void persistPreference({ previewRamCacheLimitBytes });
+                      }}
+                    >
+                      <option value={0}>Automatic</option>
+                      <option value={64 * 1024 * 1024}>64 MB</option>
+                      <option value={128 * 1024 * 1024}>128 MB</option>
+                      <option value={256 * 1024 * 1024}>256 MB</option>
+                      <option value={512 * 1024 * 1024}>512 MB</option>
+                    </select>
+                  </label>
+                  <label>
                     Hover preview cache limit (GB)
                     <input
                       type="number"
@@ -2151,7 +2228,15 @@ export function App() {
                   </label>
                   <div className="info-card">
                     <strong>Hover preview cache</strong>
-                    <span>{size(previewCacheUsage)} used</span>
+                    <span>{size(previewMemoryUsage)} in memory</span>
+                    <span>{size(previewCacheUsage)} on disk</span>
+                    <span role="status">
+                      {previewQueueStatus.active
+                        ? `Preparing ${previewQueueStatus.activeLabel ?? 'preview'} · ${previewQueueStatus.queued} queued`
+                        : previewQueueStatus.queued
+                          ? `${previewQueueStatus.queued} previews queued`
+                          : 'Generation queue idle'}
+                    </span>
                     <small>
                       Regenerable frames stay in the device-local cache and are
                       never synchronized.
@@ -2587,6 +2672,10 @@ export function App() {
                               !clearingPreviewCache
                             }
                             holdFrame={settings.thumbnailHoldFrame ?? 'first'}
+                            preloading={
+                              settings.previewPreloading ?? 'visible-nearby'
+                            }
+                            allowBackgroundPreparation={activeJobs.length === 0}
                           />
                           <span>
                             {duration(item.technical.durationSeconds)}
@@ -3763,6 +3852,8 @@ function MediaThumbnail({
   previewCacheEpoch = 0,
   enableHoverPreview = false,
   holdFrame = 'first',
+  preloading = 'visible-nearby',
+  allowBackgroundPreparation = true,
 }: {
   mediaId: string;
   fileType: string;
@@ -3772,6 +3863,8 @@ function MediaThumbnail({
   previewCacheEpoch?: number;
   enableHoverPreview?: boolean;
   holdFrame?: DeviceSettings['thumbnailHoldFrame'];
+  preloading?: DeviceSettings['previewPreloading'];
+  allowBackgroundPreparation?: boolean;
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
   const [showThumbnail, setShowThumbnail] = useState(
@@ -3806,6 +3899,48 @@ function MediaThumbnail({
     previewEntry.epoch === previewCacheEpoch
       ? previewEntry.preview
       : undefined;
+  const previewEligible =
+    Boolean(previewKey) &&
+    sourceAvailable &&
+    enableHoverPreview &&
+    previewableVideoTypes.has(fileType.toLowerCase()) &&
+    !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  const requestPreview = useCallback(
+    (priority: PreviewPriority = 0) => {
+      if (preview || !previewKey || !previewEligible) return;
+      previewWorkQueue.promote(`load:${previewKey}`, priority);
+      const generation = ++requestGeneration.current;
+      const request = hoverPreviewRequestCache.request(previewKey, () =>
+        previewWorkQueue.schedule(
+          `load:${previewKey}`,
+          priority,
+          fileType.toUpperCase(),
+          () => desktopBridge.loadHoverPreview(mediaId),
+        ),
+      );
+      void request
+        .then((result) => {
+          if (
+            generation === requestGeneration.current &&
+            result.mediaId === mediaId
+          )
+            setPreviewEntry({
+              key: previewKey,
+              epoch: previewCacheEpoch,
+              preview: result,
+            });
+        })
+        .catch(() => undefined);
+    },
+    [
+      fileType,
+      mediaId,
+      preview,
+      previewCacheEpoch,
+      previewEligible,
+      previewKey,
+    ],
+  );
   useEffect(() => {
     const element = thumbnailRef.current;
     if (!element || typeof IntersectionObserver === 'undefined') return;
@@ -3833,34 +3968,65 @@ function MediaThumbnail({
     observer.observe(element);
     return () => observer.disconnect();
   }, [releasePreview]);
-  const requestPreview = () => {
+  useEffect(() => {
+    const element = thumbnailRef.current;
     if (
+      !element ||
       preview ||
-      !previewKey ||
-      !sourceAvailable ||
-      !enableHoverPreview ||
-      !previewableVideoTypes.has(fileType.toLowerCase()) ||
-      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+      !previewEligible ||
+      preloading === 'hovered' ||
+      typeof IntersectionObserver === 'undefined'
     )
       return;
-    const generation = ++requestGeneration.current;
-    const request = hoverPreviewRequestCache.request(previewKey, () =>
-      desktopBridge.loadHoverPreview(mediaId),
-    );
-    void request
-      .then((result) => {
-        if (
-          generation === requestGeneration.current &&
-          result.mediaId === mediaId
+    const nearby = new IntersectionObserver(
+      (entries) => {
+        const isNearby = entries.some((entry) => entry.isIntersecting);
+        if (isNearby && allowBackgroundPreparation && previewKey)
+          void previewWorkQueue
+            .schedule(`prepare:${previewKey}`, 2, fileType.toUpperCase(), () =>
+              desktopBridge.prepareHoverPreview(mediaId),
+            )
+            .catch(() => undefined);
+        else if (
+          !isNearby &&
+          preloading === 'idle' &&
+          allowBackgroundPreparation &&
+          previewKey
         )
-          setPreviewEntry({
-            key: previewKey,
-            epoch: previewCacheEpoch,
-            preview: result,
-          });
-      })
-      .catch(() => undefined);
-  };
+          void previewWorkQueue
+            .schedule(`prepare:${previewKey}`, 3, fileType.toUpperCase(), () =>
+              desktopBridge.prepareHoverPreview(mediaId),
+            )
+            .catch(() => undefined);
+      },
+      { rootMargin: '400px' },
+    );
+    const visible = new IntersectionObserver(
+      (entries) => {
+        if (
+          allowBackgroundPreparation &&
+          entries.some((entry) => entry.isIntersecting)
+        )
+          requestPreview(1);
+      },
+      { rootMargin: '0px' },
+    );
+    nearby.observe(element);
+    visible.observe(element);
+    return () => {
+      nearby.disconnect();
+      visible.disconnect();
+    };
+  }, [
+    allowBackgroundPreparation,
+    fileType,
+    mediaId,
+    preloading,
+    preview,
+    previewEligible,
+    previewKey,
+    requestPreview,
+  ]);
   const displayedFrame =
     preview &&
     (previewIndex ?? holdFrameIndex(preview, holdFrame, lastHoveredRatio)) !=
@@ -3880,7 +4046,7 @@ function MediaThumbnail({
       className="media-thumbnail"
       onPointerEnter={() => {
         setIsHovering(true);
-        requestPreview();
+        requestPreview(0);
       }}
       onPointerMove={(event) => {
         if (!preview?.frames.length) return;

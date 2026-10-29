@@ -355,3 +355,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Store the thumbnail hold-frame choice in device settings and map fixed percentages to the nearest timestamp actually reported in the version-2 preview manifest. Store at most 500 per-media last-hover ratios in device-local WebView storage; never publish this presentation state into catalogue events. A card may retain its preview while near the viewport so the configured hold frame remains visible, but the existing observer releases it when distant.
 - **Consequences:** Changing the setting updates mounted cards without touching source media or catalogue identity. Nonzero timestamps and variable cadence use real cached samples, missing/offline/corrupt previews fall back to the ordinary thumbnail, and bounded last-hover persistence does not create synchronized metadata churn.
+
+## ADR-048 — Prioritize preview work and budget RAM by bytes
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Route preview work through one 64-entry, single-active frontend priority queue ordered hover, visible, nearby, then optional idle. Do not terminate an active FFmpeg process; the highest priority work runs next. A native preparation command validates or generates the fingerprinted disk entry without encoding or transferring Base64 frames and refuses background generation while ingest is active. The frontend LRU uses a conservative approximate byte count and configurable automatic/64/128/256/512 MB allowance instead of a fixed clip count.
+- **Consequences:** Prepared disk frames persist across restarts while only visible or explicitly hovered frames consume the bounded RAM allowance. Queue, RAM and disk status are device-local diagnostics. The queue drops or supersedes low-priority work when saturated, scrolling never launches unbounded FFmpeg processes, and installed CPU/disk/latency acceptance remains required.

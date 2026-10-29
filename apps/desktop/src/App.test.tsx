@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => ({
     hoverPreviewsEnabled: true,
     previewCacheLimitBytes: 536870912,
     thumbnailHoldFrame: 'first',
+    previewPreloading: 'visible-nearby',
+    previewRamCacheLimitBytes: 0,
     ingestDateOrganization: 'original-file-dates' as const,
     dateFolderPattern: 'yyyymmdd',
     initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -69,6 +71,7 @@ const mocks = vi.hoisted(() => ({
   openProjectFolder: vi.fn(),
   revealProjectAsset: vi.fn(),
   loadHoverPreview: vi.fn(),
+  prepareHoverPreview: vi.fn(),
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
@@ -144,6 +147,7 @@ vi.mock('./bridge', () => ({
     loadThumbnail: vi.fn(async () => null),
     loadThumbnailSources: mocks.loadThumbnailSources,
     loadHoverPreview: mocks.loadHoverPreview,
+    prepareHoverPreview: mocks.prepareHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
     thumbnailUrl: (path: string) => path,
@@ -220,6 +224,8 @@ describe('native application integration', () => {
       hoverPreviewsEnabled: true,
       previewCacheLimitBytes: 536870912,
       thumbnailHoldFrame: 'first',
+      previewPreloading: 'visible-nearby',
+      previewRamCacheLimitBytes: 0,
       ingestDateOrganization: 'original-file-dates',
       dateFolderPattern: 'yyyymmdd',
       initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -313,6 +319,8 @@ describe('native application integration', () => {
     mocks.revealProjectAsset.mockReset();
     mocks.revealProjectAsset.mockResolvedValue(undefined);
     mocks.loadHoverPreview.mockReset();
+    mocks.prepareHoverPreview.mockReset();
+    mocks.prepareHoverPreview.mockResolvedValue(undefined);
     mocks.hoverPreviewCacheUsage.mockReset();
     mocks.hoverPreviewCacheUsage.mockResolvedValue(0);
     mocks.clearHoverPreviewCache.mockReset();
@@ -772,6 +780,31 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it('persists device-local preview preparation and RAM allowance controls', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.selectOptions(
+      screen.getByLabelText('Preview preloading'),
+      'idle',
+    );
+    await user.selectOptions(
+      screen.getByLabelText('RAM preview-cache allowance'),
+      String(64 * 1024 * 1024),
+    );
+    await waitFor(() =>
+      expect(mocks.saveSettings.mock.calls.at(-1)?.[0]).toEqual(
+        expect.objectContaining({
+          previewPreloading: 'idle',
+          previewRamCacheLimitBytes: 64 * 1024 * 1024,
+        }),
+      ),
+    );
+    expect(screen.getByText('Generation queue idle')).toBeVisible();
   });
 
   it.each([100, 700, 3000])(

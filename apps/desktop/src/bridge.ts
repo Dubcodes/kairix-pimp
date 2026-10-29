@@ -12,6 +12,7 @@ export type ThumbnailHoldFrame =
   | '80-percent'
   | 'last'
   | 'last-hovered';
+export type PreviewPreloading = 'hovered' | 'visible-nearby' | 'idle';
 export interface DeviceSettings {
   deviceId: string;
   masterBinPath: string;
@@ -23,6 +24,8 @@ export interface DeviceSettings {
   hoverPreviewsEnabled: boolean;
   previewCacheLimitBytes: number;
   thumbnailHoldFrame: ThumbnailHoldFrame;
+  previewPreloading: PreviewPreloading;
+  previewRamCacheLimitBytes: number;
   ingestDateOrganization: DateMode;
   dateFolderPattern: string;
   initializedCataloguePath: string;
@@ -279,6 +282,8 @@ export const emptySettings = (): DeviceSettings => ({
   hoverPreviewsEnabled: true,
   previewCacheLimitBytes: 512 * 1024 * 1024,
   thumbnailHoldFrame: 'first',
+  previewPreloading: 'visible-nearby',
+  previewRamCacheLimitBytes: 0,
   ingestDateOrganization: 'today',
   dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',
@@ -469,6 +474,8 @@ export const desktopBridge = {
   },
   loadHoverPreview: (mediaId: string) =>
     invoke<HoverPreview>('load_hover_preview', { mediaId }),
+  prepareHoverPreview: (mediaId: string) =>
+    invoke<void>('prepare_hover_preview', { mediaId }),
   hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
   clearHoverPreviewCache: () => invoke<number>('clear_hover_preview_cache'),
 };

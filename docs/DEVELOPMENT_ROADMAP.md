@@ -30,6 +30,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
 - Implemented: mounted cards release large preview frames after hover/out-of-viewport, and timecodes use actual FFmpeg `showinfo` sample timestamps rather than planned positions
 - Implemented: device-local thumbnail hold-frame selection using the nearest actual preview sample, including bounded per-media last-hover persistence
+- Implemented: hover-first bounded preview preparation, visible/nearby and optional idle modes, separate disk-only preparation, byte-accounted RAM LRU limits and live queue/cache diagnostics; installed production-library profiling remains open
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows

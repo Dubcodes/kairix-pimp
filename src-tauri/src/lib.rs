@@ -75,6 +75,10 @@ struct DeviceSettings {
     preview_cache_limit_bytes: u64,
     #[serde(default = "default_thumbnail_hold_frame")]
     thumbnail_hold_frame: String,
+    #[serde(default = "default_preview_preloading")]
+    preview_preloading: String,
+    #[serde(default)]
+    preview_ram_cache_limit_bytes: u64,
     #[serde(default = "legacy_date_mode")]
     ingest_date_organization: String,
     #[serde(default = "legacy_date_folder_pattern")]
@@ -194,6 +198,9 @@ fn default_preview_cache_limit_bytes() -> u64 {
 fn default_thumbnail_hold_frame() -> String {
     "first".into()
 }
+fn default_preview_preloading() -> String {
+    "visible-nearby".into()
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -213,6 +220,8 @@ impl Default for DeviceSettings {
             hover_previews_enabled: true,
             preview_cache_limit_bytes: default_preview_cache_limit_bytes(),
             thumbnail_hold_frame: default_thumbnail_hold_frame(),
+            preview_preloading: default_preview_preloading(),
+            preview_ram_cache_limit_bytes: 0,
             ingest_date_organization: "today".into(),
             date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
@@ -609,6 +618,11 @@ fn snapshot_jobs(app: &AppHandle, state: &NativeState) -> Result<Vec<IngestJob>,
     load_jobs_unlocked(app)
 }
 
+fn has_active_ingest(jobs: &[IngestJob]) -> bool {
+    jobs.iter()
+        .any(|job| matches!(job.state.as_str(), "queued" | "copying" | "verifying"))
+}
+
 const UPDATE_OPERATION_BLOCKED: &str =
     "A verified update is being installed. Wait for the application to restart before starting or resuming ingest.";
 
@@ -821,6 +835,20 @@ fn save_settings(
             | "last-hovered"
     ) {
         return Err("Choose a supported thumbnail hold frame".into());
+    }
+    if !matches!(
+        settings.preview_preloading.as_str(),
+        "hovered" | "visible-nearby" | "idle"
+    ) {
+        return Err("Choose a supported preview preloading mode".into());
+    }
+    if settings.preview_ram_cache_limit_bytes != 0
+        && !matches!(
+            settings.preview_ram_cache_limit_bytes,
+            67_108_864 | 134_217_728 | 268_435_456 | 536_870_912
+        )
+    {
+        return Err("Choose a supported preview RAM cache allowance".into());
     }
     if !matches!(
         settings.library_folder_sort.as_str(),
@@ -4624,7 +4652,10 @@ fn hover_preview_frame_times(duration_seconds: f64) -> Result<Vec<f64>, String> 
         .collect())
 }
 
-fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<HoverPreview, String> {
+fn validate_hover_preview(
+    directory: &Path,
+    expected_fingerprint: &str,
+) -> Result<HoverPreviewManifest, String> {
     let manifest_path = directory.join("manifest.json");
     let manifest: HoverPreviewManifest = serde_json::from_slice(
         &fs::read(&manifest_path)
@@ -4640,7 +4671,6 @@ fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<Ho
     let canonical_directory = directory
         .canonicalize()
         .map_err(|error| format!("Cannot resolve hover preview directory: {error}"))?;
-    let mut frames = Vec::with_capacity(manifest.frame_files.len());
     let mut total_bytes = 0_u64;
     for reference in &manifest.frame_files {
         if reference.contains('/') || reference.contains('\\') || !reference.ends_with(".jpg") {
@@ -4653,11 +4683,24 @@ fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<Ho
         if !path.starts_with(&canonical_directory) || !path.is_file() {
             return Err("Hover preview frame resolved outside its cache entry".into());
         }
-        let bytes = fs::read(path).map_err(|error| format!("Cannot read hover preview frame: {error}"))?;
-        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        total_bytes = total_bytes.saturating_add(
+            path.metadata()
+                .map_err(|error| format!("Cannot inspect hover preview frame: {error}"))?
+                .len(),
+        );
         if total_bytes > 32 * 1024 * 1024 {
             return Err("Hover preview exceeds the 32 MB safety limit".into());
         }
+    }
+    Ok(manifest)
+}
+
+fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<HoverPreview, String> {
+    let manifest = validate_hover_preview(directory, expected_fingerprint)?;
+    let mut frames = Vec::with_capacity(manifest.frame_files.len());
+    for reference in &manifest.frame_files {
+        let bytes = fs::read(directory.join(reference))
+            .map_err(|error| format!("Cannot read hover preview frame: {error}"))?;
         frames.push(format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)));
     }
     Ok(HoverPreview {
@@ -4707,11 +4750,11 @@ fn evict_hover_preview_cache(root: &Path, budget: u64, keep: &Path) -> Result<()
     Ok(())
 }
 
-fn generate_hover_preview(
+fn ensure_hover_preview(
     settings: &DeviceSettings,
     item: &MediaItem,
     source: &Path,
-) -> Result<HoverPreview, String> {
+) -> Result<(PathBuf, String), String> {
     let duration_seconds = item
         .technical
         .duration_seconds
@@ -4722,8 +4765,8 @@ fn generate_hover_preview(
     let root = hover_preview_root(settings)?;
     let final_directory = root.join(&fingerprint);
     if final_directory.is_dir() {
-        if let Ok(preview) = read_hover_preview(&final_directory, &fingerprint) {
-            return Ok(preview);
+        if validate_hover_preview(&final_directory, &fingerprint).is_ok() {
+            return Ok((final_directory, fingerprint));
         }
         fs::remove_dir_all(&final_directory)
             .map_err(|error| format!("Cannot replace invalid hover preview cache: {error}"))?;
@@ -4798,7 +4841,16 @@ fn generate_hover_preview(
     fs::rename(&temporary, &final_directory)
         .map_err(|error| format!("Cannot commit hover preview cache entry: {error}"))?;
     evict_hover_preview_cache(&root, settings.preview_cache_limit_bytes, &final_directory)?;
-    read_hover_preview(&final_directory, &fingerprint)
+    Ok((final_directory, fingerprint))
+}
+
+fn generate_hover_preview(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+    source: &Path,
+) -> Result<HoverPreview, String> {
+    let (directory, fingerprint) = ensure_hover_preview(settings, item, source)?;
+    read_hover_preview(&directory, &fingerprint)
 }
 
 #[tauri::command]
@@ -4827,6 +4879,37 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
     })
     .await
     .map_err(|error| format!("Hover preview task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        if has_active_ingest(&snapshot_jobs(&app, &state)?) {
+            return Err("Background preview preparation is deferred while ingest is active".into());
+        }
+        let _guard = state.preview_generation.lock().unwrap();
+        let settings = load_settings_file(&app)?;
+        if !settings.hover_previews_enabled {
+            return Err("Hover previews are disabled in Settings".into());
+        }
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or("Unknown media item")?;
+        if !matches!(
+            item.file_type.to_ascii_lowercase().as_str(),
+            "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
+        ) {
+            return Err("Hover previews are available only for supported video files".into());
+        }
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        ensure_hover_preview(&settings, item, &source).map(|_| ())
+    })
+    .await
+    .map_err(|error| format!("Hover preview preparation task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -5052,6 +5135,7 @@ pub fn run() {
             load_thumbnail,
             load_thumbnail_sources,
             load_hover_preview,
+            prepare_hover_preview,
             hover_preview_cache_usage,
             clear_hover_preview_cache
         ])
@@ -5245,6 +5329,15 @@ mod tests {
         assert!(validate_job_action("queued", "resume").is_err());
         assert!(validate_job_action("completed", "cancel").is_err());
         assert!(validate_job_action("queued", "cancel").is_ok());
+    }
+
+    #[test]
+    fn background_preview_preparation_defers_for_active_ingest_only() {
+        assert!(has_active_ingest(&[ingest_job("queued", "queued")]));
+        assert!(has_active_ingest(&[ingest_job("copying", "copying")]));
+        assert!(has_active_ingest(&[ingest_job("verifying", "verifying")]));
+        assert!(!has_active_ingest(&[ingest_job("paused", "queued")]));
+        assert!(!has_active_ingest(&[ingest_job("completed", "completed")]));
     }
 
     #[test]

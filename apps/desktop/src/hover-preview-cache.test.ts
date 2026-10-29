@@ -11,7 +11,7 @@ const preview = (mediaId: string): HoverPreview => ({
 
 describe('hover preview request cache', () => {
   it('deduplicates concurrent requests and retains only a bounded LRU', async () => {
-    const cache = new HoverPreviewRequestCache(3);
+    const cache = new HoverPreviewRequestCache(170, 3);
     const loader = vi.fn(async () => preview('one'));
     const first = cache.request('one', loader);
     const duplicate = cache.request('one', loader);
@@ -22,13 +22,13 @@ describe('hover preview request cache', () => {
     await cache.request('two', async () => preview('two'));
     await cache.request('three', async () => preview('three'));
     await cache.request('four', async () => preview('four'));
-    expect(cache.size).toBe(3);
+    expect(cache.usageBytes).toBeLessThanOrEqual(170);
     await cache.request('one', loader);
     expect(loader).toHaveBeenCalledTimes(2);
   });
 
   it('bounds pending work during rapid movement across many cards', async () => {
-    const cache = new HoverPreviewRequestCache(2);
+    const cache = new HoverPreviewRequestCache(1024, 2);
     let resolveFirst!: (value: HoverPreview) => void;
     let resolveSecond!: (value: HoverPreview) => void;
     const first = cache.request(
@@ -49,7 +49,7 @@ describe('hover preview request cache', () => {
   });
 
   it('invalidates in-flight and completed frame data after cache clearing', async () => {
-    const cache = new HoverPreviewRequestCache(2);
+    const cache = new HoverPreviewRequestCache(1024, 2);
     let resolve!: (value: HoverPreview) => void;
     const request = cache.request(
       'one',
@@ -63,5 +63,15 @@ describe('hover preview request cache', () => {
     await expect(
       cache.request('one:changed-source', async () => preview('one')),
     ).resolves.toMatchObject({ mediaId: 'one' });
+  });
+
+  it('evicts by approximate frame bytes rather than clip count', async () => {
+    const cache = new HoverPreviewRequestCache(100, 8);
+    await cache.request('one', async () => preview('one'));
+    await cache.request('two', async () => preview('two'));
+    expect(cache.usageBytes).toBeLessThanOrEqual(100);
+    expect(cache.size).toBe(1);
+    cache.configure(1);
+    expect(cache.usageBytes).toBe(0);
   });
 });
