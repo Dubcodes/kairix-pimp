@@ -348,3 +348,24 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Keep bounded FPS sampling, append FFmpeg `showinfo`, and store each emitted frame's reported PTS in a version-2 preview manifest. Library cards release their preview object when hover ends or they leave the active viewport; the shared eight-entry request cache and size-limited disk cache remain the reuse layers.
 - **Consequences:** Timecodes follow actual output cadence, including non-zero PTS, and old manifests with assumed positions regenerate safely under a new fingerprint. Sequentially hovering mounted cards no longer leaves an unbounded Base64 collection in component state, while revisiting a valid disk entry does not rerun FFmpeg.
+
+## ADR-047 — Select hold frames from actual device-local preview samples
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Store the thumbnail hold-frame choice in device settings and map fixed percentages to the nearest timestamp actually reported in the version-2 preview manifest. Store at most 500 per-media last-hover ratios in device-local WebView storage; never publish this presentation state into catalogue events. A card may retain its preview while near the viewport so the configured hold frame remains visible, but the existing observer releases it when distant.
+- **Consequences:** Changing the setting updates mounted cards without touching source media or catalogue identity. Nonzero timestamps and variable cadence use real cached samples, missing/offline/corrupt previews fall back to the ordinary thumbnail, and bounded last-hover persistence does not create synchronized metadata churn.
+
+## ADR-048 — Prioritize preview work and budget RAM by bytes
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Route preview work through one 64-entry, single-active frontend priority queue ordered hover, visible, nearby, then optional idle. Optional offscreen preparation first passes through a separate bounded, serial browser-idle gate and is deferred again on pointer interaction; it does not enter the generation queue merely because a card is offscreen. Do not terminate an active FFmpeg process; the highest priority work runs next. A native preparation command validates or generates the fingerprinted disk entry without encoding or transferring Base64 frames and refuses background generation while ingest is active. The frontend LRU uses a conservative approximate byte count and configurable automatic/64/128/256/512 MB allowance instead of a fixed clip count.
+- **Consequences:** Prepared disk frames persist across restarts while only visible or explicitly hovered frames consume the bounded RAM allowance. Queue, RAM and disk status are device-local diagnostics. Idle preparation starts one item per browser idle opportunity, the queue drops or supersedes low-priority work when saturated, scrolling never launches unbounded FFmpeg processes, and installed CPU/disk/latency acceptance remains required.
+
+## ADR-049 — Start Premiere UXP integration with explicit manifest handoff
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Package the Premiere Companion separately and begin with a user-selected schema-1 JSON manifest rather than a persistent local network service. The native exporter resolves only explicit known media IDs beneath canonical Master Bin, includes selected attached audio, refuses overwrite, and exposes no arbitrary filesystem command. The UXP panel requests access only to that file, uses supported Premiere 25.6 APIs, reconciles existing media paths and never reads `.prproj` internals.
+- **Consequences:** Desktop PIMP remains independent of the plugin and no authentication/listening service is needed. Manifest selection is an explicit user step. Automated validation proves the interchange boundary, but `.ccx` packaging and real Premiere imports remain unverified until UXP Developer Tool and installed-project acceptance are completed.

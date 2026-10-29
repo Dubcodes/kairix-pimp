@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="manifest-core.cjs"></script>
+    <script src="index.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Kairix PIMP</h1>
+      <p class="muted">
+        Import selected Master Bin recordings without copying media.
+      </p>
+
+      <button id="choose-manifest" type="button">
+        Choose PIMP import manifest…
+      </button>
+      <section id="manifest-summary" class="card" hidden></section>
+
+      <label>
+        Target Premiere bin
+        <input id="target-bin" value="Kairix PIMP" maxlength="120" />
+      </label>
+      <label class="check-row">
+        <input id="preserve-bins" type="checkbox" checked />
+        Preserve PIMP date-folder hierarchy
+      </label>
+
+      <button id="import-media" class="primary" type="button" disabled>
+        Import selected PIMP media
+      </button>
+      <div id="status" role="status" aria-live="polite">
+        Choose a manifest exported by PIMP.
+      </div>
+      <ol id="results" aria-label="Import results"></ol>
+    </main>
+  </body>
+</html>

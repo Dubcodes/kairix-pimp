@@ -1,5 +1,11 @@
 # Windows beta installation and acceptance
 
+## Pull-request test build 0.1.1-6
+
+The preview/Premiere milestone uses an unsigned, short-lived `0.1.1-6` Actions artifact from PR #5. It is distinguishable from the permanent `0.1.1-5` public prerelease and does not replace it. Download the installer artifact and its `SHA256SUMS.txt` from the successful **Windows beta installer** run, verify the preferred per-user NSIS Setup hash, then install over `0.1.1-5`. Confirm the About version changes while device ID, configured roots, catalogue, recoverable jobs and device-local settings remain present.
+
+The same run publishes a separately named **Premiere Companion developer source** artifact. It is unpackaged source for UXP Developer Tool, not a `.ccx`. Follow `PREMIERE_INTEGRATION.md` and use only a disposable Premiere project with synthetic MP4/WAV media.
+
 Use the per-user NSIS installer for normal beta acceptance. If an older system-wide MSI installation exists, follow [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md); verify the new install before explicitly removing the old application entry or shortcut.
 
 Kairix PIMP 0.1.1-5 is an unsigned public prerelease candidate for Windows. It is suitable for
@@ -90,6 +96,12 @@ retain the generated source until the pass is complete.
    after scrolling through the Library, and after hovering at least 20 different
    videos. Memory may fluctuate but must plateau rather than retain every Base64
    preview; FFmpeg preview generation remains serialized.
+   Record pointer-to-first-frame latency separately for a clip already in the RAM
+   cache, a clip whose preview exists only on disk after restart, an uncached clip,
+   and an uncached clip hovered while optional idle preparation is active. Use the
+   same synthetic duration/codec and record values rather than subjective labels.
+   Confirm rapid scrubbing remains fluid and only pointer exit persists the final
+   last-hovered position.
 6. Start a separate disposable ingest of at least 63 files. While SHA-256 copy and
    verification are active, repeatedly scroll, search, open Settings, return to
    Library and hover local videos. Record the longest observed input stall, CPU
@@ -98,6 +110,8 @@ retain the generated source until the pass is complete.
 7. While a preview is generating, choose **Clear preview cache**. Confirm the UI
    reports that it is waiting, completes without an error, restores static
    thumbnails and regenerates only when a video is hovered again.
+   With optional idle preparation enabled, continuously scroll or move the pointer
+   and confirm offscreen generation does not begin until interaction settles.
 8. After ingest completion, confirm the header says **All ingests complete**,
    completed history is collapsed, and **Clear Completed** removes the indicator.
    Restart and confirm active/attention history and catalogue media remain intact.

@@ -24,18 +24,20 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
 - Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history
-- Native notification watcher, bounded thumbnail eviction, alternate thumbnail frames, folder notes and field-level conflict resolution workflow
+- Native notification watcher, bounded thumbnail eviction, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
 - Implemented: mounted cards release large preview frames after hover/out-of-viewport, and timecodes use actual FFmpeg `showinfo` sample timestamps rather than planned positions
+- Implemented: device-local thumbnail hold-frame selection using the nearest actual preview sample, including bounded per-media last-hover persistence
+- Implemented: hover-first bounded preview preparation, visible/nearby and optional idle modes, separate disk-only preparation, byte-accounted RAM LRU limits and live queue/cache diagnostics; installed production-library profiling remains open
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
 
 ## Milestone 3 — Premiere extension
 
-Build and test a UXP extension against a supported Premiere version. Use active project access, `Project.importFiles`, transactional bin creation via `FolderItem`, and `ClipProjectItem.getMediaFilePath` to reconcile actual imports. Never edit `.prproj` internals.
+A standalone UXP proof of concept and schema-1 user-selected interchange manifest are implemented. It uses active project access, `Project.importFiles`, transactional bin creation via `FolderItem`, and `ClipProjectItem.getMediaFilePath` to reconcile imports without editing `.prproj` internals. Automated tests cover manifest production/validation and UI handoff. Remaining: load in UXP Developer Tool, test imports/bin creation/duplicate reconciliation against Premiere 25.6+, obtain a distribution ID, package a `.ccx`, and complete installed acceptance.
 
 Keep direct DCM Master Bin references, dated bins and an optional virtual Audio grouping. Project collection is an explicit verified transition: the collected `.prproj` in DCM Content becomes authoritative for the existing stable project ID only after dependency checks; presence alone never changes state.
 
