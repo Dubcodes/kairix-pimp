@@ -21,6 +21,8 @@ Appearance settings now select the nearest real sampled first, 10%, 20%, middle,
 
 Preview preparation now uses a bounded priority queue: an active hover runs before queued visible, nearby and optional idle work, while an already-running FFmpeg operation finishes safely. Disk preparation is distinct from byte-budgeted RAM preloading, pauses during active ingest, and exposes queue, memory and disk usage in Appearance settings.
 
+The repository now contains a separately packaged Premiere UXP proof of concept and a native **Export Premiere manifest** handoff for selected Master Bin media, including attached WAV files. Its interchange validation is automated-test covered, but the panel has not yet been loaded or packaged with UXP Developer Tool and no real Premiere compatibility is claimed. See [Premiere Companion integration](docs/PREMIERE_INTEGRATION.md).
+
 Thumbnail cache paths are resolved in one validated native batch per catalogue revision. Near-viewport observation and lazy decoding avoid per-card catalogue replays and Base64 image transfers during Library startup.
 
 Ingest can seed normalized tags across all eligible video, audio and image recordings while retaining later per-file edits in the existing durable job metadata. Copy remains the default and only enabled source workflow; SD-card cleanup is not implemented.

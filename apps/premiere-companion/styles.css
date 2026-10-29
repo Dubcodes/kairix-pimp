@@ -1,0 +1,90 @@
+:root {
+  color: #ededed;
+  background: #242424;
+  font:
+    13px/1.45 system-ui,
+    sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 19px;
+}
+
+.muted,
+#status {
+  color: #b9b9b9;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+}
+
+button,
+input {
+  box-sizing: border-box;
+  min-height: 32px;
+  border: 1px solid #5a5a5a;
+  border-radius: 4px;
+  color: inherit;
+  background: #323232;
+  padding: 6px 9px;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid #66a8ff;
+  outline-offset: 2px;
+}
+
+button.primary {
+  border-color: #2f7fda;
+  background: #1765bd;
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+.card {
+  border: 1px solid #484848;
+  border-radius: 5px;
+  padding: 10px;
+  background: #2b2b2b;
+}
+
+#results {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 22px;
+  word-break: break-word;
+}
+
+.success {
+  color: #79d18b;
+}
+
+.skipped {
+  color: #e9c46a;
+}
+
+.failed {
+  color: #ff8585;
+}

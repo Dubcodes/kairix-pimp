@@ -87,7 +87,7 @@ Full-edition analysis runs behind an optional process-isolated `AiProcessor` con
 
 ## Premiere and archive boundaries
 
-A future UXP extension uses documented active-project, import, folder/bin, and media-path APIs. PIMP reconciles Premiere's observed contents with its manifest and never edits `.prproj` internals. The extension and desktop app communicate through a versioned, authenticated local boundary still to be designed and tested.
+The standalone Premiere Companion UXP proof of concept uses documented active-project, import, folder/bin and media-path APIs. For its first boundary, PIMP creates a versioned, user-selected, no-overwrite interchange manifest containing only the explicit physical selection and validated canonical Master Bin paths. This avoids a persistent localhost service or network permission. The extension reconciles Premiere's observed media paths and never edits `.prproj` internals. Real Premiere/UXP acceptance remains open.
 
 Until that extension exists, the default editing workflow references footage directly from Master Bin. Working Project folders and their existing Premiere saves/assets are not restructured, and users continue to use Premiere's normal desktop/laptop drive-path relinking.
 

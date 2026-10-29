@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 
 export type DateMode = 'today' | 'original-file-dates';
 export type ThumbnailHoldFrame =
@@ -478,4 +478,13 @@ export const desktopBridge = {
     invoke<void>('prepare_hover_preview', { mediaId }),
   hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
   clearHoverPreviewCache: () => invoke<number>('clear_hover_preview_cache'),
+  choosePremiereManifestDestination: () =>
+    save({
+      defaultPath: 'kairix-pimp-import.pimp-premiere.json',
+      filters: [
+        { name: 'Kairix PIMP Premiere manifest', extensions: ['json'] },
+      ],
+    }),
+  exportPremiereManifest: (mediaIds: string[], destinationPath: string) =>
+    invoke<number>('export_premiere_manifest', { mediaIds, destinationPath }),
 };

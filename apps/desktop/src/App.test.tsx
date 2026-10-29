@@ -75,6 +75,8 @@ const mocks = vi.hoisted(() => ({
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
+  choosePremiereManifestDestination: vi.fn(),
+  exportPremiereManifest: vi.fn(),
   startIngest: vi.fn(),
 }));
 
@@ -146,6 +148,8 @@ vi.mock('./bridge', () => ({
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
     loadThumbnailSources: mocks.loadThumbnailSources,
+    choosePremiereManifestDestination: mocks.choosePremiereManifestDestination,
+    exportPremiereManifest: mocks.exportPremiereManifest,
     loadHoverPreview: mocks.loadHoverPreview,
     prepareHoverPreview: mocks.prepareHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
@@ -327,6 +331,9 @@ describe('native application integration', () => {
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.loadThumbnailSources.mockReset();
     mocks.loadThumbnailSources.mockResolvedValue({});
+    mocks.choosePremiereManifestDestination.mockReset();
+    mocks.choosePremiereManifestDestination.mockResolvedValue(undefined);
+    mocks.exportPremiereManifest.mockReset();
     mocks.startIngest.mockReset();
     mocks.startIngest.mockResolvedValue({
       schemaVersion: 3,
@@ -1377,6 +1384,10 @@ describe('native application integration', () => {
   });
 
   it('presents paired video and WAV as one searchable logical recording', async () => {
+    mocks.choosePremiereManifestDestination.mockResolvedValue(
+      'C:\\Exports\\selection.pimp-premiere.json',
+    );
+    mocks.exportPremiereManifest.mockResolvedValue(2);
     mocks.catalogue = {
       media: [
         {
@@ -1464,6 +1475,15 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
         'C:\\Master\\video\r\nC:\\Master\\audio',
+      ),
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Export Premiere manifest' }),
+    );
+    await waitFor(() =>
+      expect(mocks.exportPremiereManifest).toHaveBeenCalledWith(
+        ['video', 'audio'],
+        'C:\\Exports\\selection.pimp-premiere.json',
       ),
     );
     await user.click(

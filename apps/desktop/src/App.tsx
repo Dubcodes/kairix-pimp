@@ -1007,6 +1007,24 @@ export function App() {
       setError(errorText(reason));
     }
   };
+  const exportPremiereManifest = async () => {
+    if (!selectedPhysicalIds.length) return;
+    setError('');
+    try {
+      const destination =
+        await desktopBridge.choosePremiereManifestDestination();
+      if (!destination) return;
+      const count = await desktopBridge.exportPremiereManifest(
+        selectedPhysicalIds,
+        destination,
+      );
+      setMessage(
+        `${count} verified Master Bin file${count === 1 ? '' : 's'} exported for the Kairix PIMP Premiere Companion.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
   const reEvaluateAudioPairing = async () => {
     setBusy(true);
     setError('');
@@ -2887,6 +2905,12 @@ export function App() {
                       onClick={() => void copySelectedPaths()}
                     >
                       <Copy size={13} /> Copy paths for Premiere
+                    </button>
+                    <button
+                      disabled={selectedPhysicalIds.length === 0}
+                      onClick={() => void exportPremiereManifest()}
+                    >
+                      Export Premiere manifest
                     </button>
                   </div>
                   {selectedRecording && (

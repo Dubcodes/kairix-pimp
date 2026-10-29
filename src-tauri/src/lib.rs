@@ -170,6 +170,30 @@ struct HoverPreviewManifest {
     generated_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PremiereImportManifest {
+    schema_version: u32,
+    kind: String,
+    created_at: String,
+    device_id: String,
+    items: Vec<PremiereImportItem>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PremiereImportItem {
+    media_id: String,
+    absolute_path: String,
+    relative_path: String,
+    original_filename: String,
+    sha256: String,
+    file_type: String,
+    bin_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attached_to_media_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectUpdate {
@@ -4316,6 +4340,109 @@ fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String
         .to_string())
 }
 
+fn build_premiere_import_manifest(
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+    media_ids: &[String],
+) -> Result<PremiereImportManifest, String> {
+    if media_ids.is_empty() || media_ids.len() > 5_000 {
+        return Err("Select between 1 and 5,000 media files for Premiere".into());
+    }
+    let master = Path::new(&settings.master_bin_path)
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    let mut seen = HashSet::new();
+    let mut items = Vec::with_capacity(media_ids.len());
+    for media_id in media_ids {
+        if !seen.insert(media_id) {
+            continue;
+        }
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == *media_id)
+            .ok_or_else(|| format!("Unknown media item {media_id}"))?;
+        let relative = fs_safe::validate_relative(&item.relative_path)?;
+        let absolute = fs_safe::resolve_existing(&master, &item.relative_path)?;
+        if !absolute.is_file() {
+            return Err(format!("{} is not available locally", item.original_filename));
+        }
+        let bin_path = relative
+            .parent()
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let attached_to_media_id = catalogue
+            .media
+            .iter()
+            .find(|candidate| candidate.attached_audio_id.as_deref() == Some(item.id.as_str()))
+            .map(|candidate| candidate.id.clone());
+        items.push(PremiereImportItem {
+            media_id: item.id.clone(),
+            absolute_path: absolute.to_string_lossy().into_owned(),
+            relative_path: item.relative_path.replace('\\', "/"),
+            original_filename: item.original_filename.clone(),
+            sha256: item.sha256.clone(),
+            file_type: item.file_type.clone(),
+            bin_path,
+            attached_to_media_id,
+        });
+    }
+    Ok(PremiereImportManifest {
+        schema_version: 1,
+        kind: "kairix-pimp-premiere-import".into(),
+        created_at: Utc::now().to_rfc3339(),
+        device_id: settings.device_id.clone(),
+        items,
+    })
+}
+
+fn write_new_premiere_manifest(
+    destination: &Path,
+    manifest: &PremiereImportManifest,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "The selected manifest already exists; choose a new filename so it is not silently replaced".to_string()
+            } else {
+                format!("Cannot create Premiere manifest: {error}")
+            }
+        })?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Cannot finish Premiere manifest: {error}"))
+}
+
+#[tauri::command]
+fn export_premiere_manifest(
+    app: AppHandle,
+    media_ids: Vec<String>,
+    destination_path: String,
+) -> Result<usize, String> {
+    let destination = PathBuf::from(destination_path);
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return Err("Premiere interchange manifests must use the .json extension".into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or("Choose a valid manifest destination")?;
+    if !parent.is_dir() {
+        return Err("The selected manifest destination folder is unavailable".into());
+    }
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let manifest = build_premiere_import_manifest(&settings, &catalogue, &media_ids)?;
+    write_new_premiere_manifest(&destination, &manifest)?;
+    Ok(manifest.items.len())
+}
+
 #[cfg(target_os = "windows")]
 fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
     use std::{ffi::c_void, iter::once, os::windows::ffi::OsStrExt, ptr};
@@ -5130,6 +5257,7 @@ pub fn run() {
             open_support_link,
             open_logs_folder,
             resolve_media_path,
+            export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
             load_thumbnail,
@@ -5338,6 +5466,58 @@ mod tests {
         assert!(has_active_ingest(&[ingest_job("verifying", "verifying")]));
         assert!(!has_active_ingest(&[ingest_job("paused", "queued")]));
         assert!(!has_active_ingest(&[ingest_job("completed", "completed")]));
+    }
+
+    #[test]
+    fn premiere_manifest_uses_validated_master_paths_and_attached_audio() {
+        let (root, master, _, mut catalogue) = completion_fixture("premiere-manifest");
+        let audio_path = master.join("20261024").join("clip.wav");
+        fs::write(&audio_path, b"verified-audio").unwrap();
+        let mut audio = new_media(
+            &audio_path,
+            "20261024/clip.wav".into(),
+            None,
+            sha256(&audio_path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        audio.id = "audio-a".into();
+        catalogue.media[0].id = "video-a".into();
+        catalogue.media[0].attached_audio_id = Some(audio.id.clone());
+        catalogue.media.push(audio);
+        let mut settings = DeviceSettings::default();
+        settings.master_bin_path = master.to_string_lossy().into_owned();
+
+        let manifest = build_premiere_import_manifest(
+            &settings,
+            &catalogue,
+            &["video-a".into(), "audio-a".into()],
+        )
+        .unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.items.len(), 2);
+        assert_eq!(manifest.items[0].bin_path, "20261024");
+        assert_eq!(
+            manifest.items[1].attached_to_media_id.as_deref(),
+            Some("video-a")
+        );
+        assert!(Path::new(&manifest.items[0].absolute_path).is_absolute());
+        let output = root.join("selection.pimp-premiere.json");
+        write_new_premiere_manifest(&output, &manifest).unwrap();
+        let first_bytes = fs::read(&output).unwrap();
+        assert!(write_new_premiere_manifest(&output, &manifest).is_err());
+        assert_eq!(fs::read(&output).unwrap(), first_bytes);
+
+        fs::remove_file(&audio_path).unwrap();
+        assert!(build_premiere_import_manifest(
+            &settings,
+            &catalogue,
+            &["audio-a".into()]
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

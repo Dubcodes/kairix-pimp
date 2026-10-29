@@ -37,7 +37,7 @@ UI implemented and component-test covered: application shell, primary navigation
 
 ## Milestone 3 — Premiere extension
 
-Build and test a UXP extension against a supported Premiere version. Use active project access, `Project.importFiles`, transactional bin creation via `FolderItem`, and `ClipProjectItem.getMediaFilePath` to reconcile actual imports. Never edit `.prproj` internals.
+A standalone UXP proof of concept and schema-1 user-selected interchange manifest are implemented. It uses active project access, `Project.importFiles`, transactional bin creation via `FolderItem`, and `ClipProjectItem.getMediaFilePath` to reconcile imports without editing `.prproj` internals. Automated tests cover manifest production/validation and UI handoff. Remaining: load in UXP Developer Tool, test imports/bin creation/duplicate reconciliation against Premiere 25.6+, obtain a distribution ID, package a `.ccx`, and complete installed acceptance.
 
 Keep direct DCM Master Bin references, dated bins and an optional virtual Audio grouping. Project collection is an explicit verified transition: the collected `.prproj` in DCM Content becomes authoritative for the existing stable project ID only after dependency checks; presence alone never changes state.
 

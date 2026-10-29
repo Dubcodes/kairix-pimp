@@ -362,3 +362,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Route preview work through one 64-entry, single-active frontend priority queue ordered hover, visible, nearby, then optional idle. Do not terminate an active FFmpeg process; the highest priority work runs next. A native preparation command validates or generates the fingerprinted disk entry without encoding or transferring Base64 frames and refuses background generation while ingest is active. The frontend LRU uses a conservative approximate byte count and configurable automatic/64/128/256/512 MB allowance instead of a fixed clip count.
 - **Consequences:** Prepared disk frames persist across restarts while only visible or explicitly hovered frames consume the bounded RAM allowance. Queue, RAM and disk status are device-local diagnostics. The queue drops or supersedes low-priority work when saturated, scrolling never launches unbounded FFmpeg processes, and installed CPU/disk/latency acceptance remains required.
+
+## ADR-049 — Start Premiere UXP integration with explicit manifest handoff
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Package the Premiere Companion separately and begin with a user-selected schema-1 JSON manifest rather than a persistent local network service. The native exporter resolves only explicit known media IDs beneath canonical Master Bin, includes selected attached audio, refuses overwrite, and exposes no arbitrary filesystem command. The UXP panel requests access only to that file, uses supported Premiere 25.6 APIs, reconciles existing media paths and never reads `.prproj` internals.
+- **Consequences:** Desktop PIMP remains independent of the plugin and no authentication/listening service is needed. Manifest selection is an explicit user step. Automated validation proves the interchange boundary, but `.ccx` packaging and real Premiere imports remain unverified until UXP Developer Tool and installed-project acceptance are completed.
