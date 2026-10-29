@@ -60,6 +60,11 @@ import {
 import { SettingsWriteQueue } from './settings-write-queue';
 import { hoverPreviewRequestCache } from './hover-preview-cache';
 import {
+  holdFrameIndex,
+  readLastHoveredRatio,
+  writeLastHoveredRatio,
+} from './thumbnail-hold';
+import {
   associatedMedia,
   expandLogicalMediaIds,
   logicalMediaMatches,
@@ -2090,6 +2095,35 @@ export function App() {
                       void persistPreference({ hoverPreviewsEnabled })
                     }
                   />
+                  <fieldset className="settings-subsection">
+                    <legend>Thumbnail &amp; Preview</legend>
+                    <label>
+                      Thumbnail hold frame
+                      <select
+                        value={settings.thumbnailHoldFrame ?? 'first'}
+                        onChange={(event) =>
+                          void persistPreference({
+                            thumbnailHoldFrame: event.target
+                              .value as DeviceSettings['thumbnailHoldFrame'],
+                          })
+                        }
+                      >
+                        <option value="first">First frame</option>
+                        <option value="10-percent">10% into the video</option>
+                        <option value="20-percent">20% into the video</option>
+                        <option value="middle">Middle / 50%</option>
+                        <option value="80-percent">80% into the video</option>
+                        <option value="last">Last frame</option>
+                        <option value="last-hovered">
+                          Keep last hovered frame
+                        </option>
+                      </select>
+                    </label>
+                    <small>
+                      Uses the nearest real sample in the device-local preview
+                      cache. Missing previews fall back to the normal thumbnail.
+                    </small>
+                  </fieldset>
                   <label>
                     Hover preview cache limit (GB)
                     <input
@@ -2552,6 +2586,7 @@ export function App() {
                               (settings.hoverPreviewsEnabled ?? true) &&
                               !clearingPreviewCache
                             }
+                            holdFrame={settings.thumbnailHoldFrame ?? 'first'}
                           />
                           <span>
                             {duration(item.technical.durationSeconds)}
@@ -3727,6 +3762,7 @@ function MediaThumbnail({
   previewKey,
   previewCacheEpoch = 0,
   enableHoverPreview = false,
+  holdFrame = 'first',
 }: {
   mediaId: string;
   fileType: string;
@@ -3735,6 +3771,7 @@ function MediaThumbnail({
   previewKey?: string;
   previewCacheEpoch?: number;
   enableHoverPreview?: boolean;
+  holdFrame?: DeviceSettings['thumbnailHoldFrame'];
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
   const [showThumbnail, setShowThumbnail] = useState(
@@ -3746,12 +3783,20 @@ function MediaThumbnail({
     preview: HoverPreview;
   }>();
   const [previewIndex, setPreviewIndex] = useState<number>();
+  const [lastHoveredRatio, setLastHoveredRatio] = useState(() =>
+    readLastHoveredRatio(mediaId),
+  );
+  const [isHovering, setIsHovering] = useState(false);
   const requestGeneration = useRef(0);
   const releasePreview = useCallback(() => {
     requestGeneration.current += 1;
     setPreviewIndex(undefined);
     setPreviewEntry(undefined);
   }, []);
+  const finishHover = () => {
+    setIsHovering(false);
+    setPreviewIndex(undefined);
+  };
   useEffect(() => {
     requestGeneration.current += 1;
   }, [previewCacheEpoch]);
@@ -3817,12 +3862,26 @@ function MediaThumbnail({
       .catch(() => undefined);
   };
   const displayedFrame =
-    previewIndex == null ? undefined : preview?.frames[previewIndex];
+    preview &&
+    (previewIndex ?? holdFrameIndex(preview, holdFrame, lastHoveredRatio)) !=
+      null
+      ? preview.frames[
+          previewIndex ?? holdFrameIndex(preview, holdFrame, lastHoveredRatio)!
+        ]
+      : undefined;
+  const displayedIndex =
+    previewIndex ??
+    (preview
+      ? holdFrameIndex(preview, holdFrame, lastHoveredRatio)
+      : undefined);
   return (
     <div
       ref={thumbnailRef}
       className="media-thumbnail"
-      onPointerEnter={requestPreview}
+      onPointerEnter={() => {
+        setIsHovering(true);
+        requestPreview();
+      }}
       onPointerMove={(event) => {
         if (!preview?.frames.length) return;
         const bounds = event.currentTarget.getBoundingClientRect();
@@ -3832,16 +3891,19 @@ function MediaThumbnail({
               Math.max(0, (event.clientX - bounds.left) / bounds.width),
             )
           : 0;
-        setPreviewIndex(
-          Math.min(
-            preview.frames.length - 1,
-            Math.floor(ratio * preview.frames.length),
-          ),
+        const index = Math.min(
+          preview.frames.length - 1,
+          Math.floor(ratio * preview.frames.length),
         );
+        setPreviewIndex(index);
+        setLastHoveredRatio(ratio);
+        writeLastHoveredRatio(mediaId, ratio);
       }}
-      onPointerLeave={releasePreview}
+      onPointerLeave={finishHover}
       aria-label={
-        preview ? 'Move horizontally to preview video frames' : undefined
+        preview && isHovering
+          ? 'Move horizontally to preview video frames'
+          : undefined
       }
     >
       {displayedFrame || (showThumbnail && thumbnailSource) ? (
@@ -3854,11 +3916,13 @@ function MediaThumbnail({
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>
       )}
-      {previewIndex != null && preview?.frameTimes[previewIndex] != null && (
-        <span className="preview-timecode">
-          {duration(preview.frameTimes[previewIndex])}
-        </span>
-      )}
+      {isHovering &&
+        displayedIndex != null &&
+        preview?.frameTimes[displayedIndex] != null && (
+          <span className="preview-timecode">
+            {duration(preview.frameTimes[displayedIndex])}
+          </span>
+        )}
     </div>
   );
 }

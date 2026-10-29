@@ -17,6 +17,8 @@ Full-edition AI processing is planned and is not implemented in this milestone.
 
 ## Milestone status
 
+Appearance settings now select the nearest real sampled first, 10%, 20%, middle, 80% or last thumbnail hold frame, or retain a bounded device-local per-media last-hover position. The source media and synchronized catalogue are not modified.
+
 Thumbnail cache paths are resolved in one validated native batch per catalogue revision. Near-viewport observation and lazy decoding avoid per-card catalogue replays and Base64 image transfers during Library startup.
 
 Ingest can seed normalized tags across all eligible video, audio and image recordings while retaining later per-file edits in the existing durable job metadata. Copy remains the default and only enabled source workflow; SD-card cleanup is not implemented.

@@ -73,6 +73,8 @@ struct DeviceSettings {
     hover_previews_enabled: bool,
     #[serde(default = "default_preview_cache_limit_bytes")]
     preview_cache_limit_bytes: u64,
+    #[serde(default = "default_thumbnail_hold_frame")]
+    thumbnail_hold_frame: String,
     #[serde(default = "legacy_date_mode")]
     ingest_date_organization: String,
     #[serde(default = "legacy_date_folder_pattern")]
@@ -189,6 +191,9 @@ fn default_library_folder_sort() -> String {
 fn default_preview_cache_limit_bytes() -> u64 {
     512 * 1024 * 1024
 }
+fn default_thumbnail_hold_frame() -> String {
+    "first".into()
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -207,6 +212,7 @@ impl Default for DeviceSettings {
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             hover_previews_enabled: true,
             preview_cache_limit_bytes: default_preview_cache_limit_bytes(),
+            thumbnail_hold_frame: default_thumbnail_hold_frame(),
             ingest_date_organization: "today".into(),
             date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
@@ -803,6 +809,18 @@ fn save_settings(
     }
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
+    }
+    if !matches!(
+        settings.thumbnail_hold_frame.as_str(),
+        "first"
+            | "10-percent"
+            | "20-percent"
+            | "middle"
+            | "80-percent"
+            | "last"
+            | "last-hovered"
+    ) {
+        return Err("Choose a supported thumbnail hold frame".into());
     }
     if !matches!(
         settings.library_folder_sort.as_str(),

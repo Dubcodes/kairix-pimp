@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
     thumbnailCacheLimitBytes: 2147483648,
     hoverPreviewsEnabled: true,
     previewCacheLimitBytes: 536870912,
+    thumbnailHoldFrame: 'first',
     ingestDateOrganization: 'original-file-dates' as const,
     dateFolderPattern: 'yyyymmdd',
     initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -218,6 +219,7 @@ describe('native application integration', () => {
       thumbnailCacheLimitBytes: 2147483648,
       hoverPreviewsEnabled: true,
       previewCacheLimitBytes: 536870912,
+      thumbnailHoldFrame: 'first',
       ingestDateOrganization: 'original-file-dates',
       dateFolderPattern: 'yyyymmdd',
       initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -674,7 +676,7 @@ describe('native application integration', () => {
     expect(screen.queryByText('PIMP_MASTER_001.MP4')).not.toBeInTheDocument();
   });
 
-  it('scrubs cached hover frames locally and restores the normal thumbnail', async () => {
+  it('scrubs cached hover frames locally and restores the configured first hold frame', async () => {
     mocks.catalogue = {
       media: [
         {
@@ -746,6 +748,10 @@ describe('native application integration', () => {
     expect(
       screen.queryByLabelText('Move horizontally to preview video frames'),
     ).not.toBeInTheDocument();
+    expect(container.querySelector('.media-thumbnail img')).toHaveAttribute(
+      'src',
+      'data:image/jpeg;base64,first',
+    );
     fireEvent.pointerEnter(thumbnail);
     await screen.findByLabelText('Move horizontally to preview video frames');
     expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1);

@@ -4,6 +4,14 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
 
 export type DateMode = 'today' | 'original-file-dates';
+export type ThumbnailHoldFrame =
+  | 'first'
+  | '10-percent'
+  | '20-percent'
+  | 'middle'
+  | '80-percent'
+  | 'last'
+  | 'last-hovered';
 export interface DeviceSettings {
   deviceId: string;
   masterBinPath: string;
@@ -14,6 +22,7 @@ export interface DeviceSettings {
   thumbnailCacheLimitBytes: number;
   hoverPreviewsEnabled: boolean;
   previewCacheLimitBytes: number;
+  thumbnailHoldFrame: ThumbnailHoldFrame;
   ingestDateOrganization: DateMode;
   dateFolderPattern: string;
   initializedCataloguePath: string;
@@ -269,6 +278,7 @@ export const emptySettings = (): DeviceSettings => ({
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   hoverPreviewsEnabled: true,
   previewCacheLimitBytes: 512 * 1024 * 1024,
+  thumbnailHoldFrame: 'first',
   ingestDateOrganization: 'today',
   dateFolderPattern: 'yyyymmdd',
   initializedCataloguePath: '',

@@ -348,3 +348,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Keep bounded FPS sampling, append FFmpeg `showinfo`, and store each emitted frame's reported PTS in a version-2 preview manifest. Library cards release their preview object when hover ends or they leave the active viewport; the shared eight-entry request cache and size-limited disk cache remain the reuse layers.
 - **Consequences:** Timecodes follow actual output cadence, including non-zero PTS, and old manifests with assumed positions regenerate safely under a new fingerprint. Sequentially hovering mounted cards no longer leaves an unbounded Base64 collection in component state, while revisiting a valid disk entry does not rerun FFmpeg.
+
+## ADR-047 — Select hold frames from actual device-local preview samples
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Store the thumbnail hold-frame choice in device settings and map fixed percentages to the nearest timestamp actually reported in the version-2 preview manifest. Store at most 500 per-media last-hover ratios in device-local WebView storage; never publish this presentation state into catalogue events. A card may retain its preview while near the viewport so the configured hold frame remains visible, but the existing observer releases it when distant.
+- **Consequences:** Changing the setting updates mounted cards without touching source media or catalogue identity. Nonzero timestamps and variable cadence use real cached samples, missing/offline/corrupt previews fall back to the ordinary thumbnail, and bounded last-hover persistence does not create synchronized metadata churn.
