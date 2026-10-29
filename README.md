@@ -49,6 +49,8 @@ Version `0.1.1-5` is the first public Windows beta candidate. It retains safe fi
 
 Version `0.1.1-6` is a short-lived pull-request acceptance build for the optimized preview and Premiere Companion milestone. It does not replace the `0.1.1-5` public prerelease, is unsigned, and is available only through the PR's expiring Actions artifacts.
 
+The current reliability branch makes updater checks/installations single-flight, invalidates stale failed-download state, and prevents installation from racing active ingest, backup, scan, verification, enrichment or preview filesystem work. Repeated unchanged full Library verification still hashes files but no longer appends redundant synchronized evidence events. These corrections are automated-test verified only; automatic updates remain non-operational until protected signing configuration and a real installed Windows upgrade pass.
+
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 
 The native host, web frontend, unsigned MSI and NSIS installers build on Windows. Installer signing and upgrades, a notification-based filesystem watcher, safe catalogue-location relocation, folder notes, preview-frame selection and automated Premiere integration remain incomplete.

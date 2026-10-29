@@ -56,7 +56,7 @@ Provisional metadata records which fields the user explicitly edited. An exact d
 
 Discovery traversal/hashing and enrichment FFprobe/FFmpeg processes run outside the catalogue write mutex. Before appending events, each operation reloads the projection and rejects registrations or enrichment results made stale by a concurrent ingest or metadata commit.
 
-FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. It starts asynchronously for configured libraries, publishes progress, persists the last result locally and emits catalogue changes after safe registration. Full verification deliberately rehashes previously verified files; quick scans skip unchanged evidence. A native notification watcher remains pending.
+FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. The filesystem walk and hashing execute on a blocking worker, stream accepted entries instead of retaining a complete `DirEntry` list, and publish bounded progress while the Library remains responsive. It starts asynchronously for configured libraries, persists the last result locally and emits catalogue changes after safe registration. Full verification deliberately rehashes previously verified files, but an observation identical to the current device's size, timestamp, SHA-256 and review state emits no authoritative event. The same equality check is repeated against the latest projection under the catalogue write lock to suppress a concurrent duplicate. Stable observations are retained until event persistence succeeds, so append failure is retryable without a new stability delay. Quick scans continue to skip unchanged evidence. A native notification watcher remains pending.
 
 ## Metadata, search, and Syncthing
 
@@ -110,6 +110,10 @@ Completed projects retain lightweight searchable catalogue records even when arc
 - Atomic writes and per-device append-only events protect authoritative data across interruption.
 - Keep failed jobs inspectable and retryable; cleanup only PIMP-owned temporary files after boundary verification.
 - Quarantine malformed/newer metadata and Syncthing conflicts instead of silently dropping or rewriting them.
+
+## Update-operation coordination
+
+The updater's pending resource is device-local ephemeral state. Checks and installations are single-flight; every failed check clears stale state, and a failed download requires a fresh signed check. The native operation coordinator closes the authorization race in both directions: installation begins only when durable ingest/backup state and active critical-operation permits are safe, and after authorization new ingest lifecycle changes, backups/restores, scans/verifications, enrichment and preview filesystem work fail closed. Permits are RAII-scoped and the coordinator lock is never held during long work. Tauri signature validation remains the trust boundary; this coordination protects recoverability but does not claim an installed upgrade has passed.
 
 ## Security boundaries
 

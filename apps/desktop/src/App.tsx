@@ -1173,6 +1173,18 @@ export function App() {
       );
       return;
     }
+    if (backupBusy || updateBlockingBackupJobs.length > 0) {
+      setUpdateStatus(
+        'Wait for every active backup, verification, or restore test to finish before installing an update.',
+      );
+      return;
+    }
+    if (discoveryStatus.running) {
+      setUpdateStatus(
+        'Wait for the active Library scan or integrity verification to finish before installing an update.',
+      );
+      return;
+    }
     setCheckingUpdate(true);
     setUpdateProgress({ downloaded: 0 });
     setUpdateStatus('Preparing signed update download…');
@@ -1194,9 +1206,10 @@ export function App() {
         }
       });
       setUpdateStatus(
-        'Update installed. Restart required if PIMP does not reopen.',
+        'The signed installer was launched. PIMP will close and Windows will restart it after installation; confirm the new version after it reopens.',
       );
     } catch (reason) {
+      setAvailableUpdate(undefined);
       setUpdateStatus(`Update installation failed: ${errorText(reason)}`);
     } finally {
       setCheckingUpdate(false);
@@ -1470,6 +1483,9 @@ export function App() {
   );
   const workJobs = [...activeJobs, ...needsAttentionJobs];
   const updateBlockingJobs = jobs.filter((job) => !jobIsClearableHistory(job));
+  const updateBlockingBackupJobs = backupJobs.filter((job) =>
+    ['prepared', 'copying', 'verifying'].includes(job.state),
+  );
   const totalJobBytes = activeJobs.reduce(
     (total, job) => total + job.bytesTotal,
     0,
@@ -2051,7 +2067,9 @@ export function App() {
                           <dt>Progress</dt>
                           <dd>
                             {discoveryStatus.running
-                              ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                              ? discoveryStatus.totalFiles > 0
+                                ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                                : `${discoveryStatus.filesProcessed} processed · discovering total…`
                               : 'Idle'}
                           </dd>
                         </div>
@@ -2451,12 +2469,19 @@ export function App() {
                       disabled={
                         checkingUpdate ||
                         !availableUpdate ||
-                        updateBlockingJobs.length > 0
+                        updateBlockingJobs.length > 0 ||
+                        backupBusy ||
+                        updateBlockingBackupJobs.length > 0 ||
+                        discoveryStatus.running
                       }
                       title={
                         updateBlockingJobs.length
                           ? 'Active or recoverable ingest jobs must be resolved before updating'
-                          : undefined
+                          : backupBusy || updateBlockingBackupJobs.length
+                            ? 'Active backup, verification, or restore work must finish before updating'
+                            : discoveryStatus.running
+                              ? 'The active Library scan must finish before updating'
+                              : undefined
                       }
                       onClick={installUpdate}
                     >
@@ -2602,7 +2627,9 @@ export function App() {
               >
                 <RefreshCw size={15} />
                 {discoveryStatus.running
-                  ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
+                  ? discoveryStatus.totalFiles > 0
+                    ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
+                    : `Scanning · ${discoveryStatus.filesProcessed} processed`
                   : 'Scan for new files'}
               </button>
             </section>
