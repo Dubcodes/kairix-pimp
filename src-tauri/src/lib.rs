@@ -1,8 +1,10 @@
 mod catalogue;
+mod backup;
 mod discovery;
 mod fs_safe;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use backup::BackupJob;
 use catalogue::{
     Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
 };
@@ -57,6 +59,7 @@ struct NativeState {
     tray_available: Mutex<bool>,
     update_installing: Mutex<bool>,
     preview_generation: Mutex<()>,
+    backup_job_store: Mutex<()>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -484,6 +487,198 @@ fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or("Invalid application configuration path")?
         .join("ingest-jobs.json"))
+}
+
+fn backup_jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("backup-jobs.json"))
+}
+
+fn load_backup_jobs_unlocked(app: &AppHandle) -> Result<Vec<BackupJob>, String> {
+    read_json(&backup_jobs_path(app)?)
+}
+
+fn save_backup_job(app: &AppHandle, job: &BackupJob) -> Result<(), String> {
+    let state = app.state::<NativeState>();
+    let _guard = state.backup_job_store.lock().unwrap();
+    let mut jobs = load_backup_jobs_unlocked(app)?;
+    if let Some(existing) = jobs.iter_mut().find(|existing| existing.id == job.id) {
+        *existing = job.clone();
+    } else {
+        jobs.push(job.clone());
+    }
+    write_json(&backup_jobs_path(app)?, &jobs)?;
+    let _ = app.emit("backup-jobs-changed", &jobs);
+    Ok(())
+}
+
+fn mark_interrupted_backup_jobs(jobs: &mut [BackupJob]) -> bool {
+    let mut changed = false;
+    for job in jobs {
+        if matches!(job.state.as_str(), "prepared" | "copying" | "verifying") {
+            job.state = "interrupted".into();
+            job.error = Some(
+                "The application stopped before this backup completed. Review and retry it."
+                    .into(),
+            );
+            job.updated_at = Utc::now().to_rfc3339();
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[tauri::command]
+fn initialize_backup_jobs(app: AppHandle) -> Result<Vec<BackupJob>, String> {
+    let state = app.state::<NativeState>();
+    let _guard = state.backup_job_store.lock().unwrap();
+    let mut jobs = load_backup_jobs_unlocked(&app)?;
+    let changed = mark_interrupted_backup_jobs(&mut jobs);
+    if changed {
+        write_json(&backup_jobs_path(&app)?, &jobs)?;
+    }
+    Ok(jobs)
+}
+
+#[tauri::command]
+fn list_backup_jobs(app: AppHandle) -> Result<Vec<BackupJob>, String> {
+    let state = app.state::<NativeState>();
+    let _guard = state.backup_job_store.lock().unwrap();
+    load_backup_jobs_unlocked(&app)
+}
+
+#[tauri::command]
+async fn start_project_backup(
+    app: AppHandle,
+    project_id: String,
+    destination_root: String,
+) -> Result<BackupJob, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let project = catalogue
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or("Unknown project")?;
+    let source = resolve_known_project_directory(&settings, &project_id)?;
+    let destination = PathBuf::from(destination_root);
+    let project_name = project.name.clone();
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut job = backup::plan_backup(&project_id, &project_name, &source, &destination)?;
+        save_backup_job(&worker_app, &job)?;
+        if let Err(error) = backup::execute_backup(&mut job, |snapshot| {
+            save_backup_job(&worker_app, snapshot)
+        }) {
+            if !matches!(job.state.as_str(), "needs-attention" | "failed") {
+                job.state = "failed".into();
+                job.error = Some(error.clone());
+                job.updated_at = Utc::now().to_rfc3339();
+                save_backup_job(&worker_app, &job)?;
+            }
+            return Err(error);
+        }
+        Ok(job)
+    })
+    .await
+    .map_err(|error| format!("Backup worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn retry_project_backup(
+    app: AppHandle,
+    job_id: String,
+    destination_root: Option<String>,
+) -> Result<BackupJob, String> {
+    let mut job = {
+        let state = app.state::<NativeState>();
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Backup job no longer exists")?
+    };
+    if job.state == "verified" {
+        return Err("This backup is already verified".into());
+    }
+    if let Some(destination_root) = destination_root {
+        job.destination_root = destination_root;
+    }
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut job = job;
+        job.error = None;
+        if let Err(error) = backup::execute_backup(&mut job, |snapshot| {
+            save_backup_job(&worker_app, snapshot)
+        }) {
+            if !matches!(job.state.as_str(), "needs-attention" | "failed") {
+                job.state = "failed".into();
+                job.error = Some(error.clone());
+                job.updated_at = Utc::now().to_rfc3339();
+                save_backup_job(&worker_app, &job)?;
+            }
+            return Err(error);
+        }
+        Ok(job)
+    })
+    .await
+    .map_err(|error| format!("Backup worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn verify_project_backup(app: AppHandle, job_id: String) -> Result<BackupJob, String> {
+    let mut job = {
+        let state = app.state::<NativeState>();
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Backup job no longer exists")?
+    };
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        match backup::verify_backup(&job) {
+            Ok(()) => {
+                job.state = "verified".into();
+                job.error = None;
+            }
+            Err(error) => {
+                job.state = "needs-attention".into();
+                job.error = Some(error.clone());
+                job.updated_at = Utc::now().to_rfc3339();
+                save_backup_job(&worker_app, &job)?;
+                return Err(error);
+            }
+        }
+        job.updated_at = Utc::now().to_rfc3339();
+        save_backup_job(&worker_app, &job)?;
+        Ok(job)
+    })
+    .await
+    .map_err(|error| format!("Backup verification worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn test_project_backup_restore(
+    app: AppHandle,
+    job_id: String,
+    restore_root: String,
+) -> Result<backup::RestoreTestResult, String> {
+    let job = {
+        let state = app.state::<NativeState>();
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Backup job no longer exists")?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        backup::restore_backup_test(&job, Path::new(&restore_root))
+    })
+    .await
+    .map_err(|error| format!("Restore-test worker failed: {error}"))?
 }
 
 fn discovery_status_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -4575,6 +4770,7 @@ fn support_url(destination: &str) -> Option<&'static str> {
         ),
         "website" => Some("https://www.dubcodesmedia.com/kairix/kairix-pimp"),
         "coffee" => Some("https://buymeacoffee.com/dubcodes"),
+        "degoo" => Some("https://app.degoo.com/"),
         _ => None,
     }
 }
@@ -5242,6 +5438,12 @@ pub fn run() {
             create_project,
             retry_project_synchronization,
             inventory_project,
+            initialize_backup_jobs,
+            list_backup_jobs,
+            start_project_backup,
+            retry_project_backup,
+            verify_project_backup,
+            test_project_backup_restore,
             open_project_folder,
             reveal_project_asset,
             rescan,
@@ -5274,6 +5476,18 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_backup_jobs_become_explicitly_interrupted_after_restart() {
+        let mut jobs = [BackupJob {
+            state: "copying".into(),
+            ..BackupJob::default()
+        }];
+        assert!(mark_interrupted_backup_jobs(&mut jobs));
+        assert_eq!(jobs[0].state, "interrupted");
+        assert!(jobs[0].error.as_deref().is_some_and(|error| error.contains("retry")));
+        assert!(!mark_interrupted_backup_jobs(&mut jobs));
+    }
 
     fn temporary(name: &str) -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

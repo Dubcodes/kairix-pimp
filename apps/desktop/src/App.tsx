@@ -37,6 +37,7 @@ import {
   nativeAvailable,
   type Catalogue,
   type AppInfo,
+  type BackupJob,
   type DeviceSettings,
   type DiscoveryStatus,
   type IngestJob,
@@ -209,6 +210,10 @@ export function App() {
   }>();
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
+  const [backupProjectId, setBackupProjectId] = useState<string>();
+  const [backupDestination, setBackupDestination] = useState('');
+  const [backupJobs, setBackupJobs] = useState<BackupJob[]>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
   const catalogueSignature = useRef<string | undefined>(undefined);
   const metadataWrites = useRef(new Map<string, Promise<void>>());
   const pendingMetadataPatches = useRef(
@@ -399,6 +404,7 @@ export function App() {
           setDiscoveryStatus(loadedDiscoveryStatus);
           setView((loaded.startupPage as View | undefined) ?? 'Library');
           setJobs(await desktopBridge.initializeIngestJobs());
+          setBackupJobs(await desktopBridge.initializeBackupJobs());
           if (loaded.initializedCataloguePath) {
             const before = await desktopBridge.catalogueSignature();
             let nextCatalogue = await desktopBridge.loadCatalogue();
@@ -424,6 +430,14 @@ export function App() {
       stopCatalogue?.();
     };
   }, [native, refresh, savingSettings]);
+  useEffect(() => {
+    if (!native) return;
+    let stop: (() => void) | undefined;
+    void desktopBridge.onBackupJobsChanged(setBackupJobs).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, [native]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -1371,6 +1385,81 @@ export function App() {
     setSelected([target.id]);
     selectionAnchor.current = target.id;
     setLibraryLocateId(target.id);
+  };
+  const startBackup = async () => {
+    if (!backupProjectId || !backupDestination) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      const completed = await desktopBridge.startProjectBackup(
+        backupProjectId,
+        backupDestination,
+      );
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage(
+        `Verified ${completed.manifest.sourceFileCount} files on the destination drive.`,
+      );
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const retryBackup = async (jobId: string) => {
+    const destinationRoot = await desktopBridge.chooseFolder();
+    if (!destinationRoot) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      await desktopBridge.retryProjectBackup(jobId, destinationRoot);
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage('Backup completed and independently re-verified.');
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const verifyBackup = async (jobId: string) => {
+    setBackupBusy(true);
+    setError('');
+    try {
+      await desktopBridge.verifyProjectBackup(jobId);
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage('Every backup file still matches its SHA-256 manifest.');
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const testBackupRestore = async (jobId: string) => {
+    const restoreRoot = await desktopBridge.chooseFolder();
+    if (!restoreRoot) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      const result = await desktopBridge.testProjectBackupRestore(
+        jobId,
+        restoreRoot,
+      );
+      setMessage(
+        `Restore test passed: ${result.filesVerified} files and ${size(result.bytesVerified)} independently verified.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
   };
   const activeJobs = jobs.filter((job) =>
     ['queued', 'copying', 'verifying'].includes(job.state),
@@ -3774,12 +3863,132 @@ export function App() {
             </section>
           )
         ) : (
-          <section className="empty">
-            <h2>No destructive archive actions</h2>
+          <section className="settings-form backup-workspace">
+            <h2>Verified backup</h2>
             <p>
-              Automatic deletion and cleanup are intentionally deferred. Your
-              source recordings remain untouched.
+              Copy a complete project folder to a separate drive. PIMP stages
+              each file on that drive, preserves its hierarchy, refuses
+              overwrites, and verifies every SHA-256 hash before marking the
+              backup verified.
             </p>
+            <SearchableComboBox
+              label="Project to back up"
+              mode="single"
+              options={catalogue.projects.map((project) => ({
+                id: project.id,
+                label: project.name,
+                description: project.workingDirectory,
+              }))}
+              selectedIds={backupProjectId ? [backupProjectId] : []}
+              onSelectionChange={(ids) => setBackupProjectId(ids[0])}
+              placeholder="Search projects…"
+            />
+            <PathField
+              label="External-drive destination"
+              value={backupDestination}
+              onChange={setBackupDestination}
+              onBrowse={async () => {
+                const path = await desktopBridge.chooseFolder();
+                if (path) setBackupDestination(path);
+              }}
+            />
+            <button
+              type="button"
+              className="primary"
+              disabled={backupBusy || !backupProjectId || !backupDestination}
+              onClick={() => void startBackup()}
+            >
+              {backupBusy
+                ? 'Backup operation running…'
+                : 'Start verified backup'}
+            </button>
+
+            <div className="backup-safety" role="note">
+              <strong>Cleanup is unavailable</strong>
+              <p>
+                This milestone never deletes source media. A verified backup is
+                evidence only; it does not prove Premiere dependency collection
+                or authorize cleanup.
+              </p>
+            </div>
+
+            <section className="backup-provider">
+              <h3>Degoo handoff</h3>
+              <p>
+                Degoo has no supported public integration API suitable for an
+                unattended PIMP backup. Use Degoo's official browser to upload a
+                verified generation. Cloud status remains verification pending
+                until PIMP can independently download and hash every object.
+              </p>
+              <button
+                type="button"
+                onClick={() => void desktopBridge.openSupportLink('degoo')}
+              >
+                Open official Degoo web app
+              </button>
+            </section>
+
+            <section className="backup-history">
+              <h3>Backup jobs</h3>
+              {backupJobs.length === 0 ? (
+                <p>No backup jobs have been created on this device.</p>
+              ) : (
+                backupJobs
+                  .slice()
+                  .reverse()
+                  .map((job) => (
+                    <article key={job.id} className="backup-job">
+                      <div>
+                        <strong>{job.projectName}</strong>
+                        <span className={`status ${job.state}`}>
+                          {job.state}
+                        </span>
+                      </div>
+                      <small title={job.generationPath}>
+                        {job.generationPath}
+                      </small>
+                      <progress
+                        max={Math.max(job.manifest.sourceBytes, 1)}
+                        value={job.bytesCompleted}
+                      />
+                      <small>
+                        {job.filesCompleted} / {job.manifest.sourceFileCount}{' '}
+                        files · {size(job.bytesCompleted)} /{' '}
+                        {size(job.manifest.sourceBytes)}
+                      </small>
+                      {job.error && <p role="alert">{job.error}</p>}
+                      <div className="project-actions">
+                        {job.state === 'verified' ? (
+                          <>
+                            <button
+                              type="button"
+                              disabled={backupBusy}
+                              onClick={() => void verifyBackup(job.id)}
+                            >
+                              Re-verify hashes
+                            </button>
+                            <button
+                              type="button"
+                              disabled={backupBusy}
+                              onClick={() => void testBackupRestore(job.id)}
+                            >
+                              Test restore to empty folder
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={backupBusy}
+                            onClick={() => void retryBackup(job.id)}
+                          >
+                            Choose drive and retry
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ))
+              )}
+            </section>
           </section>
         )}
       </main>

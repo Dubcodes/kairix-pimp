@@ -10,12 +10,16 @@ PIMP does not replace Syncthing or implement another synchronization service. A 
 
 ## Editions
 
-- **PIMP Light** is the current non-AI Windows beta: verified ingest, catalogue and search, metadata, project assignment, project inventory, and manual Premiere path handoff. It can read compatible AI metadata generated elsewhere but does not ship AI models or inference runtimes. Destructive cleanup and archive consolidation are not implemented.
+- **PIMP Light** is the current non-AI Windows beta: verified ingest, catalogue and search, metadata, project assignment, project inventory, manual Premiere path handoff, and a verified external-drive project-backup foundation. It can read compatible AI metadata generated elsewhere but does not ship AI models or inference runtimes. Destructive cleanup and archive consolidation are not implemented.
 - **PIMP Full** will use the same catalogue and application, with optional local workers for transcription, timestamped search, scene and activity descriptions, sound recognition, and suggested tags.
 
 Full-edition AI processing is planned and is not implemented in this milestone.
 
 ## Milestone status
+
+The Archive workspace now creates persistent, complete project backups on a selected destination drive. Each file is staged and flushed on that drive, checked against the planned source SHA-256, atomically promoted without overwrite and independently read again before the generation becomes verified. Portable manifests preserve project-relative hierarchy; device-local jobs retain destination-volume identity and interruption evidence. Verified jobs can be rechecked or restored into a separate empty folder for a full hash comparison. This foundation does not prove Premiere dependency collection and never enables cleanup.
+
+Degoo currently uses an explicit official-browser handoff only. Testing with a disposable Free account could not complete an independent download because the refreshed desktop web interface required Premium. No supported public unattended API was found, so PIMP does not call private endpoints, store browser sessions or claim cloud verification. See [Degoo integration evidence](docs/DEGOO_INTEGRATION.md).
 
 Appearance settings now select the nearest real sampled first, 10%, 20%, middle, 80% or last thumbnail hold frame, or retain a bounded device-local per-media last-hover position. The source media and synchronized catalogue are not modified.
 

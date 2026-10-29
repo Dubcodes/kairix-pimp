@@ -79,6 +79,13 @@ const mocks = vi.hoisted(() => ({
   choosePremiereManifestDestination: vi.fn(),
   exportPremiereManifest: vi.fn(),
   startIngest: vi.fn(),
+  backupJobs: [] as import('./bridge').BackupJob[],
+  initializeBackupJobs: vi.fn(),
+  listBackupJobs: vi.fn(),
+  startProjectBackup: vi.fn(),
+  retryProjectBackup: vi.fn(),
+  verifyProjectBackup: vi.fn(),
+  testProjectBackupRestore: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -103,6 +110,7 @@ vi.mock('./bridge', () => ({
       mocks.jobListener = handler;
       return () => undefined;
     }),
+    onBackupJobsChanged: vi.fn(async () => () => undefined),
     onDiscoveryProgress: vi.fn(async (handler) => {
       mocks.discoveryListener = handler;
       return () => undefined;
@@ -139,6 +147,12 @@ vi.mock('./bridge', () => ({
     createProject: vi.fn(),
     retryProjectSynchronization: mocks.retryProjectSynchronization,
     inventoryProject: mocks.inventoryProject,
+    initializeBackupJobs: mocks.initializeBackupJobs,
+    listBackupJobs: mocks.listBackupJobs,
+    startProjectBackup: mocks.startProjectBackup,
+    retryProjectBackup: mocks.retryProjectBackup,
+    verifyProjectBackup: mocks.verifyProjectBackup,
+    testProjectBackupRestore: mocks.testProjectBackupRestore,
     openProjectFolder: mocks.openProjectFolder,
     revealProjectAsset: mocks.revealProjectAsset,
     rescan: mocks.rescan,
@@ -206,6 +220,21 @@ const testJob = (id: string, state: IngestJob['state']): IngestJob => ({
 });
 
 describe('native application integration', () => {
+  it('keeps cleanup unavailable in the verified backup workspace', async () => {
+    render(<App />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Archive' }));
+    expect(
+      screen.getByRole('heading', { name: 'Verified backup' }),
+    ).toBeTruthy();
+    expect(screen.getByText('Cleanup is unavailable')).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'Start verified backup' }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Open official Degoo web app' }),
+    ).toBeTruthy();
+  });
   it('previews date, 24-hour and 12-hour folder tokens', () => {
     const now = new Date(2026, 9, 23, 17, 42, 9);
     expect(datePatternPreview('yyyymmdd', now)).toBe('20261023');
@@ -256,6 +285,15 @@ describe('native application integration', () => {
     mocks.jobs = [];
     mocks.initializeIngestJobs.mockReset();
     mocks.initializeIngestJobs.mockImplementation(async () => mocks.jobs);
+    mocks.backupJobs = [];
+    mocks.initializeBackupJobs.mockReset();
+    mocks.initializeBackupJobs.mockImplementation(async () => mocks.backupJobs);
+    mocks.listBackupJobs.mockReset();
+    mocks.listBackupJobs.mockImplementation(async () => mocks.backupJobs);
+    mocks.startProjectBackup.mockReset();
+    mocks.retryProjectBackup.mockReset();
+    mocks.verifyProjectBackup.mockReset();
+    mocks.testProjectBackupRestore.mockReset();
     mocks.clearCompletedIngestJobs.mockReset();
     mocks.clearCompletedIngestJobs.mockImplementation(
       async (jobId?: string) => {

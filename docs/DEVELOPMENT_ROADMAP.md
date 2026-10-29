@@ -49,6 +49,8 @@ Add a separately packaged worker protocol, queue, resource governor, cache, and 
 
 Inventory dependencies, support complete-source archives first, integrate Premiere Project Manager and/or PlumePack through supported interfaces, verify the output project, then add opt-in transcode/trim modes with handles and provenance. Transcodes receive new hashes linked by derivation records.
 
+Implemented foundation: persistent project backup jobs create a complete, no-overwrite external-drive copy with a portable SHA-256 manifest, destination-volume identity, restart recovery, independent re-verification and an empty-folder restore test. This is backup evidence, not Premiere collection or cleanup eligibility. Degoo currently uses an explicit manual browser handoff because no supported public unattended API was found; remote verification remains pending unless every object can be independently downloaded and hashed.
+
 Retain lightweight completed-project records in catalogue search and a portable project-local archive carrying stable project identity and its media manifest. Public sharing links and YouTube metadata remain deferred.
 
 ## Milestone 6 — safe cleanup

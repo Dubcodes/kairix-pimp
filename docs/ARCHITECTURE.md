@@ -87,6 +87,10 @@ Full-edition analysis runs behind an optional process-isolated `AiProcessor` con
 
 ## Premiere and archive boundaries
 
+The first provider-neutral backup adapter operates below future Premiere collection: it inventories an entire known Working Project, stages on a separately selected destination volume, promotes without overwrite and emits an immutable portable SHA-256 manifest only after a full destination reread. Mutable progress, absolute roots and destination-volume identity remain device-local in `backup-jobs.json`; active states become explicit interrupted work after restart. Verified generations can be rechecked and restored to a separate empty directory. This proves copied bytes, not Premiere dependency completeness or archive independence.
+
+Cloud providers consume the same manifest boundary. Upload completion is distinct from remote verification, which requires independent object reads and hash comparison. Degoo remains an explicit browser handoff because no supported unattended API was identified; browser sessions/private endpoints are not application dependencies.
+
 The standalone Premiere Companion UXP proof of concept uses documented active-project, import, folder/bin and media-path APIs. For its first boundary, PIMP creates a versioned, user-selected, no-overwrite interchange manifest containing only the explicit physical selection and validated canonical Master Bin paths. This avoids a persistent localhost service or network permission. The extension reconciles Premiere's observed media paths and never edits `.prproj` internals. Real Premiere/UXP acceptance remains open.
 
 Until that extension exists, the default editing workflow references footage directly from Master Bin. Working Project folders and their existing Premiere saves/assets are not restructured, and users continue to use Premiere's normal desktop/laptop drive-path relinking.

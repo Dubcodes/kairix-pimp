@@ -369,3 +369,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Package the Premiere Companion separately and begin with a user-selected schema-1 JSON manifest rather than a persistent local network service. The native exporter resolves only explicit known media IDs beneath canonical Master Bin, includes selected attached audio, refuses overwrite, and exposes no arbitrary filesystem command. The UXP panel requests access only to that file, uses supported Premiere 25.6 APIs, reconciles existing media paths and never reads `.prproj` internals.
 - **Consequences:** Desktop PIMP remains independent of the plugin and no authentication/listening service is needed. Manifest selection is an explicit user step. Automated validation proves the interchange boundary, but `.ccx` packaging and real Premiere imports remain unverified until UXP Developer Tool and installed-project acceptance are completed.
+
+## ADR-050 — Verify provider-neutral backups before cloud handoff
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Decision:** Back up complete registered Working Project folders through a persistent device-local job, same-destination-volume staging, source-consistency checks, atomic no-overwrite promotion and a portable SHA-256 manifest. Record destination volume identity separately from its drive letter. Treat upload acknowledgement as verification-pending until every remote object can be independently read and hashed. Use only documented provider interfaces; Degoo is a manual official-browser handoff while no suitable public API exists.
+- **Consequences:** External-drive copies can be retried and independently restored without modifying sources. The manifest remains provider-neutral and excludes credentials/device paths. Backup evidence does not imply Premiere collection completeness or cleanup eligibility, and no deletion operation exists.
