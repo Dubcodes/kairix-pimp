@@ -9,6 +9,7 @@ import {
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Catalogue, DeviceSettings, IngestJob } from './bridge';
+import { resetLastHoveredRatioMemoryCache } from './thumbnail-hold';
 
 const mocks = vi.hoisted(() => ({
   native: true,
@@ -216,6 +217,8 @@ describe('native application integration', () => {
     );
   });
   beforeEach(() => {
+    localStorage.clear();
+    resetLastHoveredRatioMemoryCache();
     mocks.native = true;
     mocks.settings = {
       deviceId: 'device-1',
@@ -691,7 +694,8 @@ describe('native application integration', () => {
     expect(screen.queryByText('PIMP_MASTER_001.MP4')).not.toBeInTheDocument();
   });
 
-  it('scrubs cached hover frames locally and restores the configured first hold frame', async () => {
+  it('scrubs immediately, persists once on exit and restores the last hovered frame', async () => {
+    mocks.settings.thumbnailHoldFrame = 'last-hovered';
     mocks.catalogue = {
       media: [
         {
@@ -748,7 +752,11 @@ describe('native application integration', () => {
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1),
     );
     await screen.findByLabelText('Move horizontally to preview video frames');
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    fireEvent.pointerMove(thumbnail, { clientX: 10 });
+    fireEvent.pointerMove(thumbnail, { clientX: 55 });
     fireEvent.pointerMove(thumbnail, { clientX: 99 });
+    expect(setItem).not.toHaveBeenCalled();
     expect(container.querySelector('.media-thumbnail img')).toHaveAttribute(
       'src',
       'data:image/jpeg;base64,last',
@@ -757,6 +765,7 @@ describe('native application integration', () => {
       '1:40',
     );
     fireEvent.pointerLeave(thumbnail);
+    expect(setItem).toHaveBeenCalledTimes(1);
     expect(
       container.querySelector('.preview-timecode'),
     ).not.toBeInTheDocument();
@@ -765,7 +774,7 @@ describe('native application integration', () => {
     ).not.toBeInTheDocument();
     expect(container.querySelector('.media-thumbnail img')).toHaveAttribute(
       'src',
-      'data:image/jpeg;base64,first',
+      'data:image/jpeg;base64,last',
     );
     fireEvent.pointerEnter(thumbnail);
     await screen.findByLabelText('Move horizontally to preview video frames');

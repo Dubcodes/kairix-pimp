@@ -5,6 +5,8 @@ const MAX_ENTRIES = 500;
 
 type StoredPosition = { ratio: number; touchedAt: number };
 
+let positionCache: Record<string, StoredPosition> | undefined;
+
 const fixedRatios: Record<
   Exclude<ThumbnailHoldFrame, 'last-hovered'>,
   number
@@ -49,14 +51,16 @@ export function holdFrameIndex(
 }
 
 function readPositions(): Record<string, StoredPosition> {
+  if (positionCache) return positionCache;
   try {
     const parsed = JSON.parse(
       localStorage.getItem(STORAGE_KEY) ?? '{}',
     ) as Record<string, StoredPosition>;
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    positionCache = parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    return {};
+    positionCache = {};
   }
+  return positionCache;
 }
 
 export function readLastHoveredRatio(mediaId: string) {
@@ -66,18 +70,28 @@ export function readLastHoveredRatio(mediaId: string) {
 
 export function writeLastHoveredRatio(mediaId: string, ratio: number) {
   const positions = readPositions();
-  positions[mediaId] = {
-    ratio: Math.max(0, Math.min(1, ratio)),
-    touchedAt: Date.now(),
+  const normalizedRatio = Math.max(0, Math.min(1, ratio));
+  if (positions[mediaId]?.ratio === normalizedRatio) return false;
+  const updated = {
+    ...positions,
+    [mediaId]: {
+      ratio: normalizedRatio,
+      touchedAt: Date.now(),
+    },
   };
-  const bounded = Object.fromEntries(
-    Object.entries(positions)
+  positionCache = Object.fromEntries(
+    Object.entries(updated)
       .sort((left, right) => right[1].touchedAt - left[1].touchedAt)
       .slice(0, MAX_ENTRIES),
   );
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(bounded));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(positionCache));
   } catch {
     // Persistence is best-effort; the in-memory card state still retains it.
   }
+  return true;
+}
+
+export function resetLastHoveredRatioMemoryCache() {
+  positionCache = undefined;
 }

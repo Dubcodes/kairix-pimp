@@ -3903,6 +3903,7 @@ function MediaThumbnail({
   const [lastHoveredRatio, setLastHoveredRatio] = useState(() =>
     readLastHoveredRatio(mediaId),
   );
+  const latestHoveredRatio = useRef(lastHoveredRatio);
   const [isHovering, setIsHovering] = useState(false);
   const requestGeneration = useRef(0);
   const releasePreview = useCallback(() => {
@@ -3913,6 +3914,8 @@ function MediaThumbnail({
   const finishHover = () => {
     setIsHovering(false);
     setPreviewIndex(undefined);
+    if (latestHoveredRatio.current != null)
+      writeLastHoveredRatio(mediaId, latestHoveredRatio.current);
   };
   useEffect(() => {
     requestGeneration.current += 1;
@@ -4087,7 +4090,7 @@ function MediaThumbnail({
         );
         setPreviewIndex(index);
         setLastHoveredRatio(ratio);
-        writeLastHoveredRatio(mediaId, ratio);
+        latestHoveredRatio.current = ratio;
       }}
       onPointerLeave={finishHover}
       aria-label={
