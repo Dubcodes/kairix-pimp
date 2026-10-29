@@ -59,6 +59,7 @@ import {
 } from './updates';
 import { SettingsWriteQueue } from './settings-write-queue';
 import { hoverPreviewRequestCache } from './hover-preview-cache';
+import { idlePreviewScheduler } from './idle-preview-scheduler';
 import {
   previewWorkQueue,
   type PreviewPriority,
@@ -4020,9 +4021,14 @@ function MediaThumbnail({
           allowBackgroundPreparation &&
           previewKey
         )
-          void previewWorkQueue
-            .schedule(`prepare:${previewKey}`, 3, fileType.toUpperCase(), () =>
-              desktopBridge.prepareHoverPreview(mediaId),
+          void idlePreviewScheduler
+            .schedule(`prepare:${previewKey}`, () =>
+              previewWorkQueue.schedule(
+                `prepare:${previewKey}`,
+                3,
+                fileType.toUpperCase(),
+                () => desktopBridge.prepareHoverPreview(mediaId),
+              ),
             )
             .catch(() => undefined);
       },
@@ -4043,6 +4049,7 @@ function MediaThumbnail({
     return () => {
       nearby.disconnect();
       visible.disconnect();
+      if (previewKey) idlePreviewScheduler.cancel(`prepare:${previewKey}`);
     };
   }, [
     allowBackgroundPreparation,
@@ -4072,10 +4079,12 @@ function MediaThumbnail({
       ref={thumbnailRef}
       className="media-thumbnail"
       onPointerEnter={() => {
+        if (previewKey) idlePreviewScheduler.cancel(`prepare:${previewKey}`);
         setIsHovering(true);
         requestPreview(0);
       }}
       onPointerMove={(event) => {
+        idlePreviewScheduler.markInteraction();
         if (!preview?.frames.length) return;
         const bounds = event.currentTarget.getBoundingClientRect();
         const ratio = bounds.width
