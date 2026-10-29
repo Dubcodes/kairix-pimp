@@ -128,3 +128,17 @@ jobs:
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/BUILD-INFO.txt
             src-tauri/target/release/bundle/SHA256SUMS.txt
+
+      - name: Upload Premiere Companion developer source
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kairix-PIMP-Premiere-Companion-${{ env.APP_VERSION }}-${{ env.SHORT_SHA }}-developer-source
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            apps/premiere-companion/index.html
+            apps/premiere-companion/index.js
+            apps/premiere-companion/manifest-core.cjs
+            apps/premiere-companion/manifest.json
+            apps/premiere-companion/styles.css
+            docs/PREMIERE_INTEGRATION.md
