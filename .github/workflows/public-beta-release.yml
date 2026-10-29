@@ -126,7 +126,7 @@ jobs:
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
           if ([BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68) -ne 2) { throw 'Release executable is not a Windows GUI application.' }
 
-      - name: Create permanent public prerelease
+      - name: Stage and publish permanent public prerelease
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -135,4 +135,14 @@ jobs:
           git tag $tag '${{ steps.identity.outputs.sha }}'
           git push origin "refs/tags/$tag"
           $assets = Get-ChildItem release-assets -File
-          gh release create $tag $assets.FullName --verify-tag --prerelease --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title 'Kairix PIMP Light — Windows Beta'
+          gh release create $tag --verify-tag --draft --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title 'Kairix PIMP Light — Windows Beta'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft public beta release.' }
+          gh release upload $tag $assets.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload every public beta asset; the release remains a draft.' }
+          $published = gh release view $tag --json assets | ConvertFrom-Json
+          foreach ($asset in $assets) {
+            $remote = @($published.assets | Where-Object { $_.name -eq $asset.Name -and [long]$_.size -eq $asset.Length })
+            if ($remote.Count -ne 1) { throw "Published asset verification failed for $($asset.Name); the release remains a draft." }
+          }
+          gh release edit $tag --draft=false --prerelease --latest=false
+          if ($LASTEXITCODE -ne 0) { throw 'Could not promote the verified draft to a public prerelease.' }

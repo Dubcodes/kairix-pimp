@@ -158,6 +158,32 @@ describe('safe ingest', () => {
       }),
     ).rejects.toThrow();
   });
+  it('never overwrites a destination that appears at promotion time', async () => {
+    const { source, master } = await fixture();
+    const input = path.join(source, 'race.mp4');
+    await writeFile(input, 'incoming');
+    let concurrentDestination = '';
+    await expect(
+      ingestFile({
+        masterBin: master,
+        sourcePath: input,
+        dateOrganization: 'today',
+        now: new Date(2026, 9, 22),
+        beforePromote: async () => {
+          concurrentDestination = path.join(
+            master,
+            'media',
+            '2026-10-22',
+            'race.mp4',
+          );
+          await writeFile(concurrentDestination, 'concurrent-owner');
+        },
+      }),
+    ).rejects.toThrow();
+    expect(await readFile(concurrentDestination, 'utf8')).toBe(
+      'concurrent-owner',
+    );
+  });
   it('detects a corrupted destination during independent verification', async () => {
     const { source, master } = await fixture();
     const input = path.join(source, 'source.mov');

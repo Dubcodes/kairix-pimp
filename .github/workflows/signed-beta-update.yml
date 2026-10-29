@@ -57,14 +57,33 @@ jobs:
           git merge-base --is-ancestor $sha origin/main
           if ($LASTEXITCODE -ne 0) { throw 'Release commit is not reachable from approved main.' }
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $desktopVersion = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if ('${{ inputs.release_tag }}' -ne "v$version") { throw 'Tag and package version disagree.' }
+          if ($desktopVersion -ne $version -or $tauriVersion -ne $version -or $cargoVersion -ne $version) {
+            throw 'Version metadata disagrees across package, desktop, Cargo and Tauri.'
+          }
           cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_beta_and_fails_closed_without_a_public_key
           if ($LASTEXITCODE -ne 0) { throw 'Updater public key is invalid.' }
           $assets = gh release view '${{ inputs.release_tag }}' --json isPrerelease,assets | ConvertFrom-Json
           if (-not $assets.isPrerelease) { throw 'Automatic beta updates require an existing prerelease.' }
           $setup = @($assets.assets | Where-Object { $_.name -like '*Setup-Unsigned.exe' -and $_.size -gt 0 })
           $checksums = @($assets.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' -and $_.size -gt 0 })
-          if ($setup.Count -ne 1 -or $checksums.Count -ne 1) { throw 'Required public release assets are missing or empty.' }
+          $buildInfo = @($assets.assets | Where-Object { $_.name -eq 'BUILD-INFO.txt' -and $_.size -gt 0 })
+          if ($setup.Count -ne 1 -or $checksums.Count -ne 1 -or $buildInfo.Count -ne 1) { throw 'Required public release assets are missing or empty.' }
+          $inputDirectory = New-Item -ItemType Directory -Force release-input
+          gh release download '${{ inputs.release_tag }}' --pattern '*Setup-Unsigned.exe' --pattern 'SHA256SUMS.txt' --pattern 'BUILD-INFO.txt' --dir $inputDirectory
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the reviewed public release evidence.' }
+          $downloadedSetup = Get-ChildItem $inputDirectory -Filter '*Setup-Unsigned.exe' -File
+          if (@($downloadedSetup).Count -ne 1) { throw 'Expected exactly one downloaded NSIS setup executable.' }
+          $setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloadedSetup.FullName).Hash.ToLowerInvariant()
+          $checksumText = Get-Content (Join-Path $inputDirectory 'SHA256SUMS.txt') -Raw
+          if (-not $checksumText.Contains("$setupHash  $($downloadedSetup.Name)")) { throw 'The reviewed NSIS setup does not match SHA256SUMS.txt.' }
+          $buildText = Get-Content (Join-Path $inputDirectory 'BUILD-INFO.txt') -Raw
+          if (-not $buildText.Contains("Version: $version") -or -not $buildText.Contains("Source commit: $sha")) {
+            throw 'The reviewed public installer build identity does not match the selected tag.'
+          }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -107,9 +126,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
-          gh release upload '${{ inputs.release_tag }}' $artifact.FullName "$($artifact.FullName).sig" src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt --clobber
+          $existing = gh release view '${{ inputs.release_tag }}' --json assets | ConvertFrom-Json
+          $protectedNames = @($artifact.Name, "$($artifact.Name).sig", 'UPDATER-SHA256SUMS.txt')
+          if (@($existing.assets | Where-Object { $protectedNames -contains $_.name }).Count -gt 0) {
+            throw 'Versioned signed updater assets already exist and will not be overwritten.'
+          }
+          gh release upload '${{ inputs.release_tag }}' $artifact.FullName "$($artifact.FullName).sig" src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing versioned signed updater assets failed.' }
           $remote = gh release view '${{ inputs.release_tag }}' --json assets --jq ".assets[] | select(.name == `"$($artifact.Name)`") | .size"
           if (-not $remote -or [long]$remote -ne $artifact.Length) { throw 'Published updater payload size does not match.' }
+
+      - name: Verify published signed payload before channel promotion
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          $localArtifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
+          $published = New-Item -ItemType Directory -Force published-verification
+          gh release download '${{ inputs.release_tag }}' --pattern $localArtifact.Name --pattern "$($localArtifact.Name).sig" --dir $published
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read back the published updater payload and signature.' }
+          $remoteArtifact = Join-Path $published $localArtifact.Name
+          $remoteSignature = "$remoteArtifact.sig"
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $remoteArtifact).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $localArtifact.FullName).Hash) {
+            throw 'Published updater payload bytes differ from the verified local payload.'
+          }
+          cargo run --quiet --manifest-path src-tauri/Cargo.toml --example verify_update -- $remoteArtifact $remoteSignature $env:PIMP_UPDATER_PUBLIC_KEY '${{ steps.identity.outputs.version }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Published updater signature verification failed.' }
 
       - name: Publish approved channel manifest last
         shell: pwsh

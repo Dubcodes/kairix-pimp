@@ -22,9 +22,14 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented: active/completed/attention job separation with collapsed summaries and native-revalidated individual/all completed-history clearing
 - Implemented: normalized batch tags seed all eligible recording files while preserving later per-file tags; verified-copy source cleanup remains design-only and disabled
 - Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
+- Implemented reliability correction: updater checks/installations are single-flight, failed checks and interrupted downloads cannot leave reusable stale state, critical filesystem operations share a native exclusion gate with installation, and publication verifies version/build/checksum/signature evidence before promoting a channel manifest
+- Implemented discovery correction: filesystem traversal/hashing runs on a blocking worker with streamed entries, repeated unchanged full verification emits no synchronized evidence event, and append failure retains stable retry evidence
+- Implemented approved ingest plans and global content deduplication: exact reviewed sources/destinations survive into the durable job; SHA-256 candidates are skipped only after a fresh stable local Master Bin verification; concurrent jobs reserve hashes
+- Implemented initial SD Card Grabber: Windows removable-volume enumeration with volume identity, manual folder fallback, recursive configurable MP4/WAV filtering, new/imported/attention summary, and copy-only verified ingest
+- Implemented ingest-triggered coalesced enrichment and ordinary-thumbnail byte-limit eviction; physical-card and installed Windows acceptance remain
 - Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history
-- Native notification watcher, bounded thumbnail eviction, folder notes and field-level conflict resolution workflow
+- Native notification watcher, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
@@ -45,9 +50,13 @@ Keep direct DCM Master Bin references, dated bins and an optional virtual Audio 
 
 Add a separately packaged worker protocol, queue, resource governor, cache, and versioned results. Evaluate whisper.cpp for compact cross-platform distribution and faster-whisper where CUDA throughput justifies Python/CTranslate2 packaging. Add frame-sampled vision and audio-event models only after benchmark and licensing review. No model is bundled in Light.
 
+The proposed offline staged pipeline, timestamped observation/result schema, model provenance boundary and phased resource-validation plan are recorded in `LOCAL_AI_ANALYSIS_DESIGN.md`; implementation and model selection remain future work.
+
 ## Milestone 5 — verified consolidation/archive
 
 Inventory dependencies, support complete-source archives first, integrate Premiere Project Manager and/or PlumePack through supported interfaces, verify the output project, then add opt-in transcode/trim modes with handles and provenance. Transcodes receive new hashes linked by derivation records.
+
+Implemented foundation: persistent project backup jobs create a complete, no-overwrite external-drive copy with a portable SHA-256 manifest, destination-volume identity, restart recovery, independent re-verification and an empty-folder restore test. This is backup evidence, not Premiere collection or cleanup eligibility. Degoo currently uses an explicit manual browser handoff because no supported public unattended API was found; remote verification remains pending unless every object can be independently downloaded and hashed.
 
 Retain lightweight completed-project records in catalogue search and a portable project-local archive carrying stable project identity and its media manifest. Public sharing links and YouTube metadata remain deferred.
 
@@ -65,4 +74,4 @@ The versioned background job foundation is implemented for ingest: it persists i
 
 ## Milestone 7 — packaging and additional platforms
 
-Implemented for the public Light beta: keyless PR installer artifacts, a protected permanent manual-prerelease workflow, a separately protected signed-update workflow that publishes the channel manifest last, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: provision the updater key pair and protected environments, complete a real signed installed upgrade, complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, add Authenticode signing, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.
+Implemented for the public Light beta: keyless PR installer artifacts, draft-until-verified manual prerelease publication, a separately protected signed-update workflow that validates the reviewed installer and reads back immutable signed assets before publishing the channel manifest last, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: provision the updater key pair and protected environments, complete a real signed installed upgrade including interruption/race/restart/data-preservation acceptance, complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, add Authenticode signing, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.

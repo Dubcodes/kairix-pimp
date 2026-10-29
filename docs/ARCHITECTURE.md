@@ -56,7 +56,7 @@ Provisional metadata records which fields the user explicitly edited. An exact d
 
 Discovery traversal/hashing and enrichment FFprobe/FFmpeg processes run outside the catalogue write mutex. Before appending events, each operation reloads the projection and rejects registrations or enrichment results made stale by a concurrent ingest or metadata commit.
 
-FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. It starts asynchronously for configured libraries, publishes progress, persists the last result locally and emits catalogue changes after safe registration. Full verification deliberately rehashes previously verified files; quick scans skip unchanged evidence. A native notification watcher remains pending.
+FFprobe and thumbnail enrichment run sequentially only for records missing required metadata or cached previews and cannot invalidate a verified copy. External discovery persists observations, waits for repeated evidence across at least 15 seconds, rechecks previously indexed files when size/timestamp evidence changes, and hashes only candidates requiring verification. The filesystem walk and hashing execute on a blocking worker, stream accepted entries instead of retaining a complete `DirEntry` list, and publish bounded progress while the Library remains responsive. It starts asynchronously for configured libraries, persists the last result locally and emits catalogue changes after safe registration. Full verification deliberately rehashes previously verified files, but an observation identical to the current device's size, timestamp, SHA-256 and review state emits no authoritative event. The same equality check is repeated against the latest projection under the catalogue write lock to suppress a concurrent duplicate. Stable observations are retained until event persistence succeeds, so append failure is retryable without a new stability delay. Quick scans continue to skip unchanged evidence. A native notification watcher remains pending.
 
 ## Metadata, search, and Syncthing
 
@@ -87,6 +87,12 @@ Full-edition analysis runs behind an optional process-isolated `AiProcessor` con
 
 ## Premiere and archive boundaries
 
+The first provider-neutral backup adapter operates below future Premiere collection: it inventories an entire known Working Project, stages on a separately selected destination volume, promotes without overwrite and emits an immutable portable SHA-256 manifest only after a full destination reread. Mutable progress, absolute roots and destination-volume identity remain device-local in `backup-jobs.json`; active states become explicit interrupted work after restart. Verified generations can be rechecked and restored to a separate empty directory. This proves copied bytes, not Premiere dependency completeness or archive independence.
+
+Cloud providers consume the same manifest boundary. Upload acknowledgement, a remote listing, provider-side size metadata, and a provider checksum with undocumented semantics remain verification-pending. Verification requires PIMP to independently read every remote object through a documented provider interface and compare its bytes or SHA-256 with the immutable local manifest. Provider authentication belongs behind a narrow adapter and operating-system credential storage; secrets, refresh tokens and browser sessions never enter portable manifests, synchronized metadata, command-line arguments or ordinary logs.
+
+Degoo remains an explicit official-browser handoff because no supported unattended API was identified. The reviewed community client demonstrates a historic reverse-engineered web protocol, not an approved integration contract: it depends on private endpoints, observed client keys/headers and browser-fingerprint impersonation, and it does not provide reliable Windows operation or independent restored-byte verification. PIMP does not copy that client, call those endpoints, retain its authentication material or treat browser automation as an unattended backup adapter. Native Degoo work requires a documented supported interface or written provider authorization before implementation.
+
 The standalone Premiere Companion UXP proof of concept uses documented active-project, import, folder/bin and media-path APIs. For its first boundary, PIMP creates a versioned, user-selected, no-overwrite interchange manifest containing only the explicit physical selection and validated canonical Master Bin paths. This avoids a persistent localhost service or network permission. The extension reconciles Premiere's observed media paths and never edits `.prproj` internals. Real Premiere/UXP acceptance remains open.
 
 Until that extension exists, the default editing workflow references footage directly from Master Bin. Working Project folders and their existing Premiere saves/assets are not restructured, and users continue to use Premiere's normal desktop/laptop drive-path relinking.
@@ -105,12 +111,22 @@ Completed projects retain lightweight searchable catalogue records even when arc
 - Keep failed jobs inspectable and retryable; cleanup only PIMP-owned temporary files after boundary verification.
 - Quarantine malformed/newer metadata and Syncthing conflicts instead of silently dropping or rewriting them.
 
+## Update-operation coordination
+
+The updater's pending resource is device-local ephemeral state. Checks and installations are single-flight; every failed check clears stale state, and a failed download requires a fresh signed check. The native operation coordinator closes the authorization race in both directions: installation begins only when durable ingest/backup state and active critical-operation permits are safe, and after authorization new ingest lifecycle changes, backups/restores, scans/verifications, enrichment and preview filesystem work fail closed. Permits are RAII-scoped and the coordinator lock is never held during long work. Tauri signature validation remains the trust boundary; this coordination protects recoverability but does not claim an installed upgrade has passed.
+
+Source review now produces a persisted device-local approved ingest plan containing the exact source paths, snapshots, hashes, destination mapping and duplicate disposition. Job creation consumes that plan instead of rescanning. MP4/WAV SD-card scans use the same verified ingest worker with a narrower configurable filter. Global duplicate lookup uses catalogue SHA-256/size only to find candidates; it then resolves a candidate under Master Bin and freshly verifies snapshot, size and SHA-256 before a no-copy completion. Catalogue-only or failed verification is never trusted. Active jobs also reserve content hashes so concurrent jobs cannot independently copy the same bytes unless the user explicitly requests a second physical copy.
+
+Newly registered media requests one coalesced background enrichment pass. FFmpeg/FFprobe failure never blocks ingest and produces no no-op enrichment event. Ordinary thumbnail JPEGs are evicted oldest-first under the configured device-local byte limit; hover-preview storage remains separately governed.
+
 ## Security boundaries
 
 - Tauri capabilities expose only required commands to approved windows.
 - Canonicalize and validate filesystem roots, symlinks/junctions, reserved names, Unicode, and case collisions.
 - Invoke processes without shell interpolation; constrain executable discovery and arguments.
 - Store a future Syncthing API key in the OS credential store and never in synchronized metadata/logs.
+- Store any future provider access/refresh tokens in the OS credential store; never accept credentials through process arguments or persist browser cookies/sessions as application integration state.
+- Use only documented provider interfaces or explicit written authorization, and fail cloud verification closed until independently restored bytes match the portable manifest.
 - Treat media metadata, AI output, event files, Premiere data, and external tool output as untrusted input.
 - Destructive actions require distinct review and explicit user authorization; none exist in the current milestone.
 

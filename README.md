@@ -10,12 +10,16 @@ PIMP does not replace Syncthing or implement another synchronization service. A 
 
 ## Editions
 
-- **PIMP Light** is the current non-AI Windows beta: verified ingest, catalogue and search, metadata, project assignment, project inventory, and manual Premiere path handoff. It can read compatible AI metadata generated elsewhere but does not ship AI models or inference runtimes. Destructive cleanup and archive consolidation are not implemented.
+- **PIMP Light** is the current non-AI Windows beta: verified ingest, catalogue and search, metadata, project assignment, project inventory, manual Premiere path handoff, and a verified external-drive project-backup foundation. It can read compatible AI metadata generated elsewhere but does not ship AI models or inference runtimes. Destructive cleanup and archive consolidation are not implemented.
 - **PIMP Full** will use the same catalogue and application, with optional local workers for transcription, timestamped search, scene and activity descriptions, sound recognition, and suggested tags.
 
-Full-edition AI processing is planned and is not implemented in this milestone.
+Full-edition AI processing is planned and is not implemented in this milestone. The offline, resumable evidence pipeline and timestamped schema proposal are documented in [Local AI media analysis design](docs/LOCAL_AI_ANALYSIS_DESIGN.md).
 
 ## Milestone status
+
+The Archive workspace now creates persistent, complete project backups on a selected destination drive. Each file is staged and flushed on that drive, checked against the planned source SHA-256, atomically promoted without overwrite and independently read again before the generation becomes verified. Portable manifests preserve project-relative hierarchy; device-local jobs retain destination-volume identity and interruption evidence. Verified jobs can be rechecked or restored into a separate empty folder for a full hash comparison. This foundation does not prove Premiere dependency collection and never enables cleanup.
+
+Degoo currently uses an explicit official-browser handoff only. Testing with a disposable Free account could not complete an independent download because the refreshed desktop web interface required Premium. No supported public unattended API was found, so PIMP does not call private endpoints, store browser sessions or claim cloud verification. See [Degoo integration evidence](docs/DEGOO_INTEGRATION.md).
 
 Appearance settings now select the nearest real sampled first, 10%, 20%, middle, 80% or last thumbnail hold frame, or retain a bounded device-local per-media last-hover position. The source media and synchronized catalogue are not modified.
 
@@ -44,6 +48,10 @@ Settings are organized into General, Library & Storage, Ingest & Discovery, Appe
 Version `0.1.1-5` is the first public Windows beta candidate. It retains safe finalized-history clearing, bounds preview data in both the shared cache and mounted cards, and labels hover frames with FFmpeg's actual sampled timestamps. Public manual installers are permanent GitHub Release assets; automatic updates remain fail-closed until the protected signing key/password and matching repository public key are provisioned and a real installed upgrade passes. See [Windows beta distribution and signed updates](docs/UPDATES.md).
 
 Version `0.1.1-6` is a short-lived pull-request acceptance build for the optimized preview and Premiere Companion milestone. It does not replace the `0.1.1-5` public prerelease, is unsigned, and is available only through the PR's expiring Actions artifacts.
+
+The current reliability branch makes updater checks/installations single-flight, invalidates stale failed-download state, and prevents installation from racing active ingest, backup, scan, verification, enrichment or preview filesystem work. Repeated unchanged full Library verification still hashes files but no longer appends redundant synchronized evidence events. These corrections are automated-test verified only; automatic updates remain non-operational until protected signing configuration and a real installed Windows upgrade pass.
+
+The Ingest page now includes an SD Card Grabber for Windows removable volumes plus manual card-folder selection. Its initial profile recursively selects case-insensitive MP4 and WAV files, freezes the reviewed inventory in a device-local approved plan, and globally compares SHA-256 content with the catalogue. A duplicate is skipped only after PIMP freshly reads an available Master Bin copy, verifies its size/hash, and confirms it did not change during verification; catalogue-only, unavailable or corrupted matches require attention. New files continue through the existing staged, independently verified, atomic no-overwrite ingest. Source cleanup remains disabled. Successful registrations request bounded asynchronous enrichment, and the ordinary thumbnail cache now enforces its configured capacity.
 
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 

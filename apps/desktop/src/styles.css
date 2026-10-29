@@ -2160,6 +2160,55 @@ select:disabled {
   color: #78837b;
   line-height: 1.6;
 }
+.backup-workspace {
+  max-width: 900px;
+}
+.backup-safety,
+.backup-provider,
+.backup-history {
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+}
+.backup-safety {
+  border-color: var(--accent);
+}
+.backup-safety p,
+.backup-provider p {
+  margin-bottom: 0;
+  color: var(--text-muted);
+}
+.backup-job {
+  display: grid;
+  gap: 8px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+.backup-job > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.backup-job small {
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+}
+.backup-job progress {
+  width: 100%;
+}
+.backup-job .status {
+  text-transform: capitalize;
+}
+.backup-job .status.verified {
+  color: var(--accent-strong);
+}
+.backup-job .status.needs-attention,
+.backup-job .status.failed,
+.backup-job .status.interrupted {
+  color: var(--danger);
+}
 @media (max-width: 1150px) {
   .cards {
     grid-template-columns: repeat(2, minmax(180px, 1fr));

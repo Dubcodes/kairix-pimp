@@ -46,6 +46,18 @@ it('fails closed before contacting an update endpoint when no public key is conf
   expect(mocks.check).not.toHaveBeenCalled();
 });
 
+it('fails closed for an invalid embedded public key before contacting the endpoint', async () => {
+  mocks.configuration.mockResolvedValue({
+    configured: false,
+    channel: 'Beta',
+    reason: 'The embedded updater public key is invalid.',
+  });
+  await expect(checkApprovedBetaUpdate()).rejects.toThrow(
+    'The embedded updater public key is invalid.',
+  );
+  expect(mocks.check).not.toHaveBeenCalled();
+});
+
 it('reports an approved higher beta returned by the configured updater', async () => {
   mocks.configuration.mockResolvedValue({
     configured: true,
@@ -68,6 +80,82 @@ it('reports an approved higher beta returned by the configured updater', async (
     notes: 'Signed beta',
     sizeBytes: undefined,
   });
+});
+
+it('clears a closed pending update when the next check fails', async () => {
+  const close = vi.fn();
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Beta',
+  });
+  mocks.check
+    .mockResolvedValueOnce({
+      currentVersion: '0.1.1-1',
+      version: '0.1.1-2',
+      rawJson: {},
+      close,
+    })
+    .mockRejectedValueOnce(new Error('offline'));
+
+  await checkApprovedBetaUpdate();
+  await expect(checkApprovedBetaUpdate()).rejects.toThrow('offline');
+  expect(close).toHaveBeenCalledOnce();
+  await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
+    'Check for a signed Beta update before installing.',
+  );
+});
+
+it.each(['manifest is malformed', 'signature verification failed'])(
+  'clears update state when the updater reports %s',
+  async (message) => {
+    mocks.configuration.mockResolvedValue({
+      configured: true,
+      channel: 'Beta',
+    });
+    mocks.check.mockRejectedValue(new Error(message));
+    await expect(checkApprovedBetaUpdate()).rejects.toThrow(message);
+    await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
+      'Check for a signed Beta update before installing.',
+    );
+  },
+);
+
+it('allows a successful fresh check after an offline failure', async () => {
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Beta',
+  });
+  mocks.check
+    .mockRejectedValueOnce(new Error('offline'))
+    .mockResolvedValueOnce({
+      currentVersion: '0.1.1-1',
+      version: '0.1.1-2',
+      rawJson: {},
+      close: vi.fn(),
+    });
+  await expect(checkApprovedBetaUpdate()).rejects.toThrow('offline');
+  await expect(checkApprovedBetaUpdate()).resolves.toMatchObject({
+    version: '0.1.1-2',
+  });
+  expect(mocks.check).toHaveBeenCalledTimes(2);
+});
+
+it('coalesces overlapping checks into one updater request', async () => {
+  let release!: () => void;
+  const blocked = new Promise<null>((resolve) => {
+    release = () => resolve(null);
+  });
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Beta',
+  });
+  mocks.check.mockReturnValue(blocked);
+
+  const first = checkApprovedBetaUpdate();
+  const second = checkApprovedBetaUpdate();
+  await vi.waitFor(() => expect(mocks.check).toHaveBeenCalledOnce());
+  release();
+  await expect(Promise.all([first, second])).resolves.toEqual([null, null]);
 });
 
 it('refuses installation until an approved update has been checked', async () => {
@@ -129,6 +217,37 @@ it('surfaces interrupted updater installation without reporting success', async 
   });
   expect(mocks.beginInstallation).toHaveBeenCalledOnce();
   expect(mocks.endInstallation).toHaveBeenCalledOnce();
+  await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
+    'Check for a signed Beta update before installing.',
+  );
+});
+
+it('rejects overlapping installation attempts', async () => {
+  let release!: () => void;
+  const download = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const downloadAndInstall = vi.fn().mockReturnValue(download);
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Beta',
+  });
+  mocks.check.mockResolvedValue({
+    currentVersion: '0.1.1-1',
+    version: '0.1.1-2',
+    rawJson: {},
+    close: vi.fn(),
+    downloadAndInstall,
+  });
+  await checkApprovedBetaUpdate();
+
+  const first = installApprovedBetaUpdate(vi.fn());
+  await vi.waitFor(() => expect(downloadAndInstall).toHaveBeenCalledOnce());
+  await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
+    'An approved update installation is already in progress.',
+  );
+  release();
+  await first;
 });
 
 it('releases the native operation gate after a successful installer return', async () => {

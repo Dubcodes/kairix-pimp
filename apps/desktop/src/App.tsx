@@ -37,6 +37,7 @@ import {
   nativeAvailable,
   type Catalogue,
   type AppInfo,
+  type BackupJob,
   type DeviceSettings,
   type DiscoveryStatus,
   type IngestJob,
@@ -49,6 +50,7 @@ import {
   type ProjectRecord,
   type ProvisionalMetadataPatch,
   type SourceInventory,
+  type RemovableVolume,
   type UpdaterConfiguration,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
@@ -154,6 +156,12 @@ export function App() {
   const [inventory, setInventory] = useState<SourceInventory>();
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryError, setInventoryError] = useState('');
+  const [sdGrabberMode, setSdGrabberMode] = useState(false);
+  const [removableVolumes, setRemovableVolumes] = useState<RemovableVolume[]>(
+    [],
+  );
+  const [showSdGrabber, setShowSdGrabber] = useState(false);
+  const [allowDuplicateCopies, setAllowDuplicateCopies] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -209,6 +217,10 @@ export function App() {
   }>();
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
+  const [backupProjectId, setBackupProjectId] = useState<string>();
+  const [backupDestination, setBackupDestination] = useState('');
+  const [backupJobs, setBackupJobs] = useState<BackupJob[]>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
   const catalogueSignature = useRef<string | undefined>(undefined);
   const metadataWrites = useRef(new Map<string, Promise<void>>());
   const pendingMetadataPatches = useRef(
@@ -399,6 +411,7 @@ export function App() {
           setDiscoveryStatus(loadedDiscoveryStatus);
           setView((loaded.startupPage as View | undefined) ?? 'Library');
           setJobs(await desktopBridge.initializeIngestJobs());
+          setBackupJobs(await desktopBridge.initializeBackupJobs());
           if (loaded.initializedCataloguePath) {
             const before = await desktopBridge.catalogueSignature();
             let nextCatalogue = await desktopBridge.loadCatalogue();
@@ -424,6 +437,14 @@ export function App() {
       stopCatalogue?.();
     };
   }, [native, refresh, savingSettings]);
+  useEffect(() => {
+    if (!native) return;
+    let stop: (() => void) | undefined;
+    void desktopBridge.onBackupJobsChanged(setBackupJobs).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, [native]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -452,8 +473,10 @@ export function App() {
         : dateOverride === 'choose'
           ? chosenDate || undefined
           : dateOverride;
-    void desktopBridge
-      .inventorySources(sources, previewDateOverride)
+    const request = sdGrabberMode
+      ? desktopBridge.inventorySdCard(sources, previewDateOverride)
+      : desktopBridge.inventorySources(sources, previewDateOverride);
+    void request
       .then((result) => {
         if (current) {
           setInventory(result);
@@ -469,7 +492,40 @@ export function App() {
     return () => {
       current = false;
     };
-  }, [native, sources, dateOverride, chosenDate]);
+  }, [
+    native,
+    sources,
+    dateOverride,
+    chosenDate,
+    sdGrabberMode,
+    settings.sdGrabberExtensions,
+    settings.sdGrabberSearchSubfolders,
+  ]);
+
+  useEffect(() => {
+    if (
+      !native ||
+      view !== 'Ingest' ||
+      !settings.sdGrabberEnabled ||
+      !settings.sdGrabberAutoDetect
+    )
+      return;
+    let current = true;
+    const refreshVolumes = () => {
+      void desktopBridge
+        .listRemovableVolumes()
+        .then((volumes) => {
+          if (current) setRemovableVolumes(volumes);
+        })
+        .catch(() => undefined);
+    };
+    refreshVolumes();
+    const timer = window.setInterval(refreshVolumes, 5_000);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [native, settings.sdGrabberAutoDetect, settings.sdGrabberEnabled, view]);
   useEffect(() => {
     if (!native || !configured) return;
     let disposed = false;
@@ -794,6 +850,7 @@ export function App() {
   const addFiles = async () => {
     const chosen = await desktopBridge.chooseFiles();
     if (chosen.length) {
+      setSdGrabberMode(false);
       setInventory(undefined);
       setInventoryError('');
       setInventoryLoading(true);
@@ -803,14 +860,50 @@ export function App() {
   const addFolder = async () => {
     const path = await desktopBridge.chooseFolder();
     if (path) {
+      setSdGrabberMode(false);
       setInventory(undefined);
       setInventoryError('');
       setInventoryLoading(true);
       setSources((current) => [...new Set([...current, path])]);
     }
   };
+  const scanSdSource = (path: string, identity?: string) => {
+    if (
+      identity &&
+      settings.sdGrabberRememberDevices &&
+      !settings.sdGrabberRecognizedDeviceIds.includes(identity)
+    ) {
+      persistPreference({
+        sdGrabberRecognizedDeviceIds: [
+          ...settings.sdGrabberRecognizedDeviceIds,
+          identity,
+        ],
+      });
+    }
+    setSdGrabberMode(true);
+    setShowSdGrabber(true);
+    setInventory(undefined);
+    setInventoryError('');
+    setInventoryLoading(true);
+    setSources([path]);
+  };
+  const chooseSdSource = async () => {
+    const path = await desktopBridge.chooseFolder();
+    if (path) scanSdSource(path);
+  };
+  const refreshRemovableVolumes = async () => {
+    try {
+      setRemovableVolumes(await desktopBridge.listRemovableVolumes());
+    } catch (reason) {
+      setInventoryError(errorText(reason));
+    }
+  };
   const ingest = async (renamedDestinations: Record<string, string> = {}) => {
     if (!sources.length) return;
+    if (!inventory?.planId) {
+      setError('Scan and review the selected source before starting ingest.');
+      return;
+    }
     setStartingIngest(true);
     setError('');
     setMessage('');
@@ -827,6 +920,8 @@ export function App() {
               : dateOverride,
         renamedDestinations,
         batchTags: ingestBatchTags,
+        approvedPlanId: inventory.planId,
+        allowDuplicateCopies,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -836,6 +931,8 @@ export function App() {
       setConflicts([]);
       setRenames({});
       setIngestBatchTags([]);
+      setAllowDuplicateCopies(false);
+      setSdGrabberMode(false);
       setJobsOpen(true);
       setMessage(
         `Ingest queued with ${job.files.length} file${job.files.length === 1 ? '' : 's'}. You can keep browsing and edit metadata now.`,
@@ -1159,6 +1256,18 @@ export function App() {
       );
       return;
     }
+    if (backupBusy || updateBlockingBackupJobs.length > 0) {
+      setUpdateStatus(
+        'Wait for every active backup, verification, or restore test to finish before installing an update.',
+      );
+      return;
+    }
+    if (discoveryStatus.running) {
+      setUpdateStatus(
+        'Wait for the active Library scan or integrity verification to finish before installing an update.',
+      );
+      return;
+    }
     setCheckingUpdate(true);
     setUpdateProgress({ downloaded: 0 });
     setUpdateStatus('Preparing signed update download…');
@@ -1180,9 +1289,10 @@ export function App() {
         }
       });
       setUpdateStatus(
-        'Update installed. Restart required if PIMP does not reopen.',
+        'The signed installer was launched. PIMP will close and Windows will restart it after installation; confirm the new version after it reopens.',
       );
     } catch (reason) {
+      setAvailableUpdate(undefined);
       setUpdateStatus(`Update installation failed: ${errorText(reason)}`);
     } finally {
       setCheckingUpdate(false);
@@ -1372,6 +1482,81 @@ export function App() {
     selectionAnchor.current = target.id;
     setLibraryLocateId(target.id);
   };
+  const startBackup = async () => {
+    if (!backupProjectId || !backupDestination) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      const completed = await desktopBridge.startProjectBackup(
+        backupProjectId,
+        backupDestination,
+      );
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage(
+        `Verified ${completed.manifest.sourceFileCount} files on the destination drive.`,
+      );
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const retryBackup = async (jobId: string) => {
+    const destinationRoot = await desktopBridge.chooseFolder();
+    if (!destinationRoot) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      await desktopBridge.retryProjectBackup(jobId, destinationRoot);
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage('Backup completed and independently re-verified.');
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const verifyBackup = async (jobId: string) => {
+    setBackupBusy(true);
+    setError('');
+    try {
+      await desktopBridge.verifyProjectBackup(jobId);
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage('Every backup file still matches its SHA-256 manifest.');
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const testBackupRestore = async (jobId: string) => {
+    const restoreRoot = await desktopBridge.chooseFolder();
+    if (!restoreRoot) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      const result = await desktopBridge.testProjectBackupRestore(
+        jobId,
+        restoreRoot,
+      );
+      setMessage(
+        `Restore test passed: ${result.filesVerified} files and ${size(result.bytesVerified)} independently verified.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
   const activeJobs = jobs.filter((job) =>
     ['queued', 'copying', 'verifying'].includes(job.state),
   );
@@ -1381,6 +1566,9 @@ export function App() {
   );
   const workJobs = [...activeJobs, ...needsAttentionJobs];
   const updateBlockingJobs = jobs.filter((job) => !jobIsClearableHistory(job));
+  const updateBlockingBackupJobs = backupJobs.filter((job) =>
+    ['prepared', 'copying', 'verifying'].includes(job.state),
+  );
   const totalJobBytes = activeJobs.reduce(
     (total, job) => total + job.bytesTotal,
     0,
@@ -1962,7 +2150,9 @@ export function App() {
                           <dt>Progress</dt>
                           <dd>
                             {discoveryStatus.running
-                              ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                              ? discoveryStatus.totalFiles > 0
+                                ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                                : `${discoveryStatus.filesProcessed} processed · discovering total…`
                               : 'Idle'}
                           </dd>
                         </div>
@@ -2063,6 +2253,91 @@ export function App() {
                       month; mm is minute.
                     </small>
                   </label>
+                  <fieldset>
+                    <legend>SD Card Grabber</legend>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberEnabled: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Enable SD Card Grabber
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberAutoDetect}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberAutoDetect: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Detect removable cards automatically
+                    </label>
+                    <label>
+                      Included file extensions
+                      <input
+                        value={settings.sdGrabberExtensions.join(', ')}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberExtensions: event.target.value
+                              .split(',')
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          })
+                        }
+                      />
+                      <small>
+                        Defaults to MP4 and WAV; matching ignores case.
+                      </small>
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberSearchSubfolders}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberSearchSubfolders: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Search subfolders
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberRememberDevices}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberRememberDevices: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Remember recognised device identities
+                    </label>
+                    <label title="Source cleanup is not implemented">
+                      <input type="checkbox" checked={false} disabled /> Offer
+                      source cleanup after independent verification
+                    </label>
+                    <small>
+                      Cleanup remains disabled. The Grabber copies, verifies and
+                      registers media without modifying the card.
+                    </small>
+                  </fieldset>
                   <div className="settings-explainer">
                     New external files require repeated stable observations and
                     SHA-256 verification. PIMP never replaces a destination on
@@ -2362,12 +2637,19 @@ export function App() {
                       disabled={
                         checkingUpdate ||
                         !availableUpdate ||
-                        updateBlockingJobs.length > 0
+                        updateBlockingJobs.length > 0 ||
+                        backupBusy ||
+                        updateBlockingBackupJobs.length > 0 ||
+                        discoveryStatus.running
                       }
                       title={
                         updateBlockingJobs.length
                           ? 'Active or recoverable ingest jobs must be resolved before updating'
-                          : undefined
+                          : backupBusy || updateBlockingBackupJobs.length
+                            ? 'Active backup, verification, or restore work must finish before updating'
+                            : discoveryStatus.running
+                              ? 'The active Library scan must finish before updating'
+                              : undefined
                       }
                       onClick={installUpdate}
                     >
@@ -2513,7 +2795,9 @@ export function App() {
               >
                 <RefreshCw size={15} />
                 {discoveryStatus.running
-                  ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
+                  ? discoveryStatus.totalFiles > 0
+                    ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
+                    : `Scanning · ${discoveryStatus.filesProcessed} processed`
                   : 'Scan for new files'}
               </button>
             </section>
@@ -3050,6 +3334,62 @@ export function App() {
         ) : view === 'Ingest' ? (
           <section className="ingest">
             <div className="drop">
+              <button
+                type="button"
+                className="primary"
+                disabled={!settings.sdGrabberEnabled}
+                onClick={() => {
+                  setShowSdGrabber((current) => !current);
+                  void refreshRemovableVolumes();
+                }}
+              >
+                <HardDrive size={18} /> Grab files from SD card
+              </button>
+              {showSdGrabber && (
+                <div className="source-list" aria-label="SD Card Grabber">
+                  <strong>SD Card Grabber</strong>
+                  <small>
+                    Scans only {settings.sdGrabberExtensions.join(', ')} files
+                    and copies verified new recordings. Nothing is deleted from
+                    the card.
+                  </small>
+                  {removableVolumes.map((volume) => (
+                    <div className="button-row" key={volume.identity}>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          scanSdSource(volume.rootPath, volume.identity)
+                        }
+                      >
+                        Scan {volume.label} ({volume.rootPath})
+                      </button>
+                      <small>
+                        {size(volume.availableBytes)} free of{' '}
+                        {size(volume.capacityBytes)}
+                        {settings.sdGrabberRecognizedDeviceIds.includes(
+                          volume.identity,
+                        )
+                          ? ' · Recognised card'
+                          : ''}
+                      </small>
+                    </div>
+                  ))}
+                  {removableVolumes.length === 0 && (
+                    <small className="pending">
+                      No Windows removable volume detected. Some card readers
+                      appear as fixed drives; choose the card folder manually.
+                    </small>
+                  )}
+                  <div className="button-row">
+                    <button type="button" onClick={chooseSdSource}>
+                      Choose card folder manually
+                    </button>
+                    <button type="button" onClick={refreshRemovableVolumes}>
+                      Refresh devices
+                    </button>
+                  </div>
+                </div>
+              )}
               <UploadCloud size={42} />
               <h2>Drop camera media here</h2>
               <p>
@@ -3082,6 +3422,8 @@ export function App() {
                       setInventoryError('');
                       setConflicts([]);
                       setRenames({});
+                      setSdGrabberMode(false);
+                      setAllowDuplicateCopies(false);
                     }}
                   >
                     Clear
@@ -3101,9 +3443,37 @@ export function App() {
               {inventory && (
                 <div className="source-list" aria-label="Source inventory">
                   <strong>
-                    {inventory.copyFileCount} of {inventory.totalFileCount}{' '}
-                    files will be copied ({size(inventory.copyBytes)})
+                    {sdGrabberMode
+                      ? `${inventory.copyFileCount} new recording${inventory.copyFileCount === 1 ? '' : 's'} — ${size(inventory.copyBytes)}`
+                      : `${inventory.copyFileCount} of ${inventory.totalFileCount} files will be copied (${size(inventory.copyBytes)})`}
                   </strong>
+                  {sdGrabberMode && (
+                    <>
+                      <small>
+                        {inventory.alreadyImportedFileCount} already imported —{' '}
+                        {size(inventory.alreadyImportedBytes)}
+                      </small>
+                      <small
+                        className={
+                          inventory.attentionFileCount ? 'error' : undefined
+                        }
+                      >
+                        {inventory.attentionFileCount} require attention —{' '}
+                        {size(inventory.attentionBytes)}
+                      </small>
+                    </>
+                  )}
+                  {!sdGrabberMode &&
+                    (inventory.alreadyImportedFileCount ?? 0) > 0 && (
+                      <small>
+                        {inventory.alreadyImportedFileCount} verified global
+                        duplicate
+                        {inventory.alreadyImportedFileCount === 1
+                          ? ''
+                          : 's'}{' '}
+                        will be skipped ({size(inventory.alreadyImportedBytes)})
+                      </small>
+                    )}
                   <small>
                     {
                       inventory.files.filter((file) => file.preserveHierarchy)
@@ -3145,8 +3515,11 @@ export function App() {
                           <span role="cell">
                             <b>Destination</b>
                             <code title={file.plannedRelativePath}>
-                              {file.plannedRelativePath}
+                              {file.disposition === 'already-imported'
+                                ? `Already imported: ${file.existingRelativePath}`
+                                : file.plannedRelativePath}
                             </code>
+                            {file.detail && <small>{file.detail}</small>}
                           </span>
                         </div>
                       ))}
@@ -3250,13 +3623,26 @@ export function App() {
                   ))}
                 </div>
               )}
+              {(inventory?.alreadyImportedFileCount ?? 0) > 0 && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowDuplicateCopies}
+                    onChange={(event) =>
+                      setAllowDuplicateCopies(event.target.checked)
+                    }
+                  />{' '}
+                  Intentionally create additional physical copies of verified
+                  duplicates
+                </label>
+              )}
               <button
                 className="primary"
                 disabled={
                   startingIngest ||
                   inventoryLoading ||
                   !inventory ||
-                  inventory.copyFileCount === 0 ||
+                  (inventory.copyFileCount === 0 && !allowDuplicateCopies) ||
                   !sources.length ||
                   (dateOverride === 'choose' && !chosenDate)
                 }
@@ -3272,7 +3658,11 @@ export function App() {
               >
                 {startingIngest
                   ? 'Creating ingest job…'
-                  : 'Start verified ingest'}
+                  : sdGrabberMode
+                    ? allowDuplicateCopies
+                      ? `Grab ${(inventory?.copyFileCount ?? 0) + (inventory?.alreadyImportedFileCount ?? 0)} files including requested duplicates`
+                      : `Grab ${inventory?.copyFileCount ?? 0} new file${inventory?.copyFileCount === 1 ? '' : 's'}`
+                    : 'Start verified ingest'}
               </button>
             </div>
           </section>
@@ -3774,12 +4164,132 @@ export function App() {
             </section>
           )
         ) : (
-          <section className="empty">
-            <h2>No destructive archive actions</h2>
+          <section className="settings-form backup-workspace">
+            <h2>Verified backup</h2>
             <p>
-              Automatic deletion and cleanup are intentionally deferred. Your
-              source recordings remain untouched.
+              Copy a complete project folder to a separate drive. PIMP stages
+              each file on that drive, preserves its hierarchy, refuses
+              overwrites, and verifies every SHA-256 hash before marking the
+              backup verified.
             </p>
+            <SearchableComboBox
+              label="Project to back up"
+              mode="single"
+              options={catalogue.projects.map((project) => ({
+                id: project.id,
+                label: project.name,
+                description: project.workingDirectory,
+              }))}
+              selectedIds={backupProjectId ? [backupProjectId] : []}
+              onSelectionChange={(ids) => setBackupProjectId(ids[0])}
+              placeholder="Search projects…"
+            />
+            <PathField
+              label="External-drive destination"
+              value={backupDestination}
+              onChange={setBackupDestination}
+              onBrowse={async () => {
+                const path = await desktopBridge.chooseFolder();
+                if (path) setBackupDestination(path);
+              }}
+            />
+            <button
+              type="button"
+              className="primary"
+              disabled={backupBusy || !backupProjectId || !backupDestination}
+              onClick={() => void startBackup()}
+            >
+              {backupBusy
+                ? 'Backup operation running…'
+                : 'Start verified backup'}
+            </button>
+
+            <div className="backup-safety" role="note">
+              <strong>Cleanup is unavailable</strong>
+              <p>
+                This milestone never deletes source media. A verified backup is
+                evidence only; it does not prove Premiere dependency collection
+                or authorize cleanup.
+              </p>
+            </div>
+
+            <section className="backup-provider">
+              <h3>Degoo handoff</h3>
+              <p>
+                Degoo has no supported public integration API suitable for an
+                unattended PIMP backup. Use Degoo's official browser to upload a
+                verified generation. Cloud status remains verification pending
+                until PIMP can independently download and hash every object.
+              </p>
+              <button
+                type="button"
+                onClick={() => void desktopBridge.openSupportLink('degoo')}
+              >
+                Open official Degoo web app
+              </button>
+            </section>
+
+            <section className="backup-history">
+              <h3>Backup jobs</h3>
+              {backupJobs.length === 0 ? (
+                <p>No backup jobs have been created on this device.</p>
+              ) : (
+                backupJobs
+                  .slice()
+                  .reverse()
+                  .map((job) => (
+                    <article key={job.id} className="backup-job">
+                      <div>
+                        <strong>{job.projectName}</strong>
+                        <span className={`status ${job.state}`}>
+                          {job.state}
+                        </span>
+                      </div>
+                      <small title={job.generationPath}>
+                        {job.generationPath}
+                      </small>
+                      <progress
+                        max={Math.max(job.manifest.sourceBytes, 1)}
+                        value={job.bytesCompleted}
+                      />
+                      <small>
+                        {job.filesCompleted} / {job.manifest.sourceFileCount}{' '}
+                        files · {size(job.bytesCompleted)} /{' '}
+                        {size(job.manifest.sourceBytes)}
+                      </small>
+                      {job.error && <p role="alert">{job.error}</p>}
+                      <div className="project-actions">
+                        {job.state === 'verified' ? (
+                          <>
+                            <button
+                              type="button"
+                              disabled={backupBusy}
+                              onClick={() => void verifyBackup(job.id)}
+                            >
+                              Re-verify hashes
+                            </button>
+                            <button
+                              type="button"
+                              disabled={backupBusy}
+                              onClick={() => void testBackupRestore(job.id)}
+                            >
+                              Test restore to empty folder
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={backupBusy}
+                            onClick={() => void retryBackup(job.id)}
+                          >
+                            Choose drive and retry
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ))
+              )}
+            </section>
           </section>
         )}
       </main>

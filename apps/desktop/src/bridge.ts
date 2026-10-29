@@ -53,6 +53,12 @@ export interface DeviceSettings {
     | 'fewest-recordings'
     | 'custom';
   libraryFolderOrder?: string[];
+  sdGrabberEnabled: boolean;
+  sdGrabberAutoDetect: boolean;
+  sdGrabberExtensions: string[];
+  sdGrabberSearchSubfolders: boolean;
+  sdGrabberRememberDevices: boolean;
+  sdGrabberRecognizedDeviceIds: string[];
 }
 export interface AppInfo {
   version: string;
@@ -129,6 +135,54 @@ export interface ProjectInventory {
   scannedAt: string;
   items: ProjectAsset[];
 }
+export interface BackupAsset {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+export interface BackupManifest {
+  schemaVersion: number;
+  backupId: string;
+  projectId: string;
+  createdAt: string;
+  sourceFileCount: number;
+  sourceBytes: number;
+  collectionComplete: boolean;
+  assets: BackupAsset[];
+}
+export type BackupJobState =
+  | 'prepared'
+  | 'copying'
+  | 'verifying'
+  | 'verified'
+  | 'interrupted'
+  | 'failed'
+  | 'needs-attention';
+export interface BackupJob {
+  schemaVersion: number;
+  id: string;
+  projectId: string;
+  projectName: string;
+  sourceRoot: string;
+  destinationRoot: string;
+  generationPath: string;
+  generationRelativePath: string;
+  destinationVolumeId: string;
+  state: BackupJobState;
+  createdAt: string;
+  updatedAt: string;
+  filesCompleted: number;
+  bytesCompleted: number;
+  currentFile?: string;
+  error?: string;
+  manifest: BackupManifest;
+}
+export interface RestoreTestResult {
+  restorePath: string;
+  filesVerified: number;
+  bytesVerified: number;
+  verifiedAt: string;
+}
 export interface HoverPreview {
   mediaId: string;
   durationSeconds: number;
@@ -199,6 +253,9 @@ export interface InventoryFile {
   kind: 'video' | 'audio' | 'image' | 'camera-support' | 'unknown';
   analysisSupported: boolean;
   preserveHierarchy: boolean;
+  disposition: 'new' | 'already-imported' | 'attention';
+  existingRelativePath?: string;
+  detail?: string;
 }
 export interface InventoryExclusion {
   path: string;
@@ -206,6 +263,7 @@ export interface InventoryExclusion {
   sizeBytes?: number;
 }
 export interface SourceInventory {
+  planId: string;
   files: InventoryFile[];
   excluded: InventoryExclusion[];
   issues: string[];
@@ -213,6 +271,17 @@ export interface SourceInventory {
   totalBytes: number;
   copyFileCount: number;
   copyBytes: number;
+  alreadyImportedFileCount: number;
+  alreadyImportedBytes: number;
+  attentionFileCount: number;
+  attentionBytes: number;
+}
+export interface RemovableVolume {
+  rootPath: string;
+  label: string;
+  identity: string;
+  capacityBytes: number;
+  availableBytes: number;
 }
 export type IngestJobState =
   | 'queued'
@@ -252,6 +321,7 @@ export interface IngestJobFile {
 export interface IngestJob {
   schemaVersion: number;
   id: string;
+  approvedPlanId?: string;
   state: IngestJobState;
   createdAt: string;
   updatedAt: string;
@@ -298,6 +368,12 @@ export const emptySettings = (): DeviceSettings => ({
   sidebarCollapsed: false,
   libraryFolderSort: 'newest',
   libraryFolderOrder: [],
+  sdGrabberEnabled: true,
+  sdGrabberAutoDetect: true,
+  sdGrabberExtensions: ['mp4', 'wav'],
+  sdGrabberSearchSubfolders: true,
+  sdGrabberRememberDevices: true,
+  sdGrabberRecognizedDeviceIds: [],
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],
@@ -358,12 +434,18 @@ export const desktopBridge = {
   },
   inventorySources: (sources: string[], dateOverride?: string) =>
     invoke<SourceInventory>('inventory_sources', { sources, dateOverride }),
+  inventorySdCard: (sources: string[], dateOverride?: string) =>
+    invoke<SourceInventory>('inventory_sd_card', { sources, dateOverride }),
+  listRemovableVolumes: () =>
+    invoke<RemovableVolume[]>('list_removable_volumes'),
   startIngest: (request: {
     jobId: string;
     sources: string[];
     dateOverride?: string;
     renamedDestinations?: Record<string, string>;
     batchTags?: string[];
+    approvedPlanId: string;
+    allowDuplicateCopies?: boolean;
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
@@ -394,6 +476,12 @@ export const desktopBridge = {
     handler: (jobs: IngestJob[]) => void,
   ): Promise<UnlistenFn> =>
     listen<IngestJob[]>('ingest-jobs-changed', (event) =>
+      handler(event.payload),
+    ),
+  onBackupJobsChanged: (
+    handler: (jobs: BackupJob[]) => void,
+  ): Promise<UnlistenFn> =>
+    listen<BackupJob[]>('backup-jobs-changed', (event) =>
       handler(event.payload),
     ),
   onDiscoveryProgress: (
@@ -432,6 +520,22 @@ export const desktopBridge = {
     }),
   inventoryProject: (projectId: string) =>
     invoke<ProjectInventory>('inventory_project', { projectId }),
+  initializeBackupJobs: () => invoke<BackupJob[]>('initialize_backup_jobs'),
+  listBackupJobs: () => invoke<BackupJob[]>('list_backup_jobs'),
+  startProjectBackup: (projectId: string, destinationRoot: string) =>
+    invoke<BackupJob>('start_project_backup', {
+      projectId,
+      destinationRoot,
+    }),
+  retryProjectBackup: (jobId: string, destinationRoot?: string) =>
+    invoke<BackupJob>('retry_project_backup', { jobId, destinationRoot }),
+  verifyProjectBackup: (jobId: string) =>
+    invoke<BackupJob>('verify_project_backup', { jobId }),
+  testProjectBackupRestore: (jobId: string, restoreRoot: string) =>
+    invoke<RestoreTestResult>('test_project_backup_restore', {
+      jobId,
+      restoreRoot,
+    }),
   openProjectFolder: (projectId: string) =>
     invoke<void>('open_project_folder', { projectId }),
   revealProjectAsset: (projectId: string, relativePath: string) =>
@@ -445,7 +549,8 @@ export const desktopBridge = {
   beginUpdateInstallation: () => invoke<void>('begin_update_installation'),
   endUpdateInstallation: () => invoke<void>('end_update_installation'),
   openSupportLink: (
-    destination: 'github' | 'releases' | 'test-builds' | 'website' | 'coffee',
+    destination:
+      'github' | 'releases' | 'test-builds' | 'website' | 'coffee' | 'degoo',
   ) => invoke<void>('open_support_link', { destination }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),
   verifyMediaIntegrity: (mediaId: string) =>

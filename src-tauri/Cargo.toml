@@ -29,3 +29,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 minisign-verify = "0.3"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+
