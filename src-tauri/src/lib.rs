@@ -53,6 +53,8 @@ struct NativeState {
     discovery_write: Mutex<()>,
     discovery_status: Mutex<DiscoveryStatus>,
     enrichment_write: Mutex<()>,
+    enrichment_worker_active: Mutex<bool>,
+    enrichment_requested: Mutex<bool>,
     job_store: Mutex<()>,
     worker_active: Mutex<bool>,
     availability: Mutex<HashMap<String, (String, bool)>>,
@@ -146,6 +148,18 @@ struct DeviceSettings {
     library_folder_sort: String,
     #[serde(default)]
     library_folder_order: Vec<String>,
+    #[serde(default = "default_true")]
+    sd_grabber_enabled: bool,
+    #[serde(default = "default_true")]
+    sd_grabber_auto_detect: bool,
+    #[serde(default = "default_sd_grabber_extensions")]
+    sd_grabber_extensions: Vec<String>,
+    #[serde(default = "default_true")]
+    sd_grabber_search_subfolders: bool,
+    #[serde(default = "default_true")]
+    sd_grabber_remember_devices: bool,
+    #[serde(default)]
+    sd_grabber_recognized_device_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -264,6 +278,9 @@ fn default_thumbnail_hold_frame() -> String {
 fn default_preview_preloading() -> String {
     "visible-nearby".into()
 }
+fn default_sd_grabber_extensions() -> Vec<String> {
+    vec!["mp4".into(), "wav".into()]
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -299,6 +316,12 @@ impl Default for DeviceSettings {
             sidebar_collapsed: false,
             library_folder_sort: default_library_folder_sort(),
             library_folder_order: vec![],
+            sd_grabber_enabled: true,
+            sd_grabber_auto_detect: true,
+            sd_grabber_extensions: default_sd_grabber_extensions(),
+            sd_grabber_search_subfolders: true,
+            sd_grabber_remember_devices: true,
+            sd_grabber_recognized_device_ids: vec![],
         }
     }
 }
@@ -313,6 +336,10 @@ struct IngestRequest {
     renamed_destinations: HashMap<String, String>,
     #[serde(default)]
     batch_tags: Vec<String>,
+    #[serde(default)]
+    approved_plan_id: Option<String>,
+    #[serde(default)]
+    allow_duplicate_copies: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -326,6 +353,12 @@ struct InventoryFile {
     kind: String,
     analysis_supported: bool,
     preserve_hierarchy: bool,
+    #[serde(default)]
+    disposition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    existing_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(skip)]
     source_root_path: String,
     #[serde(skip)]
@@ -349,6 +382,7 @@ struct InventoryExclusion {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct SourceInventory {
+    plan_id: String,
     files: Vec<InventoryFile>,
     excluded: Vec<InventoryExclusion>,
     issues: Vec<String>,
@@ -356,6 +390,49 @@ struct SourceInventory {
     total_bytes: u64,
     copy_file_count: usize,
     copy_bytes: u64,
+    #[serde(default)]
+    already_imported_file_count: usize,
+    #[serde(default)]
+    already_imported_bytes: u64,
+    #[serde(default)]
+    attention_file_count: usize,
+    #[serde(default)]
+    attention_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RemovableVolume {
+    root_path: String,
+    label: String,
+    identity: String,
+    capacity_bytes: u64,
+    available_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ApprovedIngestFile {
+    inventory: InventoryFile,
+    source_size: u64,
+    source_modified_millis: Option<u128>,
+    source_sha256: Option<String>,
+    existing_media_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ApprovedIngestPlan {
+    schema_version: u32,
+    id: String,
+    created_at: String,
+    batch_timestamp: String,
+    master_bin_path: String,
+    sources: Vec<String>,
+    date_override: Option<String>,
+    files: Vec<ApprovedIngestFile>,
+    inventory: SourceInventory,
+    sd_grabber: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -402,6 +479,14 @@ struct IngestJobFile {
     pending_metadata: Option<ProvisionalMetadata>,
     #[serde(default)]
     metadata_error: Option<String>,
+    #[serde(default)]
+    source_modified_millis: Option<u128>,
+    #[serde(default)]
+    approved_sha256: Option<String>,
+    #[serde(default)]
+    duplicate_existing_relative_path: Option<String>,
+    #[serde(default)]
+    intentional_duplicate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -409,6 +494,8 @@ struct IngestJobFile {
 struct IngestJob {
     schema_version: u32,
     id: String,
+    #[serde(default)]
+    approved_plan_id: Option<String>,
     state: String,
     created_at: String,
     updated_at: String,
@@ -523,6 +610,27 @@ fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or("Invalid application configuration path")?
         .join("ingest-jobs.json"))
+}
+
+fn approved_plan_path(app: &AppHandle, plan_id: &str) -> Result<PathBuf, String> {
+    let id = Uuid::parse_str(plan_id).map_err(|_| "Approved ingest plan ID is invalid")?;
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("approved-ingest-plans")
+        .join(format!("{id}.json")))
+}
+
+fn save_approved_plan(app: &AppHandle, plan: &ApprovedIngestPlan) -> Result<(), String> {
+    write_json(&approved_plan_path(app, &plan.id)?, plan)
+}
+
+fn load_approved_plan(app: &AppHandle, plan_id: &str) -> Result<ApprovedIngestPlan, String> {
+    let path = approved_plan_path(app, plan_id)?;
+    if !path.is_file() {
+        return Err("Approved ingest plan is missing; scan the source again".into());
+    }
+    read_json(&path)
 }
 
 fn backup_jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1139,6 +1247,41 @@ fn save_settings(
     ) {
         return Err("Choose a supported Library folder ordering".into());
     }
+    settings.sd_grabber_extensions = settings
+        .sd_grabber_extensions
+        .iter()
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if settings.sd_grabber_extensions.is_empty()
+        || settings.sd_grabber_extensions.len() > 16
+        || settings.sd_grabber_extensions.iter().any(|value| {
+            value.len() > 12
+                || !value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+    {
+        return Err("SD Card Grabber extensions must be simple file extensions".into());
+    }
+    settings.sd_grabber_recognized_device_ids = settings
+        .sd_grabber_recognized_device_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if settings.sd_grabber_recognized_device_ids.len() > 64
+        || settings
+            .sd_grabber_recognized_device_ids
+            .iter()
+            .any(|value| value.len() > 160 || value.chars().any(char::is_control))
+    {
+        return Err("Recognised SD device identities are invalid".into());
+    }
     fs::create_dir_all(settings.master_bin_path.trim())
         .map_err(|e| format!("Cannot create Master Bin: {e}"))?;
     fs::create_dir_all(settings.working_projects_path.trim())
@@ -1394,10 +1537,25 @@ fn inventory_candidate(
     relative: &Path,
     source_root: &Path,
     root_is_package: bool,
+    allowed_extensions: Option<&HashSet<String>>,
 ) {
     let size = candidate.metadata().ok().map(|metadata| metadata.len());
     inventory.total_file_count += 1;
     inventory.total_bytes += size.unwrap_or(0);
+    if allowed_extensions.is_some_and(|allowed| {
+        candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| !allowed.contains(&value.to_ascii_lowercase()))
+            .unwrap_or(true)
+    }) {
+        inventory.excluded.push(InventoryExclusion {
+            path: candidate.to_string_lossy().into(),
+            reason: "Not included by the SD Card Grabber profile".into(),
+            size_bytes: size,
+        });
+        return;
+    }
     if let Some(reason) = exclusion_reason(candidate) {
         inventory.excluded.push(InventoryExclusion {
             path: candidate.to_string_lossy().into(),
@@ -1433,6 +1591,9 @@ fn inventory_candidate(
         kind: media_kind(candidate).into(),
         analysis_supported: analysis_supported(candidate),
         preserve_hierarchy: root_is_package || package_component(relative),
+        disposition: "new".into(),
+        existing_relative_path: None,
+        detail: None,
         source_root_path,
         source_root_label,
         include_source_root: root_is_package,
@@ -1442,16 +1603,36 @@ fn inventory_candidate(
 }
 
 fn build_source_inventory(sources: &[String]) -> SourceInventory {
+    build_source_inventory_filtered(sources, None, true)
+}
+
+fn build_source_inventory_filtered(
+    sources: &[String],
+    allowed_extensions: Option<&HashSet<String>>,
+    recursive: bool,
+) -> SourceInventory {
     let mut inventory = SourceInventory::default();
     for source in sources {
         let path = PathBuf::from(source);
         if path.is_file() {
             let relative = PathBuf::from(path.file_name().unwrap_or_default());
             let root = path.parent().unwrap_or_else(|| Path::new("."));
-            inventory_candidate(&mut inventory, &path, &relative, root, false);
+            inventory_candidate(
+                &mut inventory,
+                &path,
+                &relative,
+                root,
+                false,
+                allowed_extensions,
+            );
         } else if path.is_dir() {
             let root_is_package = package_component(&path);
-            for result in WalkDir::new(&path).follow_links(false) {
+            let walker = if recursive {
+                WalkDir::new(&path)
+            } else {
+                WalkDir::new(&path).max_depth(1)
+            };
+            for result in walker.follow_links(false) {
                 match result {
                     Ok(entry) if entry.file_type().is_file() => {
                         let relative = entry.path().strip_prefix(&path).unwrap_or(entry.path());
@@ -1461,6 +1642,7 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
                             relative,
                             &path,
                             root_is_package,
+                            allowed_extensions,
                         );
                     }
                     Ok(_) => {}
@@ -1584,16 +1766,151 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
     inventory
 }
 
-#[tauri::command]
-fn inventory_sources(
-    app: AppHandle,
+fn classify_global_duplicate(
+    settings: &DeviceSettings,
+    candidates: &[&MediaItem],
+    expected_size: u64,
+    source_hash: &str,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    // Stored size observations are useful lookup hints, but they are not
+    // authoritative and older compatible records may not contain one. The
+    // fresh local snapshot and SHA-256 check below decide whether a copy is
+    // safe to trust.
+    let candidates = candidates
+        .iter()
+        .copied()
+        .filter(|item| item.sha256 == source_hash)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return ("new".into(), None, None, None);
+    }
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut failures = Vec::new();
+    for item in candidates {
+        let candidate = match fs_safe::resolve_existing(&master, &item.relative_path) {
+            Ok(path) if path.is_file() => path,
+            Ok(_) => {
+                failures.push(format!("{} is not a local file", item.relative_path));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{} is unavailable: {error}", item.relative_path));
+                continue;
+            }
+        };
+        let before = match fs_safe::snapshot(&candidate) {
+            Ok(value) if value.length == expected_size => value,
+            Ok(_) => {
+                failures.push(format!("{} has a different size", item.relative_path));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{} cannot be read: {error}", item.relative_path));
+                continue;
+            }
+        };
+        let hash = sha256(&candidate);
+        let after = fs_safe::snapshot(&candidate);
+        if hash.as_deref() == Ok(source_hash) && after.as_ref() == Ok(&before) {
+            return (
+                "already-imported".into(),
+                Some(item.id.clone()),
+                Some(item.relative_path.clone()),
+                Some("A local Master Bin copy was independently SHA-256 verified".into()),
+            );
+        }
+        failures.push(format!(
+            "{} failed fresh integrity verification",
+            item.relative_path
+        ));
+    }
+    (
+        "attention".into(),
+        None,
+        None,
+        Some(format!(
+            "Catalogue content match is not a trustworthy local copy: {}. The incoming source was not skipped.",
+            failures.join("; ")
+        )),
+    )
+}
+
+fn approved_source_matches(path: &Path, approved: &ApprovedIngestFile) -> bool {
+    let Ok(snapshot) = fs_safe::snapshot(path) else {
+        return false;
+    };
+    if snapshot.length != approved.source_size
+        || snapshot.modified_millis != approved.source_modified_millis
+    {
+        return false;
+    }
+    approved
+        .source_sha256
+        .as_deref()
+        .map(|expected| sha256(path).as_deref() == Ok(expected))
+        .unwrap_or(true)
+        && fs_safe::snapshot(path).as_ref() == Ok(&snapshot)
+}
+
+fn create_approved_inventory(
+    app: &AppHandle,
     sources: Vec<String>,
     date_override: Option<String>,
+    sd_grabber: bool,
 ) -> Result<SourceInventory, String> {
     let settings = load_settings_file(&app)?;
+    if sd_grabber && !settings.sd_grabber_enabled {
+        return Err("Enable SD Card Grabber in Settings before scanning a card".into());
+    }
     let master = PathBuf::from(&settings.master_bin_path);
+    let master_canonical = master
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve Master Bin: {error}"))?;
+    let config_root = settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve application working directory: {error}"))?;
+    let staging = fs_safe::staging_root(&master, &settings.device_id)?;
+    for source in &sources {
+        let canonical = Path::new(source)
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve selected source {source}: {error}"))?;
+        if paths_overlap(&master_canonical, &canonical)
+            || paths_overlap(&staging, &canonical)
+            || paths_overlap(&config_root, &canonical)
+        {
+            return Err(format!(
+                "Selected source {} overlaps the Master Bin or a protected PIMP working directory",
+                canonical.display()
+            ));
+        }
+    }
     let batch_timestamp = Local::now();
-    let mut inventory = build_source_inventory(&sources);
+    let allowed = settings
+        .sd_grabber_extensions
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut inventory = if sd_grabber {
+        build_source_inventory_filtered(
+            &sources,
+            Some(&allowed),
+            settings.sd_grabber_search_subfolders,
+        )
+    } else {
+        build_source_inventory(&sources)
+    };
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
+    for item in &catalogue.media {
+        hash_index
+            .entry(item.sha256.clone())
+            .or_default()
+            .push(item);
+    }
+    let mut approved_files = Vec::new();
+    let mut selection_hashes = HashMap::<String, String>::new();
     for file in &mut inventory.files {
         let filename = Path::new(&file.source_path)
             .file_name()
@@ -1608,8 +1925,199 @@ fn inventory_sources(
             &batch_timestamp,
             &filename,
         )?;
+        let source = PathBuf::from(&file.source_path);
+        let snapshot = fs_safe::snapshot(&source)?;
+        let mut existing_media_id = None;
+        let hash = sha256(&source)?;
+        if fs_safe::snapshot(&source)? != snapshot {
+            file.disposition = "attention".into();
+            file.detail =
+                Some("Source changed while the approved inventory was being built".into());
+        } else if let Some(relative_path) = selection_hashes.get(&hash) {
+            file.disposition = "already-imported".into();
+            file.existing_relative_path = Some(relative_path.clone());
+            file.detail = Some("Duplicate recording within this approved selection".into());
+        } else {
+            let candidates = hash_index.get(&hash).map(Vec::as_slice).unwrap_or(&[]);
+            let (disposition, media_id, relative_path, detail) =
+                classify_global_duplicate(&settings, candidates, snapshot.length, &hash);
+            file.disposition = disposition;
+            file.existing_relative_path = relative_path;
+            file.detail = detail;
+            existing_media_id = media_id;
+            if file.disposition == "new" {
+                selection_hashes.insert(hash.clone(), file.planned_relative_path.clone());
+            }
+        }
+        approved_files.push(ApprovedIngestFile {
+            inventory: file.clone(),
+            source_size: snapshot.length,
+            source_modified_millis: snapshot.modified_millis,
+            source_sha256: Some(hash),
+            existing_media_id,
+        });
     }
+    inventory.copy_file_count = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .count();
+    inventory.copy_bytes = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .map(|file| file.size_bytes)
+        .sum();
+    inventory.already_imported_file_count = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .count();
+    inventory.already_imported_bytes = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .map(|file| file.size_bytes)
+        .sum();
+    inventory.attention_file_count = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .count();
+    inventory.attention_bytes = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .map(|file| file.size_bytes)
+        .sum();
+    inventory.plan_id = Uuid::new_v4().to_string();
+    save_approved_plan(
+        app,
+        &ApprovedIngestPlan {
+            schema_version: 1,
+            id: inventory.plan_id.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            batch_timestamp: batch_timestamp.to_rfc3339(),
+            master_bin_path: settings.master_bin_path,
+            sources,
+            date_override,
+            files: approved_files,
+            inventory: inventory.clone(),
+            sd_grabber,
+        },
+    )?;
     Ok(inventory)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    fs_safe::within(left, right) || fs_safe::within(right, left)
+}
+
+#[tauri::command]
+fn inventory_sources(
+    app: AppHandle,
+    sources: Vec<String>,
+    date_override: Option<String>,
+) -> Result<SourceInventory, String> {
+    create_approved_inventory(&app, sources, date_override, false)
+}
+
+#[tauri::command]
+fn inventory_sd_card(
+    app: AppHandle,
+    sources: Vec<String>,
+    date_override: Option<String>,
+) -> Result<SourceInventory, String> {
+    create_approved_inventory(&app, sources, date_override, true)
+}
+
+#[cfg(target_os = "windows")]
+fn removable_volumes() -> Vec<RemovableVolume> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
+    let mut volumes = Vec::new();
+    let drives = unsafe { GetLogicalDrives() };
+    for index in 0..26_u32 {
+        if drives & (1 << index) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + index as u8) as char);
+        let wide = std::ffi::OsStr::new(&root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_REMOVABLE {
+            continue;
+        }
+        let mut label = vec![0_u16; 261];
+        let mut filesystem = vec![0_u16; 64];
+        let mut serial = 0_u32;
+        let information_ok = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                label.as_mut_ptr(),
+                label.len() as u32,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            )
+        } != 0;
+        if !information_ok {
+            continue;
+        }
+        let mut available = 0_u64;
+        let mut capacity = 0_u64;
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                &mut capacity,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            continue;
+        }
+        let label_end = label
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(label.len());
+        let filesystem_end = filesystem
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(filesystem.len());
+        let filesystem = String::from_utf16_lossy(&filesystem[..filesystem_end]);
+        volumes.push(RemovableVolume {
+            root_path: root.clone(),
+            label: {
+                let value = String::from_utf16_lossy(&label[..label_end]);
+                if value.trim().is_empty() {
+                    "Removable media".into()
+                } else {
+                    value
+                }
+            },
+            identity: format!("volume:{serial:08x}:{filesystem}:{capacity}"),
+            capacity_bytes: capacity,
+            available_bytes: available,
+        });
+    }
+    volumes
+}
+
+#[cfg(not(target_os = "windows"))]
+fn removable_volumes() -> Vec<RemovableVolume> {
+    Vec::new()
+}
+
+#[tauri::command]
+fn list_removable_volumes() -> Vec<RemovableVolume> {
+    removable_volumes()
 }
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
@@ -2300,6 +2808,38 @@ fn commit_job_file(
     Ok(())
 }
 
+fn complete_duplicate_job_file(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+    file_id: &str,
+    media_id: &str,
+) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job no longer exists")?;
+        let file = job
+            .files
+            .iter_mut()
+            .find(|file| file.id == file_id)
+            .ok_or("Ingest job file no longer exists")?;
+        file.media_id = media_id.into();
+        file.state = "completed".into();
+        file.bytes_transferred = 0;
+        file.error = None;
+        job.files_completed = job
+            .files
+            .iter()
+            .filter(|file| file.state == "completed")
+            .count();
+        job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
 fn all_job_files_completed(job: &IngestJob) -> bool {
     job.inventory_issues.is_empty()
         && !job.files.is_empty()
@@ -2423,18 +2963,75 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             )?;
             continue;
         }
+        if planned.duplicate_existing_relative_path.is_some() {
+            let expected_hash = planned
+                .approved_sha256
+                .as_deref()
+                .ok_or("Approved duplicate is missing its source hash")?;
+            let source_before = fs_safe::snapshot(&source);
+            let destination_before = fs_safe::snapshot(&destination);
+            let source_hash = sha256(&source);
+            let destination_hash = sha256(&destination);
+            let trustworthy = source_before.as_ref().is_ok_and(|snapshot| {
+                snapshot.length == planned.size_bytes
+                    && snapshot.modified_millis == planned.source_modified_millis
+            }) && source_hash.as_deref() == Ok(expected_hash)
+                && fs_safe::snapshot(&source).as_ref() == source_before.as_ref()
+                && destination_before
+                    .as_ref()
+                    .is_ok_and(|snapshot| snapshot.length == planned.size_bytes)
+                && destination_hash.as_deref() == Ok(expected_hash)
+                && fs_safe::snapshot(&destination).as_ref() == destination_before.as_ref();
+            let existing = load_catalogue_file(&settings)?
+                .media
+                .into_iter()
+                .find(|item| {
+                    item.id == planned.media_id
+                        && item.relative_path == planned.relative_path
+                        && item.sha256 == expected_hash
+                });
+            if trustworthy && existing.is_some() {
+                complete_duplicate_job_file(app, &state, job_id, &planned.id, &planned.media_id)?;
+                continue;
+            }
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "failed",
+                0,
+                Some("The previously verified duplicate is no longer trustworthy; no file was skipped".into()),
+            )?;
+            continue;
+        }
         if destination.exists() {
             match (sha256(&source), sha256(&destination)) {
                 (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
-                    commit_job_file(
-                        app,
-                        &state,
-                        &settings,
-                        job_id,
-                        &planned.id,
-                        destination_hash,
-                        None,
-                    )?;
+                    let catalogue = load_catalogue_file(&settings)?;
+                    if let Some(existing) = catalogue.media.iter().find(|item| {
+                        item.relative_path == planned.relative_path
+                            && item.sha256 == destination_hash
+                    }) {
+                        complete_duplicate_job_file(
+                            app,
+                            &state,
+                            job_id,
+                            &planned.id,
+                            &existing.id,
+                        )?;
+                    } else {
+                        commit_job_file(
+                            app,
+                            &state,
+                            &settings,
+                            job_id,
+                            &planned.id,
+                            destination_hash,
+                            None,
+                        )?;
+                        kick_enrichment_worker(app.clone());
+                    }
                     completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
                     continue;
                 }
@@ -2488,6 +3085,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     )?;
                 } else {
                     completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                    kick_enrichment_worker(app.clone());
                 }
             }
             Err(error) if error == "__cancelled__" => {
@@ -2574,6 +3172,22 @@ fn active_destination_reservations(jobs: &[IngestJob]) -> HashSet<String> {
         .collect()
 }
 
+fn active_content_reservations(jobs: &[IngestJob]) -> HashMap<String, (String, String)> {
+    jobs.iter()
+        .filter(|job| !matches!(job.state.as_str(), "completed" | "cancelled"))
+        .flat_map(|job| &job.files)
+        .filter(|file| !file.intentional_duplicate && file.state != "cancelled")
+        .filter_map(|file| {
+            file.approved_sha256.as_ref().map(|hash| {
+                (
+                    hash.clone(),
+                    (file.relative_path.clone(), file.media_id.clone()),
+                )
+            })
+        })
+        .collect()
+}
+
 fn initial_batch_metadata(kind: &str, batch_tags: &[String]) -> ProvisionalMetadata {
     if matches!(kind, "video" | "audio" | "image") && !batch_tags.is_empty() {
         ProvisionalMetadata {
@@ -2595,69 +3209,128 @@ fn start_ingest(
     let _operation = begin_critical_operation(&state.operations, "ingest start")?;
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let inventory = build_source_inventory(&request.sources);
+    let plan_id = request
+        .approved_plan_id
+        .as_deref()
+        .ok_or("Scan and review the source before starting ingest")?;
+    let plan = load_approved_plan(&app, plan_id)?;
+    if plan.schema_version != 1
+        || plan.master_bin_path != settings.master_bin_path
+        || plan.sources != request.sources
+        || plan.date_override != request.date_override
+    {
+        return Err("The approved ingest plan no longer matches this request; scan again".into());
+    }
+    if !request.renamed_destinations.is_empty() {
+        return Err("Destination renames require a new reviewed ingest plan".into());
+    }
+    let inventory = plan.inventory.clone();
     let unsupported = inventory
         .files
         .iter()
         .filter(|file| !file.analysis_supported)
         .map(|file| file.source_path.clone())
         .collect();
-    let batch_timestamp = Local::now();
-    let reserved = active_destination_reservations(&snapshot_jobs(&app, &state)?);
+    let batch_timestamp = DateTime::parse_from_rfc3339(&plan.batch_timestamp)
+        .map_err(|_| "Approved ingest plan has an invalid timestamp")?
+        .with_timezone(&Local);
+    let existing_jobs = snapshot_jobs(&app, &state)?;
+    let reserved = active_destination_reservations(&existing_jobs);
+    let reserved_content = active_content_reservations(&existing_jobs);
     let mut planned_paths = HashSet::new();
     let mut files = Vec::new();
     let batch_tags = normalized(&request.batch_tags);
-    for inventory_file in &inventory.files {
+    let media_ids_by_relative = plan
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.inventory.planned_relative_path.clone(),
+                Uuid::new_v4().to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for approved in &plan.files {
+        let inventory_file = &approved.inventory;
         let source = PathBuf::from(&inventory_file.source_path);
-        let filename = request
-            .renamed_destinations
-            .get(&source.to_string_lossy().to_string())
-            .cloned()
-            .unwrap_or_else(|| source.file_name().unwrap().to_string_lossy().to_string());
-        if Path::new(&filename)
-            .file_name()
-            .and_then(|value| value.to_str())
-            != Some(filename.as_str())
-        {
-            return Err(format!(
-                "{} has an invalid destination filename",
-                source.display()
-            ));
-        }
-        let relative_path = planned_relative_path(
-            &settings,
-            &master,
-            inventory_file,
-            &request.date_override,
-            &batch_timestamp,
-            &filename,
-        )?;
+        let source_changed = !approved_source_matches(&source, approved);
+        let active_duplicate = approved
+            .source_sha256
+            .as_ref()
+            .and_then(|hash| reserved_content.get(hash));
+        let intentional_duplicate = request.allow_duplicate_copies
+            && (inventory_file.disposition == "already-imported" || active_duplicate.is_some());
+        let is_duplicate = (inventory_file.disposition == "already-imported"
+            || active_duplicate.is_some())
+            && !intentional_duplicate;
+        let relative_path = if is_duplicate {
+            active_duplicate
+                .map(|value| value.0.clone())
+                .or_else(|| inventory_file.existing_relative_path.clone())
+                .ok_or("Approved duplicate is missing its verified destination")?
+        } else {
+            inventory_file.planned_relative_path.clone()
+        };
         let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
         let destination_path = destination.to_string_lossy().to_string();
-        let collision =
-            reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
+        let collision = !is_duplicate
+            && (reserved.contains(&destination_path)
+                || !planned_paths.insert(destination_path.clone()));
+        let attention = inventory_file.disposition == "attention";
+        let failed = collision || source_changed || attention;
+        let media_id = if is_duplicate {
+            active_duplicate
+                .map(|value| value.1.clone())
+                .or_else(|| approved.existing_media_id.clone())
+                .or_else(|| media_ids_by_relative.get(&relative_path).cloned())
+                .ok_or("Approved duplicate has no stable media identity")?
+        } else {
+            media_ids_by_relative
+                .get(&inventory_file.planned_relative_path)
+                .cloned()
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        };
         files.push(IngestJobFile {
             id: Uuid::new_v4().to_string(),
-            media_id: Uuid::new_v4().to_string(),
+            media_id,
             source_path: source.to_string_lossy().to_string(),
             source_relative_path: inventory_file.source_relative_path.clone(),
             destination_path,
-            relative_path,
+            relative_path: relative_path.clone(),
             original_filename: source.file_name().unwrap().to_string_lossy().to_string(),
             size_bytes: inventory_file.size_bytes,
             bytes_transferred: 0,
-            state: if collision { "failed" } else { "queued" }.into(),
-            error: collision
-                .then(|| "Another queued ingest already reserves this destination".into()),
+            state: if failed { "failed" } else { "queued" }.into(),
+            error: if source_changed {
+                Some("Source changed or disappeared after the approved scan; scan again".into())
+            } else if attention {
+                inventory_file.detail.clone().or_else(|| {
+                    Some("This file requires review before it can be transferred".into())
+                })
+            } else if collision {
+                Some("Another queued ingest already reserves this destination".into())
+            } else {
+                None
+            },
             metadata: initial_batch_metadata(&inventory_file.kind, &batch_tags),
             pending_metadata: None,
             metadata_error: None,
+            source_modified_millis: approved.source_modified_millis,
+            approved_sha256: approved.source_sha256.clone(),
+            duplicate_existing_relative_path: is_duplicate.then_some(relative_path.clone()),
+            intentional_duplicate,
         });
     }
     let now = Utc::now().to_rfc3339();
+    let bytes_total = files
+        .iter()
+        .filter(|file| file.duplicate_existing_relative_path.is_none() && file.state == "queued")
+        .map(|file| file.size_bytes)
+        .sum();
     let job = IngestJob {
         schema_version: 3,
         id: request.job_id,
+        approved_plan_id: Some(plan_id.into()),
         state: if files.iter().any(|file| file.state == "queued") {
             "queued"
         } else {
@@ -2668,7 +3341,7 @@ fn start_ingest(
         updated_at: now,
         batch_timestamp: batch_timestamp.to_rfc3339(),
         date_override: request.date_override,
-        bytes_total: files.iter().map(|file| file.size_bytes).sum(),
+        bytes_total,
         bytes_transferred: 0,
         files_completed: 0,
         current_file: None,
@@ -2684,9 +3357,16 @@ fn start_ingest(
         if jobs.iter().any(|existing| existing.id == job.id) {
             return Err("An ingest job with this ID already exists".into());
         }
+        if jobs
+            .iter()
+            .any(|existing| existing.approved_plan_id.as_deref() == Some(plan_id))
+        {
+            return Err("This approved ingest plan has already been used".into());
+        }
         jobs.push(job.clone());
         Ok(())
     })?;
+    let _ = fs::remove_file(approved_plan_path(&app, plan_id)?);
     kick_ingest_worker(app);
     Ok(job)
 }
@@ -4504,6 +5184,67 @@ async fn enrich_media(app: AppHandle) -> Result<usize, String> {
     .map_err(|error| format!("Media enrichment worker failed: {error}"))?
 }
 
+fn kick_enrichment_worker(app: AppHandle) {
+    let state = app.state::<NativeState>();
+    let mut active = state.enrichment_worker_active.lock().unwrap();
+    *state.enrichment_requested.lock().unwrap() = true;
+    if *active {
+        return;
+    }
+    *active = true;
+    drop(active);
+    std::thread::spawn(move || loop {
+        let state = app.state::<NativeState>();
+        {
+            let _active = state.enrichment_worker_active.lock().unwrap();
+            *state.enrichment_requested.lock().unwrap() = false;
+        }
+        if let Ok(_operation) = begin_critical_operation(&state.operations, "media enrichment") {
+            let _ = run_enrichment(&app, &state);
+        }
+        let mut active = state.enrichment_worker_active.lock().unwrap();
+        if *state.enrichment_requested.lock().unwrap() {
+            drop(active);
+            continue;
+        }
+        *active = false;
+        break;
+    });
+}
+
+fn enforce_thumbnail_cache_limit(cache: &Path, limit_bytes: u64) -> Result<u64, String> {
+    if limit_bytes == 0 || !cache.is_dir() {
+        return Ok(0);
+    }
+    let mut entries = fs::read_dir(cache)
+        .map_err(|error| format!("Cannot inspect thumbnail cache: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            (metadata.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("jpg")))
+            .then(|| (metadata.modified().ok(), path, metadata.len()))
+        })
+        .collect::<Vec<_>>();
+    let mut total = entries.iter().map(|entry| entry.2).sum::<u64>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut removed = 0;
+    for (_, path, size) in entries {
+        if total <= limit_bytes {
+            break;
+        }
+        fs::remove_file(&path)
+            .map_err(|error| format!("Cannot evict thumbnail {}: {error}", path.display()))?;
+        total = total.saturating_sub(size);
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String> {
     let settings = load_settings_file(&app)?;
     let _enrichment_guard = state.enrichment_write.lock().unwrap();
@@ -4585,6 +5326,10 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
             continue;
         }
+        let generated_thumbnail_ref = thumbnail.is_file().then_some(thumbnail_ref);
+        if technical == item.technical && generated_thumbnail_ref == item.thumbnail_path {
+            continue;
+        }
         candidates.push((
             item.id.clone(),
             item.relative_path.clone(),
@@ -4594,7 +5339,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
             CatalogueEvent::MediaEnriched {
                 media_id: item.id.clone(),
                 technical,
-                thumbnail_ref: thumbnail.is_file().then_some(thumbnail_ref),
+                thumbnail_ref: generated_thumbnail_ref,
             },
         ));
     }
@@ -4620,6 +5365,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         .collect();
     let changed = events.len();
     append_events(&settings, events)?;
+    enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
     Ok(changed)
 }
 fn resolve_catalogue_media_path(
@@ -5562,6 +6308,8 @@ pub fn run() {
             catalogue_signature,
             refresh_media_availability,
             inventory_sources,
+            inventory_sd_card,
+            list_removable_volumes,
             start_ingest,
             initialize_ingest_jobs,
             list_ingest_jobs,
@@ -5643,6 +6391,7 @@ mod tests {
         IngestJob {
             schema_version: 2,
             id: "job-1".into(),
+            approved_plan_id: None,
             state: state.into(),
             created_at: "2026-10-24T00:00:00Z".into(),
             updated_at: "2026-10-24T00:00:00Z".into(),
@@ -5674,6 +6423,10 @@ mod tests {
                 },
                 pending_metadata: None,
                 metadata_error: None,
+                source_modified_millis: None,
+                approved_sha256: None,
+                duplicate_existing_relative_path: None,
+                intentional_duplicate: false,
             }],
             unsupported: Vec::new(),
             failures: vec!["previous failure".into()],
@@ -5719,6 +6472,10 @@ mod tests {
             metadata: ProvisionalMetadata::default(),
             pending_metadata: None,
             metadata_error: None,
+            source_modified_millis: None,
+            approved_sha256: None,
+            duplicate_existing_relative_path: None,
+            intentional_duplicate: false,
         };
         let catalogue = Catalogue {
             media: vec![media],
@@ -6169,6 +6926,195 @@ mod tests {
         let inventory = build_source_inventory(&[root.to_string_lossy().into()]);
         assert_eq!(inventory.copy_file_count, 2);
         assert!(inventory.files.iter().all(|file| file.preserve_hierarchy));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sd_grabber_filters_case_insensitive_mp4_and_wav_recursively() {
+        let root = temporary("sd-filter");
+        let card = root.join("card");
+        fs::create_dir_all(card.join("PRIVATE/deep")).unwrap();
+        fs::write(card.join("CLIP.MP4"), b"video").unwrap();
+        fs::write(card.join("PRIVATE/deep/audio.WaV"), b"audio").unwrap();
+        fs::write(card.join("PRIVATE/deep/metadata.XML"), b"metadata").unwrap();
+        let allowed = HashSet::from(["mp4".to_string(), "wav".to_string()]);
+        let inventory = build_source_inventory_filtered(
+            &[card.to_string_lossy().into_owned()],
+            Some(&allowed),
+            true,
+        );
+        assert_eq!(inventory.files.len(), 2);
+        assert!(inventory
+            .files
+            .iter()
+            .any(|file| file.source_relative_path.ends_with("CLIP.MP4")));
+        assert!(inventory
+            .files
+            .iter()
+            .any(|file| file.source_relative_path.ends_with("audio.WaV")));
+        assert!(inventory
+            .excluded
+            .iter()
+            .any(|file| file.path.ends_with("metadata.XML")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn global_duplicate_requires_a_fresh_verified_local_copy() {
+        let root = temporary("global-duplicate");
+        let master = root.join("master");
+        let existing = master.join("20261001/original.mp4");
+        let incoming = root.join("renamed.mp4");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, b"same-bytes").unwrap();
+        fs::write(&incoming, b"same-bytes").unwrap();
+        let hash = sha256(&incoming).unwrap();
+        let mut item = new_media(
+            &existing,
+            "20261001/original.mp4".into(),
+            None,
+            hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        item.tags = vec!["keep-me".into()];
+        item.project_ids = vec!["project-a".into()];
+        let mut catalogue = Catalogue {
+            media: vec![item.clone()],
+            ..Default::default()
+        };
+        let mut settings = DeviceSettings::default();
+        settings.master_bin_path = master.to_string_lossy().into_owned();
+        let verified = classify_global_duplicate(
+            &settings,
+            &[&catalogue.media[0]],
+            fs::metadata(&incoming).unwrap().len(),
+            &hash,
+        );
+        assert_eq!(verified.0, "already-imported");
+        assert_eq!(verified.1.as_deref(), Some(item.id.as_str()));
+        assert_eq!(item.tags, vec!["keep-me"]);
+        assert_eq!(item.project_ids, vec!["project-a"]);
+
+        catalogue.media[0].observed_size = None;
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &hash,
+            )
+            .0,
+            "already-imported"
+        );
+
+        fs::write(&incoming, b"other-data").unwrap();
+        let different_hash = sha256(&incoming).unwrap();
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &different_hash,
+            )
+            .0,
+            "new"
+        );
+        fs::write(&incoming, b"same-bytes").unwrap();
+
+        fs::write(&existing, b"bad!-bytes").unwrap();
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &hash,
+            )
+            .0,
+            "attention"
+        );
+        fs::remove_file(&existing).unwrap();
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &hash,
+            )
+            .0,
+            "attention"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approved_inventory_detects_same_size_content_changes() {
+        let root = temporary("approved-plan-change");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"expected").unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        let approved = ApprovedIngestFile {
+            inventory: InventoryFile::default(),
+            source_size: snapshot.length,
+            source_modified_millis: snapshot.modified_millis,
+            source_sha256: Some(sha256(&source).unwrap()),
+            existing_media_id: None,
+        };
+        assert!(approved_source_matches(&source, &approved));
+        fs::write(&source, b"modified").unwrap();
+        assert!(!approved_source_matches(&source, &approved));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_overlap_detection_is_bidirectional() {
+        let root = temporary("source-overlap");
+        let master = root.join("master");
+        let child = master.join("DCIM");
+        let separate = root.join("card");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&separate).unwrap();
+        let master = master.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        let separate = separate.canonicalize().unwrap();
+        assert!(paths_overlap(&master, &child));
+        assert!(paths_overlap(&child, &master));
+        assert!(!paths_overlap(&master, &separate));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_content_reservation_prevents_concurrent_duplicate_copy() {
+        let mut job = ingest_job("copying", "copying");
+        job.files[0].approved_sha256 = Some("same-hash".into());
+        job.files[0].relative_path = "20261030/first.mp4".into();
+        job.files[0].media_id = "media-first".into();
+        let reservations = active_content_reservations(&[job]);
+        assert_eq!(
+            reservations.get("same-hash"),
+            Some(&("20261030/first.mp4".into(), "media-first".into()))
+        );
+        let mut intentional = ingest_job("copying", "copying");
+        intentional.files[0].approved_sha256 = Some("same-hash".into());
+        intentional.files[0].intentional_duplicate = true;
+        assert!(active_content_reservations(&[intentional]).is_empty());
+    }
+
+    #[test]
+    fn ordinary_thumbnail_cache_evicts_oldest_files_only() {
+        let root = temporary("thumbnail-limit");
+        let cache = root.join("cache");
+        fs::create_dir_all(cache.join("hover-previews/keep")).unwrap();
+        fs::write(cache.join("a.jpg"), vec![1_u8; 8]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(cache.join("b.jpg"), vec![2_u8; 8]).unwrap();
+        fs::write(cache.join("hover-previews/keep/frame.jpg"), b"preview").unwrap();
+        assert_eq!(enforce_thumbnail_cache_limit(&cache, 8).unwrap(), 1);
+        assert!(!cache.join("a.jpg").exists());
+        assert!(cache.join("b.jpg").is_file());
+        assert!(cache.join("hover-previews/keep/frame.jpg").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 

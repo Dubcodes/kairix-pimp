@@ -115,6 +115,10 @@ Completed projects retain lightweight searchable catalogue records even when arc
 
 The updater's pending resource is device-local ephemeral state. Checks and installations are single-flight; every failed check clears stale state, and a failed download requires a fresh signed check. The native operation coordinator closes the authorization race in both directions: installation begins only when durable ingest/backup state and active critical-operation permits are safe, and after authorization new ingest lifecycle changes, backups/restores, scans/verifications, enrichment and preview filesystem work fail closed. Permits are RAII-scoped and the coordinator lock is never held during long work. Tauri signature validation remains the trust boundary; this coordination protects recoverability but does not claim an installed upgrade has passed.
 
+Source review now produces a persisted device-local approved ingest plan containing the exact source paths, snapshots, hashes, destination mapping and duplicate disposition. Job creation consumes that plan instead of rescanning. MP4/WAV SD-card scans use the same verified ingest worker with a narrower configurable filter. Global duplicate lookup uses catalogue SHA-256/size only to find candidates; it then resolves a candidate under Master Bin and freshly verifies snapshot, size and SHA-256 before a no-copy completion. Catalogue-only or failed verification is never trusted. Active jobs also reserve content hashes so concurrent jobs cannot independently copy the same bytes unless the user explicitly requests a second physical copy.
+
+Newly registered media requests one coalesced background enrichment pass. FFmpeg/FFprobe failure never blocks ingest and produces no no-op enrichment event. Ordinary thumbnail JPEGs are evicted oldest-first under the configured device-local byte limit; hover-preview storage remains separately governed.
+
 ## Security boundaries
 
 - Tauri capabilities expose only required commands to approved windows.

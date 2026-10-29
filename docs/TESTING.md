@@ -56,3 +56,5 @@ and record its raw results before closing native startup/ingest acceptance.
 - Accessibility tests must exercise keyboard behavior and semantics. Manual assistive-technology checks remain necessary before release.
 - FFmpeg-dependent tests may skip only with a visible reason. CI installs FFmpeg so those paths execute there.
 - Record external application, OS, hardware, and version details for manual evidence.
+
+The SD Grabber/global-deduplication suite uses synthetic card trees and Master Bin files. It covers recursive mixed-case MP4/WAV filtering, metadata exclusion, renamed/different-path SHA-256 matches, stale catalogue-only candidates, corrupted/missing local copies, same-size changed sources, active content reservations, source overlap, thumbnail-cache eviction and the Node adapter's concurrent destination race. UI coverage verifies the detected-card summary and copy-only action. These tests do not prove a particular physical card reader classification; installed Windows acceptance with disposable media remains required.

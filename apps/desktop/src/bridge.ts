@@ -53,6 +53,12 @@ export interface DeviceSettings {
     | 'fewest-recordings'
     | 'custom';
   libraryFolderOrder?: string[];
+  sdGrabberEnabled: boolean;
+  sdGrabberAutoDetect: boolean;
+  sdGrabberExtensions: string[];
+  sdGrabberSearchSubfolders: boolean;
+  sdGrabberRememberDevices: boolean;
+  sdGrabberRecognizedDeviceIds: string[];
 }
 export interface AppInfo {
   version: string;
@@ -247,6 +253,9 @@ export interface InventoryFile {
   kind: 'video' | 'audio' | 'image' | 'camera-support' | 'unknown';
   analysisSupported: boolean;
   preserveHierarchy: boolean;
+  disposition: 'new' | 'already-imported' | 'attention';
+  existingRelativePath?: string;
+  detail?: string;
 }
 export interface InventoryExclusion {
   path: string;
@@ -254,6 +263,7 @@ export interface InventoryExclusion {
   sizeBytes?: number;
 }
 export interface SourceInventory {
+  planId: string;
   files: InventoryFile[];
   excluded: InventoryExclusion[];
   issues: string[];
@@ -261,6 +271,17 @@ export interface SourceInventory {
   totalBytes: number;
   copyFileCount: number;
   copyBytes: number;
+  alreadyImportedFileCount: number;
+  alreadyImportedBytes: number;
+  attentionFileCount: number;
+  attentionBytes: number;
+}
+export interface RemovableVolume {
+  rootPath: string;
+  label: string;
+  identity: string;
+  capacityBytes: number;
+  availableBytes: number;
 }
 export type IngestJobState =
   | 'queued'
@@ -300,6 +321,7 @@ export interface IngestJobFile {
 export interface IngestJob {
   schemaVersion: number;
   id: string;
+  approvedPlanId?: string;
   state: IngestJobState;
   createdAt: string;
   updatedAt: string;
@@ -346,6 +368,12 @@ export const emptySettings = (): DeviceSettings => ({
   sidebarCollapsed: false,
   libraryFolderSort: 'newest',
   libraryFolderOrder: [],
+  sdGrabberEnabled: true,
+  sdGrabberAutoDetect: true,
+  sdGrabberExtensions: ['mp4', 'wav'],
+  sdGrabberSearchSubfolders: true,
+  sdGrabberRememberDevices: true,
+  sdGrabberRecognizedDeviceIds: [],
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],
@@ -406,12 +434,18 @@ export const desktopBridge = {
   },
   inventorySources: (sources: string[], dateOverride?: string) =>
     invoke<SourceInventory>('inventory_sources', { sources, dateOverride }),
+  inventorySdCard: (sources: string[], dateOverride?: string) =>
+    invoke<SourceInventory>('inventory_sd_card', { sources, dateOverride }),
+  listRemovableVolumes: () =>
+    invoke<RemovableVolume[]>('list_removable_volumes'),
   startIngest: (request: {
     jobId: string;
     sources: string[];
     dateOverride?: string;
     renamedDestinations?: Record<string, string>;
     batchTags?: string[];
+    approvedPlanId: string;
+    allowDuplicateCopies?: boolean;
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),

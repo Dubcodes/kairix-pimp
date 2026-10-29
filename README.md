@@ -13,7 +13,7 @@ PIMP does not replace Syncthing or implement another synchronization service. A 
 - **PIMP Light** is the current non-AI Windows beta: verified ingest, catalogue and search, metadata, project assignment, project inventory, manual Premiere path handoff, and a verified external-drive project-backup foundation. It can read compatible AI metadata generated elsewhere but does not ship AI models or inference runtimes. Destructive cleanup and archive consolidation are not implemented.
 - **PIMP Full** will use the same catalogue and application, with optional local workers for transcription, timestamped search, scene and activity descriptions, sound recognition, and suggested tags.
 
-Full-edition AI processing is planned and is not implemented in this milestone.
+Full-edition AI processing is planned and is not implemented in this milestone. The offline, resumable evidence pipeline and timestamped schema proposal are documented in [Local AI media analysis design](docs/LOCAL_AI_ANALYSIS_DESIGN.md).
 
 ## Milestone status
 
@@ -50,6 +50,8 @@ Version `0.1.1-5` is the first public Windows beta candidate. It retains safe fi
 Version `0.1.1-6` is a short-lived pull-request acceptance build for the optimized preview and Premiere Companion milestone. It does not replace the `0.1.1-5` public prerelease, is unsigned, and is available only through the PR's expiring Actions artifacts.
 
 The current reliability branch makes updater checks/installations single-flight, invalidates stale failed-download state, and prevents installation from racing active ingest, backup, scan, verification, enrichment or preview filesystem work. Repeated unchanged full Library verification still hashes files but no longer appends redundant synchronized evidence events. These corrections are automated-test verified only; automatic updates remain non-operational until protected signing configuration and a real installed Windows upgrade pass.
+
+The Ingest page now includes an SD Card Grabber for Windows removable volumes plus manual card-folder selection. Its initial profile recursively selects case-insensitive MP4 and WAV files, freezes the reviewed inventory in a device-local approved plan, and globally compares SHA-256 content with the catalogue. A duplicate is skipped only after PIMP freshly reads an available Master Bin copy, verifies its size/hash, and confirms it did not change during verification; catalogue-only, unavailable or corrupted matches require attention. New files continue through the existing staged, independently verified, atomic no-overwrite ingest. Source cleanup remains disabled. Successful registrations request bounded asynchronous enrichment, and the ordinary thumbnail cache now enforces its configured capacity.
 
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 

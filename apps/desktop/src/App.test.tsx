@@ -40,6 +40,12 @@ const mocks = vi.hoisted(() => ({
     sidebarCollapsed: false,
     libraryFolderSort: 'newest' as const,
     libraryFolderOrder: [],
+    sdGrabberEnabled: true,
+    sdGrabberAutoDetect: false,
+    sdGrabberExtensions: ['mp4', 'wav'],
+    sdGrabberSearchSubfolders: true,
+    sdGrabberRememberDevices: true,
+    sdGrabberRecognizedDeviceIds: [],
   } as DeviceSettings,
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
@@ -61,6 +67,8 @@ const mocks = vi.hoisted(() => ({
   mediaToolsStatus: vi.fn(),
   chooseFiles: vi.fn(),
   inventorySources: vi.fn(),
+  inventorySdCard: vi.fn(),
+  listRemovableVolumes: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
   updaterConfiguration: vi.fn(),
@@ -140,6 +148,8 @@ vi.mock('./bridge', () => ({
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
     inventorySources: mocks.inventorySources,
+    inventorySdCard: mocks.inventorySdCard,
+    listRemovableVolumes: mocks.listRemovableVolumes,
     startIngest: mocks.startIngest,
     cancelIngest: vi.fn(),
     updateMedia: mocks.updateMedia,
@@ -276,6 +286,12 @@ describe('native application integration', () => {
       sidebarCollapsed: false,
       libraryFolderSort: 'newest',
       libraryFolderOrder: [],
+      sdGrabberEnabled: true,
+      sdGrabberAutoDetect: false,
+      sdGrabberExtensions: ['mp4', 'wav'],
+      sdGrabberSearchSubfolders: true,
+      sdGrabberRememberDevices: true,
+      sdGrabberRecognizedDeviceIds: [],
     };
     mocks.saveSettings.mockReset();
     mocks.loadCatalogue.mockReset();
@@ -343,6 +359,7 @@ describe('native application integration', () => {
     mocks.chooseFiles.mockResolvedValue([]);
     mocks.inventorySources.mockReset();
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000001',
       files: [],
       excluded: [],
       issues: [],
@@ -350,7 +367,15 @@ describe('native application integration', () => {
       totalBytes: 0,
       copyFileCount: 0,
       copyBytes: 0,
+      alreadyImportedFileCount: 0,
+      alreadyImportedBytes: 0,
+      attentionFileCount: 0,
+      attentionBytes: 0,
     });
+    mocks.inventorySdCard.mockReset();
+    mocks.inventorySdCard.mockImplementation(mocks.inventorySources);
+    mocks.listRemovableVolumes.mockReset();
+    mocks.listRemovableVolumes.mockResolvedValue([]);
     mocks.updateMedia.mockReset();
     mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
     mocks.openSupportLink.mockReset();
@@ -1031,6 +1056,7 @@ describe('native application integration', () => {
   it('shows a complete source inventory before enabling ingest', async () => {
     mocks.chooseFiles.mockResolvedValue(['E:\\XDROOT\\Clip\\A001.MXF']);
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000002',
       files: [
         {
           sourcePath: 'E:\\XDROOT\\Clip\\A001.MXF',
@@ -1073,6 +1099,76 @@ describe('native application integration', () => {
     ).toBeEnabled();
   });
 
+  it('scans a detected card and clearly separates new and imported files', async () => {
+    mocks.saveSettings.mockImplementation(async (settings) => settings);
+    mocks.listRemovableVolumes.mockResolvedValue([
+      {
+        rootPath: 'E:\\',
+        label: 'CAMERA CARD',
+        identity: 'volume:1234:FAT32:64000000000',
+        capacityBytes: 64_000_000_000,
+        availableBytes: 32_000_000_000,
+      },
+    ]);
+    mocks.inventorySdCard.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000010',
+      files: [
+        {
+          sourcePath: 'E:\\DCIM\\new.mp4',
+          sourceRelativePath: 'DCIM/new.mp4',
+          plannedRelativePath: '20261030/DCIM/new.mp4',
+          sizeBytes: 1_000,
+          kind: 'video',
+          analysisSupported: true,
+          preserveHierarchy: true,
+          disposition: 'new',
+        },
+        {
+          sourcePath: 'E:\\DCIM\\old.wav',
+          sourceRelativePath: 'DCIM/old.wav',
+          plannedRelativePath: '20261030/DCIM/old.wav',
+          sizeBytes: 2_000,
+          kind: 'audio',
+          analysisSupported: true,
+          preserveHierarchy: true,
+          disposition: 'already-imported',
+          existingRelativePath: '20261020/old.wav',
+        },
+      ],
+      excluded: [],
+      issues: [],
+      totalFileCount: 2,
+      totalBytes: 3_000,
+      copyFileCount: 1,
+      copyBytes: 1_000,
+      alreadyImportedFileCount: 1,
+      alreadyImportedBytes: 2_000,
+      attentionFileCount: 0,
+      attentionBytes: 0,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(
+      screen.getByRole('button', { name: /Grab files from SD card/ }),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: /Scan CAMERA CARD/ }),
+    );
+    await waitFor(() =>
+      expect(mocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sdGrabberRecognizedDeviceIds: ['volume:1234:FAT32:64000000000'],
+        }),
+      ),
+    );
+    expect(await screen.findByText(/1 new recording/)).toBeVisible();
+    expect(screen.getByText(/1 already imported/)).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Grab 1 new file' }),
+    ).toBeEnabled();
+  });
+
   it('renders 63 long planned paths as bounded semantic rows', async () => {
     const files = Array.from({ length: 63 }, (_, index) => {
       const name = `DJI_20261028_${String(index).padStart(4, '0')}_VERY_LONG_CAMERA_RECORDING_NAME.MP4`;
@@ -1089,6 +1185,7 @@ describe('native application integration', () => {
     });
     mocks.chooseFiles.mockResolvedValue(files.map((file) => file.sourcePath));
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000003',
       files,
       excluded: [
         {
@@ -1128,6 +1225,7 @@ describe('native application integration', () => {
   it('persists newly created batch tags in the ingest request', async () => {
     mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000004',
       files: [
         {
           sourcePath: 'E:\\DCIM\\clip.mp4',

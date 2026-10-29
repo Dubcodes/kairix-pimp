@@ -24,9 +24,12 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
 - Implemented reliability correction: updater checks/installations are single-flight, failed checks and interrupted downloads cannot leave reusable stale state, critical filesystem operations share a native exclusion gate with installation, and publication verifies version/build/checksum/signature evidence before promoting a channel manifest
 - Implemented discovery correction: filesystem traversal/hashing runs on a blocking worker with streamed entries, repeated unchanged full verification emits no synchronized evidence event, and append failure retains stable retry evidence
+- Implemented approved ingest plans and global content deduplication: exact reviewed sources/destinations survive into the durable job; SHA-256 candidates are skipped only after a fresh stable local Master Bin verification; concurrent jobs reserve hashes
+- Implemented initial SD Card Grabber: Windows removable-volume enumeration with volume identity, manual folder fallback, recursive configurable MP4/WAV filtering, new/imported/attention summary, and copy-only verified ingest
+- Implemented ingest-triggered coalesced enrichment and ordinary-thumbnail byte-limit eviction; physical-card and installed Windows acceptance remain
 - Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history
-- Native notification watcher, bounded thumbnail eviction, folder notes and field-level conflict resolution workflow
+- Native notification watcher, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
@@ -46,6 +49,8 @@ Keep direct DCM Master Bin references, dated bins and an optional virtual Audio 
 ## Milestone 4 — Full AI
 
 Add a separately packaged worker protocol, queue, resource governor, cache, and versioned results. Evaluate whisper.cpp for compact cross-platform distribution and faster-whisper where CUDA throughput justifies Python/CTranslate2 packaging. Add frame-sampled vision and audio-event models only after benchmark and licensing review. No model is bundled in Light.
+
+The proposed offline staged pipeline, timestamped observation/result schema, model provenance boundary and phased resource-validation plan are recorded in `LOCAL_AI_ANALYSIS_DESIGN.md`; implementation and model selection remain future work.
 
 ## Milestone 5 — verified consolidation/archive
 

@@ -50,6 +50,7 @@ import {
   type ProjectRecord,
   type ProvisionalMetadataPatch,
   type SourceInventory,
+  type RemovableVolume,
   type UpdaterConfiguration,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
@@ -155,6 +156,12 @@ export function App() {
   const [inventory, setInventory] = useState<SourceInventory>();
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryError, setInventoryError] = useState('');
+  const [sdGrabberMode, setSdGrabberMode] = useState(false);
+  const [removableVolumes, setRemovableVolumes] = useState<RemovableVolume[]>(
+    [],
+  );
+  const [showSdGrabber, setShowSdGrabber] = useState(false);
+  const [allowDuplicateCopies, setAllowDuplicateCopies] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -466,8 +473,10 @@ export function App() {
         : dateOverride === 'choose'
           ? chosenDate || undefined
           : dateOverride;
-    void desktopBridge
-      .inventorySources(sources, previewDateOverride)
+    const request = sdGrabberMode
+      ? desktopBridge.inventorySdCard(sources, previewDateOverride)
+      : desktopBridge.inventorySources(sources, previewDateOverride);
+    void request
       .then((result) => {
         if (current) {
           setInventory(result);
@@ -483,7 +492,40 @@ export function App() {
     return () => {
       current = false;
     };
-  }, [native, sources, dateOverride, chosenDate]);
+  }, [
+    native,
+    sources,
+    dateOverride,
+    chosenDate,
+    sdGrabberMode,
+    settings.sdGrabberExtensions,
+    settings.sdGrabberSearchSubfolders,
+  ]);
+
+  useEffect(() => {
+    if (
+      !native ||
+      view !== 'Ingest' ||
+      !settings.sdGrabberEnabled ||
+      !settings.sdGrabberAutoDetect
+    )
+      return;
+    let current = true;
+    const refreshVolumes = () => {
+      void desktopBridge
+        .listRemovableVolumes()
+        .then((volumes) => {
+          if (current) setRemovableVolumes(volumes);
+        })
+        .catch(() => undefined);
+    };
+    refreshVolumes();
+    const timer = window.setInterval(refreshVolumes, 5_000);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [native, settings.sdGrabberAutoDetect, settings.sdGrabberEnabled, view]);
   useEffect(() => {
     if (!native || !configured) return;
     let disposed = false;
@@ -808,6 +850,7 @@ export function App() {
   const addFiles = async () => {
     const chosen = await desktopBridge.chooseFiles();
     if (chosen.length) {
+      setSdGrabberMode(false);
       setInventory(undefined);
       setInventoryError('');
       setInventoryLoading(true);
@@ -817,14 +860,50 @@ export function App() {
   const addFolder = async () => {
     const path = await desktopBridge.chooseFolder();
     if (path) {
+      setSdGrabberMode(false);
       setInventory(undefined);
       setInventoryError('');
       setInventoryLoading(true);
       setSources((current) => [...new Set([...current, path])]);
     }
   };
+  const scanSdSource = (path: string, identity?: string) => {
+    if (
+      identity &&
+      settings.sdGrabberRememberDevices &&
+      !settings.sdGrabberRecognizedDeviceIds.includes(identity)
+    ) {
+      persistPreference({
+        sdGrabberRecognizedDeviceIds: [
+          ...settings.sdGrabberRecognizedDeviceIds,
+          identity,
+        ],
+      });
+    }
+    setSdGrabberMode(true);
+    setShowSdGrabber(true);
+    setInventory(undefined);
+    setInventoryError('');
+    setInventoryLoading(true);
+    setSources([path]);
+  };
+  const chooseSdSource = async () => {
+    const path = await desktopBridge.chooseFolder();
+    if (path) scanSdSource(path);
+  };
+  const refreshRemovableVolumes = async () => {
+    try {
+      setRemovableVolumes(await desktopBridge.listRemovableVolumes());
+    } catch (reason) {
+      setInventoryError(errorText(reason));
+    }
+  };
   const ingest = async (renamedDestinations: Record<string, string> = {}) => {
     if (!sources.length) return;
+    if (!inventory?.planId) {
+      setError('Scan and review the selected source before starting ingest.');
+      return;
+    }
     setStartingIngest(true);
     setError('');
     setMessage('');
@@ -841,6 +920,8 @@ export function App() {
               : dateOverride,
         renamedDestinations,
         batchTags: ingestBatchTags,
+        approvedPlanId: inventory.planId,
+        allowDuplicateCopies,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -850,6 +931,8 @@ export function App() {
       setConflicts([]);
       setRenames({});
       setIngestBatchTags([]);
+      setAllowDuplicateCopies(false);
+      setSdGrabberMode(false);
       setJobsOpen(true);
       setMessage(
         `Ingest queued with ${job.files.length} file${job.files.length === 1 ? '' : 's'}. You can keep browsing and edit metadata now.`,
@@ -2170,6 +2253,91 @@ export function App() {
                       month; mm is minute.
                     </small>
                   </label>
+                  <fieldset>
+                    <legend>SD Card Grabber</legend>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberEnabled: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Enable SD Card Grabber
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberAutoDetect}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberAutoDetect: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Detect removable cards automatically
+                    </label>
+                    <label>
+                      Included file extensions
+                      <input
+                        value={settings.sdGrabberExtensions.join(', ')}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberExtensions: event.target.value
+                              .split(',')
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          })
+                        }
+                      />
+                      <small>
+                        Defaults to MP4 and WAV; matching ignores case.
+                      </small>
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberSearchSubfolders}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberSearchSubfolders: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Search subfolders
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberRememberDevices}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberRememberDevices: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Remember recognised device identities
+                    </label>
+                    <label title="Source cleanup is not implemented">
+                      <input type="checkbox" checked={false} disabled /> Offer
+                      source cleanup after independent verification
+                    </label>
+                    <small>
+                      Cleanup remains disabled. The Grabber copies, verifies and
+                      registers media without modifying the card.
+                    </small>
+                  </fieldset>
                   <div className="settings-explainer">
                     New external files require repeated stable observations and
                     SHA-256 verification. PIMP never replaces a destination on
@@ -3166,6 +3334,62 @@ export function App() {
         ) : view === 'Ingest' ? (
           <section className="ingest">
             <div className="drop">
+              <button
+                type="button"
+                className="primary"
+                disabled={!settings.sdGrabberEnabled}
+                onClick={() => {
+                  setShowSdGrabber((current) => !current);
+                  void refreshRemovableVolumes();
+                }}
+              >
+                <HardDrive size={18} /> Grab files from SD card
+              </button>
+              {showSdGrabber && (
+                <div className="source-list" aria-label="SD Card Grabber">
+                  <strong>SD Card Grabber</strong>
+                  <small>
+                    Scans only {settings.sdGrabberExtensions.join(', ')} files
+                    and copies verified new recordings. Nothing is deleted from
+                    the card.
+                  </small>
+                  {removableVolumes.map((volume) => (
+                    <div className="button-row" key={volume.identity}>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          scanSdSource(volume.rootPath, volume.identity)
+                        }
+                      >
+                        Scan {volume.label} ({volume.rootPath})
+                      </button>
+                      <small>
+                        {size(volume.availableBytes)} free of{' '}
+                        {size(volume.capacityBytes)}
+                        {settings.sdGrabberRecognizedDeviceIds.includes(
+                          volume.identity,
+                        )
+                          ? ' · Recognised card'
+                          : ''}
+                      </small>
+                    </div>
+                  ))}
+                  {removableVolumes.length === 0 && (
+                    <small className="pending">
+                      No Windows removable volume detected. Some card readers
+                      appear as fixed drives; choose the card folder manually.
+                    </small>
+                  )}
+                  <div className="button-row">
+                    <button type="button" onClick={chooseSdSource}>
+                      Choose card folder manually
+                    </button>
+                    <button type="button" onClick={refreshRemovableVolumes}>
+                      Refresh devices
+                    </button>
+                  </div>
+                </div>
+              )}
               <UploadCloud size={42} />
               <h2>Drop camera media here</h2>
               <p>
@@ -3198,6 +3422,8 @@ export function App() {
                       setInventoryError('');
                       setConflicts([]);
                       setRenames({});
+                      setSdGrabberMode(false);
+                      setAllowDuplicateCopies(false);
                     }}
                   >
                     Clear
@@ -3217,9 +3443,37 @@ export function App() {
               {inventory && (
                 <div className="source-list" aria-label="Source inventory">
                   <strong>
-                    {inventory.copyFileCount} of {inventory.totalFileCount}{' '}
-                    files will be copied ({size(inventory.copyBytes)})
+                    {sdGrabberMode
+                      ? `${inventory.copyFileCount} new recording${inventory.copyFileCount === 1 ? '' : 's'} — ${size(inventory.copyBytes)}`
+                      : `${inventory.copyFileCount} of ${inventory.totalFileCount} files will be copied (${size(inventory.copyBytes)})`}
                   </strong>
+                  {sdGrabberMode && (
+                    <>
+                      <small>
+                        {inventory.alreadyImportedFileCount} already imported —{' '}
+                        {size(inventory.alreadyImportedBytes)}
+                      </small>
+                      <small
+                        className={
+                          inventory.attentionFileCount ? 'error' : undefined
+                        }
+                      >
+                        {inventory.attentionFileCount} require attention —{' '}
+                        {size(inventory.attentionBytes)}
+                      </small>
+                    </>
+                  )}
+                  {!sdGrabberMode &&
+                    (inventory.alreadyImportedFileCount ?? 0) > 0 && (
+                      <small>
+                        {inventory.alreadyImportedFileCount} verified global
+                        duplicate
+                        {inventory.alreadyImportedFileCount === 1
+                          ? ''
+                          : 's'}{' '}
+                        will be skipped ({size(inventory.alreadyImportedBytes)})
+                      </small>
+                    )}
                   <small>
                     {
                       inventory.files.filter((file) => file.preserveHierarchy)
@@ -3261,8 +3515,11 @@ export function App() {
                           <span role="cell">
                             <b>Destination</b>
                             <code title={file.plannedRelativePath}>
-                              {file.plannedRelativePath}
+                              {file.disposition === 'already-imported'
+                                ? `Already imported: ${file.existingRelativePath}`
+                                : file.plannedRelativePath}
                             </code>
+                            {file.detail && <small>{file.detail}</small>}
                           </span>
                         </div>
                       ))}
@@ -3366,13 +3623,26 @@ export function App() {
                   ))}
                 </div>
               )}
+              {(inventory?.alreadyImportedFileCount ?? 0) > 0 && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowDuplicateCopies}
+                    onChange={(event) =>
+                      setAllowDuplicateCopies(event.target.checked)
+                    }
+                  />{' '}
+                  Intentionally create additional physical copies of verified
+                  duplicates
+                </label>
+              )}
               <button
                 className="primary"
                 disabled={
                   startingIngest ||
                   inventoryLoading ||
                   !inventory ||
-                  inventory.copyFileCount === 0 ||
+                  (inventory.copyFileCount === 0 && !allowDuplicateCopies) ||
                   !sources.length ||
                   (dateOverride === 'choose' && !chosenDate)
                 }
@@ -3388,7 +3658,11 @@ export function App() {
               >
                 {startingIngest
                   ? 'Creating ingest job…'
-                  : 'Start verified ingest'}
+                  : sdGrabberMode
+                    ? allowDuplicateCopies
+                      ? `Grab ${(inventory?.copyFileCount ?? 0) + (inventory?.alreadyImportedFileCount ?? 0)} files including requested duplicates`
+                      : `Grab ${inventory?.copyFileCount ?? 0} new file${inventory?.copyFileCount === 1 ? '' : 's'}`
+                    : 'Start verified ingest'}
               </button>
             </div>
           </section>
