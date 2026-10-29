@@ -55,6 +55,9 @@ Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 - Light contains the complete non-AI application and may read compatible AI results, but must not import or ship AI runtimes, models, or processing dependencies.
 - Full uses the same catalogue and schemas and adds optional, isolated local AI workers. AI must not block ingest or browsing.
 - Do not claim Premiere functionality without testing against a supported Premiere installation and documented UXP APIs. Never manipulate undocumented `.prproj` internals.
+- Integrate remote storage only through documented provider interfaces or explicit written authorization. Do not ship reverse-engineered private endpoints, browser impersonation, persisted browser sessions, or browser automation as an unattended backup mechanism.
+- Treat upload acknowledgement and remote listing as verification-pending. A cloud backup is verified only after PIMP independently reads every stored object through a supported interface and matches its expected size and SHA-256.
+- Keep provider credentials and refresh tokens in the operating-system credential store, redact them from diagnostics, and never place them in portable manifests, synchronized metadata, command-line arguments, repository files, or ordinary logs.
 - Preserve the exact ingest labels **Use today's date** and **Use original file dates** as visible radio choices.
 
 ## Tests, documentation, and Git

@@ -37,6 +37,8 @@ Affected domain rules: <DR IDs and how they are preserved>.
 Affected architecture/data flows: <components and adapters>.
 Security/destructive-operation review: <risks and controls>.
 
+For an external service or third-party client, identify the documented supported interface or written authorization, authentication/credential-storage boundary, independent verification method, Windows/runtime support, dependency and license compatibility, retry/interruption semantics, and prohibited private/undocumented mechanisms. Upload acknowledgement, listings and browser-driven transfer are not backup verification.
+
 Use the smallest maintainable change. Keep portable logic out of UI/OS adapters, preserve stable IDs and relative paths, and do not redesign unrelated areas. If a requirement conflicts with a domain rule or accepted decision, stop and document the decision before implementing.
 
 ## Implementation and verification
@@ -50,6 +52,8 @@ npm run build
 npm audit --audit-level=high
 
 Run native/external checks only when their prerequisites are genuinely available. Never claim browser tests prove Tauri, camera, Syncthing, Premiere, or archive behavior.
+
+For remote storage, do not claim verification until PIMP independently reads every stored object through the supported provider interface and compares it with the immutable manifest. Record blocked or manual-only exercises as inconclusive rather than passed.
 
 Update the relevant README/docs/roadmap/decision log alongside substantive changes. Inspect the final diff and repository-local worktree state. Commit and push through the existing safe workflow only when the task explicitly requests it.
 

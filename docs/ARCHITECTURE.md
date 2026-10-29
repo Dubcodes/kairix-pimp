@@ -89,7 +89,9 @@ Full-edition analysis runs behind an optional process-isolated `AiProcessor` con
 
 The first provider-neutral backup adapter operates below future Premiere collection: it inventories an entire known Working Project, stages on a separately selected destination volume, promotes without overwrite and emits an immutable portable SHA-256 manifest only after a full destination reread. Mutable progress, absolute roots and destination-volume identity remain device-local in `backup-jobs.json`; active states become explicit interrupted work after restart. Verified generations can be rechecked and restored to a separate empty directory. This proves copied bytes, not Premiere dependency completeness or archive independence.
 
-Cloud providers consume the same manifest boundary. Upload completion is distinct from remote verification, which requires independent object reads and hash comparison. Degoo remains an explicit browser handoff because no supported unattended API was identified; browser sessions/private endpoints are not application dependencies.
+Cloud providers consume the same manifest boundary. Upload acknowledgement, a remote listing, provider-side size metadata, and a provider checksum with undocumented semantics remain verification-pending. Verification requires PIMP to independently read every remote object through a documented provider interface and compare its bytes or SHA-256 with the immutable local manifest. Provider authentication belongs behind a narrow adapter and operating-system credential storage; secrets, refresh tokens and browser sessions never enter portable manifests, synchronized metadata, command-line arguments or ordinary logs.
+
+Degoo remains an explicit official-browser handoff because no supported unattended API was identified. The reviewed community client demonstrates a historic reverse-engineered web protocol, not an approved integration contract: it depends on private endpoints, observed client keys/headers and browser-fingerprint impersonation, and it does not provide reliable Windows operation or independent restored-byte verification. PIMP does not copy that client, call those endpoints, retain its authentication material or treat browser automation as an unattended backup adapter. Native Degoo work requires a documented supported interface or written provider authorization before implementation.
 
 The standalone Premiere Companion UXP proof of concept uses documented active-project, import, folder/bin and media-path APIs. For its first boundary, PIMP creates a versioned, user-selected, no-overwrite interchange manifest containing only the explicit physical selection and validated canonical Master Bin paths. This avoids a persistent localhost service or network permission. The extension reconciles Premiere's observed media paths and never edits `.prproj` internals. Real Premiere/UXP acceptance remains open.
 
@@ -115,6 +117,8 @@ Completed projects retain lightweight searchable catalogue records even when arc
 - Canonicalize and validate filesystem roots, symlinks/junctions, reserved names, Unicode, and case collisions.
 - Invoke processes without shell interpolation; constrain executable discovery and arguments.
 - Store a future Syncthing API key in the OS credential store and never in synchronized metadata/logs.
+- Store any future provider access/refresh tokens in the OS credential store; never accept credentials through process arguments or persist browser cookies/sessions as application integration state.
+- Use only documented provider interfaces or explicit written authorization, and fail cloud verification closed until independently restored bytes match the portable manifest.
 - Treat media metadata, AI output, event files, Premiere data, and external tool output as untrusted input.
 - Destructive actions require distinct review and explicit user authorization; none exist in the current milestone.
 
