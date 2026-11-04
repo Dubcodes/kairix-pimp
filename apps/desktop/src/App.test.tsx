@@ -68,6 +68,9 @@ const mocks = vi.hoisted(() => ({
   chooseFiles: vi.fn(),
   inventorySources: vi.fn(),
   inventorySdCard: vi.fn(),
+  cancelInventory: vi.fn(),
+  listBackgroundOperations: vi.fn(),
+  reapproveIngestDestinations: vi.fn(),
   listRemovableVolumes: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
@@ -149,6 +152,9 @@ vi.mock('./bridge', () => ({
     chooseFiles: mocks.chooseFiles,
     inventorySources: mocks.inventorySources,
     inventorySdCard: mocks.inventorySdCard,
+    cancelInventory: mocks.cancelInventory,
+    listBackgroundOperations: mocks.listBackgroundOperations,
+    reapproveIngestDestinations: mocks.reapproveIngestDestinations,
     listRemovableVolumes: mocks.listRemovableVolumes,
     startIngest: mocks.startIngest,
     cancelIngest: vi.fn(),
@@ -373,6 +379,11 @@ describe('native application integration', () => {
       attentionBytes: 0,
     });
     mocks.inventorySdCard.mockReset();
+    mocks.cancelInventory.mockReset();
+    mocks.cancelInventory.mockResolvedValue(undefined);
+    mocks.listBackgroundOperations.mockReset();
+    mocks.listBackgroundOperations.mockResolvedValue([]);
+    mocks.reapproveIngestDestinations.mockReset();
     mocks.inventorySdCard.mockImplementation(mocks.inventorySources);
     mocks.listRemovableVolumes.mockReset();
     mocks.listRemovableVolumes.mockResolvedValue([]);
@@ -1167,6 +1178,46 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('button', { name: 'Grab 1 new file' }),
     ).toBeEnabled();
+  });
+
+  it('shows cancellable checksum progress in Background Operations', async () => {
+    mocks.listBackgroundOperations.mockResolvedValue([
+      {
+        id: '00000000-0000-4000-8000-000000000099',
+        kind: 'source-inventory',
+        title: 'SD-card inventory and duplicate verification',
+        state: 'running',
+        stage: 'Calculating checksums',
+        currentItem: 'A001.MP4',
+        completedItems: 3,
+        totalItems: 10,
+        bytesCompleted: 256,
+        bytesTotal: 1024,
+        counts: {
+          newFiles: 2,
+          duplicateFiles: 1,
+          attentionFiles: 0,
+          failedFiles: 0,
+        },
+        cancellable: true,
+        pausable: false,
+        retryable: false,
+        startedAt: '2026-10-31T00:00:00Z',
+        updatedAt: '2026-10-31T00:00:01Z',
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    expect(
+      screen.getByRole('region', { name: 'Background Operations' }),
+    ).toBeVisible();
+    expect(screen.getByText(/Calculating checksums · A001.MP4/)).toBeVisible();
+    expect(screen.getByText(/0 KB \/ 1 KB read/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Cancel scan' }));
+    expect(mocks.cancelInventory).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000099',
+    );
   });
 
   it('renders 63 long planned paths as bounded semantic rows', async () => {

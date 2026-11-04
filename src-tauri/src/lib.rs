@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
+    time::Instant,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
@@ -55,6 +56,7 @@ struct NativeState {
     enrichment_write: Mutex<()>,
     enrichment_worker_active: Mutex<bool>,
     enrichment_requested: Mutex<bool>,
+    enrichment_status: Mutex<Option<BackgroundOperation>>,
     job_store: Mutex<()>,
     worker_active: Mutex<bool>,
     availability: Mutex<HashMap<String, (String, bool)>>,
@@ -62,6 +64,9 @@ struct NativeState {
     operations: Mutex<OperationCoordinator>,
     preview_generation: Mutex<()>,
     backup_job_store: Mutex<()>,
+    inventory_worker: Mutex<()>,
+    inventory_cancelled: Mutex<HashSet<String>>,
+    inventory_status: Mutex<Option<BackgroundOperation>>,
 }
 
 #[derive(Default)]
@@ -340,6 +345,8 @@ struct IngestRequest {
     approved_plan_id: Option<String>,
     #[serde(default)]
     allow_duplicate_copies: bool,
+    #[serde(default)]
+    allow_unverified_reimport: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -381,11 +388,21 @@ struct InventoryExclusion {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct InventoryConflict {
+    source_path: String,
+    destination_path: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct SourceInventory {
     plan_id: String,
     files: Vec<InventoryFile>,
     excluded: Vec<InventoryExclusion>,
     issues: Vec<String>,
+    #[serde(default)]
+    conflicts: Vec<InventoryConflict>,
     total_file_count: usize,
     total_bytes: u64,
     copy_file_count: usize,
@@ -417,6 +434,8 @@ struct ApprovedIngestFile {
     source_size: u64,
     source_modified_millis: Option<u128>,
     source_sha256: Option<String>,
+    #[serde(default)]
+    source_volume_identity: Option<String>,
     existing_media_id: Option<String>,
 }
 
@@ -484,6 +503,8 @@ struct IngestJobFile {
     #[serde(default)]
     approved_sha256: Option<String>,
     #[serde(default)]
+    source_volume_identity: Option<String>,
+    #[serde(default)]
     duplicate_existing_relative_path: Option<String>,
     #[serde(default)]
     intentional_duplicate: bool,
@@ -530,6 +551,37 @@ struct IngestProgress {
     files_total: usize,
     bytes_complete: u64,
     bytes_total: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct OperationCounts {
+    new_files: usize,
+    duplicate_files: usize,
+    attention_files: usize,
+    failed_files: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundOperation {
+    id: String,
+    kind: String,
+    title: String,
+    state: String,
+    stage: String,
+    current_item: Option<String>,
+    completed_items: usize,
+    total_items: Option<usize>,
+    bytes_completed: u64,
+    bytes_total: Option<u64>,
+    counts: OperationCounts,
+    cancellable: bool,
+    pausable: bool,
+    retryable: bool,
+    error: Option<String>,
+    started_at: String,
+    updated_at: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -631,6 +683,104 @@ fn load_approved_plan(app: &AppHandle, plan_id: &str) -> Result<ApprovedIngestPl
         return Err("Approved ingest plan is missing; scan the source again".into());
     }
     read_json(&path)
+}
+
+#[tauri::command]
+fn reapprove_ingest_destinations(
+    app: AppHandle,
+    plan_id: String,
+    renamed_destinations: HashMap<String, String>,
+) -> Result<SourceInventory, String> {
+    if renamed_destinations.is_empty() {
+        return Err("Enter at least one explicit replacement filename".into());
+    }
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut plan = load_approved_plan(&app, &plan_id)?;
+    if plan.schema_version != 1 || plan.master_bin_path != settings.master_bin_path {
+        return Err("The approved plan is stale; scan the source again".into());
+    }
+    let known_sources = plan
+        .files
+        .iter()
+        .map(|file| file.inventory.source_path.clone())
+        .collect::<HashSet<_>>();
+    if renamed_destinations
+        .keys()
+        .any(|source| !known_sources.contains(source))
+    {
+        return Err("A destination rename does not belong to the approved plan".into());
+    }
+    let mut planned = HashSet::new();
+    for approved in &mut plan.files {
+        if let Some(filename) = renamed_destinations.get(&approved.inventory.source_path) {
+            let filename = fs_safe::validate_relative(filename.trim())?;
+            if filename.components().count() != 1 {
+                return Err("Conflict resolution accepts a filename, not a folder path".into());
+            }
+            let current = Path::new(&approved.inventory.planned_relative_path);
+            let parent = current.parent().unwrap_or_else(|| Path::new(""));
+            approved.inventory.planned_relative_path = portable_relative(&parent.join(filename));
+            approved.inventory.disposition = "new".into();
+            approved.inventory.detail = None;
+            approved.inventory.existing_relative_path = None;
+            approved.existing_media_id = None;
+        }
+        let destination =
+            fs_safe::resolve_for_create(&master, &approved.inventory.planned_relative_path)?;
+        if destination.exists() {
+            return Err(format!(
+                "The reviewed destination already exists: {}",
+                approved.inventory.planned_relative_path
+            ));
+        }
+        if !planned.insert(
+            approved
+                .inventory
+                .planned_relative_path
+                .to_ascii_lowercase(),
+        ) {
+            return Err("Two reviewed files still use the same destination".into());
+        }
+    }
+    plan.id = Uuid::new_v4().to_string();
+    plan.created_at = Utc::now().to_rfc3339();
+    plan.inventory.plan_id = plan.id.clone();
+    plan.inventory.files = plan
+        .files
+        .iter()
+        .map(|file| file.inventory.clone())
+        .collect();
+    plan.inventory.conflicts.clear();
+    plan.inventory.copy_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .count();
+    plan.inventory.copy_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .map(|file| file.size_bytes)
+        .sum();
+    plan.inventory.attention_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .count();
+    plan.inventory.attention_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .map(|file| file.size_bytes)
+        .sum();
+    save_approved_plan(&app, &plan)?;
+    let _ = fs::remove_file(approved_plan_path(&app, &plan_id)?);
+    Ok(plan.inventory)
 }
 
 fn backup_jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1602,18 +1752,33 @@ fn inventory_candidate(
     });
 }
 
+#[cfg(test)]
 fn build_source_inventory(sources: &[String]) -> SourceInventory {
     build_source_inventory_filtered(sources, None, true)
 }
 
+#[cfg(test)]
 fn build_source_inventory_filtered(
     sources: &[String],
     allowed_extensions: Option<&HashSet<String>>,
     recursive: bool,
 ) -> SourceInventory {
+    build_source_inventory_filtered_with_progress(sources, allowed_extensions, recursive, |_, _| {
+        Ok(())
+    })
+    .expect("no-op inventory progress cannot fail")
+}
+
+fn build_source_inventory_filtered_with_progress(
+    sources: &[String],
+    allowed_extensions: Option<&HashSet<String>>,
+    recursive: bool,
+    mut progress: impl FnMut(&SourceInventory, &Path) -> Result<(), String>,
+) -> Result<SourceInventory, String> {
     let mut inventory = SourceInventory::default();
     for source in sources {
         let path = PathBuf::from(source);
+        progress(&inventory, &path)?;
         if path.is_file() {
             let relative = PathBuf::from(path.file_name().unwrap_or_default());
             let root = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1625,6 +1790,7 @@ fn build_source_inventory_filtered(
                 false,
                 allowed_extensions,
             );
+            progress(&inventory, &path)?;
         } else if path.is_dir() {
             let root_is_package = package_component(&path);
             let walker = if recursive {
@@ -1644,8 +1810,9 @@ fn build_source_inventory_filtered(
                             root_is_package,
                             allowed_extensions,
                         );
+                        progress(&inventory, entry.path())?;
                     }
-                    Ok(_) => {}
+                    Ok(entry) => progress(&inventory, entry.path())?,
                     Err(error) => inventory.issues.push(format!(
                         "Cannot inventory {}: {error}",
                         error.path().unwrap_or(&path).display()
@@ -1763,7 +1930,7 @@ fn build_source_inventory_filtered(
     }
     inventory.copy_file_count = inventory.files.len();
     inventory.copy_bytes = inventory.files.iter().map(|file| file.size_bytes).sum();
-    inventory
+    Ok(inventory)
 }
 
 fn classify_global_duplicate(
@@ -1835,7 +2002,7 @@ fn classify_global_duplicate(
     )
 }
 
-fn approved_source_matches(path: &Path, approved: &ApprovedIngestFile) -> bool {
+fn approved_source_snapshot_matches(path: &Path, approved: &ApprovedIngestFile) -> bool {
     let Ok(snapshot) = fs_safe::snapshot(path) else {
         return false;
     };
@@ -1844,20 +2011,23 @@ fn approved_source_matches(path: &Path, approved: &ApprovedIngestFile) -> bool {
     {
         return false;
     }
-    approved
-        .source_sha256
-        .as_deref()
-        .map(|expected| sha256(path).as_deref() == Ok(expected))
-        .unwrap_or(true)
-        && fs_safe::snapshot(path).as_ref() == Ok(&snapshot)
+    if let Some(expected_volume) = approved.source_volume_identity.as_deref() {
+        if volume_identity_for_path(path).ok().flatten().as_deref() != Some(expected_volume) {
+            return false;
+        }
+    }
+    fs_safe::snapshot(path).as_ref() == Ok(&snapshot)
 }
 
 fn create_approved_inventory(
     app: &AppHandle,
+    state: &NativeState,
+    operation_id: &str,
     sources: Vec<String>,
     date_override: Option<String>,
     sd_grabber: bool,
 ) -> Result<SourceInventory, String> {
+    check_inventory_cancelled(state, operation_id)?;
     let settings = load_settings_file(&app)?;
     if sd_grabber && !settings.sd_grabber_enabled {
         return Err("Enable SD Card Grabber in Settings before scanning a card".into());
@@ -1892,15 +2062,37 @@ fn create_approved_inventory(
         .iter()
         .map(|value| value.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    let mut inventory = if sd_grabber {
-        build_source_inventory_filtered(
-            &sources,
-            Some(&allowed),
-            settings.sd_grabber_search_subfolders,
-        )
-    } else {
-        build_source_inventory(&sources)
-    };
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.state = "running".into();
+        operation.stage = "Enumerating".into();
+        operation.current_item = None;
+        operation.completed_items = 0;
+        operation.total_items = None;
+        operation.bytes_completed = 0;
+        operation.bytes_total = None;
+    });
+    let mut inventory = build_source_inventory_filtered_with_progress(
+        &sources,
+        sd_grabber.then_some(&allowed),
+        !sd_grabber || settings.sd_grabber_search_subfolders,
+        |progress, path| {
+            check_inventory_cancelled(state, operation_id)?;
+            update_inventory_operation(state, operation_id, |operation| {
+                operation.completed_items = progress.total_file_count;
+                operation.current_item = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+            });
+            Ok(())
+        },
+    )?;
+    check_inventory_cancelled(state, operation_id)?;
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.stage = "Inspecting files".into();
+        operation.completed_items = 0;
+        operation.total_items = Some(inventory.files.len());
+        operation.bytes_total = Some(inventory.files.iter().map(|file| file.size_bytes).sum());
+    });
     let catalogue = load_catalogue_file(&settings)?;
     let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
     for item in &catalogue.media {
@@ -1909,9 +2101,10 @@ fn create_approved_inventory(
             .or_default()
             .push(item);
     }
-    let mut approved_files = Vec::new();
-    let mut selection_hashes = HashMap::<String, String>::new();
-    for file in &mut inventory.files {
+    let mut snapshots = Vec::with_capacity(inventory.files.len());
+    let mut volume_identities = HashMap::<String, Option<String>>::new();
+    for (index, file) in inventory.files.iter_mut().enumerate() {
+        check_inventory_cancelled(state, operation_id)?;
         let filename = Path::new(&file.source_path)
             .file_name()
             .unwrap_or_default()
@@ -1927,20 +2120,61 @@ fn create_approved_inventory(
         )?;
         let source = PathBuf::from(&file.source_path);
         let snapshot = fs_safe::snapshot(&source)?;
+        let volume_identity = volume_identities
+            .entry(file.source_root_path.clone())
+            .or_insert_with(|| volume_identity_for_path(&source).ok().flatten())
+            .clone();
+        snapshots.push((snapshot, volume_identity));
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.completed_items = index + 1;
+            operation.current_item = Some(filename);
+        });
+    }
+
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.stage = "Calculating checksums".into();
+        operation.completed_items = 0;
+        operation.bytes_completed = 0;
+    });
+    let mut source_hashes = Vec::with_capacity(inventory.files.len());
+    let mut bytes_read = 0_u64;
+    for (index, file) in inventory.files.iter().enumerate() {
+        check_inventory_cancelled(state, operation_id)?;
+        let source = PathBuf::from(&file.source_path);
+        let hash = sha256_inventory(&source, state, operation_id, &mut bytes_read)?;
+        source_hashes.push(hash);
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.completed_items = index + 1;
+            operation.current_item = source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+        });
+    }
+
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.stage = "Checking duplicates".into();
+        operation.completed_items = 0;
+    });
+    let mut approved_files = Vec::new();
+    let mut selection_hashes = HashMap::<String, String>::new();
+    for (index, file) in inventory.files.iter_mut().enumerate() {
+        check_inventory_cancelled(state, operation_id)?;
+        let (snapshot, source_volume_identity) = &snapshots[index];
+        let hash = &source_hashes[index];
+        let source = PathBuf::from(&file.source_path);
         let mut existing_media_id = None;
-        let hash = sha256(&source)?;
-        if fs_safe::snapshot(&source)? != snapshot {
+        if fs_safe::snapshot(&source)? != *snapshot {
             file.disposition = "attention".into();
             file.detail =
                 Some("Source changed while the approved inventory was being built".into());
-        } else if let Some(relative_path) = selection_hashes.get(&hash) {
+        } else if let Some(relative_path) = selection_hashes.get(hash) {
             file.disposition = "already-imported".into();
             file.existing_relative_path = Some(relative_path.clone());
             file.detail = Some("Duplicate recording within this approved selection".into());
         } else {
-            let candidates = hash_index.get(&hash).map(Vec::as_slice).unwrap_or(&[]);
+            let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
             let (disposition, media_id, relative_path, detail) =
-                classify_global_duplicate(&settings, candidates, snapshot.length, &hash);
+                classify_global_duplicate(&settings, candidates, snapshot.length, hash);
             file.disposition = disposition;
             file.existing_relative_path = relative_path;
             file.detail = detail;
@@ -1949,12 +2183,41 @@ fn create_approved_inventory(
                 selection_hashes.insert(hash.clone(), file.planned_relative_path.clone());
             }
         }
+        if file.disposition != "already-imported" {
+            let destination = fs_safe::resolve_for_create(&master, &file.planned_relative_path)?;
+            if destination.exists() {
+                let reason = "A different file already occupies the planned destination";
+                inventory.conflicts.push(InventoryConflict {
+                    source_path: file.source_path.clone(),
+                    destination_path: file.planned_relative_path.clone(),
+                    reason: reason.into(),
+                });
+                file.disposition = "attention".into();
+                file.detail = Some(format!(
+                    "{reason}. Enter a new filename and approve the revised plan."
+                ));
+            }
+        }
+        let disposition = file.disposition.clone();
         approved_files.push(ApprovedIngestFile {
             inventory: file.clone(),
             source_size: snapshot.length,
             source_modified_millis: snapshot.modified_millis,
-            source_sha256: Some(hash),
+            source_sha256: Some(hash.clone()),
+            source_volume_identity: source_volume_identity.clone(),
             existing_media_id,
+        });
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.completed_items = index + 1;
+            operation.current_item = source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+            match disposition.as_str() {
+                "new" => operation.counts.new_files += 1,
+                "already-imported" => operation.counts.duplicate_files += 1,
+                "attention" => operation.counts.attention_files += 1,
+                _ => operation.counts.failed_files += 1,
+            }
         });
     }
     inventory.copy_file_count = inventory
@@ -2006,6 +2269,15 @@ fn create_approved_inventory(
             sd_grabber,
         },
     )?;
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.state = "completed".into();
+        operation.stage = "Ready for review".into();
+        operation.current_item = None;
+        operation.cancellable = false;
+        operation.completed_items = inventory.files.len();
+        operation.total_items = Some(inventory.files.len());
+        operation.bytes_completed = operation.bytes_total.unwrap_or(0);
+    });
     Ok(inventory)
 }
 
@@ -2013,22 +2285,157 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     fs_safe::within(left, right) || fs_safe::within(right, left)
 }
 
-#[tauri::command]
-fn inventory_sources(
+fn begin_inventory_operation(
+    state: &NativeState,
+    operation_id: &str,
+    title: &str,
+) -> Result<(), String> {
+    Uuid::parse_str(operation_id).map_err(|_| "Inventory operation ID must be a UUID")?;
+    let now = Utc::now().to_rfc3339();
+    let previous = state
+        .inventory_status
+        .lock()
+        .unwrap()
+        .replace(BackgroundOperation {
+            id: operation_id.into(),
+            kind: "source-inventory".into(),
+            title: title.into(),
+            state: "queued".into(),
+            stage: "Waiting for the inventory worker".into(),
+            current_item: None,
+            completed_items: 0,
+            total_items: None,
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: true,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: now.clone(),
+            updated_at: now,
+        });
+    if let Some(previous) = previous.filter(|operation| {
+        matches!(
+            operation.state.as_str(),
+            "queued" | "running" | "cancelling"
+        )
+    }) {
+        state
+            .inventory_cancelled
+            .lock()
+            .unwrap()
+            .insert(previous.id);
+    }
+    state
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .remove(operation_id);
+    Ok(())
+}
+
+async fn run_inventory_command(
     app: AppHandle,
+    operation_id: String,
     sources: Vec<String>,
     date_override: Option<String>,
+    sd_grabber: bool,
 ) -> Result<SourceInventory, String> {
-    create_approved_inventory(&app, sources, date_override, false)
+    let started = Instant::now();
+    {
+        let state = app.state::<NativeState>();
+        begin_inventory_operation(
+            &state,
+            &operation_id,
+            if sd_grabber {
+                "SD-card inventory and duplicate verification"
+            } else {
+                "Source inventory and duplicate verification"
+            },
+        )?;
+    }
+    let worker_app = app.clone();
+    let worker_operation_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = worker_app.state::<NativeState>();
+        let _serial = state.inventory_worker.lock().unwrap();
+        check_inventory_cancelled(&state, &worker_operation_id)?;
+        diagnostic_log(
+            &worker_app,
+            "INFO",
+            "inventory",
+            &format!("{} started", worker_operation_id),
+        );
+        create_approved_inventory(
+            &worker_app,
+            &state,
+            &worker_operation_id,
+            sources,
+            date_override,
+            sd_grabber,
+        )
+    })
+    .await
+    .map_err(|error| format!("Inventory worker failed: {error}"))?;
+    if let Err(error) = &result {
+        let state = app.state::<NativeState>();
+        let cancelled = inventory_was_cancelled(&state, &operation_id);
+        update_inventory_operation(&state, &operation_id, |operation| {
+            operation.state = if cancelled { "cancelled" } else { "failed" }.into();
+            operation.stage = if cancelled {
+                "Cancelled safely"
+            } else {
+                "Inventory failed"
+            }
+            .into();
+            operation.error = (!cancelled).then(|| error.clone());
+            operation.cancellable = false;
+            operation.retryable = !cancelled;
+        });
+        diagnostic_log(&app, "ERROR", "inventory", error);
+    } else if let Ok(inventory) = &result {
+        let seconds = started.elapsed().as_secs_f64().max(0.001);
+        diagnostic_log(
+            &app,
+            "INFO",
+            "inventory",
+            &format!(
+                "{} completed: {} files, {} source bytes read in {:.3}s ({:.1} MiB/s)",
+                operation_id,
+                inventory.total_file_count,
+                inventory.total_bytes,
+                seconds,
+                inventory.total_bytes as f64 / 1024.0 / 1024.0 / seconds
+            ),
+        );
+    }
+    app.state::<NativeState>()
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .remove(&operation_id);
+    result
 }
 
 #[tauri::command]
-fn inventory_sd_card(
+async fn inventory_sources(
     app: AppHandle,
+    operation_id: String,
     sources: Vec<String>,
     date_override: Option<String>,
 ) -> Result<SourceInventory, String> {
-    create_approved_inventory(&app, sources, date_override, true)
+    run_inventory_command(app, operation_id, sources, date_override, false).await
+}
+
+#[tauri::command]
+async fn inventory_sd_card(
+    app: AppHandle,
+    operation_id: String,
+    sources: Vec<String>,
+    date_override: Option<String>,
+) -> Result<SourceInventory, String> {
+    run_inventory_command(app, operation_id, sources, date_override, true).await
 }
 
 #[cfg(target_os = "windows")]
@@ -2119,6 +2526,78 @@ fn removable_volumes() -> Vec<RemovableVolume> {
 fn list_removable_volumes() -> Vec<RemovableVolume> {
     removable_volumes()
 }
+
+#[cfg(target_os = "windows")]
+fn volume_identity_for_path(path: &Path) -> Result<Option<String>, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetVolumeInformationW, GetVolumePathNameW,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut root = vec![0_u16; 261];
+    if unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return Err(format!(
+            "Cannot identify source volume for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut serial = 0_u32;
+    let mut filesystem = vec![0_u16; 64];
+    if unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Cannot read source-volume identity for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut capacity = 0_u64;
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            &mut capacity,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Cannot read source-volume capacity for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let end = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filesystem.len());
+    Ok(Some(format!(
+        "volume:{serial:08X}:{}:{capacity}",
+        String::from_utf16_lossy(&filesystem[..end])
+    )))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn volume_identity_for_path(_path: &Path) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     let mut hash = Sha256::new();
@@ -2131,6 +2610,211 @@ fn sha256(path: &Path) -> Result<String, String> {
         hash.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn inventory_was_cancelled(state: &NativeState, operation_id: &str) -> bool {
+    state
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .contains(operation_id)
+}
+
+fn update_inventory_operation(
+    state: &NativeState,
+    operation_id: &str,
+    update: impl FnOnce(&mut BackgroundOperation),
+) {
+    let mut status = state.inventory_status.lock().unwrap();
+    if let Some(operation) = status
+        .as_mut()
+        .filter(|operation| operation.id == operation_id)
+    {
+        update(operation);
+        operation.updated_at = Utc::now().to_rfc3339();
+    }
+}
+
+fn check_inventory_cancelled(state: &NativeState, operation_id: &str) -> Result<(), String> {
+    if inventory_was_cancelled(state, operation_id) {
+        Err("Inventory cancelled safely".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn sha256_inventory(
+    path: &Path,
+    state: &NativeState,
+    operation_id: &str,
+    total_bytes_read: &mut u64,
+) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| {
+        format!(
+            "Cannot read source while calculating its checksum {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut next_update = 0_u64;
+    let hash = sha256_reader_cancellable(
+        &mut file,
+        || inventory_was_cancelled(state, operation_id),
+        |read| {
+            *total_bytes_read = total_bytes_read.saturating_add(read);
+            if *total_bytes_read >= next_update {
+                update_inventory_operation(state, operation_id, |operation| {
+                    operation.bytes_completed = *total_bytes_read;
+                    operation.current_item = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string());
+                });
+                next_update = total_bytes_read.saturating_add(8 * 1024 * 1024);
+            }
+        },
+    )
+    .map_err(|error| {
+        if error == "Inventory cancelled safely" {
+            error
+        } else {
+            format!("Source read failed for {}: {error}", path.display())
+        }
+    })?;
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.bytes_completed = *total_bytes_read;
+    });
+    Ok(hash)
+}
+
+fn sha256_reader_cancellable(
+    reader: &mut impl Read,
+    mut cancelled: impl FnMut() -> bool,
+    mut progress: impl FnMut(u64),
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        if cancelled() {
+            return Err("Inventory cancelled safely".into());
+        }
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        progress(read as u64);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[tauri::command]
+fn cancel_inventory(state: State<'_, NativeState>, operation_id: String) -> Result<(), String> {
+    let active = state
+        .inventory_status
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|operation| {
+            operation.id == operation_id
+                && matches!(
+                    operation.state.as_str(),
+                    "queued" | "running" | "cancelling"
+                )
+        });
+    if !active {
+        return Ok(());
+    }
+    state
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .insert(operation_id.clone());
+    update_inventory_operation(&state, &operation_id, |operation| {
+        if matches!(operation.state.as_str(), "queued" | "running") {
+            operation.state = "cancelling".into();
+            operation.stage = "Stopping after the current read".into();
+            operation.cancellable = false;
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn list_background_operations(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Vec<BackgroundOperation> {
+    let mut operations = Vec::new();
+    if let Some(inventory) = state.inventory_status.lock().unwrap().clone() {
+        operations.push(inventory);
+    }
+    let discovery = state.discovery_status.lock().unwrap().clone();
+    if discovery.running {
+        operations.push(BackgroundOperation {
+            id: "library-discovery".into(),
+            kind: "library-scan".into(),
+            title: if discovery.full {
+                "Full Library integrity verification".into()
+            } else {
+                "Library scan".into()
+            },
+            state: "running".into(),
+            stage: "Inspecting Library files".into(),
+            current_item: None,
+            completed_items: discovery.files_processed,
+            total_items: Some(discovery.total_files),
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts {
+                new_files: discovery.registered,
+                attention_files: discovery.errors,
+                ..Default::default()
+            },
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: discovery.started_at.unwrap_or_default(),
+            updated_at: Utc::now().to_rfc3339(),
+        });
+    }
+    let enrichment = state.enrichment_status.lock().unwrap().clone();
+    let enrichment_active = *state.enrichment_worker_active.lock().unwrap();
+    if let Some(enrichment) = enrichment {
+        if enrichment.state != "completed" || enrichment_active {
+            operations.push(enrichment);
+        }
+    }
+    let backup_jobs = {
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app).unwrap_or_default()
+    };
+    for job in backup_jobs
+        .into_iter()
+        .filter(|job| matches!(job.state.as_str(), "prepared" | "copying" | "verifying"))
+    {
+        operations.push(BackgroundOperation {
+            id: format!("backup:{}", job.id),
+            kind: "backup".into(),
+            title: format!("Project backup: {}", job.project_name),
+            state: "running".into(),
+            stage: job.state.clone(),
+            current_item: job.current_file,
+            completed_items: job.files_completed,
+            total_items: Some(job.manifest.source_file_count),
+            bytes_completed: job.bytes_completed,
+            bytes_total: Some(job.manifest.source_bytes),
+            counts: OperationCounts::default(),
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: job.error,
+            started_at: job.created_at,
+            updated_at: job.updated_at,
+        });
+    }
+    operations
 }
 fn destination_date(
     settings: &DeviceSettings,
@@ -2305,6 +2989,17 @@ struct VerifiedCopy {
 struct RecoverySummary {
     recovered: usize,
     needs_review: usize,
+}
+
+fn verify_approved_source_hash(actual: &str, approved: &str) -> Result<(), String> {
+    if actual == approved {
+        Ok(())
+    } else {
+        Err(
+            "Source bytes no longer match the approved inventory SHA-256; staged copy was rejected"
+                .into(),
+        )
+    }
 }
 
 fn update_job_progress(
@@ -2493,7 +3188,14 @@ fn copy_verified(
     total_bytes: u64,
     file_index: usize,
     file_total: usize,
+    approved_hash: &str,
+    source_volume_identity: Option<&str>,
 ) -> Result<VerifiedCopy, String> {
+    if let Some(expected_volume) = source_volume_identity {
+        if volume_identity_for_path(source)?.as_deref() != Some(expected_volume) {
+            return Err("The source volume changed after approval; rescan the card".into());
+        }
+    }
     let before = fs_safe::snapshot(source)?;
     let staging = fs_safe::staging_root(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let staged_name = format!("{}.part", Uuid::new_v4());
@@ -2572,15 +3274,23 @@ fn copy_verified(
             },
         );
         let copied_source_hash = format!("{:x}", source_hash.finalize());
+        verify_approved_source_hash(&copied_source_hash, approved_hash)?;
         let after = fs_safe::snapshot(source)?;
         if before != after || copied != before.length {
             return Err("Source changed during transfer; staged copy was rejected".into());
         }
         let post_copy_source_hash = sha256(source)?;
-        if post_copy_source_hash != copied_source_hash {
+        if post_copy_source_hash != approved_hash {
             return Err("Source content changed during transfer; staged copy was rejected".into());
         }
-        if sha256(&temp)? != copied_source_hash {
+        if let Some(expected_volume) = source_volume_identity {
+            if volume_identity_for_path(source)?.as_deref() != Some(expected_volume) {
+                return Err(
+                    "The source volume changed during transfer; staged copy was rejected".into(),
+                );
+            }
+        }
+        if sha256(&temp)? != approved_hash {
             return Err("Independent SHA-256 verification failed".into());
         }
         journal.status = "verified".into();
@@ -2970,13 +3680,27 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                 .ok_or("Approved duplicate is missing its source hash")?;
             let source_before = fs_safe::snapshot(&source);
             let destination_before = fs_safe::snapshot(&destination);
+            let source_volume_before = volume_identity_for_path(&source).ok().flatten();
             let source_hash = sha256(&source);
             let destination_hash = sha256(&destination);
-            let trustworthy = source_before.as_ref().is_ok_and(|snapshot| {
-                snapshot.length == planned.size_bytes
-                    && snapshot.modified_millis == planned.source_modified_millis
-            }) && source_hash.as_deref() == Ok(expected_hash)
+            let volume_matches = planned
+                .source_volume_identity
+                .as_deref()
+                .is_none_or(|expected| source_volume_before.as_deref() == Some(expected));
+            let trustworthy = volume_matches
+                && source_before.as_ref().is_ok_and(|snapshot| {
+                    snapshot.length == planned.size_bytes
+                        && snapshot.modified_millis == planned.source_modified_millis
+                })
+                && source_hash.as_deref() == Ok(expected_hash)
                 && fs_safe::snapshot(&source).as_ref() == source_before.as_ref()
+                && planned
+                    .source_volume_identity
+                    .as_deref()
+                    .is_none_or(|expected| {
+                        volume_identity_for_path(&source).ok().flatten().as_deref()
+                            == Some(expected)
+                    })
                 && destination_before
                     .as_ref()
                     .is_ok_and(|snapshot| snapshot.length == planned.size_bytes)
@@ -3061,6 +3785,11 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             job.bytes_total,
             index,
             job.files.len(),
+            planned
+                .approved_sha256
+                .as_deref()
+                .ok_or("Approved ingest file is missing its SHA-256")?,
+            planned.source_volume_identity.as_deref(),
         ) {
             Ok(copy) => {
                 if let Err(error) = commit_job_file(
@@ -3253,7 +3982,7 @@ fn start_ingest(
     for approved in &plan.files {
         let inventory_file = &approved.inventory;
         let source = PathBuf::from(&inventory_file.source_path);
-        let source_changed = !approved_source_matches(&source, approved);
+        let source_changed = !approved_source_snapshot_matches(&source, approved);
         let active_duplicate = approved
             .source_sha256
             .as_ref()
@@ -3276,7 +4005,8 @@ fn start_ingest(
         let collision = !is_duplicate
             && (reserved.contains(&destination_path)
                 || !planned_paths.insert(destination_path.clone()));
-        let attention = inventory_file.disposition == "attention";
+        let attention =
+            inventory_file.disposition == "attention" && !request.allow_unverified_reimport;
         let failed = collision || source_changed || attention;
         let media_id = if is_duplicate {
             active_duplicate
@@ -3317,6 +4047,7 @@ fn start_ingest(
             metadata_error: None,
             source_modified_millis: approved.source_modified_millis,
             approved_sha256: approved.source_sha256.clone(),
+            source_volume_identity: approved.source_volume_identity.clone(),
             duplicate_existing_relative_path: is_duplicate.then_some(relative_path.clone()),
             intentional_duplicate,
         });
@@ -5192,6 +5923,26 @@ fn kick_enrichment_worker(app: AppHandle) {
         return;
     }
     *active = true;
+    let now = Utc::now().to_rfc3339();
+    *state.enrichment_status.lock().unwrap() = Some(BackgroundOperation {
+        id: "media-enrichment".into(),
+        kind: "media-enrichment".into(),
+        title: "Technical metadata and thumbnail generation".into(),
+        state: "queued".into(),
+        stage: "Waiting for background capacity".into(),
+        current_item: None,
+        completed_items: 0,
+        total_items: None,
+        bytes_completed: 0,
+        bytes_total: None,
+        counts: OperationCounts::default(),
+        cancellable: false,
+        pausable: false,
+        retryable: false,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    });
     drop(active);
     std::thread::spawn(move || loop {
         let state = app.state::<NativeState>();
@@ -5200,7 +5951,16 @@ fn kick_enrichment_worker(app: AppHandle) {
             *state.enrichment_requested.lock().unwrap() = false;
         }
         if let Ok(_operation) = begin_critical_operation(&state.operations, "media enrichment") {
-            let _ = run_enrichment(&app, &state);
+            if let Err(error) = run_enrichment(&app, &state) {
+                if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                    status.state = "failed".into();
+                    status.stage = "Enrichment failed".into();
+                    status.error = Some(error.clone());
+                    status.retryable = true;
+                    status.updated_at = Utc::now().to_rfc3339();
+                }
+                diagnostic_log(&app, "ERROR", "media-enrichment", &error);
+            }
         }
         let mut active = state.enrichment_worker_active.lock().unwrap();
         if *state.enrichment_requested.lock().unwrap() {
@@ -5252,15 +6012,59 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
     let cache = PathBuf::from(&settings.thumbnail_cache_path);
     fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let catalogue = load_catalogue_file(&settings)?;
+    let total = catalogue
+        .media
+        .iter()
+        .filter(|item| {
+            matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v")
+                && (item.technical.codec.is_none() || item.thumbnail_path.is_none())
+        })
+        .count();
+    if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+        status.state = "running".into();
+        status.stage = "Inspecting technical metadata and thumbnails".into();
+        status.completed_items = 0;
+        status.total_items = Some(total);
+        status.error = None;
+        status.updated_at = Utc::now().to_rfc3339();
+    }
     let mut candidates = Vec::new();
+    let mut processed = 0_usize;
     for item in &catalogue.media {
+        let potentially_eligible = matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v")
+            && (item.technical.codec.is_none() || item.thumbnail_path.is_none());
+        if !potentially_eligible {
+            continue;
+        }
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.stage = format!(
+                "Generating thumbnails and metadata ({}/{total})",
+                processed + 1
+            );
+            status.current_item = Some(item.original_filename.clone());
+            status.updated_at = Utc::now().to_rfc3339();
+        }
         let source = match fs_safe::resolve_existing(&master, &item.relative_path) {
             Ok(path) if path.is_file() => path,
-            _ => continue,
+            _ => {
+                processed += 1;
+                if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                    status.completed_items = processed;
+                    status.counts.failed_files += 1;
+                }
+                continue;
+            }
         };
         let source_before = match fs_safe::snapshot(&source) {
             Ok(snapshot) => snapshot,
-            Err(_) => continue,
+            Err(_) => {
+                processed += 1;
+                if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                    status.completed_items = processed;
+                    status.counts.failed_files += 1;
+                }
+                continue;
+            }
         };
         let thumbnail_ref = format!("{}.jpg", item.id);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
@@ -5272,6 +6076,10 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         let needs_thumbnail =
             matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v") && !thumbnail.is_file();
         if !needs_probe && !needs_thumbnail {
+            processed += 1;
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.completed_items = processed;
+            }
             continue;
         }
         let mut technical = item.technical.clone();
@@ -5324,10 +6132,21 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 .output();
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
+            processed += 1;
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.completed_items = processed;
+                status.counts.attention_files += 1;
+            }
             continue;
         }
         let generated_thumbnail_ref = thumbnail.is_file().then_some(thumbnail_ref);
+        let generated_thumbnail = generated_thumbnail_ref.is_some();
         if technical == item.technical && generated_thumbnail_ref == item.thumbnail_path {
+            processed += 1;
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.completed_items = processed;
+                status.counts.failed_files += 1;
+            }
             continue;
         }
         candidates.push((
@@ -5342,6 +6161,11 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 thumbnail_ref: generated_thumbnail_ref,
             },
         ));
+        processed += 1;
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.completed_items = processed;
+            status.counts.new_files += usize::from(generated_thumbnail);
+        }
     }
     let _guard = state.catalogue_write.lock().unwrap();
     let current = load_catalogue_file(&settings)?;
@@ -5366,6 +6190,13 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
     let changed = events.len();
     append_events(&settings, events)?;
     enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
+    if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+        status.state = "completed".into();
+        status.stage = "Thumbnail and metadata pass complete".into();
+        status.current_item = None;
+        status.completed_items = total;
+        status.updated_at = Utc::now().to_rfc3339();
+    }
     Ok(changed)
 }
 fn resolve_catalogue_media_path(
@@ -6276,6 +7107,33 @@ pub fn run() {
                         if tray_available && close_to_tray {
                             api.prevent_close();
                             let _ = close_window.hide();
+                        } else if let Some(operation) = app
+                            .state::<NativeState>()
+                            .inventory_status
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .filter(|operation| {
+                                matches!(
+                                    operation.state.as_str(),
+                                    "queued" | "running" | "cancelling"
+                                )
+                            })
+                        {
+                            app.state::<NativeState>()
+                                .inventory_cancelled
+                                .lock()
+                                .unwrap()
+                                .insert(operation.id.clone());
+                            diagnostic_log(
+                                &app,
+                                "INFO",
+                                "inventory-shutdown",
+                                &format!(
+                                    "Cancellation requested for {} before application close",
+                                    operation.id
+                                ),
+                            );
                         }
                     }
                 });
@@ -6309,6 +7167,9 @@ pub fn run() {
             refresh_media_availability,
             inventory_sources,
             inventory_sd_card,
+            cancel_inventory,
+            list_background_operations,
+            reapprove_ingest_destinations,
             list_removable_volumes,
             start_ingest,
             initialize_ingest_jobs,
@@ -6425,6 +7286,7 @@ mod tests {
                 metadata_error: None,
                 source_modified_millis: None,
                 approved_sha256: None,
+                source_volume_identity: None,
                 duplicate_existing_relative_path: None,
                 intentional_duplicate: false,
             }],
@@ -6474,6 +7336,7 @@ mod tests {
             metadata_error: None,
             source_modified_millis: None,
             approved_sha256: None,
+            source_volume_identity: None,
             duplicate_existing_relative_path: None,
             intentional_duplicate: false,
         };
@@ -7050,7 +7913,7 @@ mod tests {
     }
 
     #[test]
-    fn approved_inventory_detects_same_size_content_changes() {
+    fn approved_hash_rejects_same_size_content_changes_before_promotion() {
         let root = temporary("approved-plan-change");
         let source = root.join("clip.mp4");
         fs::write(&source, b"expected").unwrap();
@@ -7060,12 +7923,50 @@ mod tests {
             source_size: snapshot.length,
             source_modified_millis: snapshot.modified_millis,
             source_sha256: Some(sha256(&source).unwrap()),
+            source_volume_identity: None,
             existing_media_id: None,
         };
-        assert!(approved_source_matches(&source, &approved));
+        assert!(approved_source_snapshot_matches(&source, &approved));
         fs::write(&source, b"modified").unwrap();
-        assert!(!approved_source_matches(&source, &approved));
+        let changed_hash = sha256(&source).unwrap();
+        assert!(verify_approved_source_hash(
+            &changed_hash,
+            approved.source_sha256.as_deref().unwrap()
+        )
+        .is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checksum_inventory_cancels_before_another_large_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancelled = AtomicBool::new(false);
+        let mut source = std::io::Cursor::new(vec![7_u8; 3 * 1024 * 1024]);
+        let result = sha256_reader_cancellable(
+            &mut source,
+            || cancelled.load(Ordering::SeqCst),
+            |_| cancelled.store(true, Ordering::SeqCst),
+        );
+        assert_eq!(result.unwrap_err(), "Inventory cancelled safely");
+        assert_eq!(source.position(), 1024 * 1024);
+    }
+
+    #[test]
+    fn newer_inventory_cancels_the_stale_request_before_queueing() {
+        let state = NativeState::default();
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        begin_inventory_operation(&state, &first, "First scan").unwrap();
+        update_inventory_operation(&state, &first, |operation| {
+            operation.state = "running".into();
+        });
+        begin_inventory_operation(&state, &second, "Second scan").unwrap();
+        assert!(state.inventory_cancelled.lock().unwrap().contains(&first));
+        assert_eq!(
+            state.inventory_status.lock().unwrap().as_ref().unwrap().id,
+            second
+        );
     }
 
     #[test]

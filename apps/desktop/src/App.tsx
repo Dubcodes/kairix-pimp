@@ -38,6 +38,7 @@ import {
   type Catalogue,
   type AppInfo,
   type BackupJob,
+  type BackgroundOperation,
   type DeviceSettings,
   type DiscoveryStatus,
   type IngestJob,
@@ -150,6 +151,9 @@ export function App() {
   const [progress, setProgress] = useState<IngestProgress>();
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [jobsOpen, setJobsOpen] = useState(false);
+  const [backgroundOperations, setBackgroundOperations] = useState<
+    BackgroundOperation[]
+  >([]);
   const [completedJobsOpen, setCompletedJobsOpen] = useState(false);
   const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   const [startingIngest, setStartingIngest] = useState(false);
@@ -162,6 +166,7 @@ export function App() {
   );
   const [showSdGrabber, setShowSdGrabber] = useState(false);
   const [allowDuplicateCopies, setAllowDuplicateCopies] = useState(false);
+  const [allowUnverifiedReimport, setAllowUnverifiedReimport] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -467,6 +472,13 @@ export function App() {
   useEffect(() => {
     if (!native || sources.length === 0) return;
     let current = true;
+    const operationId = crypto.randomUUID();
+    void Promise.resolve().then(() => {
+      if (!current) return;
+      setInventoryLoading(true);
+      setInventory(undefined);
+      setInventoryError('');
+    });
     const previewDateOverride =
       dateOverride === 'default'
         ? undefined
@@ -474,23 +486,32 @@ export function App() {
           ? chosenDate || undefined
           : dateOverride;
     const request = sdGrabberMode
-      ? desktopBridge.inventorySdCard(sources, previewDateOverride)
-      : desktopBridge.inventorySources(sources, previewDateOverride);
+      ? desktopBridge.inventorySdCard(operationId, sources, previewDateOverride)
+      : desktopBridge.inventorySources(
+          operationId,
+          sources,
+          previewDateOverride,
+        );
     void request
       .then((result) => {
         if (current) {
           setInventory(result);
+          setConflicts(result.conflicts ?? []);
           setInventoryError('');
+          setAllowDuplicateCopies(false);
+          setAllowUnverifiedReimport(false);
         }
       })
       .catch((reason) => {
-        if (current) setInventoryError(errorText(reason));
+        if (current && !errorText(reason).toLowerCase().includes('cancelled'))
+          setInventoryError(errorText(reason));
       })
       .finally(() => {
         if (current) setInventoryLoading(false);
       });
     return () => {
       current = false;
+      void desktopBridge.cancelInventory(operationId).catch(() => undefined);
     };
   }, [
     native,
@@ -501,6 +522,25 @@ export function App() {
     settings.sdGrabberExtensions,
     settings.sdGrabberSearchSubfolders,
   ]);
+
+  useEffect(() => {
+    if (!native || !configured) return;
+    let current = true;
+    const refresh = () => {
+      void desktopBridge
+        .listBackgroundOperations()
+        .then((operations) => {
+          if (current) setBackgroundOperations(operations);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 500);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [configured, native]);
 
   useEffect(() => {
     if (
@@ -922,6 +962,7 @@ export function App() {
         batchTags: ingestBatchTags,
         approvedPlanId: inventory.planId,
         allowDuplicateCopies,
+        allowUnverifiedReimport,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -932,10 +973,35 @@ export function App() {
       setRenames({});
       setIngestBatchTags([]);
       setAllowDuplicateCopies(false);
+      setAllowUnverifiedReimport(false);
       setSdGrabberMode(false);
       setJobsOpen(true);
       setMessage(
         `Ingest queued with ${job.files.length} file${job.files.length === 1 ? '' : 's'}. You can keep browsing and edit metadata now.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setStartingIngest(false);
+    }
+  };
+  const reviewRenamedDestinations = async () => {
+    if (!inventory?.planId) return;
+    const reviewed = Object.fromEntries(
+      Object.entries(renames).filter(([, value]) => value.trim()),
+    );
+    setStartingIngest(true);
+    setError('');
+    try {
+      const next = await desktopBridge.reapproveIngestDestinations(
+        inventory.planId,
+        reviewed,
+      );
+      setInventory(next);
+      setConflicts([]);
+      setRenames({});
+      setMessage(
+        'Renamed destinations were validated and saved in a new approved ingest plan. Review the paths, then start ingest.',
       );
     } catch (reason) {
       setError(errorText(reason));
@@ -1565,6 +1631,13 @@ export function App() {
     (job) => !activeJobs.includes(job) && !completedJobs.includes(job),
   );
   const workJobs = [...activeJobs, ...needsAttentionJobs];
+  const visibleBackgroundOperations = backgroundOperations.filter(
+    (operation) => operation.state !== 'completed' || inventoryLoading,
+  );
+  const activeBackgroundOperations = visibleBackgroundOperations.filter(
+    (operation) =>
+      !['completed', 'cancelled', 'failed'].includes(operation.state),
+  );
   const updateBlockingJobs = jobs.filter((job) => !jobIsClearableHistory(job));
   const updateBlockingBackupJobs = backupJobs.filter((job) =>
     ['prepared', 'copying', 'verifying'].includes(job.state),
@@ -1696,21 +1769,29 @@ export function App() {
             <h1>{view}</h1>
           </div>
           <div className="header-actions">
-            {native && configured && jobs.length > 0 && (
-              <button
-                className="job-indicator"
-                aria-expanded={jobsOpen}
-                onClick={() => setJobsOpen((open) => !open)}
-              >
-                {activeJobs.length > 0
-                  ? `${activeJobs.length} active · ${Math.round(
-                      (transferredJobBytes / Math.max(totalJobBytes, 1)) * 100,
-                    )}%`
-                  : needsAttentionJobs.length > 0
-                    ? `${needsAttentionJobs.length} need${needsAttentionJobs.length === 1 ? 's' : ''} attention`
-                    : 'All ingests complete'}
-              </button>
-            )}
+            {native &&
+              configured &&
+              (jobs.length > 0 || visibleBackgroundOperations.length > 0) && (
+                <button
+                  className="job-indicator"
+                  aria-expanded={jobsOpen}
+                  onClick={() => setJobsOpen((open) => !open)}
+                >
+                  {activeJobs.length + activeBackgroundOperations.length > 0
+                    ? `${activeJobs.length + activeBackgroundOperations.length} active${
+                        activeJobs.length > 0
+                          ? ` · ${Math.round(
+                              (transferredJobBytes /
+                                Math.max(totalJobBytes, 1)) *
+                                100,
+                            )}% ingest`
+                          : ''
+                      }`
+                    : needsAttentionJobs.length > 0
+                      ? `${needsAttentionJobs.length} need${needsAttentionJobs.length === 1 ? 's' : ''} attention`
+                      : 'All ingests complete'}
+                </button>
+              )}
             <div className="sync">
               {native ? 'Native desktop' : 'Web preview'}{' '}
               <span>{configured ? 'persisted' : 'not configured'}</span>
@@ -1718,19 +1799,89 @@ export function App() {
           </div>
         </header>
         {jobsOpen && (
-          <section className="job-panel" aria-label="Ingest jobs">
+          <section className="job-panel" aria-label="Background Operations">
             <div className="job-panel-heading">
               <div>
-                <strong>Background ingest</strong>
-                <small>Pause takes effect safely between files.</small>
+                <strong>Background Operations</strong>
+                <small>
+                  Inventory cancellation stops at a safe read boundary. Ingest
+                  pause takes effect between files.
+                </small>
               </div>
               <button onClick={() => setJobsOpen(false)}>Close</button>
             </div>
             <div className="job-counts" role="status">
+              <span>Other work {visibleBackgroundOperations.length}</span>
               <span>Active {activeJobs.length}</span>
               <span>Completed {completedJobs.length}</span>
               <span>Needs attention {needsAttentionJobs.length}</span>
             </div>
+            {visibleBackgroundOperations.map((operation) => (
+              <article className="job-card" key={operation.id}>
+                <header>
+                  <div>
+                    <strong>{operation.title}</strong>
+                    <small>
+                      {operation.stage}
+                      {operation.currentItem
+                        ? ` · ${operation.currentItem}`
+                        : ''}
+                    </small>
+                  </div>
+                  <div className="job-actions">
+                    {operation.cancellable && (
+                      <button
+                        onClick={() =>
+                          void desktopBridge.cancelInventory(operation.id)
+                        }
+                      >
+                        Cancel scan
+                      </button>
+                    )}
+                  </div>
+                </header>
+                {operation.bytesTotal ? (
+                  <progress
+                    value={operation.bytesCompleted}
+                    max={operation.bytesTotal}
+                  />
+                ) : operation.totalItems ? (
+                  <progress
+                    value={operation.completedItems}
+                    max={operation.totalItems}
+                  />
+                ) : (
+                  <progress />
+                )}
+                <small>
+                  {operation.completedItems}
+                  {operation.totalItems === undefined
+                    ? ' discovered'
+                    : ` / ${operation.totalItems} files`}
+                  {operation.bytesTotal
+                    ? ` · ${size(operation.bytesCompleted)} / ${size(operation.bytesTotal)} read`
+                    : ''}
+                  {operation.kind === 'media-enrichment' ? (
+                    <>
+                      {' · '}
+                      {operation.counts.newFiles} thumbnails generated ·{' '}
+                      {operation.counts.failedFiles} unavailable or failed
+                    </>
+                  ) : (
+                    <>
+                      {' · '}
+                      {operation.counts.newFiles} new ·{' '}
+                      {operation.counts.duplicateFiles} duplicate ·{' '}
+                      {operation.counts.attentionFiles} attention ·{' '}
+                      {operation.counts.failedFiles} failed
+                    </>
+                  )}
+                </small>
+                {operation.error && (
+                  <small className="job-error">{operation.error}</small>
+                )}
+              </article>
+            ))}
             {activeJobs.length === 0 && needsAttentionJobs.length === 0 && (
               <p className="job-complete-status">All ingests complete</p>
             )}
@@ -3558,33 +3709,33 @@ export function App() {
                 </b>
                 .
               </p>
-              {[
-                ['default', 'Use remembered mode'],
-                ['today', 'Today'],
-                ['yesterday', 'Yesterday'],
-                ['choose', 'Choose date'],
-              ].map(([value, label]) => (
-                <label
-                  className={dateOverride === value ? 'chosen' : ''}
-                  key={value}
-                >
+              <details>
+                <summary>Change date for this ingest</summary>
+                <label>
+                  Override date
                   <input
-                    type="radio"
-                    checked={dateOverride === value}
-                    onChange={() => setDateOverride(value)}
+                    type="date"
+                    value={chosenDate}
+                    onChange={(event) => {
+                      setChosenDate(event.target.value);
+                      setDateOverride(
+                        event.target.value ? 'choose' : 'default',
+                      );
+                    }}
                   />
-                  <span>
-                    <b>{label}</b>
-                  </span>
                 </label>
-              ))}
-              {dateOverride === 'choose' && (
-                <input
-                  type="date"
-                  value={chosenDate}
-                  onChange={(event) => setChosenDate(event.target.value)}
-                />
-              )}
+                {dateOverride === 'choose' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setChosenDate('');
+                      setDateOverride('default');
+                    }}
+                  >
+                    Use saved date organisation
+                  </button>
+                )}
+              </details>
               <SearchableComboBox
                 label="Tags for all files in this ingest"
                 mode="multiple"
@@ -3636,33 +3787,48 @@ export function App() {
                   duplicates
                 </label>
               )}
+              {(inventory?.attentionFileCount ?? 0) > 0 && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowUnverifiedReimport}
+                    onChange={(event) =>
+                      setAllowUnverifiedReimport(event.target.checked)
+                    }
+                  />{' '}
+                  Copy safe incoming sources whose previous catalogue copy is
+                  missing or failed verification
+                </label>
+              )}
               <button
                 className="primary"
                 disabled={
                   startingIngest ||
                   inventoryLoading ||
                   !inventory ||
-                  (inventory.copyFileCount === 0 && !allowDuplicateCopies) ||
+                  (inventory.copyFileCount === 0 &&
+                    !allowDuplicateCopies &&
+                    !allowUnverifiedReimport) ||
                   !sources.length ||
                   (dateOverride === 'choose' && !chosenDate)
                 }
                 onClick={() =>
-                  void ingest(
-                    Object.fromEntries(
-                      Object.entries(renames).filter(([, value]) =>
-                        value.trim(),
-                      ),
-                    ),
-                  )
+                  conflicts.length > 0
+                    ? void reviewRenamedDestinations()
+                    : void ingest()
                 }
               >
                 {startingIngest
-                  ? 'Creating ingest job…'
-                  : sdGrabberMode
-                    ? allowDuplicateCopies
-                      ? `Grab ${(inventory?.copyFileCount ?? 0) + (inventory?.alreadyImportedFileCount ?? 0)} files including requested duplicates`
-                      : `Grab ${inventory?.copyFileCount ?? 0} new file${inventory?.copyFileCount === 1 ? '' : 's'}`
-                    : 'Start verified ingest'}
+                  ? conflicts.length > 0
+                    ? 'Approving renamed destinations…'
+                    : 'Creating ingest job…'
+                  : conflicts.length > 0
+                    ? 'Review renamed destinations'
+                    : sdGrabberMode
+                      ? allowDuplicateCopies || allowUnverifiedReimport
+                        ? `Grab ${(inventory?.copyFileCount ?? 0) + (allowDuplicateCopies ? (inventory?.alreadyImportedFileCount ?? 0) : 0) + (allowUnverifiedReimport ? (inventory?.attentionFileCount ?? 0) : 0)} reviewed files`
+                        : `Grab ${inventory?.copyFileCount ?? 0} new file${inventory?.copyFileCount === 1 ? '' : 's'}`
+                      : 'Start verified ingest'}
               </button>
             </div>
           </section>

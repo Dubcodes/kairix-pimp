@@ -267,6 +267,11 @@ export interface SourceInventory {
   files: InventoryFile[];
   excluded: InventoryExclusion[];
   issues: string[];
+  conflicts?: Array<{
+    sourcePath: string;
+    destinationPath: string;
+    reason: string;
+  }>;
   totalFileCount: number;
   totalBytes: number;
   copyFileCount: number;
@@ -282,6 +287,31 @@ export interface RemovableVolume {
   identity: string;
   capacityBytes: number;
   availableBytes: number;
+}
+export interface BackgroundOperation {
+  id: string;
+  kind: string;
+  title: string;
+  state:
+    'queued' | 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed';
+  stage: string;
+  currentItem?: string;
+  completedItems: number;
+  totalItems?: number;
+  bytesCompleted: number;
+  bytesTotal?: number;
+  counts: {
+    newFiles: number;
+    duplicateFiles: number;
+    attentionFiles: number;
+    failedFiles: number;
+  };
+  cancellable: boolean;
+  pausable: boolean;
+  retryable: boolean;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
 }
 export type IngestJobState =
   | 'queued'
@@ -432,10 +462,38 @@ export const desktopBridge = {
     const value = await open({ multiple: false, directory: true });
     return typeof value === 'string' ? value : undefined;
   },
-  inventorySources: (sources: string[], dateOverride?: string) =>
-    invoke<SourceInventory>('inventory_sources', { sources, dateOverride }),
-  inventorySdCard: (sources: string[], dateOverride?: string) =>
-    invoke<SourceInventory>('inventory_sd_card', { sources, dateOverride }),
+  inventorySources: (
+    operationId: string,
+    sources: string[],
+    dateOverride?: string,
+  ) =>
+    invoke<SourceInventory>('inventory_sources', {
+      operationId,
+      sources,
+      dateOverride,
+    }),
+  inventorySdCard: (
+    operationId: string,
+    sources: string[],
+    dateOverride?: string,
+  ) =>
+    invoke<SourceInventory>('inventory_sd_card', {
+      operationId,
+      sources,
+      dateOverride,
+    }),
+  cancelInventory: (operationId: string) =>
+    invoke<void>('cancel_inventory', { operationId }),
+  listBackgroundOperations: () =>
+    invoke<BackgroundOperation[]>('list_background_operations'),
+  reapproveIngestDestinations: (
+    planId: string,
+    renamedDestinations: Record<string, string>,
+  ) =>
+    invoke<SourceInventory>('reapprove_ingest_destinations', {
+      planId,
+      renamedDestinations,
+    }),
   listRemovableVolumes: () =>
     invoke<RemovableVolume[]>('list_removable_volumes'),
   startIngest: (request: {
@@ -446,6 +504,7 @@ export const desktopBridge = {
     batchTags?: string[];
     approvedPlanId: string;
     allowDuplicateCopies?: boolean;
+    allowUnverifiedReimport?: boolean;
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
