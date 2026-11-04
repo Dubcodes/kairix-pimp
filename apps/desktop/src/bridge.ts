@@ -144,13 +144,20 @@ export interface ProjectInventory {
     formatVersion?: string;
     mediaReferences: Array<{
       path: string;
-      evidence: 'imported-into-saved-project';
+      evidence:
+        | 'imported-into-saved-project'
+        | 'used-in-saved-timeline'
+        | 'previously-referenced-in-saved-project';
       mediaId?: string;
+      sequenceIds: string[];
+      timelinePlacements: number;
     }>;
     sequences: Array<{
       id: string;
       name: string;
       nested: boolean;
+      mediaPaths: string[];
+      timelinePlacements: number;
     }>;
     bins: string[];
     issues: string[];

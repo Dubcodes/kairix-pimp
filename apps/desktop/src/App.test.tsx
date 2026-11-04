@@ -711,15 +711,31 @@ describe('native application integration', () => {
             path: 'C:\\Master\\20261028\\DJI_0001.MP4',
             evidence: 'imported-into-saved-project',
             mediaId: 'video',
+            sequenceIds: [],
+            timelinePlacements: 0,
           },
           {
             path: 'D:\\Historical\\offline.mp4',
             evidence: 'imported-into-saved-project',
+            sequenceIds: [],
+            timelinePlacements: 0,
           },
         ],
         sequences: [
-          { id: 'sequence-main', name: 'Main Edit', nested: false },
-          { id: 'sequence-nested', name: 'Opening', nested: true },
+          {
+            id: 'sequence-main',
+            name: 'Main Edit',
+            nested: false,
+            mediaPaths: [],
+            timelinePlacements: 0,
+          },
+          {
+            id: 'sequence-nested',
+            name: 'Opening',
+            nested: true,
+            mediaPaths: [],
+            timelinePlacements: 0,
+          },
         ],
         bins: ['Media'],
         issues: [],
@@ -754,8 +770,11 @@ describe('native application integration', () => {
     );
     expect(await screen.findByText('Saved-project observation')).toBeVisible();
     expect(screen.getByText('Main Edit')).toBeVisible();
-    expect(screen.getByText('Matched to Master Bin ID')).toBeVisible();
-    expect(screen.getByText('Referenced but unresolved')).toBeVisible();
+    expect(screen.getByText(/Matched to Master Bin ID/)).toBeVisible();
+    expect(screen.getAllByText(/Unresolved/)[0]).toBeVisible();
+    expect(screen.getByText('Imported')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /Main Edit/ }));
+    expect(screen.getByText('Main Edit recordings')).toBeVisible();
 
     expect(
       (await screen.findAllByText('Simple Vlog 057.prproj'))[0],

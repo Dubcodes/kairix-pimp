@@ -138,6 +138,8 @@ export function App() {
   const [projectInventory, setProjectInventory] = useState<ProjectInventory>();
   const [projectInventoryLoading, setProjectInventoryLoading] = useState(false);
   const [projectInventoryError, setProjectInventoryError] = useState('');
+  const [selectedPremiereSequenceId, setSelectedPremiereSequenceId] =
+    useState<string>();
   const [projectMediaQuery, setProjectMediaQuery] = useState('');
   const [projectMediaSelection, setProjectMediaSelection] = useState<string[]>(
     [],
@@ -741,6 +743,36 @@ export function App() {
       ),
     [catalogue.media, projectMedia, selectedProjectId],
   );
+  const premiereSummary = useMemo(() => {
+    const index = projectInventory?.premiereIndex;
+    if (!index) return undefined;
+    const current = index.mediaReferences.filter(
+      (reference) =>
+        reference.evidence === 'imported-into-saved-project' ||
+        reference.evidence === 'used-in-saved-timeline',
+    );
+    const used = current.filter(
+      (reference) => reference.evidence === 'used-in-saved-timeline',
+    );
+    const logicalCount = (references: typeof current) =>
+      new Set(
+        references.map(
+          (reference) => reference.mediaId ?? `path:${reference.path}`,
+        ),
+      ).size;
+    return {
+      imported: logicalCount(current),
+      used: logicalCount(used),
+      unused: logicalCount(
+        current.filter(
+          (reference) => reference.evidence === 'imported-into-saved-project',
+        ),
+      ),
+      unresolved: logicalCount(
+        current.filter((reference) => !reference.mediaId),
+      ),
+    };
+  }, [projectInventory]);
   const folders = useMemo(() => {
     const summaries = new Map<
       string,
@@ -4642,9 +4674,30 @@ export function App() {
                   </div>
                   <p>
                     This local, rebuildable index observes a completed saved
-                    project. It is not live Companion evidence and never marks
-                    unknown media as not imported.
+                    project. It may differ from unsaved Premiere state, is not
+                    live Companion evidence, and never marks unknown media as
+                    not imported.
                   </p>
+                  {premiereSummary && (
+                    <div className="project-stats premiere-summary">
+                      <div>
+                        <span>Imported</span>
+                        <strong>{premiereSummary.imported}</strong>
+                      </div>
+                      <div>
+                        <span>Used in timelines</span>
+                        <strong>{premiereSummary.used}</strong>
+                      </div>
+                      <div>
+                        <span>Unused imports</span>
+                        <strong>{premiereSummary.unused}</strong>
+                      </div>
+                      <div>
+                        <span>Unresolved</span>
+                        <strong>{premiereSummary.unresolved}</strong>
+                      </div>
+                    </div>
+                  )}
                   {projectInventory.premiereIndex.issues.map((issue) => (
                     <div
                       className="project-index-issue"
@@ -4661,13 +4714,27 @@ export function App() {
                         {projectInventory.premiereIndex.sequences
                           .filter((sequence) => !sequence.nested)
                           .map((sequence) => (
-                            <div
-                              className="project-index-row"
+                            <button
+                              type="button"
+                              className="project-index-row project-index-sequence"
+                              aria-pressed={
+                                selectedPremiereSequenceId === sequence.id
+                              }
                               key={sequence.id}
+                              onClick={() =>
+                                setSelectedPremiereSequenceId(
+                                  selectedPremiereSequenceId === sequence.id
+                                    ? undefined
+                                    : sequence.id,
+                                )
+                              }
                             >
                               <strong>{sequence.name}</strong>
-                              <code>{sequence.id}</code>
-                            </div>
+                              <span>
+                                {sequence.timelinePlacements} placement
+                                {sequence.timelinePlacements === 1 ? '' : 's'}
+                              </span>
+                            </button>
                           ))}
                         {!projectInventory.premiereIndex.sequences.some(
                           (sequence) => !sequence.nested,
@@ -4685,15 +4752,69 @@ export function App() {
                           {projectInventory.premiereIndex.sequences
                             .filter((sequence) => sequence.nested)
                             .map((sequence) => (
-                              <div
-                                className="project-index-row"
+                              <button
+                                type="button"
+                                className="project-index-row project-index-sequence"
+                                aria-pressed={
+                                  selectedPremiereSequenceId === sequence.id
+                                }
                                 key={sequence.id}
+                                onClick={() =>
+                                  setSelectedPremiereSequenceId(
+                                    selectedPremiereSequenceId === sequence.id
+                                      ? undefined
+                                      : sequence.id,
+                                  )
+                                }
                               >
                                 <strong>{sequence.name}</strong>
-                                <code>{sequence.id}</code>
-                              </div>
+                                <span>
+                                  {sequence.timelinePlacements} placement
+                                  {sequence.timelinePlacements === 1 ? '' : 's'}
+                                </span>
+                              </button>
                             ))}
                         </details>
+                        {selectedPremiereSequenceId &&
+                          (() => {
+                            const sequence =
+                              projectInventory.premiereIndex?.sequences.find(
+                                (candidate) =>
+                                  candidate.id === selectedPremiereSequenceId,
+                              );
+                            if (!sequence) return null;
+                            return (
+                              <div className="sequence-recordings">
+                                <h5>{sequence.name} recordings</h5>
+                                {sequence.mediaPaths.length ? (
+                                  sequence.mediaPaths.map((path) => {
+                                    const reference =
+                                      projectInventory.premiereIndex?.mediaReferences.find(
+                                        (candidate) => candidate.path === path,
+                                      );
+                                    return (
+                                      <div
+                                        className="project-index-row"
+                                        key={path}
+                                      >
+                                        <code>{path}</code>
+                                        <span>
+                                          {reference?.mediaId
+                                            ? 'Matched'
+                                            : 'Unresolved'}
+                                        </span>
+                                      </div>
+                                    );
+                                  })
+                                ) : (
+                                  <span className="muted">
+                                    Usage unknown or no established timeline
+                                    media.
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
                       </div>
                       <div>
                         <h4>Imported-media evidence</h4>
@@ -4705,9 +4826,16 @@ export function App() {
                             >
                               <code>{reference.path}</code>
                               <span>
+                                {reference.evidence === 'used-in-saved-timeline'
+                                  ? `Used · ${reference.timelinePlacements} placement${reference.timelinePlacements === 1 ? '' : 's'}`
+                                  : reference.evidence ===
+                                      'imported-into-saved-project'
+                                    ? 'Imported · unused'
+                                    : 'Previous saved-project evidence'}
+                                {' · '}
                                 {reference.mediaId
                                   ? 'Matched to Master Bin ID'
-                                  : 'Referenced but unresolved'}
+                                  : 'Unresolved'}
                               </span>
                             </div>
                           ),

@@ -2295,6 +2295,27 @@ select:disabled {
 .project-index-issue {
   color: var(--text-muted);
 }
+.premiere-summary {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.project-index-sequence {
+  width: 100%;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.project-index-sequence[aria-pressed='true'] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.sequence-recordings {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.sequence-recordings h5 {
+  margin: 0 0 6px;
+}
 .project-index-issue {
   padding: 7px;
   border-left: 3px solid var(--accent);
@@ -2304,6 +2325,9 @@ select:disabled {
 @media (max-width: 900px) {
   .premiere-index-grid {
     grid-template-columns: 1fr;
+  }
+  .premiere-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 .project-info-editor textarea {
