@@ -4572,8 +4572,8 @@ export function App() {
                   <div>
                     <h3>Project-local files</h3>
                     <span>
-                      Read-only inventory; Premiere files are never parsed or
-                      changed
+                      Read-only inventory; supported saved projects are parsed
+                      from stable snapshots and never changed
                     </span>
                   </div>
                 </div>
@@ -4625,6 +4625,100 @@ export function App() {
                   </p>
                 )}
               </section>
+
+              {projectInventory?.premiereIndex && (
+                <section className="premiere-index">
+                  <div className="section-head">
+                    <div>
+                      <h3>Saved-project observation</h3>
+                      <span>
+                        {projectInventory.premiereIndex.status} · parser{' '}
+                        {projectInventory.premiereIndex.parserVersion} ·{' '}
+                        {new Date(
+                          projectInventory.premiereIndex.indexedAt,
+                        ).toLocaleString()}
+                      </span>
+                    </div>
+                  </div>
+                  <p>
+                    This local, rebuildable index observes a completed saved
+                    project. It is not live Companion evidence and never marks
+                    unknown media as not imported.
+                  </p>
+                  {projectInventory.premiereIndex.issues.map((issue) => (
+                    <div
+                      className="project-index-issue"
+                      role="status"
+                      key={issue}
+                    >
+                      {issue}
+                    </div>
+                  ))}
+                  {projectInventory.premiereIndex.status !== 'unsupported' && (
+                    <div className="premiere-index-grid">
+                      <div>
+                        <h4>Top-level sequences</h4>
+                        {projectInventory.premiereIndex.sequences
+                          .filter((sequence) => !sequence.nested)
+                          .map((sequence) => (
+                            <div
+                              className="project-index-row"
+                              key={sequence.id}
+                            >
+                              <strong>{sequence.name}</strong>
+                              <code>{sequence.id}</code>
+                            </div>
+                          ))}
+                        {!projectInventory.premiereIndex.sequences.some(
+                          (sequence) => !sequence.nested,
+                        ) && <span className="muted">Unknown</span>}
+                        <details>
+                          <summary>
+                            Nested sequences (
+                            {
+                              projectInventory.premiereIndex.sequences.filter(
+                                (sequence) => sequence.nested,
+                              ).length
+                            }
+                            )
+                          </summary>
+                          {projectInventory.premiereIndex.sequences
+                            .filter((sequence) => sequence.nested)
+                            .map((sequence) => (
+                              <div
+                                className="project-index-row"
+                                key={sequence.id}
+                              >
+                                <strong>{sequence.name}</strong>
+                                <code>{sequence.id}</code>
+                              </div>
+                            ))}
+                        </details>
+                      </div>
+                      <div>
+                        <h4>Imported-media evidence</h4>
+                        {projectInventory.premiereIndex.mediaReferences.map(
+                          (reference) => (
+                            <div
+                              className="project-index-row"
+                              key={reference.path}
+                            >
+                              <code>{reference.path}</code>
+                              <span>
+                                {reference.mediaId
+                                  ? 'Matched to Master Bin ID'
+                                  : 'Referenced but unresolved'}
+                              </span>
+                            </div>
+                          ),
+                        )}
+                        {!projectInventory.premiereIndex.mediaReferences
+                          .length && <span className="muted">Unknown</span>}
+                      </div>
+                    </div>
+                  )}
+                </section>
+              )}
 
               <section className="project-linked-media">
                 <div className="section-head">

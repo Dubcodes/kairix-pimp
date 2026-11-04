@@ -134,6 +134,27 @@ export interface ProjectInventory {
   mainPremiereProject?: string;
   scannedAt: string;
   items: ProjectAsset[];
+  premiereIndex?: {
+    parserVersion: string;
+    sourceRelativePath: string;
+    sourceFingerprint: string;
+    sourceModifiedMillis: number;
+    indexedAt: string;
+    status: 'supported' | 'partial' | 'unsupported';
+    formatVersion?: string;
+    mediaReferences: Array<{
+      path: string;
+      evidence: 'imported-into-saved-project';
+      mediaId?: string;
+    }>;
+    sequences: Array<{
+      id: string;
+      name: string;
+      nested: boolean;
+    }>;
+    bins: string[];
+    issues: string[];
+  };
 }
 export interface BackupAsset {
   relativePath: string;

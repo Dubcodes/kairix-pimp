@@ -419,3 +419,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Resolve Clip Viewer playback from a known catalogue ID through the native root boundary and use WebView2's media element before considering bounded on-demand proxies. Keep selection/filter state in the Library view. Generate a manually chosen thumbnail with FFmpeg only on explicit request, validate source stability and cache-owned JPEG output, and persist the JPEG only in the device cache. Do not publish a selected timestamp as synchronized authoritative metadata in this milestone.
 - **Consequences:** Common codecs gain practical offline playback without another window or source mutation, while unsupported codecs fail visibly. A custom frame survives on that device until cache eviction/regeneration but does not follow the recording to another device. Installed WebView2 codec, keyboard, fullscreen, scaling and portrait acceptance remains required.
+
+## ADR-057 — Index only bounded stable saved-project snapshots
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Add a conservative read-only fallback alongside ADR-037's preferred Companion path. Parse only the deterministic main `.prproj` after a stable size/modification read, accept bounded gzip-XML/XML, reject document types and excessive decompression/events/depth/values, and extract only explicitly recognized imported paths, bins and sequence identities. Persist the fingerprinted projection device-locally. Associate catalogue media only by exact existing canonical path.
+- **Consequences:** Projects can expose useful offline saved-state evidence without a plugin or project mutation. Real Premiere variant coverage, timeline-use/source ranges and nested relationships remain unknown until sanitized real-format structures are validated. Unknown is never represented as not imported, projections do not authorize cleanup, and live Companion evidence will retain separate provenance.

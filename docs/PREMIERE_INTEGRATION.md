@@ -74,3 +74,9 @@ Use UDT's Logs and App Logs for any unsupported method, transaction, permission 
 The `0.1.1-6` pull-request workflow publishes the exact developer source above as a distinctly named ZIP artifact. Extract it before adding `manifest.json` to UDT. This ZIP is **not** a `.ccx` and must never be renamed to one.
 
 The plugin ID must be replaced with a valid Adobe Developer Distribution ID before Marketplace publication. No local server, account credential or network permission is used in this proof of concept.
+
+## Read-only saved-project fallback
+
+PIMP now contains an intentionally narrow, offline fallback for the deterministic main `.prproj` in a registered Working Project. It reads one stable snapshot, accepts bounded gzip-XML or XML containers, rejects document types and excessive size/depth/event/value budgets, and extracts only structurally recognized imported paths, bin names and sequence identities. It never writes `.prproj` or `.prin`, does not interpret effects or proprietary embeddings, and does not yet claim compatibility with a real Premiere-generated project version.
+
+The index is fingerprinted and stored as device-local rebuildable JSON. An imported path associates with a PIMP media ID only when both resolve to the same existing canonical file; filenames alone are not evidence. Sequence timeline use, source ranges and nested relationships are reported only where an explicit supported field exists. Unknown or unsupported structure remains visibly unknown. Live Companion observation remains the preferred future source and must coexist with, not overwrite, saved-project evidence.

@@ -2,12 +2,14 @@ mod backup;
 mod catalogue;
 mod discovery;
 mod fs_safe;
+mod premiere_index;
 
 use backup::BackupJob;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use catalogue::{
     Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
 };
+use premiere_index::PremiereProjectIndex;
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
@@ -205,6 +207,8 @@ struct ProjectInventory {
     main_premiere_project: Option<String>,
     scanned_at: String,
     items: Vec<ProjectAsset>,
+    #[serde(default)]
+    premiere_index: Option<PremiereProjectIndex>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -5489,7 +5493,55 @@ fn inventory_project_directory_with_limits(
         main_premiere_project,
         scanned_at: Utc::now().to_rfc3339(),
         items,
+        premiere_index: None,
     })
+}
+
+fn premiere_index_path(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
+    if project_id.is_empty()
+        || !project_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+    {
+        return Err("Project identifier is not safe for local index storage".into());
+    }
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Application settings path has no parent")?
+        .join("premiere-indexes")
+        .join(format!("{project_id}.json")))
+}
+
+fn associate_premiere_media(
+    index: &mut PremiereProjectIndex,
+    project_directory: &Path,
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+) {
+    let Ok(master) = Path::new(&settings.master_bin_path).canonicalize() else {
+        return;
+    };
+    let known = catalogue
+        .media
+        .iter()
+        .filter_map(|media| {
+            fs_safe::resolve_existing(&master, &media.relative_path)
+                .ok()
+                .and_then(|path| path.canonicalize().ok())
+                .map(|path| (path, media.id.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    for reference in &mut index.media_references {
+        let path = PathBuf::from(&reference.path);
+        let candidate = if path.is_absolute() {
+            path
+        } else {
+            project_directory.join(path)
+        };
+        if let Ok(canonical) = candidate.canonicalize() {
+            reference.media_id = known.get(&canonical).cloned();
+        }
+    }
 }
 
 #[tauri::command]
@@ -5503,11 +5555,45 @@ async fn inventory_project(app: AppHandle, project_id: String) -> Result<Project
         .ok_or("Unknown project")?;
     let project_name = project.name.clone();
     let directory = resolve_known_project_directory(&settings, &project_id)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        inventory_project_directory(&project_id, &project_name, &directory)
+    let task_directory = directory.clone();
+    let task_project_id = project_id.clone();
+    let (mut inventory, parsed_index) = tauri::async_runtime::spawn_blocking(move || {
+        let inventory = inventory_project_directory(
+            &task_project_id,
+            &project_name,
+            &task_directory,
+        )?;
+        let parsed = inventory.main_premiere_project.as_ref().map(|relative| {
+            fs_safe::resolve_existing(&task_directory, relative).and_then(|path| {
+                premiere_index::index_project(&path, relative, Utc::now().to_rfc3339())
+            })
+        });
+        Ok::<_, String>((inventory, parsed))
     })
     .await
-    .map_err(|error| format!("Project inventory task failed: {error}"))?
+    .map_err(|error| format!("Project inventory task failed: {error}"))??;
+    if let Some(parsed_index) = parsed_index {
+        let relative = inventory.main_premiere_project.clone().unwrap_or_default();
+        match parsed_index {
+            Ok(mut index) => {
+                associate_premiere_media(&mut index, &directory, &settings, &catalogue);
+                let path = premiere_index_path(&app, &project_id)?;
+                write_json(&path, &index)?;
+                inventory.premiere_index = Some(index);
+            }
+            Err(error) => {
+                inventory.premiere_index = Some(PremiereProjectIndex {
+                    parser_version: premiere_index::PARSER_VERSION.into(),
+                    source_relative_path: relative,
+                    indexed_at: Utc::now().to_rfc3339(),
+                    status: "unsupported".into(),
+                    issues: vec![error],
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    Ok(inventory)
 }
 
 #[tauri::command]

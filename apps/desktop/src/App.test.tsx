@@ -698,6 +698,32 @@ describe('native application integration', () => {
       sizeBytes: 300,
       mainPremiereProject: 'Simple Vlog 057.prproj',
       scannedAt: '2026-10-28T01:00:00Z',
+      premiereIndex: {
+        parserVersion: 'pimp-prproj-1',
+        sourceRelativePath: 'Simple Vlog 057.prproj',
+        sourceFingerprint: 'fixture-hash',
+        sourceModifiedMillis: 1,
+        indexedAt: '2026-10-28T01:00:00Z',
+        status: 'supported',
+        formatVersion: '42',
+        mediaReferences: [
+          {
+            path: 'C:\\Master\\20261028\\DJI_0001.MP4',
+            evidence: 'imported-into-saved-project',
+            mediaId: 'video',
+          },
+          {
+            path: 'D:\\Historical\\offline.mp4',
+            evidence: 'imported-into-saved-project',
+          },
+        ],
+        sequences: [
+          { id: 'sequence-main', name: 'Main Edit', nested: false },
+          { id: 'sequence-nested', name: 'Opening', nested: true },
+        ],
+        bins: ['Media'],
+        issues: [],
+      },
       items: [
         {
           relativePath: 'Simple Vlog 057.prproj',
@@ -726,6 +752,10 @@ describe('native application integration', () => {
     await user.click(
       screen.getByRole('button', { name: /Simple Vlog 057.*1 assigned/ }),
     );
+    expect(await screen.findByText('Saved-project observation')).toBeVisible();
+    expect(screen.getByText('Main Edit')).toBeVisible();
+    expect(screen.getByText('Matched to Master Bin ID')).toBeVisible();
+    expect(screen.getByText('Referenced but unresolved')).toBeVisible();
 
     expect(
       (await screen.findAllByText('Simple Vlog 057.prproj'))[0],

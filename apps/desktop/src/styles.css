@@ -2252,6 +2252,7 @@ select:disabled {
 }
 .project-info-editor,
 .project-assets,
+.premiere-index,
 .project-linked-media {
   padding: 16px;
   border: 1px solid var(--border);
@@ -2259,6 +2260,51 @@ select:disabled {
   background: var(--bg-elevated);
   display: grid;
   gap: 12px;
+}
+.premiere-index > p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.premiere-index-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.premiere-index-grid > div {
+  min-width: 0;
+}
+.premiere-index-grid h4 {
+  margin: 0 0 8px;
+}
+.project-index-row {
+  margin-top: 6px;
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-control);
+  display: grid;
+  gap: 3px;
+}
+.project-index-row code,
+.project-index-row span {
+  overflow-wrap: anywhere;
+  font-size: 0.68rem;
+}
+.project-index-row span,
+.project-index-issue {
+  color: var(--text-muted);
+}
+.project-index-issue {
+  padding: 7px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-control);
+  font-size: 0.72rem;
+}
+@media (max-width: 900px) {
+  .premiere-index-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .project-info-editor textarea {
   min-height: 100px;
