@@ -560,6 +560,12 @@ struct OperationCounts {
     duplicate_files: usize,
     attention_files: usize,
     failed_files: usize,
+    #[serde(default)]
+    attempted_files: usize,
+    #[serde(default)]
+    existing_files: usize,
+    #[serde(default)]
+    pending_files: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -5119,16 +5125,20 @@ async fn update_media(
             });
         }
         if let Some(notes) = &update.notes {
-            events.push(CatalogueEvent::MediaNotesSet {
-                media_id: item.id.clone(),
-                value: notes.clone(),
-            });
+            if &item.notes != notes {
+                events.push(CatalogueEvent::MediaNotesSet {
+                    media_id: item.id.clone(),
+                    value: notes.clone(),
+                });
+            }
         }
         if let Some(favourite) = update.favourite {
-            events.push(CatalogueEvent::MediaFavouriteSet {
-                media_id: item.id.clone(),
-                value: favourite,
-            });
+            if item.favourite != favourite {
+                events.push(CatalogueEvent::MediaFavouriteSet {
+                    media_id: item.id.clone(),
+                    value: favourite,
+                });
+            }
         }
     }
     events.retain(|event| match event {
@@ -5909,6 +5919,26 @@ async fn enrich_media(app: AppHandle) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
         let _operation = begin_critical_operation(&state.operations, "media enrichment")?;
+        let now = Utc::now().to_rfc3339();
+        *state.enrichment_status.lock().unwrap() = Some(BackgroundOperation {
+            id: "media-enrichment".into(),
+            kind: "media-enrichment".into(),
+            title: "Technical metadata and thumbnail generation".into(),
+            state: "queued".into(),
+            stage: "Waiting for background capacity".into(),
+            current_item: None,
+            completed_items: 0,
+            total_items: None,
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: now.clone(),
+            updated_at: now,
+        });
         run_enrichment(&app, &state)
     })
     .await
@@ -6005,6 +6035,71 @@ fn enforce_thumbnail_cache_limit(cache: &Path, limit_bytes: u64) -> Result<u64, 
     Ok(removed)
 }
 
+fn valid_cached_thumbnail(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() < 4 || metadata.len() > 10 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 3];
+    file.read_exact(&mut header).is_ok() && header == [0xFF, 0xD8, 0xFF]
+}
+
+fn thumbnail_reference_is_available(cache: &Path, item: &MediaItem) -> bool {
+    item.thumbnail_path.as_deref() == Some(&format!("{}.jpg", item.id))
+        && valid_cached_thumbnail(&cache.join(format!("{}.jpg", item.id)))
+}
+
+fn enrichment_video_type(file_type: &str) -> bool {
+    matches!(
+        file_type.to_ascii_lowercase().as_str(),
+        "mp4"
+            | "mov"
+            | "m4v"
+            | "mxf"
+            | "mts"
+            | "m2ts"
+            | "avi"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "r3d"
+            | "braw"
+    )
+}
+
+fn generate_thumbnail_atomic(source: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or("Thumbnail destination has no cache directory")?;
+    let temporary = parent.join(format!(".thumbnail-{}.jpg", Uuid::new_v4()));
+    let output = media_tool_command("ffmpeg")
+        .args(["-y", "-ss", "0.1", "-i"])
+        .arg(source)
+        .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
+        .arg(&temporary)
+        .output()
+        .map_err(|error| format!("Could not start FFmpeg thumbnail generation: {error}"))?;
+    if !output.status.success() || !valid_cached_thumbnail(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "FFmpeg did not produce a valid thumbnail (exit status {})",
+            output.status
+        ));
+    }
+    if destination.exists() {
+        fs::remove_file(destination)
+            .map_err(|error| format!("Cannot replace invalid cached thumbnail: {error}"))?;
+    }
+    fs::rename(&temporary, destination)
+        .map_err(|error| format!("Cannot commit generated thumbnail: {error}"))?;
+    Ok(())
+}
+
 fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String> {
     let settings = load_settings_file(&app)?;
     let _enrichment_guard = state.enrichment_write.lock().unwrap();
@@ -6016,8 +6111,18 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         .media
         .iter()
         .filter(|item| {
-            matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v")
-                && (item.technical.codec.is_none() || item.thumbnail_path.is_none())
+            enrichment_video_type(&item.file_type)
+                && (item.technical.codec.is_none()
+                    || !thumbnail_reference_is_available(&cache, item))
+        })
+        .count();
+    let existing = catalogue
+        .media
+        .iter()
+        .filter(|item| {
+            enrichment_video_type(&item.file_type)
+                && item.technical.codec.is_some()
+                && thumbnail_reference_is_available(&cache, item)
         })
         .count();
     if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
@@ -6025,14 +6130,20 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         status.stage = "Inspecting technical metadata and thumbnails".into();
         status.completed_items = 0;
         status.total_items = Some(total);
+        status.counts = OperationCounts {
+            existing_files: existing,
+            pending_files: total,
+            ..OperationCounts::default()
+        };
         status.error = None;
         status.updated_at = Utc::now().to_rfc3339();
     }
     let mut candidates = Vec::new();
     let mut processed = 0_usize;
     for item in &catalogue.media {
-        let potentially_eligible = matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v")
-            && (item.technical.codec.is_none() || item.thumbnail_path.is_none());
+        let potentially_eligible = enrichment_video_type(&item.file_type)
+            && (item.technical.codec.is_none()
+                || !thumbnail_reference_is_available(&cache, item));
         if !potentially_eligible {
             continue;
         }
@@ -6051,6 +6162,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                     status.completed_items = processed;
                     status.counts.failed_files += 1;
+                    status.counts.pending_files = total.saturating_sub(processed);
                 }
                 continue;
             }
@@ -6062,6 +6174,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                     status.completed_items = processed;
                     status.counts.failed_files += 1;
+                    status.counts.pending_files = total.saturating_sub(processed);
                 }
                 continue;
             }
@@ -6071,10 +6184,13 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
             continue;
         }
         let thumbnail = cache.join(&thumbnail_ref);
-        let needs_probe = item.technical.codec.is_none()
-            && matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v");
-        let needs_thumbnail =
-            matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v") && !thumbnail.is_file();
+        let needs_probe = item.technical.codec.is_none();
+        let needs_thumbnail = !valid_cached_thumbnail(&thumbnail);
+        if !needs_thumbnail {
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.counts.existing_files += 1;
+            }
+        }
         if !needs_probe && !needs_thumbnail {
             processed += 1;
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
@@ -6123,29 +6239,38 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 }
             }
         }
+        let mut thumbnail_failed = false;
         if needs_thumbnail {
-            let _ = media_tool_command("ffmpeg")
-                .args(["-y", "-ss", "0.1", "-i"])
-                .arg(&source)
-                .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
-                .arg(&thumbnail)
-                .output();
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.counts.attempted_files += 1;
+            }
+            if let Err(error) = generate_thumbnail_atomic(&source, &thumbnail) {
+                thumbnail_failed = true;
+                diagnostic_log(app, "ERROR", "thumbnail-generation", &format!("{}: {error}", item.relative_path));
+            }
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
             processed += 1;
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                 status.completed_items = processed;
                 status.counts.attention_files += 1;
+                status.counts.pending_files = total.saturating_sub(processed);
             }
             continue;
         }
-        let generated_thumbnail_ref = thumbnail.is_file().then_some(thumbnail_ref);
-        let generated_thumbnail = generated_thumbnail_ref.is_some();
+        let generated_thumbnail_ref =
+            valid_cached_thumbnail(&thumbnail).then_some(thumbnail_ref);
+        let generated_thumbnail = needs_thumbnail && generated_thumbnail_ref.is_some();
+        if thumbnail_failed {
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.counts.failed_files += 1;
+            }
+        }
         if technical == item.technical && generated_thumbnail_ref == item.thumbnail_path {
             processed += 1;
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                 status.completed_items = processed;
-                status.counts.failed_files += 1;
+                status.counts.pending_files = total.saturating_sub(processed);
             }
             continue;
         }
@@ -6165,6 +6290,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
             status.completed_items = processed;
             status.counts.new_files += usize::from(generated_thumbnail);
+            status.counts.pending_files = total.saturating_sub(processed);
         }
     }
     let _guard = state.catalogue_write.lock().unwrap();
@@ -6189,12 +6315,17 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         .collect();
     let changed = events.len();
     append_events(&settings, events)?;
+    if changed > 0 {
+        let _ = app.emit("catalogue-changed", ());
+    }
     enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
     if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
         status.state = "completed".into();
         status.stage = "Thumbnail and metadata pass complete".into();
         status.current_item = None;
         status.completed_items = total;
+        status.counts.pending_files = 0;
+        status.retryable = status.counts.failed_files > 0;
         status.updated_at = Utc::now().to_rfc3339();
     }
     Ok(changed)
@@ -6243,6 +6374,32 @@ fn compatible_windows_handoff_path(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn explorer_boundary_path(value: &str) -> Result<String, String> {
+    let candidate = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(drive) = value.strip_prefix(r"\\?\") {
+        drive.to_string()
+    } else {
+        value.to_string()
+    };
+    if candidate.encode_utf16().count() >= 260 {
+        return Err(
+            "Windows Explorer cannot reliably select this path because it exceeds the Shell's supported path length; open its containing folder manually"
+                .into(),
+        );
+    }
+    if candidate
+        .split(['\\', '/'])
+        .any(|segment| segment.ends_with(' ') || segment.ends_with('.'))
+    {
+        return Err(
+            "Windows Explorer cannot safely select a path whose name ends in a space or period"
+                .into(),
+        );
+    }
+    Ok(candidate)
 }
 
 fn handoff_path(path: &Path) -> String {
@@ -6375,6 +6532,7 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
     #[link(name = "shell32")]
     extern "system" {
         fn ILCreateFromPathW(path: *const u16) -> *mut c_void;
+        fn ILFindLastID(pidl: *const c_void) -> *const c_void;
         fn ILFree(pidl: *mut c_void);
         fn SHOpenFolderAndSelectItems(
             folder: *const c_void,
@@ -6388,7 +6546,17 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
     const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
     const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
 
-    let wide_path = path
+    let shell_path = explorer_boundary_path(&path.to_string_lossy())?;
+    let shell_path = PathBuf::from(shell_path);
+    let parent = shell_path
+        .parent()
+        .ok_or("Windows Explorer could not determine the containing folder")?;
+    let wide_path = shell_path
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    let wide_parent = parent
         .as_os_str()
         .encode_wide()
         .chain(once(0))
@@ -6405,19 +6573,25 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
             ));
         }
 
+        let folder = ILCreateFromPathW(wide_parent.as_ptr());
         let item = ILCreateFromPathW(wide_path.as_ptr());
-        if item.is_null() {
+        if folder.is_null() || item.is_null() {
+            if !folder.is_null() {
+                ILFree(folder);
+            }
+            if !item.is_null() {
+                ILFree(item);
+            }
             if initialized >= 0 {
                 CoUninitialize();
             }
             return Err("Windows Explorer could not resolve this recording".into());
         }
-
-        // With item_count zero, the Shell opens the parent and selects this item.
-        // This avoids explorer.exe command-line quoting ambiguity for commas,
-        // whitespace and Unicode names and lets an existing Explorer window be reused.
-        let selected = SHOpenFolderAndSelectItems(item, 0, ptr::null(), 0);
+        let child = ILFindLastID(item);
+        let children = [child];
+        let selected = SHOpenFolderAndSelectItems(folder, 1, children.as_ptr(), 0);
         ILFree(item);
+        ILFree(folder);
         if initialized >= 0 {
             CoUninitialize();
         }
@@ -6615,6 +6789,9 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
     if metadata.len() > 10 * 1024 * 1024 {
         return Err("Thumbnail exceeds the 10 MB safety limit".into());
     }
+    if !valid_cached_thumbnail(&path) {
+        return Ok(None);
+    }
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     Ok(Some(format!(
         "data:image/jpeg;base64,{}",
@@ -6654,7 +6831,7 @@ fn load_thumbnail_sources(
         let Ok(path) = path.canonicalize() else {
             continue;
         };
-        if path.starts_with(&cache) && path.is_file() {
+        if path.starts_with(&cache) && valid_cached_thumbnail(&path) {
             sources.insert(item.id.clone(), path.to_string_lossy().into_owned());
         }
     }
@@ -7545,6 +7722,25 @@ mod tests {
     }
 
     #[test]
+    fn explorer_boundary_converts_short_drive_and_unc_paths_only() {
+        assert_eq!(
+            explorer_boundary_path(r"\\?\C:\Media\Unicode カード, 1\clip.mp4").unwrap(),
+            r"C:\Media\Unicode カード, 1\clip.mp4"
+        );
+        assert_eq!(
+            explorer_boundary_path(r"\\?\UNC\server\share\clip.wav").unwrap(),
+            r"\\server\share\clip.wav"
+        );
+        assert_eq!(
+            explorer_boundary_path(r"\\server\share\clip.wav").unwrap(),
+            r"\\server\share\clip.wav"
+        );
+        let long = format!(r"\\?\C:\Media\{}\clip.mp4", "x".repeat(260));
+        assert!(explorer_boundary_path(&long).unwrap_err().contains("path length"));
+        assert!(explorer_boundary_path(r"\\?\C:\Media\legacy.\clip.mp4").is_err());
+    }
+
+    #[test]
     fn queued_jobs_reserve_destinations_until_completion_or_cancellation() {
         let queued = ingest_job("queued", "queued");
         let destination = queued.files[0].destination_path.clone();
@@ -8068,6 +8264,30 @@ mod tests {
         assert!(!cache.join("a.jpg").exists());
         assert!(cache.join("b.jpg").is_file());
         assert!(cache.join("hover-previews/keep/frame.jpg").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_empty_and_invalid_thumbnail_cache_entries_require_regeneration() {
+        let (root, _, _, mut catalogue) = completion_fixture("thumbnail-validity");
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let mut item = catalogue.media.remove(0);
+        item.id = "media-a".into();
+        item.thumbnail_path = Some("media-a.jpg".into());
+        let thumbnail = cache.join("media-a.jpg");
+        assert!(!thumbnail_reference_is_available(&cache, &item));
+        fs::write(&thumbnail, []).unwrap();
+        assert!(!thumbnail_reference_is_available(&cache, &item));
+        fs::write(&thumbnail, b"not-a-jpeg").unwrap();
+        assert!(!thumbnail_reference_is_available(&cache, &item));
+        fs::write(&thumbnail, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert!(thumbnail_reference_is_available(&cache, &item));
+        fs::remove_file(&thumbnail).unwrap();
+        assert!(!thumbnail_reference_is_available(&cache, &item));
+        item.thumbnail_path = Some("different.jpg".into());
+        fs::write(&thumbnail, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert!(!thumbnail_reference_is_available(&cache, &item));
         fs::remove_dir_all(root).unwrap();
     }
 

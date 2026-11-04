@@ -305,6 +305,9 @@ export interface BackgroundOperation {
     duplicateFiles: number;
     attentionFiles: number;
     failedFiles: number;
+    attemptedFiles: number;
+    existingFiles: number;
+    pendingFiles: number;
   };
   cancellable: boolean;
   pausable: boolean;

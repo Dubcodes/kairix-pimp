@@ -1198,6 +1198,9 @@ describe('native application integration', () => {
           duplicateFiles: 1,
           attentionFiles: 0,
           failedFiles: 0,
+          attemptedFiles: 0,
+          existingFiles: 0,
+          pendingFiles: 8,
         },
         cancellable: true,
         pausable: false,
@@ -1858,6 +1861,139 @@ describe('native application integration', () => {
     expect(first).not.toBeChecked();
     expect(third).toBeChecked();
     expect(screen.getByText('1 selected')).toBeVisible();
+  });
+
+  it('loads the selected description and ignores a late save for another selection', async () => {
+    mocks.catalogue = {
+      media: ['one', 'two'].map((name, index) => ({
+        id: `media-${index + 1}`,
+        relativePath: `20261024/${name}.mp4`,
+        originalFilename: `${name}.mp4`,
+        sha256: name,
+        captureDateProvenance: 'unknown' as const,
+        ingestDate: '2026-10-24',
+        fileType: 'mp4',
+        tags: [],
+        projectIds: [],
+        notes: `${name} saved note`,
+        technical: { sizeBytes: 10 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    const pending = deferred<typeof mocks.catalogue>();
+    mocks.updateMedia.mockReturnValueOnce(pending.promise);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole('checkbox', { name: 'Select one.mp4' }),
+    );
+    const description = screen.getByRole('textbox', {
+      name: /Description for one.mp4/,
+    });
+    expect(description).toHaveValue('one saved note');
+    await user.clear(description);
+    await user.type(description, 'updated one');
+    await user.click(screen.getByRole('button', { name: 'Save description' }));
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['media-1'],
+      notes: 'updated one',
+    });
+
+    await user.click(screen.getByText('two.mp4'));
+    expect(
+      screen.getByRole('textbox', { name: /Description for two.mp4/ }),
+    ).toHaveValue('two saved note');
+    pending.resolve({
+      ...mocks.catalogue,
+      media: mocks.catalogue.media.map((item) =>
+        item.id === 'media-1' ? { ...item, notes: 'updated one' } : item,
+      ),
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('textbox', { name: /Description for two.mp4/ }),
+      ).toHaveValue('two saved note'),
+    );
+  });
+
+  it('preserves a failed description draft and reports the failure', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'media-1',
+          relativePath: '20261024/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'clip',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.updateMedia.mockRejectedValueOnce(new Error('disk unavailable'));
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(
+      await screen.findByRole('checkbox', { name: 'Select clip.mp4' }),
+    );
+    const description = screen.getByRole('textbox', {
+      name: /Description for clip.mp4/,
+    });
+    await user.type(description, 'Keep this draft');
+    await user.click(screen.getByRole('button', { name: 'Save description' }));
+    expect(await screen.findByText('Failed: disk unavailable')).toBeVisible();
+    expect(description).toHaveValue('Keep this draft');
+  });
+
+  it('falls back to a file-type placeholder when a thumbnail URL breaks', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'media-1',
+          relativePath: '20261024/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'clip',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          thumbnailPath: 'media-1.jpg',
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.loadThumbnailSources.mockResolvedValue({
+      'media-1': 'asset://localhost/media-1.jpg',
+    });
+    render(<App />);
+    const image = await waitFor(() => {
+      const candidate = document.querySelector(
+        'img[src="asset://localhost/media-1.jpg"]',
+      );
+      expect(candidate).not.toBeNull();
+      return candidate as HTMLImageElement;
+    });
+    fireEvent.error(image);
+    expect(await screen.findByText('MP4')).toBeVisible();
   });
 
   it('explains optional feature loss when FFmpeg tools are missing', async () => {

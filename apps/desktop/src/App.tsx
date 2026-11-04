@@ -212,7 +212,15 @@ export function App() {
   const [removeBatchTags, setRemoveBatchTags] = useState<string[]>([]);
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
   const [removeBatchProjects, setRemoveBatchProjects] = useState<string[]>([]);
-  const [batchDescription, setBatchDescription] = useState('');
+  const [descriptionDraft, setDescriptionDraft] = useState({
+    selectionKey: '',
+    value: '',
+  });
+  const [descriptionSaveStatus, setDescriptionSaveStatus] = useState<{
+    selectionKey: string;
+    state: 'idle' | 'saving' | 'saved' | 'failed';
+    detail?: string;
+  }>({ selectionKey: '', state: 'idle' });
   const [ingestBatchTags, setIngestBatchTags] = useState<string[]>([]);
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
@@ -232,6 +240,8 @@ export function App() {
     new Map<string, ProvisionalMetadataPatch>(),
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
+  const descriptionSaveGeneration = useRef(0);
+  const selectionKeyRef = useRef('');
   const contentRef = useRef<HTMLElement>(null);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
@@ -540,6 +550,17 @@ export function App() {
       current = false;
       window.clearInterval(timer);
     };
+  }, [configured, native]);
+
+  useEffect(() => {
+    if (!native || !configured) return;
+    void desktopBridge
+      .enrichMedia()
+      .catch((reason) =>
+        desktopBridge.logUiError(
+          `Startup thumbnail repair failed: ${errorText(reason)}`,
+        ),
+      );
   }, [configured, native]);
 
   useEffect(() => {
@@ -1122,10 +1143,66 @@ export function App() {
     selected.length === 1
       ? catalogue.media.find((item) => item.id === selected[0])
       : undefined;
+  const selectionKey = selected.join('\u0000');
+  useEffect(() => {
+    selectionKeyRef.current = selectionKey;
+  }, [selectionKey]);
+  const descriptionValue =
+    descriptionDraft.selectionKey === selectionKey
+      ? descriptionDraft.value
+      : (selectedRecording?.notes ?? '');
+  const visibleDescriptionStatus =
+    descriptionSaveStatus.selectionKey === selectionKey
+      ? descriptionSaveStatus
+      : { selectionKey, state: 'idle' as const };
   const selectedAssociatedMedia = selectedRecording
     ? associatedMedia(selectedRecording, catalogue.media)
     : [];
   const selectedPhysicalIds = expandLogicalMediaIds(selected, catalogue.media);
+  const saveSelectionDescription = async () => {
+    if (!selectedPhysicalIds.length) return;
+    const requestId = ++descriptionSaveGeneration.current;
+    const requestSelectionKey = selectionKey;
+    const mediaIds = [...selectedPhysicalIds];
+    const notes = descriptionValue;
+    const currentValues = mediaIds
+      .map((id) => catalogue.media.find((item) => item.id === id)?.notes)
+      .filter((value): value is string => value !== undefined);
+    setDescriptionSaveStatus({
+      selectionKey: requestSelectionKey,
+      state: 'saving',
+    });
+    if (
+      currentValues.length === mediaIds.length &&
+      currentValues.every((value) => value === notes)
+    ) {
+      setDescriptionSaveStatus({
+        selectionKey: requestSelectionKey,
+        state: 'saved',
+      });
+      return;
+    }
+    try {
+      const updated = await desktopBridge.updateMedia({ mediaIds, notes });
+      if (requestId !== descriptionSaveGeneration.current) return;
+      setCatalogue(updated);
+      if (selectionKeyRef.current === requestSelectionKey)
+        setDescriptionSaveStatus({
+          selectionKey: requestSelectionKey,
+          state: 'saved',
+        });
+    } catch (reason) {
+      if (
+        requestId === descriptionSaveGeneration.current &&
+        selectionKeyRef.current === requestSelectionKey
+      )
+        setDescriptionSaveStatus({
+          selectionKey: requestSelectionKey,
+          state: 'failed',
+          detail: errorText(reason),
+        });
+    }
+  };
   const contextRecording = contextMenu
     ? catalogue.media.find((item) => item.id === contextMenu.mediaId)
     : undefined;
@@ -1865,7 +1942,10 @@ export function App() {
                     <>
                       {' · '}
                       {operation.counts.newFiles} thumbnails generated ·{' '}
-                      {operation.counts.failedFiles} unavailable or failed
+                      {operation.counts.existingFiles} existing ·{' '}
+                      {operation.counts.attemptedFiles} attempted ·{' '}
+                      {operation.counts.failedFiles} unavailable or failed ·{' '}
+                      {operation.counts.pendingFiles} pending
                     </>
                   ) : (
                     <>
@@ -3316,23 +3396,56 @@ export function App() {
                     />
                   </div>
                   <label className="batch-description">
-                    Description for selection
+                    {selected.length === 1
+                      ? `Description for ${selectedRecording?.originalFilename ?? 'recording'}`
+                      : 'Replace description on all selected recordings'}
                     <input
-                      value={batchDescription}
+                      value={descriptionValue}
                       onChange={(event) =>
-                        setBatchDescription(event.target.value)
+                        setDescriptionDraft({
+                          selectionKey,
+                          value: event.target.value,
+                        })
                       }
-                      placeholder="Replace description on selected media"
+                      placeholder={
+                        selected.length === 1
+                          ? 'Describe this recording'
+                          : 'Bulk replacement description'
+                      }
                     />
+                    {selected.length > 1 && (
+                      <small>
+                        Bulk replacement overwrites the description on every
+                        selected physical recording.
+                      </small>
+                    )}
                     <button
                       className="batch-primary"
-                      disabled={busy}
-                      onClick={() =>
-                        void updateSelection({ notes: batchDescription })
+                      disabled={
+                        busy || visibleDescriptionStatus.state === 'saving'
+                      }
+                      onClick={() => void saveSelectionDescription()}
+                    >
+                      {visibleDescriptionStatus.state === 'saving'
+                        ? 'Saving…'
+                        : selected.length === 1
+                          ? 'Save description'
+                          : 'Replace descriptions'}
+                    </button>
+                    <span
+                      role="status"
+                      className={
+                        visibleDescriptionStatus.state === 'failed'
+                          ? 'field-error'
+                          : undefined
                       }
                     >
-                      Apply description
-                    </button>
+                      {visibleDescriptionStatus.state === 'saved'
+                        ? 'Saved'
+                        : visibleDescriptionStatus.state === 'failed'
+                          ? `Failed: ${visibleDescriptionStatus.detail}`
+                          : ''}
+                    </span>
                   </label>
                   <div className="file-actions" aria-label="Selection actions">
                     <button
@@ -3439,7 +3552,7 @@ export function App() {
                       setRemoveBatchTags([]);
                       setBatchProjects([]);
                       setRemoveBatchProjects([]);
-                      setBatchDescription('');
+                      setDescriptionDraft({ selectionKey: '', value: '' });
                       selectionAnchor.current = undefined;
                     }}
                   >
@@ -4601,6 +4714,7 @@ function MediaThumbnail({
   );
   const latestHoveredRatio = useRef(lastHoveredRatio);
   const [isHovering, setIsHovering] = useState(false);
+  const [failedImageSource, setFailedImageSource] = useState<string>();
   const requestGeneration = useRef(0);
   const releasePreview = useCallback(() => {
     requestGeneration.current += 1;
@@ -4769,6 +4883,12 @@ function MediaThumbnail({
     (preview
       ? holdFrameIndex(preview, holdFrame, lastHoveredRatio)
       : undefined);
+  const imageSource =
+    displayedFrame && displayedFrame !== failedImageSource
+      ? displayedFrame
+      : thumbnailSource && thumbnailSource !== failedImageSource
+        ? thumbnailSource
+        : undefined;
   return (
     <div
       ref={thumbnailRef}
@@ -4803,12 +4923,13 @@ function MediaThumbnail({
           : undefined
       }
     >
-      {displayedFrame || (showThumbnail && thumbnailSource) ? (
+      {imageSource && (displayedFrame || showThumbnail) ? (
         <img
-          src={displayedFrame ?? thumbnailSource}
+          src={imageSource}
           alt=""
           loading="lazy"
           decoding="async"
+          onError={() => setFailedImageSource(imageSource)}
         />
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>

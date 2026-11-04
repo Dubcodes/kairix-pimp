@@ -39,6 +39,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
+- Implemented Library reliability repair: correct Windows Shell parent/child reveal boundary, selection-keyed description persistence with failure/stale-response handling, and bounded regeneration of missing/invalid/evicted thumbnail JPEGs
 
 ## Milestone 3 — Premiere extension
 

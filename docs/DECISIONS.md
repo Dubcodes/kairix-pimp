@@ -405,3 +405,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Continue the first-party UXP companion on documented 25.6 APIs, recursively reconcile existing media paths, reuse exact child-bin names and default to `PIMP Media / <actual Master Bin folder>`. Rename clipboard UI to **Copy file paths** and describe it as text. Convert only short legacy-safe extended drive paths at the human/API boundary. Do not enable direct loopback handoff until authenticated pairing and Premiere 26.0.2 network-permission behavior are accepted. Do not enable outbound drag until a Windows OLE `IDataObject`/`CF_HDROP` copy-only source is accepted against Explorer and Premiere 26.0.2.
 - **Consequences:** Manual manifest selection remains an extra step but is explicit, offline and narrow. Automated tests establish selection, path conversion and reconciliation logic, not real Premiere behavior. HTML/text drag, direct `.prproj` modification, third-party helpers and Premiere 27-only drag features remain excluded.
+
+## ADR-055 — Validate rebuildable thumbnails and isolate Windows Shell paths
+
+- **Date:** 2026-11-04
+- **Status:** Accepted
+- **Decision:** Treat a catalogue thumbnail reference as a hint and require the expected cache-owned file to be a bounded non-empty JPEG before display or reuse. Regenerate only missing/invalid candidates through a cache-local temporary file and atomic rename, expose attempted/generated/existing/failed/pending counts, and retry on later startup passes. At the Explorer boundary only, convert short legacy-safe extended drive/UNC paths and invoke `SHOpenFolderAndSelectItems` with the containing-folder PIDL plus child PIDL.
+- **Consequences:** Eviction and damaged cache files self-heal without rebuilding every thumbnail or touching originals. Long or legacy-unsafe Shell paths fail with a precise limitation instead of mutating canonical filesystem paths. Automated API-boundary tests do not replace installed Explorer/WebView2 acceptance.
