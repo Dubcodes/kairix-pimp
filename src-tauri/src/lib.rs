@@ -1383,7 +1383,7 @@ fn save_settings(
     }
     if !matches!(
         settings.preview_preloading.as_str(),
-        "hovered" | "visible-nearby" | "idle"
+        "off" | "hovered" | "visible" | "visible-nearby" | "idle"
     ) {
         return Err("Choose a supported preview preloading mode".into());
     }
@@ -6994,6 +6994,76 @@ fn load_thumbnail_sources(
     Ok(sources)
 }
 
+#[tauri::command]
+async fn prepare_media_thumbnail(
+    app: AppHandle,
+    media_id: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _operation =
+            begin_critical_operation(&state.operations, "visible thumbnail generation")?;
+        let _enrichment_guard = state.enrichment_write.lock().unwrap();
+        let settings = load_settings_file(&app)?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .cloned()
+            .ok_or("Unknown media item")?;
+        if !enrichment_video_type(&item.file_type) {
+            return Ok(None);
+        }
+        let cache = PathBuf::from(&settings.thumbnail_cache_path);
+        fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+        let thumbnail_ref = format!("{}.jpg", item.id);
+        if !catalogue::safe_cache_reference(&thumbnail_ref) {
+            return Err("Media identity is not safe for the thumbnail cache".into());
+        }
+        let thumbnail = cache.join(&thumbnail_ref);
+        if !valid_cached_thumbnail(&thumbnail) {
+            let master = PathBuf::from(&settings.master_bin_path);
+            let source = fs_safe::resolve_existing(&master, &item.relative_path)?;
+            let before = fs_safe::snapshot(&source)?;
+            generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
+            if fs_safe::snapshot(&source)? != before {
+                return Err("Media changed while its thumbnail was being generated".into());
+            }
+        }
+        if item.thumbnail_path.as_deref() != Some(&thumbnail_ref) {
+            let _catalogue_guard = state.catalogue_write.lock().unwrap();
+            let current = load_catalogue_file(&settings)?;
+            let current_item = current
+                .media
+                .iter()
+                .find(|candidate| candidate.id == media_id)
+                .ok_or("Media changed while its thumbnail was being generated")?;
+            if current_item.relative_path != item.relative_path
+                || current_item.sha256 != item.sha256
+            {
+                return Err("Media changed while its thumbnail was being generated".into());
+            }
+            append_events(
+                &settings,
+                vec![CatalogueEvent::MediaEnriched {
+                    media_id: item.id.clone(),
+                    technical: current_item.technical.clone(),
+                    thumbnail_ref: Some(thumbnail_ref),
+                }],
+            )?;
+            let _ = app.emit("catalogue-changed", ());
+        }
+        enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
+        if !valid_cached_thumbnail(&thumbnail) {
+            return Ok(None);
+        }
+        Ok(Some(thumbnail.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| format!("Visible thumbnail worker failed: {error}"))?
+}
+
 fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
     let root = PathBuf::from(&settings.thumbnail_cache_path).join("hover-previews");
     fs::create_dir_all(&root)
@@ -7571,6 +7641,7 @@ pub fn run() {
             set_media_thumbnail_frame,
             load_thumbnail,
             load_thumbnail_sources,
+            prepare_media_thumbnail,
             load_hover_preview,
             prepare_hover_preview,
             hover_preview_cache_usage,

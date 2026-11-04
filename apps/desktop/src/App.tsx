@@ -111,6 +111,27 @@ const projectCategoryLabels: Record<string, string> = {
   'notes-documentation': 'Notes and documentation',
   other: 'Other project assets',
 };
+const staticThumbnailRequests = new Map<string, Promise<string | undefined>>();
+const requestStaticThumbnail = (key: string, mediaId: string) => {
+  const existing = staticThumbnailRequests.get(key);
+  if (existing) return existing;
+  const request = previewWorkQueue
+    .schedule(`static:${key}`, 0, 'Static thumbnail', () =>
+      desktopBridge.prepareMediaThumbnail(mediaId),
+    )
+    .catch((reason) => {
+      if (String(reason).includes('active viewport'))
+        staticThumbnailRequests.delete(key);
+      return undefined;
+    });
+  staticThumbnailRequests.set(key, request);
+  while (staticThumbnailRequests.size > 512) {
+    const oldest = staticThumbnailRequests.keys().next().value;
+    if (oldest) staticThumbnailRequests.delete(oldest);
+    else break;
+  }
+  return request;
+};
 const size = (bytes: number) =>
   bytes < 1024 * 1024
     ? `${Math.round(bytes / 1024)} KB`
@@ -710,6 +731,15 @@ export function App() {
           );
       });
   }, [catalogue.media, native]);
+  const receivePreparedThumbnail = useCallback(
+    (mediaId: string, source: string) =>
+      setThumbnailSources((current) =>
+        current[mediaId] === source
+          ? current
+          : { ...current, [mediaId]: source },
+      ),
+    [],
+  );
   const selectedProject = catalogue.projects.find(
     (project) => project.id === selectedProjectId,
   );
@@ -2770,14 +2800,6 @@ export function App() {
                       <option value="compact">Compact</option>
                     </select>
                   </label>
-                  <ToggleField
-                    label="Enable hover preview"
-                    description="Generate low-resolution video frames locally when a Library thumbnail is hovered. No audio is played."
-                    checked={settings.hoverPreviewsEnabled ?? true}
-                    onChange={(hoverPreviewsEnabled) =>
-                      void persistPreference({ hoverPreviewsEnabled })
-                    }
-                  />
                   <fieldset className="settings-subsection">
                     <legend>Thumbnail &amp; Preview</legend>
                     <label>
@@ -2810,15 +2832,23 @@ export function App() {
                   <label>
                     Preview preloading
                     <select
-                      value={settings.previewPreloading ?? 'visible-nearby'}
-                      onChange={(event) =>
-                        void persistPreference({
-                          previewPreloading: event.target
-                            .value as DeviceSettings['previewPreloading'],
-                        })
+                      value={
+                        settings.hoverPreviewsEnabled === false
+                          ? 'off'
+                          : (settings.previewPreloading ?? 'visible-nearby')
                       }
+                      onChange={(event) => {
+                        const previewPreloading = event.target
+                          .value as DeviceSettings['previewPreloading'];
+                        void persistPreference({
+                          previewPreloading,
+                          hoverPreviewsEnabled: previewPreloading !== 'off',
+                        });
+                      }}
                     >
-                      <option value="hovered">Only when hovered</option>
+                      <option value="off">Off (static thumbnails only)</option>
+                      <option value="hovered">On hover</option>
+                      <option value="visible">Visible recordings</option>
                       <option value="visible-nearby">
                         Visible and nearby recordings (recommended)
                       </option>
@@ -3625,10 +3655,12 @@ export function App() {
                             fileType={item.fileType}
                             thumbnailSource={thumbnailSources[item.id]}
                             sourceAvailable={item.available}
+                            onThumbnailPrepared={receivePreparedThumbnail}
                             previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
                             previewCacheEpoch={previewCacheEpoch}
                             enableHoverPreview={
                               (settings.hoverPreviewsEnabled ?? true) &&
+                              settings.previewPreloading !== 'off' &&
                               !clearingPreviewCache
                             }
                             holdFrame={settings.thumbnailHoldFrame ?? 'first'}
@@ -5023,6 +5055,9 @@ export function App() {
                               mediaId={item.id}
                               fileType={item.fileType}
                               thumbnailSource={thumbnailSources[item.id]}
+                              sourceAvailable={item.available}
+                              previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
+                              onThumbnailPrepared={receivePreparedThumbnail}
                             />
                           </div>
                           <span>
@@ -5365,6 +5400,7 @@ function MediaThumbnail({
   holdFrame = 'first',
   preloading = 'visible-nearby',
   allowBackgroundPreparation = true,
+  onThumbnailPrepared,
 }: {
   mediaId: string;
   fileType: string;
@@ -5376,6 +5412,7 @@ function MediaThumbnail({
   holdFrame?: DeviceSettings['thumbnailHoldFrame'];
   preloading?: DeviceSettings['previewPreloading'];
   allowBackgroundPreparation?: boolean;
+  onThumbnailPrepared?: (mediaId: string, source: string) => void;
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
   const [showThumbnail, setShowThumbnail] = useState(
@@ -5463,14 +5500,35 @@ function MediaThumbnail({
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
           setShowThumbnail(true);
-          observer.disconnect();
+          if (
+            !thumbnailSource &&
+            sourceAvailable &&
+            previewKey &&
+            previewableVideoTypes.has(fileType.toLowerCase())
+          ) {
+            void requestStaticThumbnail(previewKey, mediaId).then((source) => {
+              if (source) onThumbnailPrepared?.(mediaId, source);
+            });
+          }
+        } else if (previewKey) {
+          previewWorkQueue.cancel(`static:${previewKey}`);
         }
       },
       { rootMargin: '400px' },
     );
     observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
+    return () => {
+      observer.disconnect();
+      if (previewKey) previewWorkQueue.cancel(`static:${previewKey}`);
+    };
+  }, [
+    fileType,
+    mediaId,
+    onThumbnailPrepared,
+    previewKey,
+    sourceAvailable,
+    thumbnailSource,
+  ]);
   useEffect(() => {
     const element = thumbnailRef.current;
     if (!element || typeof IntersectionObserver === 'undefined') return;
@@ -5488,8 +5546,10 @@ function MediaThumbnail({
     if (
       !element ||
       preview ||
+      !thumbnailSource ||
       !previewEligible ||
       preloading === 'hovered' ||
+      preloading === 'off' ||
       typeof IntersectionObserver === 'undefined'
     )
       return;
@@ -5519,7 +5579,7 @@ function MediaThumbnail({
             )
             .catch(() => undefined);
       },
-      { rootMargin: '400px' },
+      { rootMargin: preloading === 'visible' ? '0px' : '400px' },
     );
     const visible = new IntersectionObserver(
       (entries) => {
@@ -5547,6 +5607,7 @@ function MediaThumbnail({
     previewEligible,
     previewKey,
     requestPreview,
+    thumbnailSource,
   ]);
   const displayedFrame =
     preview &&

@@ -23,7 +23,7 @@ Degoo currently uses an explicit official-browser handoff only. Testing with a d
 
 Appearance settings now select the nearest real sampled first, 10%, 20%, middle, 80% or last thumbnail hold frame, or retain a bounded device-local per-media last-hover position. The source media and synchronized catalogue are not modified.
 
-Preview preparation now uses a bounded priority queue: an active hover runs before queued visible, nearby and optional idle work, while an already-running FFmpeg operation finishes safely. Disk preparation is distinct from byte-budgeted RAM preloading, pauses during active ingest, and exposes queue, memory and disk usage in Appearance settings.
+Preview preparation uses a bounded priority queue: an active hover runs before queued visible, nearby and optional idle work, while an already-running FFmpeg operation finishes safely. Appearance offers static-only, hover, visible, visible-and-nearby and idle modes. A missing ordinary thumbnail entering the near viewport is generated first through the canonical media-ID cache path; hover preparation waits for that static image. The resulting source map is shared by Library and Projects. Disk preparation is distinct from byte-budgeted RAM preloading, pauses during active ingest, and exposes queue, memory and disk usage in Appearance settings.
 
 The repository now contains a separately packaged Premiere UXP proof of concept and a native **Export Premiere manifest** handoff for selected Master Bin media, including attached WAV files. Its interchange validation is automated-test covered, but the panel has not yet been loaded or packaged with UXP Developer Tool and no real Premiere compatibility is claimed. See [Premiere Companion integration](docs/PREMIERE_INTEGRATION.md).
 

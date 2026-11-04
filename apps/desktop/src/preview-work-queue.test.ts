@@ -73,4 +73,20 @@ describe('preview work queue', () => {
     await Promise.all([active, load, other]);
     expect(order).toEqual(['clip', 'other']);
   });
+
+  it('cancels queued work that leaves the active viewport', async () => {
+    const queue = new PreviewWorkQueue();
+    let release!: () => void;
+    const active = queue.schedule(
+      'active',
+      0,
+      'active',
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    const queued = queue.schedule('static:clip', 0, 'static', async () => {});
+    expect(queue.cancel('static:clip')).toBe(true);
+    await expect(queued).rejects.toThrow(/active viewport/);
+    release();
+    await active;
+  });
 });

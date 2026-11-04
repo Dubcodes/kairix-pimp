@@ -304,8 +304,8 @@ Known early decisions predate this log; their original dates were not recorded. 
 
 - **Date:** 2026-10-28
 - **Status:** Accepted
-- **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card.
-- **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Cards outside the viewport retain placeholders until near view. The grid itself is still not virtualized; the 3,000-card component measurement remains a baseline for the planned large-library virtualization milestone.
+- **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card. If a near-visible available video has no valid static image, request one fingerprint-keyed canonical cache generation and share its source with every workspace.
+- **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Existing cached cards outside the viewport retain placeholders until near view; genuinely missing near-visible images no longer wait behind catalogue-order enrichment, and hover preparation waits for the static result. The request cache is bounded and retains failures for that source fingerprint to prevent remount retry loops. The grid itself is still not virtualized; installed performance measurement remains required.
 
 ## ADR-041 — Seed durable ingest metadata without replacing file edits
 

@@ -89,6 +89,7 @@ const mocks = vi.hoisted(() => ({
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
+  prepareMediaThumbnail: vi.fn(),
   choosePremiereManifestDestination: vi.fn(),
   exportPremiereManifest: vi.fn(),
   startIngest: vi.fn(),
@@ -183,6 +184,7 @@ vi.mock('./bridge', () => ({
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
     loadThumbnailSources: mocks.loadThumbnailSources,
+    prepareMediaThumbnail: mocks.prepareMediaThumbnail,
     choosePremiereManifestDestination: mocks.choosePremiereManifestDestination,
     exportPremiereManifest: mocks.exportPremiereManifest,
     loadHoverPreview: mocks.loadHoverPreview,
@@ -420,6 +422,8 @@ describe('native application integration', () => {
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.loadThumbnailSources.mockReset();
     mocks.loadThumbnailSources.mockResolvedValue({});
+    mocks.prepareMediaThumbnail.mockReset();
+    mocks.prepareMediaThumbnail.mockResolvedValue(undefined);
     mocks.choosePremiereManifestDestination.mockReset();
     mocks.choosePremiereManifestDestination.mockResolvedValue(undefined);
     mocks.exportPremiereManifest.mockReset();
@@ -2154,6 +2158,94 @@ describe('native application integration', () => {
     });
     fireEvent.error(image);
     expect(await screen.findByText('MP4')).toBeVisible();
+  });
+
+  it('prepares one missing visible thumbnail and reuses it in Projects', async () => {
+    mocks.settings.previewPreloading = 'hovered';
+    const originalObserver = globalThis.IntersectionObserver;
+    class ImmediateIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {}
+      observe(target: Element) {
+        this.callback(
+          [{ isIntersecting: true, target } as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver,
+        );
+      }
+      unobserve() {}
+      disconnect() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = '0px';
+      thresholds = [0];
+    }
+    globalThis.IntersectionObserver =
+      ImmediateIntersectionObserver as unknown as typeof IntersectionObserver;
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'shared-thumbnail',
+          relativePath: '20261024/shared.mp4',
+          originalFilename: 'shared.mp4',
+          sha256: 'shared-sha',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: ['project-a'],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Shared thumbnail project',
+          workingDirectory: 'C:\\Projects\\Shared',
+          mediaIds: ['shared-thumbnail'],
+          notes: '',
+          tags: [],
+          createdAt: '2026-10-24T00:00:00Z',
+        },
+      ],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.prepareMediaThumbnail.mockResolvedValue(
+      'asset://localhost/shared-thumbnail.jpg',
+    );
+    mocks.inventoryProject.mockResolvedValue({
+      projectId: 'project-a',
+      rootPath: 'C:\\Projects\\Shared',
+      itemCount: 0,
+      sizeBytes: 0,
+      scannedAt: '2026-10-24T00:00:00Z',
+      items: [],
+    });
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+      await user.click(await screen.findByRole('button', { name: 'Library' }));
+      await waitFor(() =>
+        expect(mocks.prepareMediaThumbnail).toHaveBeenCalledTimes(1),
+      );
+      await user.click(screen.getByRole('button', { name: 'Projects' }));
+      await user.click(
+        screen.getByRole('button', { name: /Shared thumbnail project/ }),
+      );
+      await waitFor(() =>
+        expect(
+          document.querySelector(
+            'img[src="asset://localhost/shared-thumbnail.jpg"]',
+          ),
+        ).not.toBeNull(),
+      );
+      expect(mocks.prepareMediaThumbnail).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.IntersectionObserver = originalObserver;
+    }
   });
 
   it('explains optional feature loss when FFmpeg tools are missing', async () => {

@@ -12,7 +12,8 @@ export type ThumbnailHoldFrame =
   | '80-percent'
   | 'last'
   | 'last-hovered';
-export type PreviewPreloading = 'hovered' | 'visible-nearby' | 'idle';
+export type PreviewPreloading =
+  'off' | 'hovered' | 'visible' | 'visible-nearby' | 'idle';
 export interface DeviceSettings {
   deviceId: string;
   masterBinPath: string;
@@ -670,6 +671,12 @@ export const desktopBridge = {
         convertFileSrc(path),
       ]),
     );
+  },
+  prepareMediaThumbnail: async (mediaId: string) => {
+    const path = await invoke<string | null>('prepare_media_thumbnail', {
+      mediaId,
+    });
+    return path ? convertFileSrc(path) : undefined;
   },
   loadHoverPreview: (mediaId: string) =>
     invoke<HoverPreview>('load_hover_preview', { mediaId }),

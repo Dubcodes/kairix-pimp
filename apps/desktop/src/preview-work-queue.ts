@@ -108,6 +108,15 @@ export class PreviewWorkQueue {
     this.emit();
   }
 
+  cancel(key: string) {
+    const work = this.queued.get(key);
+    if (!work) return false;
+    this.queued.delete(key);
+    work.reject(new Error('Preview work left the active viewport.'));
+    this.emit();
+    return true;
+  }
+
   get status(): PreviewQueueStatus {
     return {
       active: Boolean(this.active),
