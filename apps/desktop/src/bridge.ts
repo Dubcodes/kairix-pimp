@@ -621,6 +621,10 @@ export const desktopBridge = {
   mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
   resolveMediaPath: (mediaId: string) =>
     invoke<string>('resolve_media_path', { mediaId }),
+  resolveMediaPlaybackSource: async (mediaId: string) =>
+    convertFileSrc(await invoke<string>('resolve_media_path', { mediaId })),
+  setMediaThumbnailFrame: (mediaId: string, seconds: number) =>
+    invoke<string>('set_media_thumbnail_frame', { mediaId, seconds }),
   revealMediaInExplorer: (mediaId: string) =>
     invoke<void>('reveal_media_in_explorer', { mediaId }),
   openMediaFolder: (mediaId: string) =>

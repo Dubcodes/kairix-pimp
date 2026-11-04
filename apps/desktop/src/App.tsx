@@ -130,6 +130,8 @@ export function App() {
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>('General');
   const [query, setQuery] = useState('');
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
+  const [includeUnavailable, setIncludeUnavailable] = useState(false);
   const [folder, setFolder] = useState('All media');
   const [selected, setSelected] = useState<string[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
@@ -223,6 +225,11 @@ export function App() {
   }>({ selectionKey: '', state: 'idle' });
   const [ingestBatchTags, setIngestBatchTags] = useState<string[]>([]);
   const [showScrollTop, setShowScrollTop] = useState(false);
+  const [viewerMediaId, setViewerMediaId] = useState<string>();
+  const [viewerSource, setViewerSource] = useState<string>();
+  const [viewerError, setViewerError] = useState('');
+  const [thumbnailFrameStatus, setThumbnailFrameStatus] = useState('');
+  const [showSelectionDetails, setShowSelectionDetails] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     mediaId: string;
     x: number;
@@ -243,6 +250,8 @@ export function App() {
   const descriptionSaveGeneration = useRef(0);
   const selectionKeyRef = useRef('');
   const contentRef = useRef<HTMLElement>(null);
+  const viewerVideoRef = useRef<HTMLVideoElement>(null);
+  const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
@@ -782,12 +791,85 @@ export function App() {
           item.relativePath.split('/').slice(0, -1).join('/') ||
           'Master Bin root';
         return (
+          (includeUnavailable || item.available) &&
           (folder === 'All media' || folder === itemFolder) &&
+          tagFilters.every((filter) =>
+            logicalTags(item, catalogue.media).some(
+              (tag) => tag.toLocaleLowerCase() === filter.toLocaleLowerCase(),
+            ),
+          ) &&
           logicalMediaMatches(item, query, catalogue)
         );
       }),
-    [catalogue, displayedMedia, folder, query],
+    [catalogue, displayedMedia, folder, includeUnavailable, query, tagFilters],
   );
+  const viewerRecording = viewerMediaId
+    ? catalogue.media.find((item) => item.id === viewerMediaId)
+    : undefined;
+  const viewerIndex = viewerRecording
+    ? filtered.findIndex((item) => item.id === viewerRecording.id)
+    : -1;
+  const viewerAssociatedMedia = viewerRecording
+    ? associatedMedia(viewerRecording, catalogue.media)
+    : [];
+  useEffect(() => {
+    if (!viewerMediaId || !viewerRecording?.available || !native) return;
+    let current = true;
+    void Promise.resolve().then(() => {
+      if (!current) return;
+      setViewerSource(undefined);
+      setViewerError('');
+    });
+    void desktopBridge
+      .resolveMediaPlaybackSource(viewerMediaId)
+      .then((source) => {
+        if (current) setViewerSource(source);
+      })
+      .catch((reason) => {
+        if (current) setViewerError(errorText(reason));
+      });
+    return () => {
+      current = false;
+    };
+  }, [native, viewerMediaId, viewerRecording?.available]);
+  const openClipViewer = (mediaId: string) => {
+    libraryScrollPosition.current = contentRef.current?.scrollTop ?? 0;
+    setSelected([mediaId]);
+    selectionAnchor.current = mediaId;
+    setViewerMediaId(mediaId);
+  };
+  const closeClipViewer = () => {
+    setViewerMediaId(undefined);
+    const top = libraryScrollPosition.current;
+    window.requestAnimationFrame(() => contentRef.current?.scrollTo?.({ top }));
+  };
+  const navigateClipViewer = (offset: -1 | 1) => {
+    const next = filtered[viewerIndex + offset];
+    if (!next) return;
+    setSelected([next.id]);
+    selectionAnchor.current = next.id;
+    setViewerMediaId(next.id);
+  };
+  const saveCurrentViewerFrame = async () => {
+    if (!viewerRecording || !viewerVideoRef.current) return;
+    setThumbnailFrameStatus('Saving thumbnail…');
+    try {
+      const source = await desktopBridge.setMediaThumbnailFrame(
+        viewerRecording.id,
+        viewerVideoRef.current.currentTime,
+      );
+      setThumbnailSources((current) => ({
+        ...current,
+        [viewerRecording.id]: source,
+      }));
+      setPreviewCacheEpoch((current) => current + 1);
+      setThumbnailFrameStatus(
+        'Thumbnail saved in this device’s cache. The frame choice is device-local.',
+      );
+    } catch (reason) {
+      setThumbnailFrameStatus(`Thumbnail failed: ${errorText(reason)}`);
+    }
+  };
   useEffect(() => {
     if (view !== 'Library' || !libraryLocateId) return;
     const card = libraryCardRefs.current.get(libraryLocateId);
@@ -1109,6 +1191,17 @@ export function App() {
         setMessage(
           `Catalogue changes saved. ${pendingManifests} project manifest update${pendingManifests === 1 ? ' is' : 's are'} pending automatic retry.`,
         );
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
+  const updateRecording = async (
+    mediaId: string,
+    next: { removeTags?: string[] },
+  ) => {
+    try {
+      const mediaIds = expandLogicalMediaIds([mediaId], catalogue.media);
+      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...next }));
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -3020,6 +3113,30 @@ export function App() {
                   placeholder="Search filenames, folders, tags, notes, projects, dates, codec…"
                 />
               </label>
+              <div className="library-filter-combo">
+                <SearchableComboBox
+                  label="Filter by tags"
+                  mode="multiple"
+                  options={knownTags.map((tag) => ({ id: tag, label: tag }))}
+                  selectedIds={tagFilters}
+                  onSelectionChange={setTagFilters}
+                  placeholder="Filter tags…"
+                />
+              </div>
+              <label
+                className="availability-toggle"
+                title="Unavailable means not present on this device; it does not mean safely archived"
+              >
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={includeUnavailable}
+                  onChange={(event) =>
+                    setIncludeUnavailable(event.target.checked)
+                  }
+                />
+                Include unavailable
+              </label>
               <button
                 disabled={busy || discoveryStatus.running}
                 onClick={doRescan}
@@ -3032,7 +3149,283 @@ export function App() {
                   : 'Scan for new files'}
               </button>
             </section>
-            <section className="content-grid">
+            {viewerRecording && (
+              <section
+                className={`clip-viewer ${
+                  viewerRecording.technical.height &&
+                  viewerRecording.technical.width &&
+                  viewerRecording.technical.height >
+                    viewerRecording.technical.width
+                    ? 'portrait'
+                    : 'landscape'
+                }`}
+                aria-label={`Clip viewer for ${viewerRecording.originalFilename}`}
+              >
+                <header className="clip-viewer-header">
+                  <button type="button" onClick={closeClipViewer}>
+                    <ArrowLeft aria-hidden="true" size={15} /> Back to Library
+                  </button>
+                  <div>
+                    <strong>{viewerRecording.originalFilename}</strong>
+                    <span>{viewerRecording.relativePath}</span>
+                  </div>
+                  <nav aria-label="Clip viewer navigation">
+                    <button
+                      type="button"
+                      disabled={viewerIndex <= 0}
+                      onClick={() => navigateClipViewer(-1)}
+                    >
+                      Previous
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        viewerIndex < 0 || viewerIndex >= filtered.length - 1
+                      }
+                      onClick={() => navigateClipViewer(1)}
+                    >
+                      Next
+                    </button>
+                  </nav>
+                </header>
+                <div className="clip-viewer-upper">
+                  <div className="clip-player">
+                    {!viewerRecording.available ? (
+                      <div className="clip-player-state" role="status">
+                        <strong>Media unavailable locally</strong>
+                        <span>
+                          Unavailable means the file is not present on this
+                          device; it does not mean archived or deleted.
+                        </span>
+                      </div>
+                    ) : viewerError ? (
+                      <div className="clip-player-state" role="alert">
+                        <strong>Preview unavailable</strong>
+                        <span>{viewerError}</span>
+                      </div>
+                    ) : viewerSource ? (
+                      <video
+                        ref={viewerVideoRef}
+                        src={viewerSource}
+                        controls
+                        preload="metadata"
+                        aria-label={`Playback ${viewerRecording.originalFilename}`}
+                        onError={() =>
+                          setViewerError(
+                            'WebView2 could not play this file or codec. The original media was not changed.',
+                          )
+                        }
+                      />
+                    ) : (
+                      <div className="clip-player-state" role="status">
+                        Loading local preview…
+                      </div>
+                    )}
+                  </div>
+                  <aside className="clip-metadata" aria-label="Clip metadata">
+                    <h3>Recording details</h3>
+                    <dl>
+                      <div>
+                        <dt>Resolution</dt>
+                        <dd>
+                          {viewerRecording.technical.width &&
+                          viewerRecording.technical.height
+                            ? `${viewerRecording.technical.width} × ${viewerRecording.technical.height}`
+                            : 'Unknown'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Frame rate</dt>
+                        <dd>
+                          {viewerRecording.technical.frameRate
+                            ? `${viewerRecording.technical.frameRate} fps`
+                            : 'Unknown'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Codec</dt>
+                        <dd>{viewerRecording.technical.codec ?? 'Unknown'}</dd>
+                      </div>
+                      <div>
+                        <dt>Duration</dt>
+                        <dd>
+                          {duration(viewerRecording.technical.durationSeconds)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Size</dt>
+                        <dd>{size(viewerRecording.technical.sizeBytes)}</dd>
+                      </div>
+                      <div>
+                        <dt>Integrity</dt>
+                        <dd>
+                          {viewerRecording.needsReview
+                            ? 'Needs review'
+                            : viewerRecording.available
+                              ? 'Verified locally'
+                              : 'Unavailable locally'}
+                        </dd>
+                      </div>
+                    </dl>
+                    <div className="clip-associated">
+                      <strong>
+                        {viewerAssociatedMedia.length} associated physical file
+                        {viewerAssociatedMedia.length === 1 ? '' : 's'}
+                      </strong>
+                      {viewerAssociatedMedia.map((recording) => (
+                        <div key={recording.id}>
+                          <span>{recording.originalFilename}</span>
+                          <button
+                            type="button"
+                            disabled={!recording.available}
+                            onClick={() =>
+                              void runSelectedFileAction('reveal', recording)
+                            }
+                          >
+                            Reveal
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </aside>
+                </div>
+                <div className="clip-editor">
+                  <label className="clip-description">
+                    Description
+                    <textarea
+                      value={descriptionValue}
+                      onChange={(event) =>
+                        setDescriptionDraft({
+                          selectionKey,
+                          value: event.target.value,
+                        })
+                      }
+                      placeholder="Describe this recording"
+                    />
+                    <button
+                      type="button"
+                      disabled={
+                        busy || visibleDescriptionStatus.state === 'saving'
+                      }
+                      onClick={() => void saveSelectionDescription()}
+                    >
+                      {visibleDescriptionStatus.state === 'saving'
+                        ? 'Saving…'
+                        : 'Save description'}
+                    </button>
+                    <span role="status">
+                      {visibleDescriptionStatus.state === 'saved'
+                        ? 'Saved'
+                        : visibleDescriptionStatus.state === 'failed'
+                          ? `Failed: ${visibleDescriptionStatus.detail}`
+                          : ''}
+                    </span>
+                  </label>
+                  <div className="clip-editor-field">
+                    <SearchableComboBox
+                      label="Add tags"
+                      mode="multiple"
+                      options={knownTags.map((tag) => ({
+                        id: tag,
+                        label: tag,
+                      }))}
+                      selectedIds={[]}
+                      onSelectionChange={(ids) =>
+                        void updateSelection({ addTags: ids })
+                      }
+                      placeholder="Search or create tags…"
+                      onCreate={(label) => ({ id: label, label })}
+                    />
+                    <div className="clip-chips">
+                      {logicalTags(viewerRecording, catalogue.media).map(
+                        (tag) => (
+                          <button
+                            type="button"
+                            key={tag}
+                            aria-label={`Remove tag ${tag}`}
+                            onClick={() =>
+                              void updateSelection({ removeTags: [tag] })
+                            }
+                          >
+                            {tag} ×
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </div>
+                  <div className="clip-editor-field">
+                    <SearchableComboBox
+                      label="Assign projects"
+                      mode="multiple"
+                      options={catalogue.projects.map((project) => ({
+                        id: project.id,
+                        label: project.name,
+                      }))}
+                      selectedIds={logicalProjectIds(
+                        viewerRecording,
+                        catalogue.media,
+                      )}
+                      onSelectionChange={(ids) => {
+                        const current = logicalProjectIds(
+                          viewerRecording,
+                          catalogue.media,
+                        );
+                        void updateSelection({
+                          addProjectIds: ids.filter(
+                            (id) => !current.includes(id),
+                          ),
+                          removeProjectIds: current.filter(
+                            (id) => !ids.includes(id),
+                          ),
+                        });
+                      }}
+                      placeholder="Search projects…"
+                    />
+                    <button
+                      type="button"
+                      className="clip-favourite"
+                      onClick={() =>
+                        void updateSelection({
+                          favourite: !viewerRecording.favourite,
+                        })
+                      }
+                    >
+                      <Star
+                        aria-hidden="true"
+                        size={14}
+                        fill={
+                          viewerRecording.favourite ? 'currentColor' : 'none'
+                        }
+                      />{' '}
+                      {viewerRecording.favourite
+                        ? 'Remove favourite'
+                        : 'Favourite'}
+                    </button>
+                  </div>
+                  <section className="analysis-placeholder">
+                    <strong>Analysis</strong>
+                    <span>
+                      Transcript, summary and observations are unavailable in
+                      the Light edition. No analysis result is fabricated.
+                    </span>
+                  </section>
+                  <section className="thumbnail-frame-control">
+                    <strong>Thumbnail</strong>
+                    <button
+                      type="button"
+                      disabled={!viewerSource || Boolean(viewerError)}
+                      onClick={() => void saveCurrentViewerFrame()}
+                    >
+                      Use current video frame
+                    </button>
+                    <span role="status">{thumbnailFrameStatus}</span>
+                  </section>
+                </div>
+              </section>
+            )}
+            <section
+              className={`content-grid ${viewerRecording ? 'library-hidden' : ''}`}
+            >
               <div className="folder-panel">
                 <div className="folder-panel-heading">
                   <h3>Folders</h3>
@@ -3167,6 +3560,7 @@ export function App() {
                             range: event.shiftKey,
                           });
                         }}
+                        onDoubleClick={() => openClipViewer(item.id)}
                         onKeyDown={(event) => {
                           if (event.key !== 'Enter' && event.key !== ' ')
                             return;
@@ -3242,7 +3636,36 @@ export function App() {
                           <small>{item.relativePath}</small>
                           <div className="pills">
                             {logicalTags(item, catalogue.media).map((tag) => (
-                              <em key={tag}>{tag}</em>
+                              <span className="tag-chip" key={tag}>
+                                <button
+                                  type="button"
+                                  title={`Filter Library by ${tag}`}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onContextMenu={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    setTagFilters((current) =>
+                                      current.includes(tag)
+                                        ? current
+                                        : [...current, tag],
+                                    );
+                                  }}
+                                >
+                                  {tag}
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label={`Remove tag ${tag} from ${item.originalFilename}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void updateRecording(item.id, {
+                                      removeTags: [tag],
+                                    });
+                                  }}
+                                >
+                                  ×
+                                </button>
+                              </span>
                             ))}
                           </div>
                           <div className="projects">
@@ -3299,7 +3722,9 @@ export function App() {
                 )}
               </div>
             </section>
-            <div className="library-overlays">
+            <div
+              className={`library-overlays ${viewerRecording ? 'library-hidden' : ''}`}
+            >
               {showScrollTop && (
                 <button
                   type="button"
@@ -3326,7 +3751,7 @@ export function App() {
                     <strong>{selected.length} selected</strong>
                     <span>Changes persist immediately</span>
                   </div>
-                  <div className="batch-combo">
+                  <div className="batch-combo compact-batch-control">
                     <Tag size={15} />
                     <SearchableComboBox
                       label="Add tags"
@@ -3340,31 +3765,14 @@ export function App() {
                         setBatchTags(ids);
                         void updateSelection({ addTags: ids });
                       }}
-                      placeholder="Search or create tags…"
+                      placeholder="Add tags…"
                       onCreate={(label) => ({ id: label, label })}
                     />
                   </div>
-                  <div className="batch-combo">
-                    <Tag size={15} />
-                    <SearchableComboBox
-                      label="Remove tags"
-                      mode="multiple"
-                      options={knownTags.map((tag) => ({
-                        id: tag,
-                        label: tag,
-                      }))}
-                      selectedIds={removeBatchTags}
-                      onSelectionChange={(ids) => {
-                        setRemoveBatchTags(ids);
-                        void updateSelection({ removeTags: ids });
-                      }}
-                      placeholder="Remove tags…"
-                    />
-                  </div>
-                  <div className="batch-combo">
+                  <div className="batch-combo compact-batch-control">
                     <UsersRound size={15} />
                     <SearchableComboBox
-                      label="Add projects"
+                      label="Assign projects"
                       mode="multiple"
                       options={catalogue.projects.map((project) => ({
                         id: project.id,
@@ -3375,173 +3783,221 @@ export function App() {
                         setBatchProjects(ids);
                         void updateSelection({ addProjectIds: ids });
                       }}
-                      placeholder="Search projects…"
+                      placeholder="Assign project…"
                     />
                   </div>
-                  <div className="batch-combo">
-                    <UsersRound size={15} />
-                    <SearchableComboBox
-                      label="Remove projects"
-                      mode="multiple"
-                      options={catalogue.projects.map((project) => ({
-                        id: project.id,
-                        label: project.name,
-                      }))}
-                      selectedIds={removeBatchProjects}
-                      onSelectionChange={(ids) => {
-                        setRemoveBatchProjects(ids);
-                        void updateSelection({ removeProjectIds: ids });
-                      }}
-                      placeholder="Remove projects…"
-                    />
-                  </div>
-                  <label className="batch-description">
-                    {selected.length === 1
-                      ? `Description for ${selectedRecording?.originalFilename ?? 'recording'}`
-                      : 'Replace description on all selected recordings'}
-                    <input
-                      value={descriptionValue}
-                      onChange={(event) =>
-                        setDescriptionDraft({
-                          selectionKey,
-                          value: event.target.value,
-                        })
-                      }
-                      placeholder={
-                        selected.length === 1
-                          ? 'Describe this recording'
-                          : 'Bulk replacement description'
-                      }
-                    />
-                    {selected.length > 1 && (
-                      <small>
-                        Bulk replacement overwrites the description on every
-                        selected physical recording.
-                      </small>
-                    )}
-                    <button
-                      className="batch-primary"
-                      disabled={
-                        busy || visibleDescriptionStatus.state === 'saving'
-                      }
-                      onClick={() => void saveSelectionDescription()}
-                    >
-                      {visibleDescriptionStatus.state === 'saving'
-                        ? 'Saving…'
-                        : selected.length === 1
-                          ? 'Save description'
-                          : 'Replace descriptions'}
-                    </button>
-                    <span
-                      role="status"
-                      className={
-                        visibleDescriptionStatus.state === 'failed'
-                          ? 'field-error'
-                          : undefined
-                      }
-                    >
-                      {visibleDescriptionStatus.state === 'saved'
-                        ? 'Saved'
-                        : visibleDescriptionStatus.state === 'failed'
-                          ? `Failed: ${visibleDescriptionStatus.detail}`
-                          : ''}
-                    </span>
-                  </label>
-                  <div className="file-actions" aria-label="Selection actions">
-                    <button
-                      className="batch-primary"
-                      onClick={() => void updateSelection({ favourite: true })}
-                    >
-                      <Star size={13} /> Favourite
-                    </button>
-                    <button
-                      onClick={() => void updateSelection({ favourite: false })}
-                    >
-                      Remove favourite
-                    </button>
-                    <button
-                      disabled={selectedPhysicalIds.every(
-                        (id) =>
-                          !catalogue.media.find((item) => item.id === id)
-                            ?.available,
-                      )}
-                      onClick={() => void copySelectedPaths()}
-                      title="Copies newline-separated text; it does not import media"
-                    >
-                      <Copy size={13} /> Copy file paths
-                    </button>
-                    <button
-                      disabled={selectedPhysicalIds.length === 0}
-                      onClick={() => void exportPremiereManifest()}
-                    >
-                      Export Premiere manifest
-                    </button>
-                    <small className="action-note">
-                      File paths are copied as text only; this does not import
-                      media into Premiere.
-                    </small>
-                  </div>
-                  {selectedRecording && (
+                  <button
+                    type="button"
+                    className="batch-primary"
+                    onClick={() => void updateSelection({ favourite: true })}
+                  >
+                    <Star size={13} /> Favourite
+                  </button>
+                  <button
+                    type="button"
+                    disabled={selectedPhysicalIds.length === 0}
+                    onClick={() => void exportPremiereManifest()}
+                  >
+                    Export Premiere manifest
+                  </button>
+                  <button
+                    type="button"
+                    className="batch-clear"
+                    aria-expanded={showSelectionDetails}
+                    onClick={() =>
+                      setShowSelectionDetails((current) => !current)
+                    }
+                  >
+                    {showSelectionDetails ? 'Fewer actions' : 'More actions'}
+                  </button>
+                  {showSelectionDetails && (
                     <>
-                      <div
-                        className="associated-files"
-                        role="group"
-                        aria-label="Associated physical files"
-                      >
-                        <strong>
-                          {selectedAssociatedMedia.length} associated file
-                          {selectedAssociatedMedia.length === 1 ? '' : 's'}
-                        </strong>
-                        {selectedAssociatedMedia.map((recording) => (
-                          <div className="associated-file" key={recording.id}>
-                            <div>
-                              <b>{recording.originalFilename}</b>
-                              <span>
-                                {recording.fileType.toUpperCase()} ·{' '}
-                                {size(recording.technical.sizeBytes)} ·{' '}
-                                {recording.needsReview
-                                  ? 'Integrity needs review'
-                                  : recording.available
-                                    ? 'Integrity verified'
-                                    : 'Unavailable locally'}
-                              </span>
-                              <code>{recording.relativePath}</code>
-                            </div>
-                            <button
-                              disabled={!recording.available}
-                              aria-label={`Reveal ${recording.originalFilename} in Explorer`}
-                              onClick={() =>
-                                void runSelectedFileAction('reveal', recording)
-                              }
-                            >
-                              <LocateFixed size={13} /> Reveal
-                            </button>
-                          </div>
-                        ))}
+                      <div className="batch-combo">
+                        <Tag size={15} />
+                        <SearchableComboBox
+                          label="Remove tags"
+                          mode="multiple"
+                          options={knownTags.map((tag) => ({
+                            id: tag,
+                            label: tag,
+                          }))}
+                          selectedIds={removeBatchTags}
+                          onSelectionChange={(ids) => {
+                            setRemoveBatchTags(ids);
+                            void updateSelection({ removeTags: ids });
+                          }}
+                          placeholder="Remove tags…"
+                        />
                       </div>
+                      <div className="batch-combo">
+                        <UsersRound size={15} />
+                        <SearchableComboBox
+                          label="Remove projects"
+                          mode="multiple"
+                          options={catalogue.projects.map((project) => ({
+                            id: project.id,
+                            label: project.name,
+                          }))}
+                          selectedIds={removeBatchProjects}
+                          onSelectionChange={(ids) => {
+                            setRemoveBatchProjects(ids);
+                            void updateSelection({ removeProjectIds: ids });
+                          }}
+                          placeholder="Remove projects…"
+                        />
+                      </div>
+                      <label className="batch-description">
+                        {selected.length === 1
+                          ? `Description for ${selectedRecording?.originalFilename ?? 'recording'}`
+                          : 'Replace description on all selected recordings'}
+                        <input
+                          value={descriptionValue}
+                          onChange={(event) =>
+                            setDescriptionDraft({
+                              selectionKey,
+                              value: event.target.value,
+                            })
+                          }
+                          placeholder={
+                            selected.length === 1
+                              ? 'Describe this recording'
+                              : 'Bulk replacement description'
+                          }
+                        />
+                        {selected.length > 1 && (
+                          <small>
+                            Bulk replacement overwrites the description on every
+                            selected physical recording.
+                          </small>
+                        )}
+                        <button
+                          className="batch-primary"
+                          disabled={
+                            busy || visibleDescriptionStatus.state === 'saving'
+                          }
+                          onClick={() => void saveSelectionDescription()}
+                        >
+                          {visibleDescriptionStatus.state === 'saving'
+                            ? 'Saving…'
+                            : selected.length === 1
+                              ? 'Save description'
+                              : 'Replace descriptions'}
+                        </button>
+                        <span
+                          role="status"
+                          className={
+                            visibleDescriptionStatus.state === 'failed'
+                              ? 'field-error'
+                              : undefined
+                          }
+                        >
+                          {visibleDescriptionStatus.state === 'saved'
+                            ? 'Saved'
+                            : visibleDescriptionStatus.state === 'failed'
+                              ? `Failed: ${visibleDescriptionStatus.detail}`
+                              : ''}
+                        </span>
+                      </label>
                       <div
                         className="file-actions"
-                        aria-label="Recording actions"
+                        aria-label="Selection actions"
                       >
                         <button
-                          disabled={!selectedRecording.available}
-                          onClick={() => void runSelectedFileAction('reveal')}
+                          onClick={() =>
+                            void updateSelection({ favourite: false })
+                          }
                         >
-                          <LocateFixed size={13} /> Reveal in Explorer
+                          Remove favourite
                         </button>
                         <button
-                          disabled={!selectedRecording.available}
-                          onClick={() => void runSelectedFileAction('folder')}
+                          disabled={selectedPhysicalIds.every(
+                            (id) =>
+                              !catalogue.media.find((item) => item.id === id)
+                                ?.available,
+                          )}
+                          onClick={() => void copySelectedPaths()}
+                          title="Copies newline-separated text; it does not import media"
                         >
-                          <FolderOpen size={13} /> Open date folder
+                          <Copy size={13} /> Copy file paths
                         </button>
-                        <button
-                          disabled={!selectedRecording.available}
-                          onClick={() => void runSelectedFileAction('copy')}
-                        >
-                          <Copy size={13} /> Copy path
-                        </button>
+                        <small className="action-note">
+                          File paths are copied as text only; this does not
+                          import media into Premiere.
+                        </small>
                       </div>
+                      {selectedRecording && (
+                        <>
+                          <div
+                            className="associated-files"
+                            role="group"
+                            aria-label="Associated physical files"
+                          >
+                            <strong>
+                              {selectedAssociatedMedia.length} associated file
+                              {selectedAssociatedMedia.length === 1 ? '' : 's'}
+                            </strong>
+                            {selectedAssociatedMedia.map((recording) => (
+                              <div
+                                className="associated-file"
+                                key={recording.id}
+                              >
+                                <div>
+                                  <b>{recording.originalFilename}</b>
+                                  <span>
+                                    {recording.fileType.toUpperCase()} ·{' '}
+                                    {size(recording.technical.sizeBytes)} ·{' '}
+                                    {recording.needsReview
+                                      ? 'Integrity needs review'
+                                      : recording.available
+                                        ? 'Integrity verified'
+                                        : 'Unavailable locally'}
+                                  </span>
+                                  <code>{recording.relativePath}</code>
+                                </div>
+                                <button
+                                  disabled={!recording.available}
+                                  aria-label={`Reveal ${recording.originalFilename} in Explorer`}
+                                  onClick={() =>
+                                    void runSelectedFileAction(
+                                      'reveal',
+                                      recording,
+                                    )
+                                  }
+                                >
+                                  <LocateFixed size={13} /> Reveal
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                          <div
+                            className="file-actions"
+                            aria-label="Recording actions"
+                          >
+                            <button
+                              disabled={!selectedRecording.available}
+                              onClick={() =>
+                                void runSelectedFileAction('reveal')
+                              }
+                            >
+                              <LocateFixed size={13} /> Reveal in Explorer
+                            </button>
+                            <button
+                              disabled={!selectedRecording.available}
+                              onClick={() =>
+                                void runSelectedFileAction('folder')
+                              }
+                            >
+                              <FolderOpen size={13} /> Open date folder
+                            </button>
+                            <button
+                              disabled={!selectedRecording.available}
+                              onClick={() => void runSelectedFileAction('copy')}
+                            >
+                              <Copy size={13} /> Copy path
+                            </button>
+                          </div>
+                        </>
+                      )}
                     </>
                   )}
                   <button

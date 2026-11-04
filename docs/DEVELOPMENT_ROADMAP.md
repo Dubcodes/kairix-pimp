@@ -17,6 +17,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented Projects workspace: navigable project details, read-only categorized folder inventory, local status/size/main-project evidence, portable notes/tags, linked logical recordings and Library/Explorer navigation
 - Implemented Projects workspace resilience: stale-request suppression, bounded read-only inventory, independent accessible row controls, grouped recording metadata actions and focus-preserving Library location
 - Implemented Library usability: persistent icon-only sidebar, six deterministic folder sort modes plus accessible custom order, logical video/WAV metadata and counts, clean thumbnail placeholders, themed batch editing and content scroll-to-top
+- Implemented same-window Clip Viewer foundation: WebView2 playback controls and error states, responsive portrait/landscape layout, previous/next navigation, catalogue metadata editing, associated-file reveal and explicit device-local thumbnail-frame selection
 - Implemented installed-app P0 corrections: responsive scroll-bounded ingest destination mapping and one validated batched thumbnail-source lookup with near-viewport lazy decoding
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
 - Implemented: active/completed/attention job separation with collapsed summaries and native-revalidated individual/all completed-history clearing

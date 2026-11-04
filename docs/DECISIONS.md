@@ -412,3 +412,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Treat a catalogue thumbnail reference as a hint and require the expected cache-owned file to be a bounded non-empty JPEG before display or reuse. Regenerate only missing/invalid candidates through a cache-local temporary file and atomic rename, expose attempted/generated/existing/failed/pending counts, and retry on later startup passes. At the Explorer boundary only, convert short legacy-safe extended drive/UNC paths and invoke `SHOpenFolderAndSelectItems` with the containing-folder PIDL plus child PIDL.
 - **Consequences:** Eviction and damaged cache files self-heal without rebuilding every thumbnail or touching originals. Long or legacy-unsafe Shell paths fail with a precise limitation instead of mutating canonical filesystem paths. Automated API-boundary tests do not replace installed Explorer/WebView2 acceptance.
+
+## ADR-056 — Keep clip playback in-window and custom frames device-local
+
+- **Date:** 2026-11-04
+- **Status:** Accepted
+- **Decision:** Resolve Clip Viewer playback from a known catalogue ID through the native root boundary and use WebView2's media element before considering bounded on-demand proxies. Keep selection/filter state in the Library view. Generate a manually chosen thumbnail with FFmpeg only on explicit request, validate source stability and cache-owned JPEG output, and persist the JPEG only in the device cache. Do not publish a selected timestamp as synchronized authoritative metadata in this milestone.
+- **Consequences:** Common codecs gain practical offline playback without another window or source mutation, while unsupported codecs fail visibly. A custom frame survives on that device until cache eviction/regeneration but does not follow the recording to another device. Installed WebView2 codec, keyboard, fullscreen, scaling and portrait acceptance remains required.

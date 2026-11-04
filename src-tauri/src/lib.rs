@@ -6072,13 +6072,29 @@ fn enrichment_video_type(file_type: &str) -> bool {
     )
 }
 
-fn generate_thumbnail_atomic(source: &Path, destination: &Path) -> Result<(), String> {
+fn validate_thumbnail_frame(seconds: f64, duration: Option<f64>) -> Result<(), String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("Thumbnail frame time must be a finite non-negative value".into());
+    }
+    if duration.is_some_and(|duration| seconds > duration) {
+        return Err("Thumbnail frame time is beyond the recording duration".into());
+    }
+    Ok(())
+}
+
+fn generate_thumbnail_atomic(
+    source: &Path,
+    destination: &Path,
+    seek_seconds: f64,
+) -> Result<(), String> {
+    validate_thumbnail_frame(seek_seconds, None)?;
     let parent = destination
         .parent()
         .ok_or("Thumbnail destination has no cache directory")?;
     let temporary = parent.join(format!(".thumbnail-{}.jpg", Uuid::new_v4()));
+    let seek = format!("{seek_seconds:.3}");
     let output = media_tool_command("ffmpeg")
-        .args(["-y", "-ss", "0.1", "-i"])
+        .args(["-y", "-ss", &seek, "-i"])
         .arg(source)
         .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
         .arg(&temporary)
@@ -6142,8 +6158,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
     let mut processed = 0_usize;
     for item in &catalogue.media {
         let potentially_eligible = enrichment_video_type(&item.file_type)
-            && (item.technical.codec.is_none()
-                || !thumbnail_reference_is_available(&cache, item));
+            && (item.technical.codec.is_none() || !thumbnail_reference_is_available(&cache, item));
         if !potentially_eligible {
             continue;
         }
@@ -6244,9 +6259,14 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                 status.counts.attempted_files += 1;
             }
-            if let Err(error) = generate_thumbnail_atomic(&source, &thumbnail) {
+            if let Err(error) = generate_thumbnail_atomic(&source, &thumbnail, 0.1) {
                 thumbnail_failed = true;
-                diagnostic_log(app, "ERROR", "thumbnail-generation", &format!("{}: {error}", item.relative_path));
+                diagnostic_log(
+                    app,
+                    "ERROR",
+                    "thumbnail-generation",
+                    &format!("{}: {error}", item.relative_path),
+                );
             }
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
@@ -6258,8 +6278,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
             }
             continue;
         }
-        let generated_thumbnail_ref =
-            valid_cached_thumbnail(&thumbnail).then_some(thumbnail_ref);
+        let generated_thumbnail_ref = valid_cached_thumbnail(&thumbnail).then_some(thumbnail_ref);
         let generated_thumbnail = needs_thumbnail && generated_thumbnail_ref.is_some();
         if thumbnail_failed {
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
@@ -6366,10 +6385,7 @@ fn compatible_windows_handoff_path(value: &str) -> String {
     let legacy_safe_segments = without_prefix
         .split(['\\', '/'])
         .all(|segment| !segment.ends_with(' ') && !segment.ends_with('.'));
-    if ordinary_drive_path
-        && legacy_safe_segments
-        && without_prefix.encode_utf16().count() < 260
-    {
+    if ordinary_drive_path && legacy_safe_segments && without_prefix.encode_utf16().count() < 260 {
         without_prefix.to_string()
     } else {
         value.to_string()
@@ -6753,6 +6769,60 @@ fn begin_update_installation(app: AppHandle, state: State<'_, NativeState>) -> R
 #[tauri::command]
 fn end_update_installation(state: State<'_, NativeState>) {
     end_update_gate(&state.operations);
+}
+
+#[tauri::command]
+fn set_media_thumbnail_frame(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    media_id: String,
+    seconds: f64,
+) -> Result<String, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let item = catalogue
+        .media
+        .iter()
+        .find(|item| item.id == media_id)
+        .cloned()
+        .ok_or("Unknown media item")?;
+    if !enrichment_video_type(&item.file_type) {
+        return Err("Custom thumbnail frames are supported only for video recordings".into());
+    }
+    validate_thumbnail_frame(seconds, item.technical.duration_seconds)?;
+    let source = resolve_catalogue_media_path(&settings, &media_id)?;
+    let before = fs_safe::snapshot(&source)?;
+    let cache = PathBuf::from(&settings.thumbnail_cache_path);
+    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+    let cache = cache
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
+    let thumbnail_ref = format!("{}.jpg", item.id);
+    let destination = cache.join(&thumbnail_ref);
+    let _enrichment_guard = state.enrichment_write.lock().unwrap();
+    generate_thumbnail_atomic(&source, &destination, seconds)?;
+    if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
+        let _ = fs::remove_file(&destination);
+        return Err(
+            "Source changed while selecting the thumbnail frame; retry after writes finish".into(),
+        );
+    }
+    if item.thumbnail_path.as_deref() != Some(&thumbnail_ref) {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        append_events(
+            &settings,
+            vec![CatalogueEvent::MediaEnriched {
+                media_id: item.id,
+                technical: item.technical,
+                thumbnail_ref: Some(thumbnail_ref),
+            }],
+        )?;
+    }
+    enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
+    let bytes = fs::read(&destination)
+        .map_err(|error| format!("Cannot load selected thumbnail: {error}"))?;
+    let _ = app.emit("catalogue-changed", ());
+    Ok(format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)))
 }
 
 #[tauri::command]
@@ -7412,6 +7482,7 @@ pub fn run() {
             export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
+            set_media_thumbnail_frame,
             load_thumbnail,
             load_thumbnail_sources,
             load_hover_preview,
@@ -7736,7 +7807,9 @@ mod tests {
             r"\\server\share\clip.wav"
         );
         let long = format!(r"\\?\C:\Media\{}\clip.mp4", "x".repeat(260));
-        assert!(explorer_boundary_path(&long).unwrap_err().contains("path length"));
+        assert!(explorer_boundary_path(&long)
+            .unwrap_err()
+            .contains("path length"));
         assert!(explorer_boundary_path(r"\\?\C:\Media\legacy.\clip.mp4").is_err());
     }
 
@@ -8289,6 +8362,16 @@ mod tests {
         fs::write(&thumbnail, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
         assert!(!thumbnail_reference_is_available(&cache, &item));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_thumbnail_frame_rejects_invalid_or_out_of_range_times() {
+        assert!(validate_thumbnail_frame(0.0, Some(10.0)).is_ok());
+        assert!(validate_thumbnail_frame(10.0, Some(10.0)).is_ok());
+        assert!(validate_thumbnail_frame(-0.1, Some(10.0)).is_err());
+        assert!(validate_thumbnail_frame(10.1, Some(10.0)).is_err());
+        assert!(validate_thumbnail_frame(f64::NAN, None).is_err());
+        assert!(validate_thumbnail_frame(f64::INFINITY, None).is_err());
     }
 
     #[test]

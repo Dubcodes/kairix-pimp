@@ -62,6 +62,8 @@ const mocks = vi.hoisted(() => ({
   discoveryListener: undefined as
     ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
   resolveMediaPath: vi.fn(),
+  resolveMediaPlaybackSource: vi.fn(),
+  setMediaThumbnailFrame: vi.fn(),
   revealMediaInExplorer: vi.fn(),
   openMediaFolder: vi.fn(),
   mediaToolsStatus: vi.fn(),
@@ -175,6 +177,8 @@ vi.mock('./bridge', () => ({
     enrichMedia: vi.fn(async () => 0),
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
+    resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
+    setMediaThumbnailFrame: mocks.setMediaThumbnailFrame,
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
@@ -341,6 +345,14 @@ describe('native application integration', () => {
     });
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
+    mocks.resolveMediaPlaybackSource.mockReset();
+    mocks.resolveMediaPlaybackSource.mockResolvedValue(
+      'asset://localhost/clip.mp4',
+    );
+    mocks.setMediaThumbnailFrame.mockReset();
+    mocks.setMediaThumbnailFrame.mockResolvedValue(
+      'data:image/jpeg;base64,selected',
+    );
     mocks.revealMediaInExplorer.mockReset();
     mocks.revealMediaInExplorer.mockResolvedValue(undefined);
     mocks.openMediaFolder.mockReset();
@@ -427,6 +439,100 @@ describe('native application integration', () => {
       filesCompleted: 0,
     });
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
+  });
+
+  it('opens, navigates and closes the in-window Clip Viewer without losing Library state', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'portrait-clip',
+          relativePath: '20261104/portrait.mp4',
+          originalFilename: 'portrait.mp4',
+          sha256: 'portrait',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-04',
+          fileType: 'mp4',
+          tags: ['interview'],
+          projectIds: [],
+          notes: 'Opening shot',
+          technical: {
+            sizeBytes: 2_000,
+            durationSeconds: 65,
+            width: 1080,
+            height: 1920,
+            codec: 'h264',
+            frameRate: 25,
+          },
+          available: true,
+          needsReview: false,
+        },
+        {
+          id: 'next-clip',
+          relativePath: '20261104/next.mp4',
+          originalFilename: 'next.mp4',
+          sha256: 'next',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-04',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 1_000, durationSeconds: 5 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-04T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    render(<App />);
+
+    const portraitName = await screen.findByText('portrait.mp4');
+    fireEvent.doubleClick(portraitName.closest('article')!);
+
+    expect(
+      await screen.findByRole('region', {
+        name: 'Clip viewer for portrait.mp4',
+      }),
+    ).toHaveClass('portrait');
+    const player = await screen.findByLabelText('Playback portrait.mp4');
+    expect(player).toHaveAttribute('src', 'asset://localhost/clip.mp4');
+    expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith(
+      'portrait-clip',
+    );
+    Object.defineProperty(player, 'currentTime', {
+      configurable: true,
+      value: 12.5,
+    });
+    await user.click(
+      screen.getByRole('button', { name: 'Use current video frame' }),
+    );
+    expect(mocks.setMediaThumbnailFrame).toHaveBeenCalledWith(
+      'portrait-clip',
+      12.5,
+    );
+    expect(
+      await screen.findByText(/frame choice is device-local/i),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(
+      await screen.findByRole('region', { name: 'Clip viewer for next.mp4' }),
+    ).toBeVisible();
+    expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith('next-clip');
+
+    fireEvent.error(await screen.findByLabelText('Playback next.mp4'));
+    expect(await screen.findByText('Preview unavailable')).toBeVisible();
+    expect(screen.getByText(/original media was not changed/i)).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Back to Library' }));
+    expect(
+      screen.getByRole('heading', { name: 'Media library' }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('checkbox', { name: 'Select next.mp4' }),
+    ).toBeChecked();
   });
 
   it('separates active, completed and attention jobs and clears one completed entry', async () => {
@@ -1570,6 +1676,7 @@ describe('native application integration', () => {
     });
     render(<App />);
     await user.click(await screen.findByText('clip.mp4'));
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
 
     await user.click(
       screen.getByRole('button', { name: /Reveal in Explorer/ }),
@@ -1655,6 +1762,7 @@ describe('native application integration', () => {
       'dji_0001.wav',
     );
     await user.click(screen.getByRole('option', { name: /DJI_0001.MP4/ }));
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
 
     const associatedFiles = screen.getByRole('group', {
       name: 'Associated physical files',
@@ -1779,6 +1887,7 @@ describe('native application integration', () => {
 
     await user.keyboard('{Control>}a{/Control}');
     expect(screen.getByText('3 selected')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
     await user.click(screen.getByRole('button', { name: 'Favourite' }));
     expect(mocks.updateMedia).toHaveBeenCalledWith({
       mediaIds: ['media-1', 'media-2', 'media-3'],
@@ -1891,6 +2000,7 @@ describe('native application integration', () => {
     await user.click(
       await screen.findByRole('checkbox', { name: 'Select one.mp4' }),
     );
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
     const description = screen.getByRole('textbox', {
       name: /Description for one.mp4/,
     });
@@ -1949,6 +2059,7 @@ describe('native application integration', () => {
     await user.click(
       await screen.findByRole('checkbox', { name: 'Select clip.mp4' }),
     );
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
     const description = screen.getByRole('textbox', {
       name: /Description for clip.mp4/,
     });
