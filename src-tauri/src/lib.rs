@@ -6223,12 +6223,38 @@ fn resolve_catalogue_media_path(
     Ok(path)
 }
 
+fn compatible_windows_handoff_path(value: &str) -> String {
+    let Some(without_prefix) = value.strip_prefix(r"\\?\") else {
+        return value.to_string();
+    };
+    let bytes = without_prefix.as_bytes();
+    let ordinary_drive_path = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let legacy_safe_segments = without_prefix
+        .split(['\\', '/'])
+        .all(|segment| !segment.ends_with(' ') && !segment.ends_with('.'));
+    if ordinary_drive_path
+        && legacy_safe_segments
+        && without_prefix.encode_utf16().count() < 260
+    {
+        without_prefix.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn handoff_path(path: &Path) -> String {
+    compatible_windows_handoff_path(&path.to_string_lossy())
+}
+
 #[tauri::command]
 fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String> {
     let settings = load_settings_file(&app)?;
-    Ok(resolve_catalogue_media_path(&settings, &media_id)?
-        .to_string_lossy()
-        .to_string())
+    Ok(handoff_path(&resolve_catalogue_media_path(
+        &settings, &media_id,
+    )?))
 }
 
 fn build_premiere_import_manifest(
@@ -6272,7 +6298,7 @@ fn build_premiere_import_manifest(
             .map(|candidate| candidate.id.clone());
         items.push(PremiereImportItem {
             media_id: item.id.clone(),
-            absolute_path: absolute.to_string_lossy().into_owned(),
+            absolute_path: handoff_path(&absolute),
             relative_path: item.relative_path.replace('\\', "/"),
             original_filename: item.original_filename.clone(),
             sha256: item.sha256.clone(),
@@ -7490,6 +7516,32 @@ mod tests {
             build_premiere_import_manifest(&settings, &catalogue, &["audio-a".into()]).is_err()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premiere_handoff_paths_strip_only_safe_short_drive_prefixes() {
+        assert_eq!(
+            compatible_windows_handoff_path(r"C:\Media\Unicode カード\clip 1.mp4"),
+            r"C:\Media\Unicode カード\clip 1.mp4"
+        );
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\server\share\clip 1.mp4"),
+            r"\\server\share\clip 1.mp4"
+        );
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\?\C:\Media\Unicode カード\clip 1.mp4"),
+            r"C:\Media\Unicode カード\clip 1.mp4"
+        );
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\?\UNC\server\share\clip.mp4"),
+            r"\\?\UNC\server\share\clip.mp4"
+        );
+        let long = format!(r"\\?\C:\Media\{}\clip.mp4", "x".repeat(260));
+        assert_eq!(compatible_windows_handoff_path(&long), long);
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\?\C:\Media\legacy.\clip.mp4"),
+            r"\\?\C:\Media\legacy.\clip.mp4"
+        );
     }
 
     #[test]

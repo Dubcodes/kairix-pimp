@@ -62,10 +62,11 @@ the installed application, not `npm run dev`.
       and confirm scrolling/navigation remains responsive while near-visible thumbnails load.
 - [ ] Hover several local videos, scrub across the frames, move the pointer away
       and confirm the static thumbnail returns without audio or console windows.
-- [ ] Exercise click, Ctrl+click, Shift+click and Ctrl+A selection; batch add and
-      remove tags/projects, set a description and favourite state.
-- [ ] Copy multiple CRLF-separated paths for manual Premiere import and confirm
-      the right-click actions match the visible selection actions.
+- [ ] Exercise thumbnail checkboxes by mouse and keyboard plus click, Ctrl+click,
+      Shift+click and Ctrl+A; confirm deselecting one checkbox preserves the rest,
+      then batch-edit tags/projects, description and favourite state.
+- [ ] Use **Copy file paths** and confirm it produces CRLF-separated text only;
+      it must not claim that Premiere imported the media.
 - [ ] Confirm **Reveal in Explorer** visibly selects disposable files whose names contain spaces, commas and Unicode, including an attached WAV; repeat with an already-open Explorer window and confirm an offline file reports an error.
 - [ ] Remove FFmpeg/FFprobe from `PATH`, restart, and confirm the warning while
       verified ingest and ordinary catalogue use remain functional.

@@ -1665,9 +1665,7 @@ describe('native application integration', () => {
       mediaIds: ['video', 'audio'],
       favourite: true,
     });
-    await user.click(
-      screen.getByRole('button', { name: /Copy paths for Premiere/ }),
-    );
+    await user.click(screen.getByRole('button', { name: /Copy file paths/ }));
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
         'C:\\Master\\video\r\nC:\\Master\\audio',
@@ -1784,9 +1782,7 @@ describe('native application integration', () => {
       favourite: true,
     });
 
-    await user.click(
-      screen.getByRole('button', { name: /Copy paths for Premiere/ }),
-    );
+    await user.click(screen.getByRole('button', { name: /Copy file paths/ }));
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
         'C:\\Master\\media-1.mp4\r\nC:\\Master\\media-2.mp4\r\nC:\\Master\\media-3.mp4',
@@ -1822,6 +1818,46 @@ describe('native application integration', () => {
     );
     expect(scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'auto' });
     vi.unstubAllGlobals();
+  });
+
+  it('toggles independent Library checkboxes without collapsing multiselection', async () => {
+    mocks.catalogue = {
+      media: ['one', 'two', 'three'].map((name, index) => ({
+        id: `media-${index + 1}`,
+        relativePath: `20261024/${name}.mp4`,
+        originalFilename: `${name}.mp4`,
+        sha256: name,
+        captureDateProvenance: 'unknown' as const,
+        ingestDate: '2026-10-24',
+        fileType: 'mp4',
+        tags: [],
+        projectIds: [],
+        notes: '',
+        technical: { sizeBytes: 10 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    render(<App />);
+
+    const first = await screen.findByRole('checkbox', {
+      name: 'Select one.mp4',
+    });
+    const third = screen.getByRole('checkbox', { name: 'Select three.mp4' });
+    await user.click(first);
+    await user.click(third);
+    expect(first).toBeChecked();
+    expect(third).toBeChecked();
+    expect(screen.getByText('2 selected')).toBeVisible();
+
+    first.focus();
+    await user.keyboard(' ');
+    expect(first).not.toBeChecked();
+    expect(third).toBeChecked();
+    expect(screen.getByText('1 selected')).toBeVisible();
   });
 
   it('explains optional feature loss when FFmpeg tools are missing', async () => {

@@ -1165,7 +1165,7 @@ export function App() {
       await navigator.clipboard.writeText(paths.join('\r\n'));
       const skipped = recordings.length - available.length;
       setMessage(
-        `${paths.length} media path${paths.length === 1 ? '' : 's'} copied for manual Premiere import${skipped ? `; ${skipped} unavailable item${skipped === 1 ? '' : 's'} skipped` : ''}.`,
+        `${paths.length} file path${paths.length === 1 ? '' : 's'} copied as text${skipped ? `; ${skipped} unavailable item${skipped === 1 ? '' : 's'} skipped` : ''}.`,
       );
     } catch (reason) {
       setError(errorText(reason));
@@ -3131,12 +3131,26 @@ export function App() {
                             }
                             allowBackgroundPreparation={activeJobs.length === 0}
                           />
+                          <input
+                            className="media-select"
+                            type="checkbox"
+                            checked={selected.includes(item.id)}
+                            aria-label={`Select ${item.originalFilename}`}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
+                            onChange={() => {
+                              setContextMenu(undefined);
+                              selectRecording(item.id, {
+                                toggle: true,
+                                range: false,
+                              });
+                            }}
+                          />
                           <span>
                             {duration(item.technical.durationSeconds)}
                           </span>
-                          {selected.includes(item.id) && (
-                            <b className="check">✓</b>
-                          )}
                         </div>
                         <div className="card-body">
                           <strong>{item.originalFilename}</strong>
@@ -3339,8 +3353,9 @@ export function App() {
                             ?.available,
                       )}
                       onClick={() => void copySelectedPaths()}
+                      title="Copies newline-separated text; it does not import media"
                     >
-                      <Copy size={13} /> Copy paths for Premiere
+                      <Copy size={13} /> Copy file paths
                     </button>
                     <button
                       disabled={selectedPhysicalIds.length === 0}
@@ -3348,6 +3363,10 @@ export function App() {
                     >
                       Export Premiere manifest
                     </button>
+                    <small className="action-note">
+                      File paths are copied as text only; this does not import
+                      media into Premiere.
+                    </small>
                   </div>
                   {selectedRecording && (
                     <>
@@ -3464,7 +3483,7 @@ export function App() {
                     void copySelectedPaths();
                   }}
                 >
-                  Copy path for Premiere
+                  Copy file paths
                 </button>
                 <button
                   role="menuitem"
