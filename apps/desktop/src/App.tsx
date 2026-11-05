@@ -74,6 +74,10 @@ import {
   writeLastHoveredRatio,
 } from './thumbnail-hold';
 import {
+  StaticThumbnailBackoffError,
+  StaticThumbnailRequestRegistry,
+} from './static-thumbnail-requests';
+import {
   associatedMedia,
   expandLogicalMediaIds,
   logicalMediaMatches,
@@ -119,26 +123,28 @@ const projectCategoryLabels: Record<string, string> = {
   'notes-documentation': 'Notes and documentation',
   other: 'Other project assets',
 };
-const staticThumbnailRequests = new Map<string, Promise<string | undefined>>();
-const requestStaticThumbnail = (key: string, mediaId: string) => {
-  const existing = staticThumbnailRequests.get(key);
-  if (existing) return existing;
-  const request = previewWorkQueue
-    .schedule(`static:${key}`, 0, 'Static thumbnail', () =>
-      desktopBridge.prepareMediaThumbnail(mediaId),
-    )
-    .catch((reason) => {
-      if (String(reason).includes('active viewport'))
-        staticThumbnailRequests.delete(key);
-      return undefined;
-    });
-  staticThumbnailRequests.set(key, request);
-  while (staticThumbnailRequests.size > 512) {
-    const oldest = staticThumbnailRequests.keys().next().value;
-    if (oldest) staticThumbnailRequests.delete(oldest);
-    else break;
-  }
-  return request;
+const staticThumbnailRequests = new StaticThumbnailRequestRegistry();
+const staticThumbnailQueueKey = (key: string, cacheGeneration: number) =>
+  `static:${cacheGeneration}:${key}`;
+const requestStaticThumbnail = (
+  key: string,
+  mediaId: string,
+  priority: PreviewPriority,
+  cacheGeneration: number,
+) => {
+  const requestKey = `${cacheGeneration}:${key}`;
+  previewWorkQueue.promote(
+    staticThumbnailQueueKey(key, cacheGeneration),
+    priority,
+  );
+  return staticThumbnailRequests.request(requestKey, () =>
+    previewWorkQueue.schedule(
+      staticThumbnailQueueKey(key, cacheGeneration),
+      priority,
+      'Static thumbnail',
+      () => desktopBridge.prepareMediaThumbnail(mediaId),
+    ),
+  );
 };
 const size = (bytes: number) =>
   bytes < 1024 * 1024
@@ -324,6 +330,8 @@ export function App() {
   const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
+  const preparedThumbnailVersion = useRef(0);
+  const preparedThumbnailVersions = useRef(new Map<string, number>());
   const inventoryDateOverride = useRef<string | undefined>(undefined);
   const dateSelectionRef = useRef({ dateOverride, chosenDate });
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
@@ -800,6 +808,7 @@ export function App() {
   useEffect(() => {
     if (!native) return;
     const generation = ++thumbnailSourceGeneration.current;
+    const preparedVersionAtStart = preparedThumbnailVersion.current;
     const mediaIds = catalogue.media
       .filter((item) => item.thumbnailPath)
       .map((item) => item.id);
@@ -807,8 +816,21 @@ export function App() {
       .loadThumbnailSources(mediaIds)
       .then((sources) => {
         setThumbnailSourceRequestCount((count) => count + 1);
-        if (generation === thumbnailSourceGeneration.current)
-          setThumbnailSources(sources);
+        if (generation === thumbnailSourceGeneration.current) {
+          setThumbnailSources((current) => {
+            const next = { ...current };
+            for (const mediaId of mediaIds) {
+              if (
+                (preparedThumbnailVersions.current.get(mediaId) ?? 0) >
+                preparedVersionAtStart
+              )
+                continue;
+              if (sources[mediaId]) next[mediaId] = sources[mediaId];
+              else delete next[mediaId];
+            }
+            return next;
+          });
+        }
       })
       .catch((reason) => {
         setThumbnailSourceRequestCount((count) => count + 1);
@@ -819,12 +841,15 @@ export function App() {
       });
   }, [catalogue.media, native]);
   const receivePreparedThumbnail = useCallback(
-    (mediaId: string, source: string) =>
+    (mediaId: string, source: string) => {
+      const version = ++preparedThumbnailVersion.current;
+      preparedThumbnailVersions.current.set(mediaId, version);
       setThumbnailSources((current) =>
         current[mediaId] === source
           ? current
           : { ...current, [mediaId]: source },
-      ),
+      );
+    },
     [],
   );
   const selectedProject = catalogue.projects.find(
@@ -5613,6 +5638,7 @@ export function App() {
                                   thumbnailSource={thumbnailSources[item.id]}
                                   sourceAvailable={item.available}
                                   previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
+                                  previewCacheEpoch={previewCacheEpoch}
                                   onThumbnailPrepared={receivePreparedThumbnail}
                                 />
                               </div>
@@ -6024,6 +6050,7 @@ function MediaThumbnail({
   const [isHovering, setIsHovering] = useState(false);
   const [failedImageSource, setFailedImageSource] = useState<string>();
   const requestGeneration = useRef(0);
+  const staticRequestGeneration = useRef(0);
   const releasePreview = useCallback(() => {
     requestGeneration.current += 1;
     setPreviewIndex(undefined);
@@ -6051,7 +6078,7 @@ function MediaThumbnail({
     previewableVideoTypes.has(fileType.toLowerCase()) &&
     !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
   const requestPreview = useCallback(
-    (priority: PreviewPriority = 0) => {
+    (priority: PreviewPriority = 2) => {
       if (preview || !previewKey || !previewEligible) return;
       previewWorkQueue.promote(`load:${previewKey}`, priority);
       const generation = ++requestGeneration.current;
@@ -6089,36 +6116,88 @@ function MediaThumbnail({
   useEffect(() => {
     const element = thumbnailRef.current;
     if (!element || typeof IntersectionObserver === 'undefined') return;
-    const observer = new IntersectionObserver(
+    const generation = ++staticRequestGeneration.current;
+    let nearby = false;
+    let attempts = 0;
+    let retryTimer: number | undefined;
+    const request = (priority: PreviewPriority) => {
+      if (
+        !nearby ||
+        thumbnailSource ||
+        !sourceAvailable ||
+        !previewKey ||
+        !previewableVideoTypes.has(fileType.toLowerCase())
+      )
+        return;
+      void requestStaticThumbnail(
+        previewKey,
+        mediaId,
+        priority,
+        previewCacheEpoch,
+      )
+        .then((source) => {
+          if (generation === staticRequestGeneration.current)
+            onThumbnailPrepared?.(mediaId, source);
+        })
+        .catch((reason) => {
+          if (
+            generation !== staticRequestGeneration.current ||
+            !nearby ||
+            attempts >= 4
+          )
+            return;
+          attempts += 1;
+          const delay =
+            reason instanceof StaticThumbnailBackoffError
+              ? Math.max(50, reason.retryAt - Date.now())
+              : Math.min(30_000, 500 * 2 ** (attempts - 1));
+          retryTimer = window.setTimeout(() => request(priority), delay);
+        });
+    };
+    const nearObserver = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
+          nearby = true;
           setShowThumbnail(true);
-          if (
-            !thumbnailSource &&
-            sourceAvailable &&
-            previewKey &&
-            previewableVideoTypes.has(fileType.toLowerCase())
-          ) {
-            void requestStaticThumbnail(previewKey, mediaId).then((source) => {
-              if (source) onThumbnailPrepared?.(mediaId, source);
-            });
-          }
+          request(1);
         } else if (previewKey) {
-          previewWorkQueue.cancel(`static:${previewKey}`);
+          nearby = false;
+          if (retryTimer != null) window.clearTimeout(retryTimer);
+          previewWorkQueue.cancel(
+            staticThumbnailQueueKey(previewKey, previewCacheEpoch),
+          );
         }
       },
       { rootMargin: '400px' },
     );
-    observer.observe(element);
+    const visibleObserver = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          nearby = true;
+          request(0);
+        }
+      },
+      { rootMargin: '0px' },
+    );
+    nearObserver.observe(element);
+    visibleObserver.observe(element);
     return () => {
-      observer.disconnect();
-      if (previewKey) previewWorkQueue.cancel(`static:${previewKey}`);
+      staticRequestGeneration.current += 1;
+      nearby = false;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      nearObserver.disconnect();
+      visibleObserver.disconnect();
+      if (previewKey)
+        previewWorkQueue.cancel(
+          staticThumbnailQueueKey(previewKey, previewCacheEpoch),
+        );
     };
   }, [
     fileType,
     mediaId,
     onThumbnailPrepared,
     previewKey,
+    previewCacheEpoch,
     sourceAvailable,
     thumbnailSource,
   ]);
@@ -6151,7 +6230,7 @@ function MediaThumbnail({
         const isNearby = entries.some((entry) => entry.isIntersecting);
         if (isNearby && allowBackgroundPreparation && previewKey)
           void previewWorkQueue
-            .schedule(`prepare:${previewKey}`, 2, fileType.toUpperCase(), () =>
+            .schedule(`prepare:${previewKey}`, 4, fileType.toUpperCase(), () =>
               desktopBridge.prepareHoverPreview(mediaId),
             )
             .catch(() => undefined);
@@ -6165,7 +6244,7 @@ function MediaThumbnail({
             .schedule(`prepare:${previewKey}`, () =>
               previewWorkQueue.schedule(
                 `prepare:${previewKey}`,
-                3,
+                5,
                 fileType.toUpperCase(),
                 () => desktopBridge.prepareHoverPreview(mediaId),
               ),
@@ -6180,7 +6259,7 @@ function MediaThumbnail({
           allowBackgroundPreparation &&
           entries.some((entry) => entry.isIntersecting)
         )
-          requestPreview(1);
+          requestPreview(3);
       },
       { rootMargin: '0px' },
     );

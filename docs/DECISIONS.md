@@ -447,3 +447,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Keep assigned project recordings visible. Keep available-to-add media collapsed and unmounted until requested, then filter it by text/tags and render 50 logical recordings per page. Reuse canonical media IDs, logical audio grouping, thumbnail-source state and the ordinary missing-thumbnail recovery path from Library.
 - **Consequences:** Opening a project no longer mounts hundreds of hidden cards or starts page-specific media work. Assignment remains an authoritative metadata operation. Native outbound drag remains disabled under ADR-054 until a copy-only OLE payload is accepted in Explorer and Premiere 26.0.2.
+
+## ADR-061 — Retain only in-flight static-thumbnail requests
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Deduplicate static-thumbnail requests only while their promise is in flight. Store bounded failure/backoff state separately, retry cancellations immediately, and key requests by source identity plus cache generation. Prioritize visible and nearby static images ahead of explicit and automatic hover work. Coordinate native writes with bounded per-media locks while keeping FFmpeg outside the catalogue write mutex and protecting the returned file during cache eviction.
+- **Consequences:** An empty or failed request no longer permanently suppresses a visible thumbnail, navigation shares genuine concurrent work, and enrichment of another recording cannot block the foreground image behind the whole pass. Repeated failures remain rate-limited, cache/source replacements get fresh request identities, and no synchronized event is emitted when catalogue enrichment would be a no-op.

@@ -2,31 +2,60 @@ import { describe, expect, it, vi } from 'vitest';
 import { PreviewWorkQueue } from './preview-work-queue';
 
 describe('preview work queue', () => {
-  it('runs hover work before queued visible, nearby and idle preparation', async () => {
+  it('prioritizes static thumbnails before interactive and automatic hover work', async () => {
     const queue = new PreviewWorkQueue();
     const order: string[] = [];
     let release!: () => void;
     const active = queue.schedule(
       'active',
-      2,
+      4,
       'nearby',
       () =>
         new Promise<void>((resolve) => {
           release = resolve;
         }),
     );
-    const idle = queue.schedule('idle', 3, 'idle', async () => {
+    const idle = queue.schedule('idle', 5, 'idle', async () => {
       order.push('idle');
     });
-    const visible = queue.schedule('visible', 1, 'visible', async () => {
-      order.push('visible');
+    const automatic = queue.schedule('automatic', 3, 'automatic', async () => {
+      order.push('automatic');
     });
-    const hover = queue.schedule('hover', 0, 'hover', async () => {
+    const hover = queue.schedule('hover', 2, 'hover', async () => {
       order.push('hover');
     });
+    const nearbyStatic = queue.schedule(
+      'static-nearby',
+      1,
+      'static nearby',
+      async () => {
+        order.push('static-nearby');
+      },
+    );
+    const visibleStatic = queue.schedule(
+      'static-visible',
+      0,
+      'static visible',
+      async () => {
+        order.push('static-visible');
+      },
+    );
     release();
-    await Promise.all([active, idle, visible, hover]);
-    expect(order).toEqual(['hover', 'visible', 'idle']);
+    await Promise.all([
+      active,
+      idle,
+      automatic,
+      hover,
+      nearbyStatic,
+      visibleStatic,
+    ]);
+    expect(order).toEqual([
+      'static-visible',
+      'static-nearby',
+      'hover',
+      'automatic',
+      'idle',
+    ]);
   });
 
   it('deduplicates a key and bounds queued low-priority work', async () => {

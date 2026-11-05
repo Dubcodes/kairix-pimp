@@ -21,7 +21,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -65,6 +65,7 @@ struct NativeState {
     tray_available: Mutex<bool>,
     operations: Mutex<OperationCoordinator>,
     preview_generation: Mutex<()>,
+    thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     backup_job_store: Mutex<()>,
     inventory_worker: Mutex<()>,
     inventory_cancelled: Mutex<HashSet<String>>,
@@ -6265,7 +6266,22 @@ fn kick_enrichment_worker(app: AppHandle) {
     });
 }
 
-fn enforce_thumbnail_cache_limit(cache: &Path, limit_bytes: u64) -> Result<u64, String> {
+fn thumbnail_generation_lock(state: &NativeState, media_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.thumbnail_generations.lock().unwrap();
+    if locks.len() > 2_048 {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    locks
+        .entry(media_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn enforce_thumbnail_cache_limit(
+    cache: &Path,
+    limit_bytes: u64,
+    protected: Option<&Path>,
+) -> Result<u64, String> {
     if limit_bytes == 0 || !cache.is_dir() {
         return Ok(0);
     }
@@ -6274,6 +6290,9 @@ fn enforce_thumbnail_cache_limit(cache: &Path, limit_bytes: u64) -> Result<u64, 
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
             let metadata = entry.metadata().ok()?;
             (metadata.is_file()
                 && path
@@ -6289,6 +6308,9 @@ fn enforce_thumbnail_cache_limit(cache: &Path, limit_bytes: u64) -> Result<u64, 
     for (_, path, size) in entries {
         if total <= limit_bytes {
             break;
+        }
+        if protected.is_some_and(|protected| path == protected) {
+            continue;
         }
         fs::remove_file(&path)
             .map_err(|error| format!("Cannot evict thumbnail {}: {error}", path.display()))?;
@@ -6371,6 +6393,10 @@ fn generate_thumbnail_atomic(
         ));
     }
     if destination.exists() {
+        if valid_cached_thumbnail(destination) {
+            let _ = fs::remove_file(&temporary);
+            return Ok(());
+        }
         fs::remove_file(destination)
             .map_err(|error| format!("Cannot replace invalid cached thumbnail: {error}"))?;
     }
@@ -6425,6 +6451,8 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
         if !potentially_eligible {
             continue;
         }
+        let generation_lock = thumbnail_generation_lock(state, &item.id);
+        let _generation_guard = generation_lock.lock().unwrap();
         if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
             status.stage = format!(
                 "Generating thumbnails and metadata ({}/{total})",
@@ -6533,6 +6561,9 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
             }
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
+            if needs_thumbnail {
+                let _ = fs::remove_file(&thumbnail);
+            }
             processed += 1;
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                 status.completed_items = processed;
@@ -6600,7 +6631,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
     if changed > 0 {
         let _ = app.emit("catalogue-changed", ());
     }
-    enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
+    enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes, None)?;
     if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
         status.state = "completed".into();
         status.stage = "Thumbnail and metadata pass complete".into();
@@ -7168,7 +7199,8 @@ fn set_media_thumbnail_frame(
         .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
     let thumbnail_ref = format!("{}.jpg", item.id);
     let destination = cache.join(&thumbnail_ref);
-    let _enrichment_guard = state.enrichment_write.lock().unwrap();
+    let generation_lock = thumbnail_generation_lock(&state, &media_id);
+    let _generation_guard = generation_lock.lock().unwrap();
     generate_thumbnail_atomic(&source, &destination, seconds)?;
     if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
         let _ = fs::remove_file(&destination);
@@ -7187,7 +7219,11 @@ fn set_media_thumbnail_frame(
             }],
         )?;
     }
-    enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
+    enforce_thumbnail_cache_limit(
+        &cache,
+        settings.thumbnail_cache_limit_bytes,
+        Some(&destination),
+    )?;
     let bytes = fs::read(&destination)
         .map_err(|error| format!("Cannot load selected thumbnail: {error}"))?;
     let _ = app.emit("catalogue-changed", ());
@@ -7286,7 +7322,8 @@ async fn prepare_media_thumbnail(
         let state = app.state::<NativeState>();
         let _operation =
             begin_critical_operation(&state.operations, "visible thumbnail generation")?;
-        let _enrichment_guard = state.enrichment_write.lock().unwrap();
+        let generation_lock = thumbnail_generation_lock(&state, &media_id);
+        let _generation_guard = generation_lock.lock().unwrap();
         let settings = load_settings_file(&app)?;
         let catalogue = load_catalogue_file(&settings)?;
         let item = catalogue
@@ -7311,6 +7348,7 @@ async fn prepare_media_thumbnail(
             let before = fs_safe::snapshot(&source)?;
             generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
             if fs_safe::snapshot(&source)? != before {
+                let _ = fs::remove_file(&thumbnail);
                 return Err("Media changed while its thumbnail was being generated".into());
             }
         }
@@ -7337,7 +7375,11 @@ async fn prepare_media_thumbnail(
             )?;
             let _ = app.emit("catalogue-changed", ());
         }
-        enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes)?;
+        enforce_thumbnail_cache_limit(
+            &cache,
+            settings.thumbnail_cache_limit_bytes,
+            Some(&thumbnail),
+        )?;
         if !valid_cached_thumbnail(&thumbnail) {
             return Ok(None);
         }
@@ -8775,11 +8817,30 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(cache.join("b.jpg"), vec![2_u8; 8]).unwrap();
         fs::write(cache.join("hover-previews/keep/frame.jpg"), b"preview").unwrap();
-        assert_eq!(enforce_thumbnail_cache_limit(&cache, 8).unwrap(), 1);
+        assert_eq!(enforce_thumbnail_cache_limit(&cache, 8, None).unwrap(), 1);
         assert!(!cache.join("a.jpg").exists());
         assert!(cache.join("b.jpg").is_file());
         assert!(cache.join("hover-previews/keep/frame.jpg").is_file());
+        fs::write(cache.join("older.jpg"), vec![3_u8; 8]).unwrap();
+        let protected = cache.join("visible.jpg");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&protected, vec![4_u8; 8]).unwrap();
+        enforce_thumbnail_cache_limit(&cache, 8, Some(&protected)).unwrap();
+        assert!(protected.is_file());
+        assert!(!cache.join("older.jpg").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn thumbnail_generation_locks_are_per_media_identity() {
+        let state = NativeState::default();
+        let first = thumbnail_generation_lock(&state, "media-a");
+        let same = thumbnail_generation_lock(&state, "media-a");
+        let different = thumbnail_generation_lock(&state, "media-b");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &different));
+        let _first_guard = first.lock().unwrap();
+        assert!(different.try_lock().is_ok());
     }
 
     #[test]

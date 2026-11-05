@@ -1,4 +1,4 @@
-export type PreviewPriority = 0 | 1 | 2 | 3;
+export type PreviewPriority = 0 | 1 | 2 | 3 | 4 | 5;
 
 export interface PreviewQueueStatus {
   active: boolean;
