@@ -19,6 +19,8 @@ Schema-2 files under `events/` are authoritative. Each device appends and flushe
 
 Device settings, absolute project-path mappings, pending project-manifest reconciliation, discovery observations, ingest jobs, operation journals, local availability and the thumbnail cache are device-local. `ingest-jobs.json` is a recoverably replaced versioned array beside device settings. Each job records stable job/file/media IDs, source inventory, optional source-volume identity, approved SHA-256, planned destinations, lifecycle and byte progress, failures, and provisional metadata. Provisional metadata includes an explicit edited-field mask so untouched defaults cannot erase an existing duplicate's metadata. Completed-file edits remain in a durable pending slot until their authoritative event append succeeds. Ingest staging is a hidden sibling of Master Bin on the same filesystem rather than a child of the synchronized tree. A future SQLite/FTS database remains a disposable local projection and must never be synchronized.
 
+Playback-proxy operations are high-frequency device-local state, not synchronized records. Their stable operation key is derived from media ID, authoritative content hash, source snapshot and transform version. Progress, cancellation flags, child-process IDs, active-view pins and partial paths live only in native memory; completed derivatives live only beneath the PIMP cache and are rebuildable. `playbackProxyCacheLimitBytes` is a backward-compatible device preference with a 2 GB default.
+
 The remembered ingest date mode is a device preference, not shared production metadata. Legacy `shared-settings.json` is retained but no longer overwritten; this removes its former last-writer-wins role without discarding it.
 
 ## Identities and records

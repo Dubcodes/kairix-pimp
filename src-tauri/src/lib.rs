@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
@@ -66,6 +66,12 @@ struct NativeState {
     operations: Mutex<OperationCoordinator>,
     preview_generation: Mutex<()>,
     thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    playback_proxy_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    playback_proxy_status: Mutex<HashMap<String, BackgroundOperation>>,
+    playback_proxy_cancelled: Mutex<HashSet<String>>,
+    active_playback_proxies: Mutex<HashMap<String, PathBuf>>,
+    playback_proxy_temporaries: Mutex<HashSet<PathBuf>>,
+    playback_proxy_processes: Mutex<HashMap<String, u32>>,
     backup_job_store: Mutex<()>,
     approved_plan_store: Mutex<()>,
     inventory_worker: Mutex<()>,
@@ -123,6 +129,8 @@ struct DeviceSettings {
     hover_previews_enabled: bool,
     #[serde(default = "default_preview_cache_limit_bytes")]
     preview_cache_limit_bytes: u64,
+    #[serde(default = "default_playback_proxy_cache_limit_bytes")]
+    playback_proxy_cache_limit_bytes: u64,
     #[serde(default = "default_thumbnail_hold_frame")]
     thumbnail_hold_frame: String,
     #[serde(default = "default_preview_preloading")]
@@ -283,6 +291,10 @@ fn default_library_folder_sort() -> String {
 fn default_preview_cache_limit_bytes() -> u64 {
     512 * 1024 * 1024
 }
+
+fn default_playback_proxy_cache_limit_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
 fn default_thumbnail_hold_frame() -> String {
     "first".into()
 }
@@ -310,6 +322,7 @@ impl Default for DeviceSettings {
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             hover_previews_enabled: true,
             preview_cache_limit_bytes: default_preview_cache_limit_bytes(),
+            playback_proxy_cache_limit_bytes: default_playback_proxy_cache_limit_bytes(),
             thumbnail_hold_frame: default_thumbnail_hold_frame(),
             preview_preloading: default_preview_preloading(),
             preview_ram_cache_limit_bytes: 0,
@@ -3047,6 +3060,14 @@ fn list_background_operations(
     if let Some(inventory) = state.inventory_status.lock().unwrap().clone() {
         operations.push(inventory);
     }
+    operations.extend(
+        state
+            .playback_proxy_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
     let discovery = state.discovery_status.lock().unwrap().clone();
     if discovery.running {
         operations.push(BackgroundOperation {
@@ -6853,23 +6874,136 @@ fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String
     )?))
 }
 
-fn valid_playback_proxy(path: &Path) -> bool {
-    path.is_file()
-        && path.metadata().is_ok_and(|metadata| metadata.len() > 1_024)
-        && media_tool_command("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
-            .arg(path)
-            .output()
-            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+#[derive(Debug, Deserialize)]
+struct PlaybackProbeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
+    duration: Option<String>,
 }
 
-fn enforce_playback_proxy_limit(root: &Path, limit: u64, protected: &Path) -> Result<(), String> {
+#[derive(Debug, Deserialize)]
+struct PlaybackProbeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaybackProbe {
+    #[serde(default)]
+    streams: Vec<PlaybackProbeStream>,
+    format: Option<PlaybackProbeFormat>,
+}
+
+fn probe_playback_media(path: &Path) -> Result<PlaybackProbe, String> {
+    let output = media_tool_command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt,duration:format=format_name,duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Could not start FFprobe: {error}"))?;
+    if !output.status.success() {
+        return Err("FFprobe could not read the playback proxy".into());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("FFprobe returned invalid proxy metadata: {error}"))
+}
+
+fn parsed_duration_millis(value: Option<&str>) -> Option<u64> {
+    let seconds = value?.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds > 0.0).then(|| (seconds * 1_000.0).round() as u64)
+}
+
+fn probe_duration_millis(probe: &PlaybackProbe) -> Option<u64> {
+    parsed_duration_millis(
+        probe
+            .format
+            .as_ref()
+            .and_then(|format| format.duration.as_deref()),
+    )
+    .or_else(|| {
+        probe.streams.iter().find_map(|stream| {
+            (stream.codec_type.as_deref() == Some("video"))
+                .then(|| parsed_duration_millis(stream.duration.as_deref()))
+                .flatten()
+        })
+    })
+}
+
+fn playback_proxy_probe_is_valid(probe: &PlaybackProbe) -> bool {
+    let Some(format) = &probe.format else {
+        return false;
+    };
+    let mp4_container = format
+        .format_name
+        .as_deref()
+        .is_some_and(|names| names.split(',').any(|name| matches!(name, "mov" | "mp4")));
+    let video = probe.streams.iter().find(|stream| {
+        stream.codec_type.as_deref() == Some("video")
+            && stream.codec_name.as_deref() == Some("h264")
+            && stream
+                .pix_fmt
+                .as_deref()
+                .is_some_and(|format| format.starts_with("yuv420p"))
+    });
+    let audio_valid = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .all(|stream| stream.codec_name.as_deref() == Some("aac"));
+    mp4_container && video.is_some() && audio_valid && probe_duration_millis(probe).is_some()
+}
+
+fn valid_playback_proxy(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file() && metadata.len() > 1_024
+    }) && probe_playback_media(path).is_ok_and(|probe| playback_proxy_probe_is_valid(&probe))
+}
+
+fn playback_proxy_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
+    let cache = PathBuf::from(&settings.thumbnail_cache_path);
+    fs::create_dir_all(&cache)
+        .map_err(|error| format!("Cannot create device cache root: {error}"))?;
+    let root = cache.join("playback-proxies");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Cannot create playback proxy cache: {error}"))?;
+    if fs::symlink_metadata(&root)
+        .map_err(|error| error.to_string())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Playback proxy cache may not be a link or junction".into());
+    }
+    let canonical_cache = cache
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve device cache root: {error}"))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve playback proxy cache: {error}"))?;
+    if !fs_safe::within(&canonical_cache, &canonical_root) {
+        return Err("Playback proxy cache resolved outside PIMP's device cache".into());
+    }
+    Ok(canonical_root)
+}
+
+fn enforce_playback_proxy_limit(
+    root: &Path,
+    limit: u64,
+    protected: &HashSet<PathBuf>,
+) -> Result<(), String> {
     let mut entries = fs::read_dir(root)
         .map_err(|error| format!("Cannot inspect playback proxy cache: {error}"))?
         .filter_map(Result::ok)
         .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
             let metadata = entry.metadata().ok()?;
-            (metadata.is_file()
+            (file_type.is_file()
                 && entry
                     .path()
                     .extension()
@@ -6883,12 +7017,304 @@ fn enforce_playback_proxy_limit(root: &Path, limit: u64, protected: &Path) -> Re
         if total <= limit {
             break;
         }
-        if path == protected {
+        if protected.contains(&path) {
             continue;
         }
         fs::remove_file(&path).map_err(|error| format!("Cannot evict playback proxy: {error}"))?;
         total = total.saturating_sub(size);
     }
+    Ok(())
+}
+
+fn update_playback_proxy_status(
+    state: &NativeState,
+    operation_id: &str,
+    update: impl FnOnce(&mut BackgroundOperation),
+) {
+    if let Some(operation) = state
+        .playback_proxy_status
+        .lock()
+        .unwrap()
+        .get_mut(operation_id)
+    {
+        update(operation);
+        operation.updated_at = Utc::now().to_rfc3339();
+    }
+}
+
+fn playback_progress_millis(line: &str) -> Option<u64> {
+    if let Some(value) = line.strip_prefix("out_time_us=") {
+        return value.parse::<u64>().ok().map(|value| value / 1_000);
+    }
+    let value = line.strip_prefix("out_time=")?;
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<f64>().ok()?;
+    let minutes = parts.next()?.parse::<f64>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    Some(((hours * 3_600.0 + minutes * 60.0 + seconds) * 1_000.0) as u64)
+}
+
+struct ManagedChild(std::process::Child);
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+struct PlaybackProcessGuard<'a> {
+    processes: &'a Mutex<HashMap<String, u32>>,
+    operation_id: String,
+}
+
+impl Drop for PlaybackProcessGuard<'_> {
+    fn drop(&mut self) {
+        self.processes.lock().unwrap().remove(&self.operation_id);
+    }
+}
+
+fn terminate_playback_proxy_process(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = media_tool_command("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+fn cancel_all_playback_proxy_processes(state: &NativeState) {
+    let processes = state.playback_proxy_processes.lock().unwrap().clone();
+    for (operation_id, pid) in processes {
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .insert(operation_id.clone());
+        update_playback_proxy_status(state, &operation_id, |operation| {
+            operation.state = "cancelling".into();
+            operation.stage = "Application is closing; stopping FFmpeg".into();
+            operation.cancellable = false;
+        });
+        terminate_playback_proxy_process(pid);
+    }
+}
+
+fn protected_playback_proxy_paths(state: &NativeState, current: &Path) -> HashSet<PathBuf> {
+    let mut paths = state
+        .active_playback_proxies
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<HashSet<_>>();
+    paths.insert(current.to_path_buf());
+    paths.extend(
+        state
+            .playback_proxy_temporaries
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    paths
+}
+
+struct PlaybackTemporaryGuard<'a> {
+    paths: &'a Mutex<HashSet<PathBuf>>,
+    path: PathBuf,
+}
+
+impl Drop for PlaybackTemporaryGuard<'_> {
+    fn drop(&mut self) {
+        self.paths.lock().unwrap().remove(&self.path);
+    }
+}
+
+fn protect_playback_temporary<'a>(
+    state: &'a NativeState,
+    path: &Path,
+) -> PlaybackTemporaryGuard<'a> {
+    state
+        .playback_proxy_temporaries
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf());
+    PlaybackTemporaryGuard {
+        paths: &state.playback_proxy_temporaries,
+        path: path.to_path_buf(),
+    }
+}
+
+fn cleanup_abandoned_playback_temporaries(
+    state: &NativeState,
+    root: &Path,
+) -> Result<(), String> {
+    let active = state.playback_proxy_temporaries.lock().unwrap().clone();
+    for entry in fs::read_dir(root)
+        .map_err(|error| format!("Cannot inspect playback proxy cache: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if active.contains(&path)
+            || !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            || !entry.file_name().to_string_lossy().starts_with(".proxy-")
+        {
+            continue;
+        }
+        fs::remove_file(path)
+            .map_err(|error| format!("Cannot remove abandoned playback proxy output: {error}"))?;
+    }
+    Ok(())
+}
+
+fn fail_playback_proxy_status(state: &NativeState, operation_id: &str, error: &str) {
+    update_playback_proxy_status(state, operation_id, |operation| {
+        if operation.state != "cancelled" {
+            operation.state = "failed".into();
+            operation.stage = "Proxy generation failed".into();
+            operation.error = Some(error.to_owned());
+            operation.cancellable = false;
+            operation.retryable = true;
+        }
+    });
+}
+
+fn run_playback_proxy_generation(
+    state: &NativeState,
+    operation_id: &str,
+    source: &Path,
+    temporary: &Path,
+    duration_millis: Option<u64>,
+) -> Result<(), String> {
+    let mut command = media_tool_command("ffmpeg");
+    command
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(source)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            "scale=min(1280\\,iw):-2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-n",
+        ])
+        .arg(temporary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ManagedChild(
+        command
+            .spawn()
+            .map_err(|error| format!("Could not start FFmpeg playback proxy generation: {error}"))?,
+    );
+    state
+        .playback_proxy_processes
+        .lock()
+        .unwrap()
+        .insert(operation_id.to_owned(), child.0.id());
+    let _process_guard = PlaybackProcessGuard {
+        processes: &state.playback_proxy_processes,
+        operation_id: operation_id.to_owned(),
+    };
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or("FFmpeg progress stream is unavailable")?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or("FFmpeg diagnostic stream is unavailable")?;
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut processed = 0_u64;
+    let status = loop {
+        while let Ok(line) = receiver.try_recv() {
+            if let Some(value) = playback_progress_millis(&line) {
+                processed = processed.max(value);
+                update_playback_proxy_status(state, operation_id, |operation| {
+                    operation.completed_items = usize::try_from(processed / 1_000).unwrap_or(usize::MAX);
+                });
+            }
+        }
+        if state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .contains(operation_id)
+        {
+            child
+                .0
+                .kill()
+                .map_err(|error| format!("Could not stop FFmpeg safely: {error}"))?;
+            let _ = child.0.wait();
+            update_playback_proxy_status(state, operation_id, |operation| {
+                operation.state = "cancelled".into();
+                operation.stage = "Cancelled; partial output removed".into();
+                operation.cancellable = false;
+            });
+            return Err("Playback proxy generation was cancelled safely".into());
+        }
+        if let Some(status) = child
+            .0
+            .try_wait()
+            .map_err(|error| format!("Could not monitor FFmpeg: {error}"))?
+        {
+            break status;
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    };
+    let mut diagnostics = String::new();
+    BufReader::new(stderr)
+        .read_to_string(&mut diagnostics)
+        .map_err(|error| format!("Could not read FFmpeg diagnostics: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "FFmpeg could not create a compatible playback proxy (exit status {status}): {}",
+            diagnostics.trim()
+        ));
+    }
+    update_playback_proxy_status(state, operation_id, |operation| {
+        operation.completed_items = duration_millis
+            .map(|value| usize::try_from(value / 1_000).unwrap_or(usize::MAX))
+            .unwrap_or(operation.completed_items);
+        operation.stage = "Validating completed proxy".into();
+        operation.cancellable = false;
+    });
     Ok(())
 }
 
@@ -6906,6 +7332,8 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
         let before = fs_safe::snapshot(&source)?;
+        let source_probe = probe_playback_media(&source)?;
+        let duration_millis = probe_duration_millis(&source_probe);
         let mut digest = Sha256::new();
         digest.update(b"pimp-playback-proxy-v1\0");
         digest.update(item.id.as_bytes());
@@ -6915,48 +7343,161 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
         digest.update(before.modified_millis.unwrap_or_default().to_le_bytes());
         digest.update(b"1280-h264-aac-crf23");
         let fingerprint = format!("{:x}", digest.finalize());
-        let root = PathBuf::from(&settings.thumbnail_cache_path).join("playback-proxies");
-        fs::create_dir_all(&root).map_err(|error| format!("Cannot create playback proxy cache: {error}"))?;
+        let operation_id = format!("playback-proxy:{}", &fingerprint[..24]);
+        let generation = {
+            let mut generations = state.playback_proxy_generations.lock().unwrap();
+            generations
+                .entry(operation_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _generation_guard = generation.lock().unwrap();
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .remove(&operation_id);
+        let root = playback_proxy_root(&settings)?;
+        cleanup_abandoned_playback_temporaries(&state, &root)?;
         let destination = root.join(format!("{}-{}.mp4", item.id, &fingerprint[..24]));
         if valid_playback_proxy(&destination) {
+            state
+                .active_playback_proxies
+                .lock()
+                .unwrap()
+                .insert(media_id.clone(), destination.clone());
             enforce_playback_proxy_limit(
                 &root,
-                settings.preview_cache_limit_bytes.max(512 * 1024 * 1024),
-                &destination,
+                settings.playback_proxy_cache_limit_bytes,
+                &protected_playback_proxy_paths(&state, &destination),
             )?;
             return Ok(destination.to_string_lossy().into_owned());
         }
-        let temporary = root.join(format!(".proxy-{}.mp4", Uuid::new_v4()));
-        let output = media_tool_command("ffmpeg")
-            .args(["-v", "error", "-nostdin", "-i"])
-            .arg(&source)
-            .args(["-map", "0:v:0", "-map", "0:a?", "-vf", "scale=min(1280\\,iw):-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-n"])
-            .arg(&temporary)
-            .output()
-            .map_err(|error| format!("Could not start FFmpeg playback proxy generation: {error}"))?;
-        if !output.status.success() || !valid_playback_proxy(&temporary) {
-            let _ = fs::remove_file(&temporary);
-            return Err(format!("FFmpeg could not create a compatible playback proxy (exit status {})", output.status));
+        if fs::symlink_metadata(&destination).is_ok() {
+            fs::remove_file(&destination)
+                .map_err(|error| format!("Cannot remove invalid cached proxy: {error}"))?;
         }
-        if fs_safe::snapshot(&source)? != before {
+        let temporary = root.join(format!(".proxy-{}.mp4", Uuid::new_v4()));
+        let _temporary_guard = protect_playback_temporary(&state, &temporary);
+        let now = Utc::now().to_rfc3339();
+        state.playback_proxy_status.lock().unwrap().insert(
+            operation_id.clone(),
+            BackgroundOperation {
+                id: operation_id.clone(),
+                kind: "playback-proxy".into(),
+                title: format!("Playback proxy: {}", item.original_filename),
+                state: "running".into(),
+                stage: "Transcoding H.264/AAC preview".into(),
+                current_item: Some(item.original_filename.clone()),
+                completed_items: 0,
+                total_items: duration_millis
+                    .map(|value| usize::try_from(value / 1_000).unwrap_or(usize::MAX)),
+                bytes_completed: 0,
+                bytes_total: None,
+                counts: OperationCounts::default(),
+                cancellable: true,
+                pausable: false,
+                retryable: false,
+                error: None,
+                started_at: now.clone(),
+                updated_at: now,
+            },
+        );
+        let generated = run_playback_proxy_generation(
+            &state,
+            &operation_id,
+            &source,
+            &temporary,
+            duration_millis,
+        );
+        if let Err(error) = generated {
             let _ = fs::remove_file(&temporary);
-            return Err("Source changed while its playback proxy was being generated".into());
+            fail_playback_proxy_status(&state, &operation_id, &error);
+            return Err(error);
+        }
+        if !valid_playback_proxy(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            let error = "The generated playback proxy failed codec/container validation";
+            fail_playback_proxy_status(&state, &operation_id, error);
+            return Err(error.into());
+        }
+        let after = match fs_safe::snapshot(&source) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                fail_playback_proxy_status(&state, &operation_id, &error);
+                return Err(error);
+            }
+        };
+        if after != before {
+            let _ = fs::remove_file(&temporary);
+            let error = "Source changed while its playback proxy was being generated";
+            fail_playback_proxy_status(&state, &operation_id, error);
+            return Err(error.into());
         }
         if destination.exists() {
             let _ = fs::remove_file(&temporary);
         } else {
-            fs::rename(&temporary, &destination).map_err(|error| format!("Cannot commit playback proxy: {error}"))?;
+            if let Err(error) = fs::rename(&temporary, &destination) {
+                let error = format!("Cannot commit playback proxy: {error}");
+                fail_playback_proxy_status(&state, &operation_id, &error);
+                return Err(error);
+            }
         }
         if !valid_playback_proxy(&destination) {
-            return Err("The generated playback proxy failed validation".into());
+            let error = "The generated playback proxy failed validation";
+            fail_playback_proxy_status(&state, &operation_id, error);
+            return Err(error.into());
         }
-        enforce_playback_proxy_limit(
+        state
+            .active_playback_proxies
+            .lock()
+            .unwrap()
+            .insert(media_id, destination.clone());
+        if let Err(error) = enforce_playback_proxy_limit(
             &root,
-            settings.preview_cache_limit_bytes.max(512 * 1024 * 1024),
-            &destination,
-        )?;
+            settings.playback_proxy_cache_limit_bytes,
+            &protected_playback_proxy_paths(&state, &destination),
+        ) {
+            fail_playback_proxy_status(&state, &operation_id, &error);
+            return Err(error);
+        }
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            operation.state = "completed".into();
+            operation.stage = "Compatible proxy ready".into();
+            operation.cancellable = false;
+        });
         Ok(destination.to_string_lossy().into_owned())
     }).await.map_err(|error| format!("Playback proxy worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn release_playback_proxy(state: State<'_, NativeState>, media_id: String) {
+    state.active_playback_proxies.lock().unwrap().remove(&media_id);
+}
+
+#[tauri::command]
+fn cancel_background_operation(
+    state: State<'_, NativeState>,
+    operation_id: String,
+) -> Result<(), String> {
+    if operation_id.starts_with("playback-proxy:") {
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .insert(operation_id.clone());
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            if operation.state == "running" {
+                operation.state = "cancelling".into();
+                operation.stage = "Stopping FFmpeg and removing partial output".into();
+                operation.cancellable = false;
+            }
+        });
+        Ok(())
+    } else {
+        cancel_inventory(state, operation_id)
+    }
 }
 
 fn build_premiere_import_manifest(
@@ -7944,7 +8485,10 @@ pub fn run() {
                 .tooltip("Kairix PIMP Light")
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => restore_main_window(app, "tray menu"),
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        cancel_all_playback_proxy_processes(&app.state::<NativeState>());
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -7990,33 +8534,38 @@ pub fn run() {
                         if tray_available && close_to_tray {
                             api.prevent_close();
                             let _ = close_window.hide();
-                        } else if let Some(operation) = app
-                            .state::<NativeState>()
-                            .inventory_status
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .filter(|operation| {
-                                matches!(
-                                    operation.state.as_str(),
-                                    "queued" | "running" | "cancelling"
-                                )
-                            })
-                        {
-                            app.state::<NativeState>()
-                                .inventory_cancelled
-                                .lock()
-                                .unwrap()
-                                .insert(operation.id.clone());
-                            diagnostic_log(
-                                &app,
-                                "INFO",
-                                "inventory-shutdown",
-                                &format!(
-                                    "Cancellation requested for {} before application close",
-                                    operation.id
-                                ),
-                            );
+                        } else {
+                            let state = app.state::<NativeState>();
+                            cancel_all_playback_proxy_processes(&state);
+                            let inventory_operation = {
+                                state
+                                    .inventory_status
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .filter(|operation| {
+                                    matches!(
+                                        operation.state.as_str(),
+                                        "queued" | "running" | "cancelling"
+                                    )
+                                })
+                            };
+                            if let Some(operation) = inventory_operation {
+                                state
+                                    .inventory_cancelled
+                                    .lock()
+                                    .unwrap()
+                                    .insert(operation.id.clone());
+                                diagnostic_log(
+                                    &app,
+                                    "INFO",
+                                    "inventory-shutdown",
+                                    &format!(
+                                        "Cancellation requested for {} before application close",
+                                        operation.id
+                                    ),
+                                );
+                            }
                         }
                     }
                 });
@@ -8051,6 +8600,7 @@ pub fn run() {
             inventory_sources,
             inventory_sd_card,
             cancel_inventory,
+            cancel_background_operation,
             list_background_operations,
             reapprove_ingest_destinations,
             replan_ingest_destinations,
@@ -8091,6 +8641,7 @@ pub fn run() {
             open_logs_folder,
             resolve_media_path,
             prepare_playback_proxy,
+            release_playback_proxy,
             export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
@@ -8267,6 +8818,169 @@ mod tests {
         assert_eq!(revised.lineage_id, original_id);
         assert_eq!(revised.revision, 1);
         assert_eq!(revised.inventory.plan_id, revised.id);
+    }
+
+    fn playback_probe(json: &str) -> PlaybackProbe {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn playback_proxy_validation_requires_finalized_h264_yuv420_and_aac() {
+        let valid = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"12.500"}}"#,
+        );
+        assert!(playback_proxy_probe_is_valid(&valid));
+
+        let wrong_video = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"hevc","pix_fmt":"yuv420p10le"}],"format":{"format_name":"mov,mp4","duration":"12.5"}}"#,
+        );
+        assert!(!playback_proxy_probe_is_valid(&wrong_video));
+        let wrong_audio = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"pcm_s16le"}],"format":{"format_name":"mov,mp4","duration":"12.5"}}"#,
+        );
+        assert!(!playback_proxy_probe_is_valid(&wrong_audio));
+        let unfinished = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"}],"format":{"format_name":"mov,mp4","duration":"0"}}"#,
+        );
+        assert!(!playback_proxy_probe_is_valid(&unfinished));
+    }
+
+    #[test]
+    fn playback_proxy_progress_parses_ffmpeg_machine_output() {
+        assert_eq!(playback_progress_millis("out_time_us=13450000"), Some(13_450));
+        assert_eq!(playback_progress_millis("out_time=00:02:14.250000"), Some(134_250));
+        assert_eq!(playback_progress_millis("progress=continue"), None);
+    }
+
+    #[test]
+    fn playback_proxy_cache_honors_budget_and_protects_active_and_partial_files() {
+        let root = temporary("playback-proxy-cache");
+        let old = root.join("old.mp4");
+        let protected = root.join("protected.mp4");
+        let abandoned = root.join(".proxy-abandoned.mp4");
+        let active_partial = root.join(".proxy-active.mp4");
+        fs::write(&old, vec![1_u8; 32]).unwrap();
+        fs::write(&protected, vec![2_u8; 32]).unwrap();
+        fs::write(&abandoned, vec![3_u8; 32]).unwrap();
+        fs::write(&active_partial, vec![4_u8; 32]).unwrap();
+        let state = NativeState::default();
+        state
+            .playback_proxy_temporaries
+            .lock()
+            .unwrap()
+            .insert(active_partial.clone());
+        cleanup_abandoned_playback_temporaries(&state, &root).unwrap();
+        assert!(!abandoned.exists());
+        assert!(active_partial.exists());
+
+        let protected_paths = HashSet::from([protected.clone(), active_partial.clone()]);
+        enforce_playback_proxy_limit(&root, 1, &protected_paths).unwrap();
+        assert!(!old.exists());
+        assert!(protected.exists());
+        assert!(active_partial.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_playback_proxy_transcodes_hevc_and_cancels_without_touching_source() {
+        if tool_version("ffmpeg").is_none() || tool_version("ffprobe").is_none() {
+            return;
+        }
+        let root = temporary("playback-proxy-managed");
+        let source = root.join("synthetic-hevc.mp4");
+        let generated = media_tool_command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=30",
+                "-t",
+                "1",
+                "-c:v",
+                "libx265",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status();
+        if !generated.is_ok_and(|status| status.success()) {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let source_hash = sha256(&source).unwrap();
+        let state = NativeState::default();
+        let operation_id = "playback-proxy:managed-test";
+        let operation = BackgroundOperation {
+            id: operation_id.into(),
+            kind: "playback-proxy".into(),
+            title: "Playback proxy: synthetic-hevc.mp4".into(),
+            state: "running".into(),
+            stage: "Transcoding H.264/AAC preview".into(),
+            current_item: Some("synthetic-hevc.mp4".into()),
+            completed_items: 0,
+            total_items: Some(1),
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: true,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        state
+            .playback_proxy_status
+            .lock()
+            .unwrap()
+            .insert(operation_id.into(), operation.clone());
+        let output = root.join("managed.mp4");
+        run_playback_proxy_generation(&state, operation_id, &source, &output, Some(1_000))
+            .unwrap();
+        assert!(valid_playback_proxy(&output));
+        assert_eq!(sha256(&source).unwrap(), source_hash);
+        assert!(state.playback_proxy_processes.lock().unwrap().is_empty());
+
+        let cancel_id = "playback-proxy:cancel-test";
+        state
+            .playback_proxy_status
+            .lock()
+            .unwrap()
+            .insert(cancel_id.into(), BackgroundOperation { id: cancel_id.into(), ..operation });
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .insert(cancel_id.into());
+        let cancelled_output = root.join("cancelled.mp4");
+        let error = run_playback_proxy_generation(
+            &state,
+            cancel_id,
+            &source,
+            &cancelled_output,
+            Some(1_000),
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled safely"));
+        assert_eq!(
+            state
+                .playback_proxy_status
+                .lock()
+                .unwrap()
+                .get(cancel_id)
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+        assert!(state.playback_proxy_processes.lock().unwrap().is_empty());
+        assert_eq!(sha256(&source).unwrap(), source_hash);
+        let _ = fs::remove_file(cancelled_output);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn ingest_job(state: &str, file_state: &str) -> IngestJob {

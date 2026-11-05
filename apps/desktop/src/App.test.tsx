@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
     thumbnailCacheLimitBytes: 2147483648,
     hoverPreviewsEnabled: true,
     previewCacheLimitBytes: 536870912,
+    playbackProxyCacheLimitBytes: 2147483648,
     thumbnailHoldFrame: 'first',
     previewPreloading: 'visible-nearby',
     previewRamCacheLimitBytes: 0,
@@ -64,6 +65,7 @@ const mocks = vi.hoisted(() => ({
   resolveMediaPath: vi.fn(),
   resolveMediaPlaybackSource: vi.fn(),
   preparePlaybackProxy: vi.fn(),
+  releasePlaybackProxy: vi.fn(),
   setMediaThumbnailFrame: vi.fn(),
   revealMediaInExplorer: vi.fn(),
   openMediaFolder: vi.fn(),
@@ -72,6 +74,7 @@ const mocks = vi.hoisted(() => ({
   inventorySources: vi.fn(),
   inventorySdCard: vi.fn(),
   cancelInventory: vi.fn(),
+  cancelBackgroundOperation: vi.fn(),
   listBackgroundOperations: vi.fn(),
   reapproveIngestDestinations: vi.fn(),
   replanIngestDestinations: vi.fn(),
@@ -158,6 +161,7 @@ vi.mock('./bridge', () => ({
     inventorySources: mocks.inventorySources,
     inventorySdCard: mocks.inventorySdCard,
     cancelInventory: mocks.cancelInventory,
+    cancelBackgroundOperation: mocks.cancelBackgroundOperation,
     listBackgroundOperations: mocks.listBackgroundOperations,
     reapproveIngestDestinations: mocks.reapproveIngestDestinations,
     replanIngestDestinations: mocks.replanIngestDestinations,
@@ -183,6 +187,7 @@ vi.mock('./bridge', () => ({
     resolveMediaPath: mocks.resolveMediaPath,
     resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
     preparePlaybackProxy: mocks.preparePlaybackProxy,
+    releasePlaybackProxy: mocks.releasePlaybackProxy,
     setMediaThumbnailFrame: mocks.setMediaThumbnailFrame,
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
@@ -285,6 +290,7 @@ describe('native application integration', () => {
       thumbnailCacheLimitBytes: 2147483648,
       hoverPreviewsEnabled: true,
       previewCacheLimitBytes: 536870912,
+      playbackProxyCacheLimitBytes: 2147483648,
       thumbnailHoldFrame: 'first',
       previewPreloading: 'visible-nearby',
       previewRamCacheLimitBytes: 0,
@@ -356,6 +362,8 @@ describe('native application integration', () => {
     mocks.preparePlaybackProxy.mockResolvedValue(
       'asset://localhost/playback-proxy.mp4',
     );
+    mocks.releasePlaybackProxy.mockReset();
+    mocks.releasePlaybackProxy.mockResolvedValue(undefined);
     mocks.resolveMediaPlaybackSource.mockResolvedValue(
       'asset://localhost/clip.mp4',
     );
@@ -403,6 +411,8 @@ describe('native application integration', () => {
     mocks.inventorySdCard.mockReset();
     mocks.cancelInventory.mockReset();
     mocks.cancelInventory.mockResolvedValue(undefined);
+    mocks.cancelBackgroundOperation.mockReset();
+    mocks.cancelBackgroundOperation.mockResolvedValue(undefined);
     mocks.listBackgroundOperations.mockReset();
     mocks.listBackgroundOperations.mockResolvedValue([]);
     mocks.reapproveIngestDestinations.mockReset();
@@ -1652,8 +1662,46 @@ describe('native application integration', () => {
     expect(screen.getByText(/Calculating checksums · A001.MP4/)).toBeVisible();
     expect(screen.getByText(/0 KB \/ 1 KB read/)).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Cancel scan' }));
-    expect(mocks.cancelInventory).toHaveBeenCalledWith(
+    expect(mocks.cancelBackgroundOperation).toHaveBeenCalledWith(
       '00000000-0000-4000-8000-000000000099',
+    );
+  });
+
+  it('shows real playback-proxy time progress and routes safe cancellation', async () => {
+    mocks.listBackgroundOperations.mockResolvedValue([
+      {
+        id: 'playback-proxy:fixture',
+        kind: 'playback-proxy',
+        title: 'Playback proxy: interview.mxf',
+        state: 'running',
+        stage: 'Transcoding H.264/AAC preview',
+        currentItem: 'interview.mxf',
+        completedItems: 134,
+        totalItems: 516,
+        bytesCompleted: 0,
+        counts: {
+          newFiles: 0,
+          duplicateFiles: 0,
+          attentionFiles: 0,
+          failedFiles: 0,
+          attemptedFiles: 0,
+          existingFiles: 0,
+          pendingFiles: 0,
+        },
+        cancellable: true,
+        pausable: false,
+        retryable: false,
+        startedAt: '2026-11-06T00:00:00Z',
+        updatedAt: '2026-11-06T00:02:14Z',
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    expect(screen.getByText(/2:14 \/ 8:36 processed/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Cancel conversion' }));
+    expect(mocks.cancelBackgroundOperation).toHaveBeenCalledWith(
+      'playback-proxy:fixture',
     );
   });
 

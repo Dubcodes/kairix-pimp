@@ -1111,6 +1111,13 @@ export function App() {
       current = false;
     };
   }, [native, viewerMediaId, viewerRecording?.available]);
+  useEffect(() => {
+    if (!native || !viewerMediaId) return;
+    const mediaId = viewerMediaId;
+    return () => {
+      void desktopBridge.releasePlaybackProxy(mediaId).catch(() => undefined);
+    };
+  }, [native, viewerMediaId]);
   const openClipViewer = (mediaId: string) => {
     libraryScrollPosition.current = contentRef.current?.scrollTop ?? 0;
     replaceSelection([mediaId], mediaId);
@@ -2382,10 +2389,14 @@ export function App() {
                     {operation.cancellable && (
                       <button
                         onClick={() =>
-                          void desktopBridge.cancelInventory(operation.id)
+                          void desktopBridge.cancelBackgroundOperation(
+                            operation.id,
+                          )
                         }
                       >
-                        Cancel scan
+                        {operation.kind === 'playback-proxy'
+                          ? 'Cancel conversion'
+                          : 'Cancel scan'}
                       </button>
                     )}
                   </div>
@@ -2404,14 +2415,27 @@ export function App() {
                   <progress />
                 )}
                 <small>
-                  {operation.completedItems}
-                  {operation.totalItems === undefined
-                    ? ' discovered'
-                    : ` / ${operation.totalItems} files`}
+                  {operation.kind === 'playback-proxy' ? (
+                    <>
+                      {duration(operation.completedItems)}
+                      {operation.totalItems === undefined
+                        ? ' processed'
+                        : ` / ${duration(operation.totalItems)} processed`}
+                    </>
+                  ) : (
+                    <>
+                      {operation.completedItems}
+                      {operation.totalItems === undefined
+                        ? ' discovered'
+                        : ` / ${operation.totalItems} files`}
+                    </>
+                  )}
                   {operation.bytesTotal
                     ? ` · ${size(operation.bytesCompleted)} / ${size(operation.bytesTotal)} read`
                     : ''}
-                  {operation.kind === 'media-enrichment' ? (
+                  {operation.kind ===
+                  'playback-proxy' ? null : operation.kind ===
+                    'media-enrichment' ? (
                     <>
                       {' · '}
                       {operation.counts.newFiles} thumbnails generated ·{' '}
@@ -3291,6 +3315,32 @@ export function App() {
                         void persistPreference({
                           previewCacheLimitBytes: Math.max(
                             100 * 1024 * 1024,
+                            Math.round(
+                              Number(event.target.value) * 1024 * 1024 * 1024,
+                            ),
+                          ),
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Playback proxy cache limit (GB)
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="100"
+                      step="0.5"
+                      value={(
+                        (settings.playbackProxyCacheLimitBytes ??
+                          2 * 1024 * 1024 * 1024) /
+                        1024 /
+                        1024 /
+                        1024
+                      ).toFixed(1)}
+                      onChange={(event) =>
+                        void persistPreference({
+                          playbackProxyCacheLimitBytes: Math.max(
+                            512 * 1024 * 1024,
                             Math.round(
                               Number(event.target.value) * 1024 * 1024 * 1024,
                             ),

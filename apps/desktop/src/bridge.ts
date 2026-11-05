@@ -24,6 +24,7 @@ export interface DeviceSettings {
   thumbnailCacheLimitBytes: number;
   hoverPreviewsEnabled: boolean;
   previewCacheLimitBytes: number;
+  playbackProxyCacheLimitBytes: number;
   thumbnailHoldFrame: ThumbnailHoldFrame;
   previewPreloading: PreviewPreloading;
   previewRamCacheLimitBytes: number;
@@ -413,6 +414,7 @@ export const emptySettings = (): DeviceSettings => ({
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   hoverPreviewsEnabled: true,
   previewCacheLimitBytes: 512 * 1024 * 1024,
+  playbackProxyCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   thumbnailHoldFrame: 'first',
   previewPreloading: 'visible-nearby',
   previewRamCacheLimitBytes: 0,
@@ -516,6 +518,8 @@ export const desktopBridge = {
     }),
   cancelInventory: (operationId: string) =>
     invoke<void>('cancel_inventory', { operationId }),
+  cancelBackgroundOperation: (operationId: string) =>
+    invoke<void>('cancel_background_operation', { operationId }),
   listBackgroundOperations: () =>
     invoke<BackgroundOperation[]>('list_background_operations'),
   reapproveIngestDestinations: (
@@ -659,6 +663,8 @@ export const desktopBridge = {
     convertFileSrc(await invoke<string>('resolve_media_path', { mediaId })),
   preparePlaybackProxy: async (mediaId: string) =>
     convertFileSrc(await invoke<string>('prepare_playback_proxy', { mediaId })),
+  releasePlaybackProxy: (mediaId: string) =>
+    invoke<void>('release_playback_proxy', { mediaId }),
   setMediaThumbnailFrame: (mediaId: string, seconds: number) =>
     invoke<string>('set_media_thumbnail_frame', { mediaId, seconds }),
   revealMediaInExplorer: (mediaId: string) =>
