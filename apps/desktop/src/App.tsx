@@ -334,6 +334,10 @@ export function App() {
   const preparedThumbnailVersions = useRef(new Map<string, number>());
   const inventoryDateOverride = useRef<string | undefined>(undefined);
   const dateSelectionRef = useRef({ dateOverride, chosenDate });
+  const activeInventoryPlanId = useRef<string | undefined>(undefined);
+  const inventoryApprovalGeneration = useRef(0);
+  const dateReplanIntent = useRef(0);
+  const dateReplanQueue = useRef<Promise<void>>(Promise.resolve());
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
   const [libraryLocateId, setLibraryLocateId] = useState<string>();
   const settingsRef = useRef(settings);
@@ -579,6 +583,9 @@ export function App() {
 
   useEffect(() => {
     if (!native || sources.length === 0) return;
+    const approvalGeneration = ++inventoryApprovalGeneration.current;
+    ++dateReplanIntent.current;
+    activeInventoryPlanId.current = undefined;
     let current = true;
     const operationId = crypto.randomUUID();
     void Promise.resolve().then(() => {
@@ -602,8 +609,12 @@ export function App() {
         );
     void request
       .then((result) => {
-        if (current) {
+        if (
+          current &&
+          approvalGeneration === inventoryApprovalGeneration.current
+        ) {
           setInventory(result);
+          activeInventoryPlanId.current = result.planId;
           setConflicts(result.conflicts ?? []);
           setInventoryError('');
           setAllowDuplicateCopies(false);
@@ -635,29 +646,36 @@ export function App() {
       dateOverride === 'choose' ? chosenDate || undefined : dateOverride;
     if (!nextDateOverride || inventoryDateOverride.current === nextDateOverride)
       return;
-    let current = true;
+    const intent = ++dateReplanIntent.current;
+    const approvalGeneration = inventoryApprovalGeneration.current;
     inventoryDateOverride.current = nextDateOverride;
     setInventoryLoading(true);
     setInventoryError('');
-    void desktopBridge
-      .replanIngestDestinations(inventory.planId, nextDateOverride)
-      .then((result) => {
-        if (!current) return;
-        setInventory(result);
-        setConflicts(result.conflicts ?? []);
-      })
-      .catch((reason) => {
-        if (current) {
+    const run = dateReplanQueue.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (intent !== dateReplanIntent.current) return;
+        const planId = activeInventoryPlanId.current ?? inventory.planId;
+        try {
+          const result = await desktopBridge.replanIngestDestinations(
+            planId,
+            nextDateOverride,
+          );
+          if (approvalGeneration !== inventoryApprovalGeneration.current)
+            return;
+          activeInventoryPlanId.current = result.planId;
+          if (intent !== dateReplanIntent.current) return;
+          setInventory(result);
+          setConflicts(result.conflicts ?? []);
+        } catch (reason) {
+          if (intent !== dateReplanIntent.current) return;
           inventoryDateOverride.current = undefined;
           setInventoryError(errorText(reason));
+        } finally {
+          if (intent === dateReplanIntent.current) setInventoryLoading(false);
         }
-      })
-      .finally(() => {
-        if (current) setInventoryLoading(false);
       });
-    return () => {
-      current = false;
-    };
+    dateReplanQueue.current = run;
   }, [native, inventory?.planId, dateOverride, chosenDate]);
 
   useEffect(() => {

@@ -67,6 +67,7 @@ struct NativeState {
     preview_generation: Mutex<()>,
     thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     backup_job_store: Mutex<()>,
+    approved_plan_store: Mutex<()>,
     inventory_worker: Mutex<()>,
     inventory_cancelled: Mutex<HashSet<String>>,
     inventory_status: Mutex<Option<BackgroundOperation>>,
@@ -438,6 +439,8 @@ struct ApprovedIngestFile {
     inventory: InventoryFile,
     source_size: u64,
     source_modified_millis: Option<u128>,
+    #[serde(default)]
+    planning_modified_millis: Option<u128>,
     source_sha256: Option<String>,
     #[serde(default)]
     source_volume_identity: Option<String>,
@@ -449,6 +452,10 @@ struct ApprovedIngestFile {
 struct ApprovedIngestPlan {
     schema_version: u32,
     id: String,
+    #[serde(default)]
+    lineage_id: String,
+    #[serde(default)]
+    revision: u64,
     created_at: String,
     batch_timestamp: String,
     master_bin_path: String,
@@ -522,6 +529,8 @@ struct IngestJob {
     id: String,
     #[serde(default)]
     approved_plan_id: Option<String>,
+    #[serde(default)]
+    approved_plan_lineage_id: Option<String>,
     state: String,
     created_at: String,
     updated_at: String,
@@ -696,6 +705,76 @@ fn load_approved_plan(app: &AppHandle, plan_id: &str) -> Result<ApprovedIngestPl
     read_json(&path)
 }
 
+fn approved_plan_lineage(plan: &ApprovedIngestPlan) -> &str {
+    if plan.lineage_id.is_empty() {
+        &plan.id
+    } else {
+        &plan.lineage_id
+    }
+}
+
+fn current_approved_plan(
+    app: &AppHandle,
+    requested_id: &str,
+) -> Result<ApprovedIngestPlan, String> {
+    let requested = load_approved_plan(app, requested_id)?;
+    let lineage = approved_plan_lineage(&requested).to_owned();
+    let directory = approved_plan_path(app, requested_id)?
+        .parent()
+        .ok_or("Invalid approved plan directory")?
+        .to_path_buf();
+    let mut current = requested;
+    if !directory.is_dir() {
+        return Ok(current);
+    }
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(candidate) = read_json::<ApprovedIngestPlan>(&path) else {
+            continue;
+        };
+        if approved_plan_lineage(&candidate) == lineage && candidate.revision > current.revision {
+            current = candidate;
+        }
+    }
+    Ok(current)
+}
+
+fn begin_approved_plan_revision(mut plan: ApprovedIngestPlan) -> ApprovedIngestPlan {
+    let lineage = approved_plan_lineage(&plan).to_owned();
+    plan.id = Uuid::new_v4().to_string();
+    plan.lineage_id = lineage;
+    plan.revision = plan.revision.saturating_add(1);
+    plan.created_at = Utc::now().to_rfc3339();
+    plan.inventory.plan_id = plan.id.clone();
+    plan
+}
+
+fn remove_approved_plan_lineage(app: &AppHandle, lineage: &str) -> Result<(), String> {
+    let directory = approved_plan_path(app, lineage)?
+        .parent()
+        .ok_or("Invalid approved plan directory")?
+        .to_path_buf();
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(plan) = read_json::<ApprovedIngestPlan>(&path) else {
+            continue;
+        };
+        if approved_plan_lineage(&plan) == lineage {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn reapprove_ingest_destinations(
     app: AppHandle,
@@ -705,9 +784,11 @@ fn reapprove_ingest_destinations(
     if renamed_destinations.is_empty() {
         return Err("Enter at least one explicit replacement filename".into());
     }
+    let state = app.state::<NativeState>();
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let mut plan = load_approved_plan(&app, &plan_id)?;
+    let mut plan = current_approved_plan(&app, &plan_id)?;
     if plan.schema_version != 1 || plan.master_bin_path != settings.master_bin_path {
         return Err("The approved plan is stale; scan the source again".into());
     }
@@ -754,9 +835,7 @@ fn reapprove_ingest_destinations(
             return Err("Two reviewed files still use the same destination".into());
         }
     }
-    plan.id = Uuid::new_v4().to_string();
-    plan.created_at = Utc::now().to_rfc3339();
-    plan.inventory.plan_id = plan.id.clone();
+    plan = begin_approved_plan_revision(plan);
     plan.inventory.files = plan
         .files
         .iter()
@@ -790,45 +869,89 @@ fn reapprove_ingest_destinations(
         .map(|file| file.size_bytes)
         .sum();
     save_approved_plan(&app, &plan)?;
-    let _ = fs::remove_file(approved_plan_path(&app, &plan_id)?);
     Ok(plan.inventory)
 }
 
 #[tauri::command]
-fn replan_ingest_destinations(
+async fn replan_ingest_destinations(
     app: AppHandle,
     plan_id: String,
     date_override: String,
 ) -> Result<SourceInventory, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        replan_ingest_destinations_blocking(app, plan_id, date_override)
+    })
+    .await
+    .map_err(|error| format!("Date reapproval worker failed: {error}"))?
+}
+
+fn local_datetime_from_millis(millis: Option<u128>) -> Option<DateTime<Local>> {
+    let millis = u64::try_from(millis?).ok()?;
+    let time =
+        std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(millis))?;
+    Some(DateTime::<Local>::from(time))
+}
+
+fn replan_approved_relative_path(
+    settings: &DeviceSettings,
+    master: &Path,
+    approved: &ApprovedIngestFile,
+    date_override: &str,
+    batch_timestamp: &DateTime<Local>,
+) -> Result<String, String> {
+    let current = fs_safe::validate_relative(&approved.inventory.planned_relative_path)?;
+    let suffix = current.components().skip(1).collect::<PathBuf>();
+    if suffix.as_os_str().is_empty() {
+        return Err("Approved destination is missing its filename; scan the source again".into());
+    }
+    let original_dates = date_override == "original-file-dates";
+    if original_dates
+        && approved.planning_modified_millis.is_none()
+        && package_component(Path::new(&approved.inventory.source_relative_path))
+    {
+        return Err(
+            "This camera-package plan predates safe date reapproval; scan the source again".into(),
+        );
+    }
+    let planning_millis = approved
+        .planning_modified_millis
+        .or(approved.source_modified_millis);
+    let (date, _, _) = destination_date_from_modified(
+        settings,
+        local_datetime_from_millis(planning_millis),
+        &Some(date_override.to_owned()),
+        batch_timestamp,
+    )?;
+    let compact_date = date.replace('-', "");
+    let date_folder = if !settings.master_bin_path.trim().is_empty() && master.join(&date).is_dir()
+    {
+        date
+    } else if !settings.master_bin_path.trim().is_empty() && master.join(&compact_date).is_dir() {
+        compact_date
+    } else {
+        date
+    };
+    let relative = PathBuf::from(date_folder).join(suffix);
+    fs_safe::validate_relative(&relative.to_string_lossy())?;
+    Ok(portable_relative(&relative))
+}
+
+fn replan_ingest_destinations_blocking(
+    app: AppHandle,
+    plan_id: String,
+    date_override: String,
+) -> Result<SourceInventory, String> {
+    let state = app.state::<NativeState>();
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let mut plan = load_approved_plan(&app, &plan_id)?;
+    let mut plan = current_approved_plan(&app, &plan_id)?;
     if plan.schema_version != 1 || plan.master_bin_path != settings.master_bin_path {
         return Err("The approved plan is stale; scan the source again".into());
     }
     let batch_timestamp = DateTime::parse_from_rfc3339(&plan.batch_timestamp)
         .map_err(|_| "The approved plan has an invalid batch timestamp; scan again")?
         .with_timezone(&Local);
-    let allowed = settings
-        .sd_grabber_extensions
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let rebuilt = build_source_inventory_filtered_with_progress(
-        &plan.sources,
-        plan.sd_grabber.then_some(&allowed),
-        !plan.sd_grabber || settings.sd_grabber_search_subfolders,
-        |_, _| Ok(()),
-    )?;
-    let mut rebuilt_by_source = rebuilt
-        .files
-        .into_iter()
-        .map(|file| (file.source_path.clone(), file))
-        .collect::<HashMap<_, _>>();
-    if rebuilt_by_source.len() != plan.files.len() {
-        return Err("The selected source contents changed; scan the source again".into());
-    }
-
     let catalogue = load_catalogue_file(&settings)?;
     let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
     for item in &catalogue.media {
@@ -838,14 +961,9 @@ fn replan_ingest_destinations(
     let mut planned_destinations = HashSet::new();
     let mut conflicts = Vec::new();
     for approved in &mut plan.files {
-        let mut inventory = rebuilt_by_source
-            .remove(&approved.inventory.source_path)
-            .ok_or("The selected source contents changed; scan the source again")?;
+        let mut inventory = approved.inventory.clone();
         let source = PathBuf::from(&inventory.source_path);
-        let snapshot = fs_safe::snapshot(&source)?;
-        if snapshot.length != approved.source_size
-            || snapshot.modified_millis != approved.source_modified_millis
-        {
+        if !approved_source_snapshot_matches(&source, approved) {
             return Err(format!(
                 "Source changed since approval: {}; scan the source again",
                 source.display()
@@ -855,18 +973,12 @@ fn replan_ingest_destinations(
             .source_sha256
             .as_ref()
             .ok_or("The approved plan predates safe date reapproval; scan the source again")?;
-        let filename = source
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        inventory.planned_relative_path = planned_relative_path(
+        inventory.planned_relative_path = replan_approved_relative_path(
             &settings,
             &master,
-            &inventory,
-            &Some(date_override.clone()),
+            approved,
+            &date_override,
             &batch_timestamp,
-            &filename,
         )?;
         approved.existing_media_id = None;
         if let Some(relative_path) = selection_hashes.get(hash) {
@@ -876,7 +988,7 @@ fn replan_ingest_destinations(
         } else {
             let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
             let (disposition, media_id, relative_path, detail) =
-                classify_global_duplicate(&settings, candidates, snapshot.length, hash);
+                classify_global_duplicate(&settings, candidates, approved.source_size, hash);
             inventory.disposition = disposition;
             inventory.existing_relative_path = relative_path;
             inventory.detail = detail;
@@ -909,14 +1021,8 @@ fn replan_ingest_destinations(
         }
         approved.inventory = inventory;
     }
-    if !rebuilt_by_source.is_empty() {
-        return Err("The selected source contents changed; scan the source again".into());
-    }
-
-    plan.id = Uuid::new_v4().to_string();
-    plan.created_at = Utc::now().to_rfc3339();
+    plan = begin_approved_plan_revision(plan);
     plan.date_override = Some(date_override);
-    plan.inventory.plan_id = plan.id.clone();
     plan.inventory.files = plan
         .files
         .iter()
@@ -963,7 +1069,6 @@ fn replan_ingest_destinations(
         .map(|file| file.size_bytes)
         .sum();
     save_approved_plan(&app, &plan)?;
-    let _ = fs::remove_file(approved_plan_path(&app, &plan_id)?);
     Ok(plan.inventory)
 }
 
@@ -2387,6 +2492,12 @@ fn create_approved_inventory(
             inventory: file.clone(),
             source_size: snapshot.length,
             source_modified_millis: snapshot.modified_millis,
+            planning_modified_millis: file
+                .package_date_source_path
+                .as_deref()
+                .and_then(|path| fs_safe::snapshot(Path::new(path)).ok())
+                .and_then(|snapshot| snapshot.modified_millis)
+                .or(snapshot.modified_millis),
             source_sha256: Some(hash.clone()),
             source_volume_identity: source_volume_identity.clone(),
             existing_media_id,
@@ -2438,11 +2549,14 @@ fn create_approved_inventory(
         .map(|file| file.size_bytes)
         .sum();
     inventory.plan_id = Uuid::new_v4().to_string();
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
     save_approved_plan(
         app,
         &ApprovedIngestPlan {
             schema_version: 1,
             id: inventory.plan_id.clone(),
+            lineage_id: inventory.plan_id.clone(),
+            revision: 0,
             created_at: Utc::now().to_rfc3339(),
             batch_timestamp: batch_timestamp.to_rfc3339(),
             master_bin_path: settings.master_bin_path,
@@ -4124,13 +4238,18 @@ fn start_ingest(
     request: IngestRequest,
 ) -> Result<IngestJob, String> {
     let _operation = begin_critical_operation(&state.operations, "ingest start")?;
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
     let plan_id = request
         .approved_plan_id
         .as_deref()
         .ok_or("Scan and review the source before starting ingest")?;
-    let plan = load_approved_plan(&app, plan_id)?;
+    let plan = current_approved_plan(&app, plan_id)?;
+    if plan.id != plan_id {
+        return Err("This approved ingest plan was superseded; review the latest plan".into());
+    }
+    let plan_lineage = approved_plan_lineage(&plan).to_owned();
     if plan.schema_version != 1
         || plan.master_bin_path != settings.master_bin_path
         || plan.sources != request.sources
@@ -4250,6 +4369,7 @@ fn start_ingest(
         schema_version: 3,
         id: request.job_id,
         approved_plan_id: Some(plan_id.into()),
+        approved_plan_lineage_id: Some(plan_lineage.clone()),
         state: if files.iter().any(|file| file.state == "queued") {
             "queued"
         } else {
@@ -4276,16 +4396,25 @@ fn start_ingest(
         if jobs.iter().any(|existing| existing.id == job.id) {
             return Err("An ingest job with this ID already exists".into());
         }
-        if jobs
-            .iter()
-            .any(|existing| existing.approved_plan_id.as_deref() == Some(plan_id))
+        if jobs.iter().any(|existing| {
+            existing.approved_plan_lineage_id.as_deref() == Some(plan_lineage.as_str())
+                || (existing.approved_plan_lineage_id.is_none()
+                    && existing.approved_plan_id.as_deref() == Some(plan_id))
+        })
         {
             return Err("This approved ingest plan has already been used".into());
         }
         jobs.push(job.clone());
         Ok(())
     })?;
-    let _ = fs::remove_file(approved_plan_path(&app, plan_id)?);
+    if let Err(error) = remove_approved_plan_lineage(&app, &plan_lineage) {
+        diagnostic_log(
+            &app,
+            "WARN",
+            "approved-plan-cleanup",
+            &format!("Ingest started, but consumed plan cleanup was incomplete: {error}"),
+        );
+    }
     kick_ingest_worker(app);
     Ok(job)
 }
@@ -8006,11 +8135,146 @@ mod tests {
         root
     }
 
+    fn approved_file_for_replan(
+        relative_path: &str,
+        source_modified_millis: u128,
+        planning_modified_millis: Option<u128>,
+    ) -> ApprovedIngestFile {
+        ApprovedIngestFile {
+            inventory: InventoryFile {
+                source_path: format!("card/{relative_path}"),
+                source_relative_path: relative_path.into(),
+                planned_relative_path: format!("2026-01-01/{relative_path}"),
+                ..InventoryFile::default()
+            },
+            source_size: 64,
+            source_modified_millis: Some(source_modified_millis),
+            planning_modified_millis,
+            source_sha256: Some("approved-hash".into()),
+            source_volume_identity: Some("volume-a".into()),
+            existing_media_id: None,
+        }
+    }
+
+    #[test]
+    fn date_reapproval_preserves_package_suffix_and_approved_evidence() {
+        let root = temporary("date-reapproval-package");
+        let mut settings = DeviceSettings {
+            master_bin_path: root.to_string_lossy().into_owned(),
+            date_folder_pattern: "yyyy-MM-dd".into(),
+            ..DeviceSettings::default()
+        };
+        let first_millis = 1_767_268_800_000_u128;
+        let package_millis = 1_767_355_200_000_u128;
+        let mxf = approved_file_for_replan(
+            "PRIVATE/AVCHD/BDMV/STREAM/clip.mxf",
+            first_millis,
+            Some(package_millis),
+        );
+        let xml = approved_file_for_replan(
+            "PRIVATE/AVCHD/BDMV/CLIPINF/clip.xml",
+            first_millis + 172_800_000,
+            Some(package_millis),
+        );
+        let batch = Local::now();
+        let expected_date = local_datetime_from_millis(Some(package_millis))
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mxf_path = replan_approved_relative_path(
+            &settings,
+            &root,
+            &mxf,
+            "original-file-dates",
+            &batch,
+        )
+        .unwrap();
+        let xml_path = replan_approved_relative_path(
+            &settings,
+            &root,
+            &xml,
+            "original-file-dates",
+            &batch,
+        )
+        .unwrap();
+        assert!(mxf_path.starts_with(&expected_date));
+        assert!(xml_path.starts_with(&expected_date));
+        assert!(mxf_path.ends_with("PRIVATE/AVCHD/BDMV/STREAM/clip.mxf"));
+        assert!(xml_path.ends_with("PRIVATE/AVCHD/BDMV/CLIPINF/clip.xml"));
+        assert_eq!(mxf.source_sha256.as_deref(), Some("approved-hash"));
+        assert_eq!(mxf.source_volume_identity.as_deref(), Some("volume-a"));
+
+        settings.date_folder_pattern = "yyyyMMdd".into();
+        assert!(replan_approved_relative_path(
+            &settings,
+            &root,
+            &approved_file_for_replan("PRIVATE/clip.mxf", first_millis, None),
+            "original-file-dates",
+            &batch,
+        )
+        .unwrap_err()
+        .contains("predates safe date reapproval"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_reapproval_keeps_independent_clip_dates_separate() {
+        let root = temporary("date-reapproval-independent");
+        let settings = DeviceSettings {
+            master_bin_path: root.to_string_lossy().into_owned(),
+            date_folder_pattern: "yyyy-MM-dd".into(),
+            ..DeviceSettings::default()
+        };
+        let first = approved_file_for_replan("card-a/clip.mp4", 1_767_268_800_000, None);
+        let second = approved_file_for_replan("card-b/clip.mp4", 1_767_441_600_000, None);
+        let batch = Local::now();
+        let first_path = replan_approved_relative_path(
+            &settings,
+            &root,
+            &first,
+            "original-file-dates",
+            &batch,
+        )
+        .unwrap();
+        let second_path = replan_approved_relative_path(
+            &settings,
+            &root,
+            &second,
+            "original-file-dates",
+            &batch,
+        )
+        .unwrap();
+        assert_ne!(Path::new(&first_path).components().next(), Path::new(&second_path).components().next());
+        assert!(first_path.ends_with("card-a/clip.mp4"));
+        assert!(second_path.ends_with("card-b/clip.mp4"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approved_plan_revisions_preserve_lineage_and_leave_prior_plan_immutable() {
+        let original_id = Uuid::new_v4().to_string();
+        let original = ApprovedIngestPlan {
+            schema_version: 1,
+            id: original_id.clone(),
+            lineage_id: original_id.clone(),
+            revision: 0,
+            ..ApprovedIngestPlan::default()
+        };
+        let revised = begin_approved_plan_revision(original.clone());
+        assert_eq!(original.id, original_id);
+        assert_eq!(original.revision, 0);
+        assert_ne!(revised.id, original.id);
+        assert_eq!(revised.lineage_id, original_id);
+        assert_eq!(revised.revision, 1);
+        assert_eq!(revised.inventory.plan_id, revised.id);
+    }
+
     fn ingest_job(state: &str, file_state: &str) -> IngestJob {
         IngestJob {
             schema_version: 2,
             id: "job-1".into(),
             approved_plan_id: None,
+            approved_plan_lineage_id: None,
             state: state.into(),
             created_at: "2026-10-24T00:00:00Z".into(),
             updated_at: "2026-10-24T00:00:00Z".into(),
@@ -8727,6 +8991,7 @@ mod tests {
             inventory: InventoryFile::default(),
             source_size: snapshot.length,
             source_modified_millis: snapshot.modified_millis,
+            planning_modified_millis: snapshot.modified_millis,
             source_sha256: Some(sha256(&source).unwrap()),
             source_volume_identity: None,
             existing_media_id: None,

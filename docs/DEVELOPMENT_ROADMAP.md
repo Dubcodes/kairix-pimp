@@ -45,6 +45,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
 - Implemented Library reliability repair: correct Windows Shell parent/child reveal boundary, selection-keyed description persistence with failure/stale-response handling, and bounded regeneration of missing/invalid/evicted thumbnail JPEGs
 - Implemented thumbnail retry hardening: in-flight-only deduplication, bounded failure backoff, visible/near-static priority ahead of hover work, refresh-safe shared URLs, per-media native generation coordination and protected cache eviction
+- Implemented lightweight date reapproval: exact approved-file stat checks, zero source-content rereads, package-date evidence, immutable serialized plan revisions and stale-plan rejection
 
 ## Milestone 3 — Premiere extension
 

@@ -1478,6 +1478,72 @@ describe('native application integration', () => {
     },
   );
 
+  it('serializes rapid date changes and rebases the latest intent on the durable revision', async () => {
+    mocks.settings.ingestDateOrganization = 'original-file-dates';
+    const sourceInventory = {
+      planId: '00000000-0000-4000-8000-000000000030',
+      files: [
+        {
+          sourcePath: 'E:\\DCIM\\clip.mp4',
+          sourceRelativePath: 'DCIM/clip.mp4',
+          plannedRelativePath: '20261105/DCIM/clip.mp4',
+          sizeBytes: 100,
+          kind: 'video',
+          analysisSupported: true,
+          preserveHierarchy: true,
+        },
+      ],
+      excluded: [],
+      issues: [],
+      totalFileCount: 1,
+      totalBytes: 100,
+      copyFileCount: 1,
+      copyBytes: 100,
+    };
+    const firstRevision = {
+      ...sourceInventory,
+      planId: '00000000-0000-4000-8000-000000000031',
+    };
+    let resolveFirst!: (inventory: typeof sourceInventory) => void;
+    mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
+    mocks.inventorySources.mockResolvedValue(sourceInventory);
+    mocks.replanIngestDestinations
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockImplementationOnce(async () => ({
+        ...sourceInventory,
+        planId: '00000000-0000-4000-8000-000000000032',
+      }));
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(screen.getByRole('button', { name: 'Choose files' }));
+    await screen.findByText('1 of 1 files will be copied (0 KB)');
+    await user.click(screen.getByRole('radio', { name: 'Yesterday' }));
+    await waitFor(() =>
+      expect(mocks.replanIngestDestinations).toHaveBeenCalledWith(
+        sourceInventory.planId,
+        'yesterday',
+      ),
+    );
+    await user.click(screen.getByRole('radio', { name: 'Today' }));
+    expect(mocks.replanIngestDestinations).toHaveBeenCalledTimes(1);
+
+    resolveFirst(firstRevision);
+    await waitFor(() =>
+      expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+        firstRevision.planId,
+        'today',
+      ),
+    );
+    expect(mocks.inventorySources).toHaveBeenCalledTimes(1);
+  });
+
   it('scans a detected card and clearly separates new and imported files', async () => {
     mocks.saveSettings.mockImplementation(async (settings) => settings);
     mocks.listRemovableVolumes.mockResolvedValue([
