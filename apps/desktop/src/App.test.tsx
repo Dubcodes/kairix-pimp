@@ -963,9 +963,7 @@ describe('native application integration', () => {
         name: 'Filter available recordings by tags',
       }),
     );
-    await user.click(
-      screen.getByRole('option', { name: 'interview' }),
-    );
+    await user.click(screen.getByRole('option', { name: 'interview' }));
     expect(
       screen.getByRole('checkbox', { name: 'Select clip-0119.mp4' }),
     ).toBeVisible();
