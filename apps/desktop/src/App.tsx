@@ -170,6 +170,12 @@ export function App() {
   const [selectedPremiereSequenceId, setSelectedPremiereSequenceId] =
     useState<string>();
   const [projectMediaQuery, setProjectMediaQuery] = useState('');
+  const [projectAvailableOpen, setProjectAvailableOpen] = useState(false);
+  const [projectAvailableQuery, setProjectAvailableQuery] = useState('');
+  const [projectAvailableTags, setProjectAvailableTags] = useState<string[]>(
+    [],
+  );
+  const [projectAvailablePage, setProjectAvailablePage] = useState(1);
   const [projectMediaSelection, setProjectMediaSelection] = useState<string[]>(
     [],
   );
@@ -853,6 +859,30 @@ export function App() {
           ),
       ),
     [catalogue.media, projectMedia, selectedProjectId],
+  );
+  const availableProjectMedia = useMemo(() => {
+    const query = projectAvailableQuery.trim().toLocaleLowerCase();
+    return unlinkedProjectMedia.filter((item) => {
+      const tags = logicalTags(item, catalogue.media);
+      return (
+        (!query || logicalMediaMatches(item, query, catalogue)) &&
+        projectAvailableTags.every((tag) => tags.includes(tag))
+      );
+    });
+  }, [
+    catalogue,
+    projectAvailableQuery,
+    projectAvailableTags,
+    unlinkedProjectMedia,
+  ]);
+  const availableProjectPageSize = 50;
+  const availableProjectPageCount = Math.max(
+    1,
+    Math.ceil(availableProjectMedia.length / availableProjectPageSize),
+  );
+  const pagedAvailableProjectMedia = availableProjectMedia.slice(
+    (projectAvailablePage - 1) * availableProjectPageSize,
+    projectAvailablePage * availableProjectPageSize,
   );
   const premiereSummary = useMemo(() => {
     const index = projectInventory?.premiereIndex;
@@ -1901,6 +1931,10 @@ export function App() {
     setProjectNotes(project.notes);
     setProjectTags(project.tags);
     setProjectMediaQuery('');
+    setProjectAvailableOpen(false);
+    setProjectAvailableQuery('');
+    setProjectAvailableTags([]);
+    setProjectAvailablePage(1);
     setProjectMediaSelection([]);
     setProjectAddTags([]);
     setProjectRemoveTags([]);
@@ -5347,9 +5381,10 @@ export function App() {
                   <Search aria-hidden="true" size={17} />
                   <input
                     value={projectMediaQuery}
-                    onChange={(event) =>
-                      setProjectMediaQuery(event.target.value)
-                    }
+                    onChange={(event) => {
+                      setProjectMediaQuery(event.target.value);
+                      setProjectAvailablePage(1);
+                    }}
                     placeholder="Search Master Bin footage to link…"
                   />
                 </label>
@@ -5475,82 +5510,187 @@ export function App() {
                   </div>
                 )}
                 {[
-                  ['Assigned recordings', linkedProjectMedia],
-                  ['Available to add', unlinkedProjectMedia],
-                ].map(([heading, recordings]) => (
-                  <div
-                    className="project-media-section"
-                    key={heading as string}
-                  >
-                    <h4>{heading as string}</h4>
-                    <div className="project-media-list">
-                      {(recordings as typeof projectMedia).map((item) => (
-                        <div className="project-media-row" key={item.id}>
-                          <input
-                            type="checkbox"
-                            aria-label={`Select ${item.originalFilename}`}
-                            checked={projectMediaSelection.includes(item.id)}
-                            onChange={(event) => {
-                              setProjectMediaSelection((current) =>
-                                event.target.checked
-                                  ? [...new Set([...current, item.id])]
-                                  : current.filter((id) => id !== item.id),
-                              );
-                              if (event.target.checked) {
-                                setProjectMediaDescription(item.notes);
-                                setProjectAddTags([]);
-                                setProjectRemoveTags([]);
-                              }
-                            }}
-                          />
-                          <div className="project-media-thumb">
-                            <MediaThumbnail
-                              mediaId={item.id}
-                              fileType={item.fileType}
-                              thumbnailSource={thumbnailSources[item.id]}
-                              sourceAvailable={item.available}
-                              previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
-                              onThumbnailPrepared={receivePreparedThumbnail}
-                            />
-                          </div>
-                          <span>
-                            <strong>{item.originalFilename}</strong>
-                            <small>{item.relativePath}</small>
-                            <span className="pills">
-                              {logicalTags(item, catalogue.media).map((tag) => (
-                                <em key={tag}>{tag}</em>
-                              ))}
-                            </span>
-                          </span>
-                          {item.favourite && (
-                            <Star aria-label="Favourite" size={14} />
-                          )}
+                  {
+                    heading: 'Assigned recordings',
+                    recordings: linkedProjectMedia,
+                  },
+                  {
+                    heading: 'Available to add',
+                    recordings: unlinkedProjectMedia,
+                  },
+                ].map(({ heading, recordings }) => {
+                  const available = heading === 'Available to add';
+                  if (available && !projectAvailableOpen) {
+                    return (
+                      <div className="project-media-section" key={heading}>
+                        <button
+                          type="button"
+                          className="project-media-section-toggle"
+                          aria-expanded="false"
+                          onClick={() => setProjectAvailableOpen(true)}
+                        >
+                          Available to add ({unlinkedProjectMedia.length})
+                        </button>
+                      </div>
+                    );
+                  }
+                  const displayedRecordings = available
+                    ? pagedAvailableProjectMedia
+                    : recordings;
+                  return (
+                    <div className="project-media-section" key={heading}>
+                      {available ? (
+                        <div className="project-available-heading">
                           <button
                             type="button"
-                            disabled={!item.available}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void desktopBridge
-                                .revealMediaInExplorer(item.id)
-                                .catch((reason) => setError(errorText(reason)));
-                            }}
+                            className="project-media-section-toggle"
+                            aria-expanded="true"
+                            onClick={() => setProjectAvailableOpen(false)}
                           >
-                            Reveal
+                            Available to add ({unlinkedProjectMedia.length})
                           </button>
+                          <label>
+                            Search available recordings
+                            <input
+                              value={projectAvailableQuery}
+                              onChange={(event) => {
+                                setProjectAvailableQuery(event.target.value);
+                                setProjectAvailablePage(1);
+                              }}
+                            />
+                          </label>
+                          <SearchableComboBox
+                            label="Filter available recordings by tags"
+                            mode="multiple"
+                            options={knownTags.map((tag) => ({
+                              id: tag,
+                              label: tag,
+                            }))}
+                            selectedIds={projectAvailableTags}
+                            onSelectionChange={(tags) => {
+                              setProjectAvailableTags(tags);
+                              setProjectAvailablePage(1);
+                            }}
+                            placeholder="Filter tags…"
+                          />
+                          <small>
+                            Showing {displayedRecordings.length} of{' '}
+                            {availableProjectMedia.length} matching recordings
+                          </small>
+                        </div>
+                      ) : (
+                        <h4>
+                          Assigned recordings ({linkedProjectMedia.length})
+                        </h4>
+                      )}
+                      <div className="project-media-list">
+                        {(displayedRecordings as typeof projectMedia).map(
+                          (item) => (
+                            <div className="project-media-row" key={item.id}>
+                              <input
+                                type="checkbox"
+                                aria-label={`Select ${item.originalFilename}`}
+                                checked={projectMediaSelection.includes(
+                                  item.id,
+                                )}
+                                onChange={(event) => {
+                                  setProjectMediaSelection((current) =>
+                                    event.target.checked
+                                      ? [...new Set([...current, item.id])]
+                                      : current.filter((id) => id !== item.id),
+                                  );
+                                  if (event.target.checked) {
+                                    setProjectMediaDescription(item.notes);
+                                    setProjectAddTags([]);
+                                    setProjectRemoveTags([]);
+                                  }
+                                }}
+                              />
+                              <div className="project-media-thumb">
+                                <MediaThumbnail
+                                  mediaId={item.id}
+                                  fileType={item.fileType}
+                                  thumbnailSource={thumbnailSources[item.id]}
+                                  sourceAvailable={item.available}
+                                  previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
+                                  onThumbnailPrepared={receivePreparedThumbnail}
+                                />
+                              </div>
+                              <span>
+                                <strong>{item.originalFilename}</strong>
+                                <small>{item.relativePath}</small>
+                                <span className="pills">
+                                  {logicalTags(item, catalogue.media).map(
+                                    (tag) => (
+                                      <em key={tag}>{tag}</em>
+                                    ),
+                                  )}
+                                </span>
+                              </span>
+                              {item.favourite && (
+                                <Star aria-label="Favourite" size={14} />
+                              )}
+                              <button
+                                type="button"
+                                disabled={!item.available}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void desktopBridge
+                                    .revealMediaInExplorer(item.id)
+                                    .catch((reason) =>
+                                      setError(errorText(reason)),
+                                    );
+                                }}
+                              >
+                                Reveal
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  navigateProjectMediaToLibrary(item.id);
+                                }}
+                              >
+                                View in Library
+                              </button>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                      {available && availableProjectPageCount > 1 && (
+                        <div
+                          className="project-available-pages"
+                          aria-label="Available recording pages"
+                        >
                           <button
                             type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              navigateProjectMediaToLibrary(item.id);
-                            }}
+                            disabled={projectAvailablePage === 1}
+                            onClick={() =>
+                              setProjectAvailablePage((page) => page - 1)
+                            }
                           >
-                            View in Library
+                            Previous
+                          </button>
+                          <span>
+                            Page {projectAvailablePage} of{' '}
+                            {availableProjectPageCount}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={
+                              projectAvailablePage === availableProjectPageCount
+                            }
+                            onClick={() =>
+                              setProjectAvailablePage((page) => page + 1)
+                            }
+                          >
+                            Next
                           </button>
                         </div>
-                      ))}
+                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </section>
             </section>
           ) : (

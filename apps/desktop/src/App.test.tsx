@@ -839,6 +839,12 @@ describe('native application integration', () => {
       removeProjectIds: ['project-a'],
     });
 
+    expect(
+      screen.queryByRole('checkbox', { name: /title.png/ }),
+    ).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole('button', { name: 'Available to add (1)' }),
+    );
     await user.click(screen.getByRole('checkbox', { name: /title.png/ }));
     await user.click(screen.getByRole('button', { name: 'Add to project' }));
     expect(mocks.updateMedia).toHaveBeenCalledWith({
@@ -874,6 +880,98 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('heading', { name: 'Simple Vlog 057' }),
     ).toBeVisible();
+  });
+
+  it('keeps available project recordings collapsed and paginates mounted rows', async () => {
+    mocks.catalogue = {
+      media: Array.from({ length: 120 }, (_, index) => ({
+        id: `available-${index}`,
+        relativePath: `20261105/clip-${String(index).padStart(4, '0')}.mp4`,
+        originalFilename: `clip-${String(index).padStart(4, '0')}.mp4`,
+        sha256: `sha-${index}`,
+        captureDateProvenance: 'filesystem',
+        ingestDate: '2026-11-05',
+        fileType: 'mp4',
+        tags: index === 119 ? ['interview'] : [],
+        projectIds: [],
+        notes: '',
+        technical: { sizeBytes: 100 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Large project',
+          workingDirectory: 'C:\\Projects\\Large',
+          mediaIds: [],
+          notes: '',
+          tags: [],
+          createdAt: '2026-11-05T00:00:00Z',
+        },
+      ],
+      updatedAt: '2026-11-05T00:00:00Z',
+    };
+    mocks.inventoryProject.mockResolvedValue({
+      projectId: 'project-a',
+      rootPath: 'C:\\Projects\\Large',
+      itemCount: 0,
+      sizeBytes: 0,
+      scannedAt: '2026-11-05T00:00:00Z',
+      items: [],
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Projects' }));
+    await user.click(
+      screen.getByRole('button', { name: /Large project.*0 assigned/ }),
+    );
+
+    const toggle = await screen.findByRole('button', {
+      name: 'Available to add (120)',
+    });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(
+      screen.queryByRole('checkbox', { name: 'Select clip-0000.mp4' }),
+    ).not.toBeInTheDocument();
+    await user.click(toggle);
+    expect(
+      screen.getAllByRole('checkbox', { name: /Select clip-/ }),
+    ).toHaveLength(50);
+    expect(screen.getByText('Page 1 of 3')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(
+      screen.getByRole('checkbox', { name: 'Select clip-0050.mp4' }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('checkbox', { name: 'Select clip-0000.mp4' }),
+    ).not.toBeInTheDocument();
+
+    const availableSearch = screen.getByRole('textbox', {
+      name: 'Search available recordings',
+    });
+    await user.type(availableSearch, 'clip-0119');
+    expect(
+      screen.getByRole('checkbox', { name: 'Select clip-0119.mp4' }),
+    ).toBeVisible();
+    expect(
+      screen.getAllByRole('checkbox', { name: /Select clip-/ }),
+    ).toHaveLength(1);
+    await user.clear(availableSearch);
+    await user.click(
+      screen.getByRole('combobox', {
+        name: 'Filter available recordings by tags',
+      }),
+    );
+    await user.click(
+      screen.getByRole('option', { name: 'interview' }),
+    );
+    expect(
+      screen.getByRole('checkbox', { name: 'Select clip-0119.mp4' }),
+    ).toBeVisible();
+    expect(
+      screen.getAllByRole('checkbox', { name: /Select clip-/ }),
+    ).toHaveLength(1);
   });
 
   it('ignores superseded project inventory results and failures', async () => {

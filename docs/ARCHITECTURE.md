@@ -104,6 +104,8 @@ The Clip Viewer stays in the existing WebView and resolves playback only through
 
 An approved ingest plan stores the source selection, snapshots, SHA-256 values and destination mapping. A per-batch date change re-enumerates the same selection and checks each stored size/modification snapshot before recomputing destinations and duplicate/collision state with the stored hashes. It creates a new opaque approved-plan ID and invalidates the prior plan without rereading every source byte solely to change a folder date.
 
+Projects uses the same canonical media IDs, logical MP4/WAV grouping and device-local thumbnail-source map as Library. Assigned media is rendered immediately. The unassigned catalogue projection stays unmounted until explicitly expanded, then applies local text/tag filters and renders at most 50 rows per page. This is a bounded presentation projection only; assignments still write normal authoritative media metadata events.
+
 Until that extension exists, the default editing workflow references footage directly from Master Bin. Working Project folders and their existing Premiere saves/assets are not restructured, and users continue to use Premiere's normal desktop/laptop drive-path relinking.
 
 The established product layout calls that source root **DCM Master Bin**. Dated folders become Premiere bins and an optional virtual Audio grouping may expose paired audio without moving it. A future explicit collection workflow writes a verified portable archive under DCM Content; only its successful state transition makes the collected `.prproj` authoritative for the stable project ID.

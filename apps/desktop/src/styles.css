@@ -2469,6 +2469,30 @@ select:disabled {
 .project-media-section h4 {
   margin: 12px 0 4px;
 }
+.project-media-section-toggle {
+  width: 100%;
+  justify-content: flex-start;
+  margin-top: 8px;
+  font-weight: 700;
+}
+.project-available-heading {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr);
+  gap: 8px;
+  align-items: end;
+}
+.project-available-heading > button,
+.project-available-heading > small {
+  grid-column: 1 / -1;
+}
+.project-available-pages {
+  margin-top: 8px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+}
 .project-media-row {
   min-width: 0;
   padding: 9px;

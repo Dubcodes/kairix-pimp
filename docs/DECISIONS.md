@@ -440,3 +440,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Restore exactly Today, Yesterday, Choose date and Use clip date as request-scoped ingest choices. When an approved inventory exists, re-enumerate its source selection, reject any size/modification change, reuse its stored SHA-256 evidence and issue a replacement approved plan after recomputing package-safe destinations, duplicates and collisions. For Clip Viewer failures, generate only an explicitly requested H.264/AAC proxy in the device cache, fingerprinted by media/source/transform identity, validated with FFprobe and committed only after a source-stability recheck.
 - **Consequences:** Destination-only date changes do not impose another full-card read and cannot silently alter the saved two-mode preference. Unsupported codecs gain a bounded retryable cache fallback without changing originals or prebuilding the Library. Installed HEVC playback plus conversion cancellation and meaningful progress remain required before calling the fallback fully accepted.
+
+## ADR-060 — Bound available project media without a second cache
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Keep assigned project recordings visible. Keep available-to-add media collapsed and unmounted until requested, then filter it by text/tags and render 50 logical recordings per page. Reuse canonical media IDs, logical audio grouping, thumbnail-source state and the ordinary missing-thumbnail recovery path from Library.
+- **Consequences:** Opening a project no longer mounts hundreds of hidden cards or starts page-specific media work. Assignment remains an authoritative metadata operation. Native outbound drag remains disabled under ADR-054 until a copy-only OLE payload is accepted in Explorer and Premiere 26.0.2.
