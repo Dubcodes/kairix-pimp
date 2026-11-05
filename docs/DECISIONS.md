@@ -426,3 +426,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Add a conservative read-only fallback alongside ADR-037's preferred Companion path. Parse only the deterministic main `.prproj` after a stable size/modification read, accept bounded gzip-XML/XML, reject document types and excessive decompression/events/depth/values, and resolve only unambiguous canonical object definitions/references, project containers, bins and track items. Persist the fingerprinted projection device-locally. Associate catalogue media only by exact existing canonical path.
 - **Consequences:** Projects can expose useful offline saved-state evidence without a plugin or project mutation. Sanitized Premiere-26-shaped evidence supports named definition deduplication, root/nested placement, imported/used/previous path states and placement counts. Time ranges and ambiguous relationships remain unknown rather than inferred. Projections never authorize cleanup, and live Companion evidence retains separate provenance.
+
+## ADR-058 — Keep selection workflow history local and non-authoritative
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Keep the compact Library selection toolbar fixed above the scrolling grid and store only its device-local position/action visibility in WebView local storage. Retain at most 50 in-memory selection snapshots containing stable media IDs and the range anchor. Keyboard undo/redo applies only to selection and yields to editable controls.
+- **Consequences:** Accidental selection loss is recoverable without undoing metadata or filesystem operations, toolbar preferences never enter synchronized events, and removed media IDs are pruned from history. Installed WebView2 focus, zoom and assistive-technology acceptance remains required.

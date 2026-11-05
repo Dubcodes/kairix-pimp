@@ -1054,6 +1054,18 @@ describe('native application integration', () => {
       ),
     );
     expect(screen.getByText('Generation queue idle')).toBeVisible();
+    await user.selectOptions(screen.getByLabelText('Position'), 'bottom-left');
+    await user.click(screen.getByRole('checkbox', { name: 'Add tags' }));
+    expect(localStorage.getItem('pimp-selection-toolbar-position')).toBe(
+      'bottom-left',
+    );
+    expect(
+      localStorage.getItem('pimp-selection-toolbar-actions'),
+    ).not.toContain('tags');
+    await user.click(
+      screen.getByRole('button', { name: 'Reset toolbar to defaults' }),
+    );
+    expect(localStorage.getItem('pimp-selection-toolbar-position')).toBeNull();
   });
 
   it.each([100, 700, 3000])(
@@ -1940,6 +1952,19 @@ describe('native application integration', () => {
 
     await user.keyboard('{Control>}a{/Control}');
     expect(screen.getByText('3 selected')).toBeVisible();
+    expect(
+      screen.getByRole('toolbar', { name: 'Selected recordings' }),
+    ).toBeVisible();
+    await user.keyboard('{Control>}z{/Control}');
+    expect(screen.getByText('2 selected')).toBeVisible();
+    await user.keyboard('{Control>}y{/Control}');
+    expect(screen.getByText('3 selected')).toBeVisible();
+    const search = screen.getByPlaceholderText(/Search filenames, folders/);
+    await user.click(search);
+    await user.type(search, 'x');
+    await user.keyboard('{Control>}z{/Control}');
+    expect(screen.getByText('3 selected')).toBeVisible();
+    await user.clear(search);
     await user.click(screen.getByRole('button', { name: 'More actions' }));
     await user.click(screen.getByRole('button', { name: 'Favourite' }));
     expect(mocks.updateMedia).toHaveBeenCalledWith({

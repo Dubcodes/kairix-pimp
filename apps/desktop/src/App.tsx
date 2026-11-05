@@ -93,6 +93,14 @@ type SettingsSection =
   | 'About & Support'
   | 'Diagnostics';
 type FolderSort = NonNullable<DeviceSettings['libraryFolderSort']>;
+type SelectionToolbarAction = 'tags' | 'projects' | 'favourite';
+type SelectionToolbarPosition =
+  'bottom-right' | 'bottom-center' | 'bottom-left';
+const defaultSelectionToolbarActions: SelectionToolbarAction[] = [
+  'tags',
+  'projects',
+  'favourite',
+];
 
 const icons = {
   Ingest: Inbox,
@@ -253,6 +261,30 @@ export function App() {
   const [viewerError, setViewerError] = useState('');
   const [thumbnailFrameStatus, setThumbnailFrameStatus] = useState('');
   const [showSelectionDetails, setShowSelectionDetails] = useState(false);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const [selectionToolbarPosition, setSelectionToolbarPosition] =
+    useState<SelectionToolbarPosition>(() => {
+      const saved = localStorage.getItem('pimp-selection-toolbar-position');
+      return saved === 'bottom-left' || saved === 'bottom-center'
+        ? saved
+        : 'bottom-right';
+    });
+  const [selectionToolbarActions, setSelectionToolbarActions] = useState<
+    SelectionToolbarAction[]
+  >(() => {
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem('pimp-selection-toolbar-actions') ?? 'null',
+      );
+      return Array.isArray(saved)
+        ? defaultSelectionToolbarActions.filter((action) =>
+            saved.includes(action),
+          )
+        : defaultSelectionToolbarActions;
+    } catch {
+      return defaultSelectionToolbarActions;
+    }
+  });
   const [contextMenu, setContextMenu] = useState<{
     mediaId: string;
     x: number;
@@ -270,9 +302,17 @@ export function App() {
     new Map<string, ProvisionalMetadataPatch>(),
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
+  const selectionUndo = useRef<
+    Array<{ ids: string[]; anchor: string | undefined }>
+  >([]);
+  const selectionRedo = useRef<
+    Array<{ ids: string[]; anchor: string | undefined }>
+  >([]);
+  const lastEscapeAt = useRef(0);
   const descriptionSaveGeneration = useRef(0);
   const selectionKeyRef = useRef('');
   const contentRef = useRef<HTMLElement>(null);
+  const librarySearchRef = useRef<HTMLInputElement>(null);
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
@@ -865,6 +905,68 @@ export function App() {
       }),
     [catalogue, displayedMedia, folder, includeUnavailable, query, tagFilters],
   );
+  const replaceSelection = useCallback(
+    (ids: string[], anchor: string | undefined, recordHistory = true) => {
+      const known = new Set(catalogue.media.map((item) => item.id));
+      const next = [...new Set(ids.filter((id) => known.has(id)))];
+      if (
+        next.length === selected.length &&
+        next.every((id, index) => id === selected[index]) &&
+        anchor === selectionAnchor.current
+      )
+        return;
+      if (recordHistory) {
+        selectionUndo.current.push({
+          ids: [...selected],
+          anchor: selectionAnchor.current,
+        });
+        if (selectionUndo.current.length > 50) selectionUndo.current.shift();
+        selectionRedo.current = [];
+      }
+      selectionAnchor.current = anchor;
+      setSelected(next);
+    },
+    [catalogue.media, selected],
+  );
+  const undoSelection = useCallback(() => {
+    const previous = selectionUndo.current.pop();
+    if (!previous) return;
+    selectionRedo.current.push({
+      ids: [...selected],
+      anchor: selectionAnchor.current,
+    });
+    replaceSelection(previous.ids, previous.anchor, false);
+  }, [replaceSelection, selected]);
+  const redoSelection = useCallback(() => {
+    const next = selectionRedo.current.pop();
+    if (!next) return;
+    selectionUndo.current.push({
+      ids: [...selected],
+      anchor: selectionAnchor.current,
+    });
+    replaceSelection(next.ids, next.anchor, false);
+  }, [replaceSelection, selected]);
+  useEffect(() => {
+    const known = new Set(catalogue.media.map((item) => item.id));
+    selectionUndo.current = selectionUndo.current
+      .map((snapshot) => ({
+        ids: snapshot.ids.filter((id) => known.has(id)),
+        anchor:
+          snapshot.anchor && known.has(snapshot.anchor)
+            ? snapshot.anchor
+            : undefined,
+      }))
+      .slice(-50);
+    selectionRedo.current = selectionRedo.current
+      .map((snapshot) => ({
+        ids: snapshot.ids.filter((id) => known.has(id)),
+        anchor:
+          snapshot.anchor && known.has(snapshot.anchor)
+            ? snapshot.anchor
+            : undefined,
+      }))
+      .slice(-50);
+  }, [catalogue.media]);
   const viewerRecording = viewerMediaId
     ? catalogue.media.find((item) => item.id === viewerMediaId)
     : undefined;
@@ -896,8 +998,7 @@ export function App() {
   }, [native, viewerMediaId, viewerRecording?.available]);
   const openClipViewer = (mediaId: string) => {
     libraryScrollPosition.current = contentRef.current?.scrollTop ?? 0;
-    setSelected([mediaId]);
-    selectionAnchor.current = mediaId;
+    replaceSelection([mediaId], mediaId);
     setViewerMediaId(mediaId);
   };
   const closeClipViewer = () => {
@@ -908,8 +1009,7 @@ export function App() {
   const navigateClipViewer = (offset: -1 | 1) => {
     const next = filtered[viewerIndex + offset];
     if (!next) return;
-    setSelected([next.id]);
-    selectionAnchor.current = next.id;
+    replaceSelection([next.id], next.id);
     setViewerMediaId(next.id);
   };
   const saveCurrentViewerFrame = async () => {
@@ -960,17 +1060,87 @@ export function App() {
   );
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (view !== 'Library' || !(event.ctrlKey || event.metaKey)) return;
-      if (event.key.toLowerCase() !== 'a') return;
+      if (view !== 'Library') return;
       const target = event.target as HTMLElement | null;
-      if (target?.closest('input, textarea, [contenteditable="true"]')) return;
-      event.preventDefault();
-      setSelected(filtered.map((item) => item.id));
-      selectionAnchor.current = filtered.at(-1)?.id;
+      const editing = Boolean(
+        target?.closest('input, textarea, select, [contenteditable="true"]'),
+      );
+      const key = event.key.toLowerCase();
+      if (viewerMediaId && (key === 'k' || event.key === ' ')) {
+        event.preventDefault();
+        const video = viewerVideoRef.current;
+        if (video?.paused) void video.play();
+        else video?.pause();
+        return;
+      }
+      if (event.altKey && event.key === 'ArrowLeft') {
+        event.preventDefault();
+        if (viewerMediaId) closeClipViewer();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'f' && !editing) {
+        event.preventDefault();
+        librarySearchRef.current?.focus();
+        return;
+      }
+      if (editing) return;
+      if ((event.ctrlKey || event.metaKey) && key === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) redoSelection();
+        else undoSelection();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'y') {
+        event.preventDefault();
+        redoSelection();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'a') {
+        event.preventDefault();
+        replaceSelection(
+          filtered.map((item) => item.id),
+          filtered.at(-1)?.id,
+        );
+        return;
+      }
+      if (event.key === '?' && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        setShowShortcutHelp(true);
+        return;
+      }
+      if (event.key === 'Escape') {
+        if (showShortcutHelp) {
+          event.preventDefault();
+          setShowShortcutHelp(false);
+          return;
+        }
+        if (contextMenu) return;
+        if (viewerMediaId) {
+          event.preventDefault();
+          closeClipViewer();
+          return;
+        }
+        const now = Date.now();
+        if (now - lastEscapeAt.current < 600 && selected.length) {
+          event.preventDefault();
+          replaceSelection([], undefined);
+        }
+        lastEscapeAt.current = now;
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [filtered, view]);
+  }, [
+    contextMenu,
+    filtered,
+    redoSelection,
+    replaceSelection,
+    selected.length,
+    showShortcutHelp,
+    undoSelection,
+    view,
+    viewerMediaId,
+  ]);
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(undefined);
@@ -1280,19 +1450,21 @@ export function App() {
       if (start >= 0 && end >= 0) {
         const [from, to] = start < end ? [start, end] : [end, start];
         const range = filtered.slice(from, to + 1).map((item) => item.id);
-        setSelected((current) =>
-          options.toggle ? [...new Set([...current, ...range])] : range,
+        replaceSelection(
+          options.toggle ? [...new Set([...selected, ...range])] : range,
+          selectionAnchor.current,
         );
         return;
       }
     }
-    selectionAnchor.current = mediaId;
-    setSelected((current) => {
-      if (!options.toggle) return [mediaId];
-      return current.includes(mediaId)
-        ? current.filter((id) => id !== mediaId)
-        : [...current, mediaId];
-    });
+    replaceSelection(
+      !options.toggle
+        ? [mediaId]
+        : selected.includes(mediaId)
+          ? selected.filter((id) => id !== mediaId)
+          : [...selected, mediaId],
+      mediaId,
+    );
   };
   const selectedRecording =
     selected.length === 1
@@ -1314,6 +1486,22 @@ export function App() {
     ? associatedMedia(selectedRecording, catalogue.media)
     : [];
   const selectedPhysicalIds = expandLogicalMediaIds(selected, catalogue.media);
+  const selectedTagState = (tag: string) => {
+    const selectedItems = selectedPhysicalIds
+      .map((id) => catalogue.media.find((item) => item.id === id))
+      .filter((item): item is NonNullable<typeof item> => Boolean(item));
+    const count = selectedItems.filter((item) =>
+      item.tags.some(
+        (candidate) =>
+          candidate.toLocaleLowerCase() === tag.toLocaleLowerCase(),
+      ),
+    ).length;
+    return count === 0
+      ? 'Present on none selected'
+      : count === selectedItems.length
+        ? 'Present on all selected'
+        : 'Present on some selected';
+  };
   const saveSelectionDescription = async () => {
     if (!selectedPhysicalIds.length) return;
     const requestId = ++descriptionSaveGeneration.current;
@@ -1776,8 +1964,7 @@ export function App() {
     setView('Library');
     setFolder('All media');
     setQuery('');
-    setSelected([target.id]);
-    selectionAnchor.current = target.id;
+    replaceSelection([target.id], target.id);
     setLibraryLocateId(target.id);
   };
   const startBackup = async () => {
@@ -2800,6 +2987,78 @@ export function App() {
                       <option value="compact">Compact</option>
                     </select>
                   </label>
+                  <fieldset className="settings-subsection toolbar-settings">
+                    <legend>Library selection toolbar</legend>
+                    <label>
+                      Position
+                      <select
+                        value={selectionToolbarPosition}
+                        onChange={(event) => {
+                          const position = event.target
+                            .value as SelectionToolbarPosition;
+                          setSelectionToolbarPosition(position);
+                          localStorage.setItem(
+                            'pimp-selection-toolbar-position',
+                            position,
+                          );
+                        }}
+                      >
+                        <option value="bottom-right">Bottom right</option>
+                        <option value="bottom-center">Bottom center</option>
+                        <option value="bottom-left">Bottom left</option>
+                      </select>
+                    </label>
+                    <div role="group" aria-label="Primary selection actions">
+                      {(
+                        [
+                          ['tags', 'Add tags'],
+                          ['projects', 'Assign projects'],
+                          ['favourite', 'Favourite'],
+                        ] as Array<[SelectionToolbarAction, string]>
+                      ).map(([action, label]) => (
+                        <label className="inline-check" key={action}>
+                          <input
+                            type="checkbox"
+                            checked={selectionToolbarActions.includes(action)}
+                            onChange={(event) => {
+                              const next = event.target.checked
+                                ? [...selectionToolbarActions, action]
+                                : selectionToolbarActions.filter(
+                                    (candidate) => candidate !== action,
+                                  );
+                              setSelectionToolbarActions(next);
+                              localStorage.setItem(
+                                'pimp-selection-toolbar-actions',
+                                JSON.stringify(next),
+                              );
+                            }}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectionToolbarPosition('bottom-right');
+                        setSelectionToolbarActions(
+                          defaultSelectionToolbarActions,
+                        );
+                        localStorage.removeItem(
+                          'pimp-selection-toolbar-position',
+                        );
+                        localStorage.removeItem(
+                          'pimp-selection-toolbar-actions',
+                        );
+                      }}
+                    >
+                      Reset toolbar to defaults
+                    </button>
+                    <small>
+                      Toolbar layout stays on this device and never changes
+                      catalogue metadata.
+                    </small>
+                  </fieldset>
                   <fieldset className="settings-subsection">
                     <legend>Thumbnail &amp; Preview</legend>
                     <label>
@@ -3170,6 +3429,7 @@ export function App() {
               <label className="search">
                 <Search size={17} />
                 <input
+                  ref={librarySearchRef}
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
                   placeholder="Search filenames, folders, tags, notes, projects, dates, codec…"
@@ -3390,6 +3650,7 @@ export function App() {
                       options={knownTags.map((tag) => ({
                         id: tag,
                         label: tag,
+                        description: selectedTagState(tag),
                       }))}
                       selectedIds={[]}
                       onSelectionChange={(ids) =>
@@ -3603,6 +3864,7 @@ export function App() {
                           else libraryCardRefs.current.delete(item.id);
                         }}
                         role="option"
+                        data-media-id={item.id}
                         tabIndex={0}
                         aria-selected={selected.includes(item.id)}
                         onMouseDown={(event) => {
@@ -3624,13 +3886,53 @@ export function App() {
                         }}
                         onDoubleClick={() => openClipViewer(item.id)}
                         onKeyDown={(event) => {
-                          if (event.key !== 'Enter' && event.key !== ' ')
+                          if (
+                            [
+                              'ArrowLeft',
+                              'ArrowUp',
+                              'ArrowRight',
+                              'ArrowDown',
+                            ].includes(event.key)
+                          ) {
+                            event.preventDefault();
+                            const offset =
+                              event.key === 'ArrowLeft' ||
+                              event.key === 'ArrowUp'
+                                ? -1
+                                : 1;
+                            const index = filtered.findIndex(
+                              (candidate) => candidate.id === item.id,
+                            );
+                            const target = filtered[index + offset];
+                            if (!target) return;
+                            libraryCardRefs.current.get(target.id)?.focus();
+                            if (event.shiftKey)
+                              selectRecording(target.id, {
+                                toggle: true,
+                                range: true,
+                              });
                             return;
-                          event.preventDefault();
-                          selectRecording(item.id, {
-                            toggle: event.ctrlKey || event.metaKey,
-                            range: event.shiftKey,
-                          });
+                          }
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            openClipViewer(item.id);
+                            return;
+                          }
+                          if (event.key.toLowerCase() === 'k') {
+                            event.preventDefault();
+                            openClipViewer(item.id);
+                            window.requestAnimationFrame(
+                              () => void viewerVideoRef.current?.play(),
+                            );
+                            return;
+                          }
+                          if (event.key === ' ') {
+                            event.preventDefault();
+                            selectRecording(item.id, {
+                              toggle: true,
+                              range: event.shiftKey,
+                            });
+                          }
                         }}
                         onContextMenu={(event) => {
                           event.preventDefault();
@@ -3810,59 +4112,77 @@ export function App() {
                 </button>
               )}
               {selected.length > 0 && (
-                <div className="batch">
+                <div
+                  className={`batch selection-toolbar ${selectionToolbarPosition}`}
+                  role="toolbar"
+                  aria-label="Selected recordings"
+                >
                   <div className="batch-heading">
                     <strong>{selected.length} selected</strong>
                     <span>Changes persist immediately</span>
                   </div>
-                  <div className="batch-combo compact-batch-control">
-                    <Tag size={15} />
-                    <SearchableComboBox
-                      label="Add tags"
-                      mode="multiple"
-                      options={knownTags.map((tag) => ({
-                        id: tag,
-                        label: tag,
-                      }))}
-                      selectedIds={batchTags}
-                      onSelectionChange={(ids) => {
-                        setBatchTags(ids);
-                        void updateSelection({ addTags: ids });
-                      }}
-                      placeholder="Add tags…"
-                      onCreate={(label) => ({ id: label, label })}
-                    />
-                  </div>
-                  <div className="batch-combo compact-batch-control">
-                    <UsersRound size={15} />
-                    <SearchableComboBox
-                      label="Assign projects"
-                      mode="multiple"
-                      options={catalogue.projects.map((project) => ({
-                        id: project.id,
-                        label: project.name,
-                      }))}
-                      selectedIds={batchProjects}
-                      onSelectionChange={(ids) => {
-                        setBatchProjects(ids);
-                        void updateSelection({ addProjectIds: ids });
-                      }}
-                      placeholder="Assign project…"
-                    />
-                  </div>
+                  {selectionToolbarActions.includes('tags') && (
+                    <div className="batch-combo compact-batch-control">
+                      <Tag size={15} />
+                      <SearchableComboBox
+                        label="Add tags"
+                        mode="multiple"
+                        options={knownTags.map((tag) => ({
+                          id: tag,
+                          label: tag,
+                          description: selectedTagState(tag),
+                        }))}
+                        selectedIds={batchTags}
+                        onSelectionChange={(ids) => {
+                          setBatchTags(ids);
+                          void updateSelection({ addTags: ids });
+                        }}
+                        placeholder="Add tags…"
+                        onCreate={(label) => ({ id: label, label })}
+                      />
+                    </div>
+                  )}
+                  {selectionToolbarActions.includes('projects') && (
+                    <div className="batch-combo compact-batch-control">
+                      <UsersRound size={15} />
+                      <SearchableComboBox
+                        label="Assign projects"
+                        mode="multiple"
+                        options={catalogue.projects.map((project) => ({
+                          id: project.id,
+                          label: project.name,
+                        }))}
+                        selectedIds={batchProjects}
+                        onSelectionChange={(ids) => {
+                          setBatchProjects(ids);
+                          void updateSelection({ addProjectIds: ids });
+                        }}
+                        placeholder="Assign project…"
+                      />
+                    </div>
+                  )}
+                  {selectionToolbarActions.includes('favourite') && (
+                    <button
+                      type="button"
+                      className="batch-primary"
+                      onClick={() => void updateSelection({ favourite: true })}
+                    >
+                      <Star size={13} /> Favourite
+                    </button>
+                  )}
                   <button
                     type="button"
-                    className="batch-primary"
-                    onClick={() => void updateSelection({ favourite: true })}
+                    className="batch-clear"
+                    onClick={() => {
+                      replaceSelection([], undefined);
+                      setBatchTags([]);
+                      setRemoveBatchTags([]);
+                      setBatchProjects([]);
+                      setRemoveBatchProjects([]);
+                      setDescriptionDraft({ selectionKey: '', value: '' });
+                    }}
                   >
-                    <Star size={13} /> Favourite
-                  </button>
-                  <button
-                    type="button"
-                    disabled={selectedPhysicalIds.length === 0}
-                    onClick={() => void exportPremiereManifest()}
-                  >
-                    Export Premiere manifest
+                    Clear selection
                   </button>
                   <button
                     type="button"
@@ -3876,6 +4196,13 @@ export function App() {
                   </button>
                   {showSelectionDetails && (
                     <>
+                      <button
+                        type="button"
+                        disabled={selectedPhysicalIds.length === 0}
+                        onClick={() => void exportPremiereManifest()}
+                      >
+                        Export Premiere manifest
+                      </button>
                       <div className="batch-combo">
                         <Tag size={15} />
                         <SearchableComboBox
@@ -4064,20 +4391,6 @@ export function App() {
                       )}
                     </>
                   )}
-                  <button
-                    className="batch-clear"
-                    onClick={() => {
-                      setSelected([]);
-                      setBatchTags([]);
-                      setRemoveBatchTags([]);
-                      setBatchProjects([]);
-                      setRemoveBatchProjects([]);
-                      setDescriptionDraft({ selectionKey: '', value: '' });
-                      selectionAnchor.current = undefined;
-                    }}
-                  >
-                    Clear selection
-                  </button>
                 </div>
               )}
             </div>
@@ -4131,6 +4444,73 @@ export function App() {
                     ? 'Remove favourite'
                     : 'Favourite'}
                 </button>
+              </div>
+            )}
+            {showShortcutHelp && (
+              <div className="modal-backdrop" role="presentation">
+                <section
+                  className="shortcut-dialog"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="shortcut-title"
+                >
+                  <div className="section-head">
+                    <h2 id="shortcut-title">Library shortcuts</h2>
+                    <button
+                      type="button"
+                      autoFocus
+                      onClick={() => setShowShortcutHelp(false)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <dl>
+                    <div>
+                      <dt>Arrow keys</dt>
+                      <dd>Move card focus</dd>
+                    </div>
+                    <div>
+                      <dt>Shift + arrow</dt>
+                      <dd>Extend selection</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + Space</dt>
+                      <dd>Toggle focused recording</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + A</dt>
+                      <dd>Select filtered recordings</dd>
+                    </div>
+                    <div>
+                      <dt>Enter</dt>
+                      <dd>Open focused recording</dd>
+                    </div>
+                    <div>
+                      <dt>K / Space</dt>
+                      <dd>Open or toggle viewer playback</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + F</dt>
+                      <dd>Focus Library search</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + Z / Ctrl + Y</dt>
+                      <dd>Undo or redo selection only</dd>
+                    </div>
+                    <div>
+                      <dt>Escape twice</dt>
+                      <dd>Clear selection</dd>
+                    </div>
+                    <div>
+                      <dt>?</dt>
+                      <dd>Show this reference</dd>
+                    </div>
+                  </dl>
+                  <p>
+                    Text fields keep their normal typing and undo shortcuts.
+                    Selection undo never changes metadata or files.
+                  </p>
+                </section>
               </div>
             )}
           </>

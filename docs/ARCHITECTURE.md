@@ -29,6 +29,7 @@ The frontend never receives broad arbitrary-filesystem permission. A host comman
 ## Layer responsibilities
 
 - `apps/desktop`: presentation and local interaction state. `SearchableComboBox` is the shared stable-ID selector for growing lists; Ariakit supplies ARIA/keyboard/focus/popover primitives while PIMP supplies filtering, result caps, explicit creation, and styling.
+- Library selection presentation remains device-local: the floating-toolbar layout uses WebView local storage, and the bounded undo/redo stack holds stable media IDs plus the range anchor in memory only. Neither writes presentation history to portable events.
 - `packages/core`: platform-neutral identities, catalogue events/projection, search, date rules, and optional AI contracts. It cannot import browser, Node, Tauri, OS, or model dependencies.
 - `packages/node-adapter`: tested reference filesystem/process implementation for atomic records, safe ingest, manifests, FFprobe, and thumbnails.
 - `src-tauri`: production trust boundary for purpose-built commands, event replay/migration, capability enforcement, safe ingest/discovery, OS integration, durable ingest jobs and operation journals.
