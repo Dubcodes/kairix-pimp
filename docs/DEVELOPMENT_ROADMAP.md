@@ -48,6 +48,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented lightweight date reapproval: exact approved-file stat checks, zero source-content rereads, package-date evidence, immutable serialized plan revisions and stale-plan rejection
 - Implemented managed playback proxies: per-fingerprint deduplication, real time progress, safe FFmpeg cancellation, strict codec/container validation, active-file protection and a separate cache budget
 - Implemented keyboard ownership and conservative Premiere evidence: editable/combo/modal surfaces retain native keys and undo; arbitrary saved-project paths stay unclassified, historical labels require prior positive evidence and incomplete timeline relationships report Unknown
+- Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, and saved-Premiere folder/read/resolve stages remain device-local; a unified resource governor remains future work
 
 ## Milestone 3 — Premiere extension
 

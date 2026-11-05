@@ -77,6 +77,7 @@ struct NativeState {
     inventory_worker: Mutex<()>,
     inventory_cancelled: Mutex<HashSet<String>>,
     inventory_status: Mutex<Option<BackgroundOperation>>,
+    project_inventory_status: Mutex<HashMap<String, BackgroundOperation>>,
 }
 
 #[derive(Default)]
@@ -3068,6 +3069,14 @@ fn list_background_operations(
             .values()
             .cloned(),
     );
+    operations.extend(
+        state
+            .project_inventory_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
     let discovery = state.discovery_status.lock().unwrap().clone();
     if discovery.running {
         operations.push(BackgroundOperation {
@@ -5882,54 +5891,143 @@ async fn inventory_project(app: AppHandle, project_id: String) -> Result<Project
         .find(|project| project.id == project_id)
         .ok_or("Unknown project")?;
     let project_name = project.name.clone();
-    let directory = resolve_known_project_directory(&settings, &project_id)?;
-    let task_directory = directory.clone();
-    let task_project_id = project_id.clone();
-    let (mut inventory, parsed_index) = tauri::async_runtime::spawn_blocking(move || {
-        let inventory = inventory_project_directory(
-            &task_project_id,
-            &project_name,
-            &task_directory,
-        )?;
-        let parsed = inventory.main_premiere_project.as_ref().map(|relative| {
-            fs_safe::resolve_existing(&task_directory, relative).and_then(|path| {
-                premiere_index::index_project(&path, relative, Utc::now().to_rfc3339())
-            })
-        });
-        Ok::<_, String>((inventory, parsed))
-    })
-    .await
-    .map_err(|error| format!("Project inventory task failed: {error}"))??;
-    if let Some(parsed_index) = parsed_index {
-        let relative = inventory.main_premiere_project.clone().unwrap_or_default();
-        match parsed_index {
-            Ok(mut index) => {
-                let path = premiere_index_path(&app, &project_id)?;
-                if path.is_file() {
-                    if let Ok(previous) = read_json::<PremiereProjectIndex>(&path) {
-                        premiere_index::carry_forward_historical_evidence(
-                            &mut index,
-                            &previous,
-                        );
+    let operation_id = format!("project-index:{project_id}");
+    let now = Utc::now().to_rfc3339();
+    app.state::<NativeState>()
+        .project_inventory_status
+        .lock()
+        .unwrap()
+        .insert(
+            operation_id.clone(),
+            BackgroundOperation {
+                id: operation_id.clone(),
+                kind: "premiere-index".into(),
+                title: format!("Premiere project index: {project_name}"),
+                state: "running".into(),
+                stage: "Reading project folder".into(),
+                current_item: None,
+                completed_items: 0,
+                total_items: None,
+                bytes_completed: 0,
+                bytes_total: None,
+                counts: OperationCounts::default(),
+                cancellable: false,
+                pausable: false,
+                retryable: false,
+                error: None,
+                started_at: now.clone(),
+                updated_at: now,
+            },
+        );
+
+    let result: Result<ProjectInventory, String> = async {
+        let directory = resolve_known_project_directory(&settings, &project_id)?;
+        let task_directory = directory.clone();
+        let task_project_id = project_id.clone();
+        let task_operation_id = operation_id.clone();
+        let task_app = app.clone();
+        let (mut inventory, parsed_index) = tauri::async_runtime::spawn_blocking(move || {
+            let inventory = inventory_project_directory(
+                &task_project_id,
+                &project_name,
+                &task_directory,
+            )?;
+            update_project_inventory_operation(
+                &task_app.state::<NativeState>(),
+                &task_operation_id,
+                |operation| {
+                    operation.completed_items = inventory.items.len();
+                    operation.stage = if inventory.main_premiere_project.is_some() {
+                        "Reading saved Premiere project".into()
+                    } else {
+                        "Project folder indexed".into()
+                    };
+                    operation.current_item = inventory.main_premiere_project.clone();
+                },
+            );
+            let parsed = inventory.main_premiere_project.as_ref().map(|relative| {
+                fs_safe::resolve_existing(&task_directory, relative).and_then(|path| {
+                    premiere_index::index_project(&path, relative, Utc::now().to_rfc3339())
+                })
+            });
+            Ok::<_, String>((inventory, parsed))
+        })
+        .await
+        .map_err(|error| format!("Project inventory task failed: {error}"))??;
+        if let Some(parsed_index) = parsed_index {
+            update_project_inventory_operation(
+                &app.state::<NativeState>(),
+                &operation_id,
+                |operation| {
+                    operation.stage = "Resolving saved media references".into();
+                },
+            );
+            let relative = inventory.main_premiere_project.clone().unwrap_or_default();
+            match parsed_index {
+                Ok(mut index) => {
+                    let path = premiere_index_path(&app, &project_id)?;
+                    if path.is_file() {
+                        if let Ok(previous) = read_json::<PremiereProjectIndex>(&path) {
+                            premiere_index::carry_forward_historical_evidence(
+                                &mut index, &previous,
+                            );
+                        }
                     }
+                    associate_premiere_media(&mut index, &directory, &settings, &catalogue);
+                    write_json(&path, &index)?;
+                    inventory.premiere_index = Some(index);
                 }
-                associate_premiere_media(&mut index, &directory, &settings, &catalogue);
-                write_json(&path, &index)?;
-                inventory.premiere_index = Some(index);
-            }
-            Err(error) => {
-                inventory.premiere_index = Some(PremiereProjectIndex {
-                    parser_version: premiere_index::PARSER_VERSION.into(),
-                    source_relative_path: relative,
-                    indexed_at: Utc::now().to_rfc3339(),
-                    status: "unsupported".into(),
-                    issues: vec![error],
-                    ..Default::default()
-                });
+                Err(error) => {
+                    inventory.premiere_index = Some(PremiereProjectIndex {
+                        parser_version: premiere_index::PARSER_VERSION.into(),
+                        source_relative_path: relative,
+                        indexed_at: Utc::now().to_rfc3339(),
+                        status: "unsupported".into(),
+                        issues: vec![error],
+                        ..Default::default()
+                    });
+                }
             }
         }
+        Ok(inventory)
     }
-    Ok(inventory)
+    .await;
+
+    if let Err(error) = &result {
+        update_project_inventory_operation(
+            &app.state::<NativeState>(),
+            &operation_id,
+            |operation| {
+                operation.state = "failed".into();
+                operation.stage = "Project indexing failed".into();
+                operation.error = Some(error.clone());
+                operation.retryable = true;
+            },
+        );
+    } else {
+        app.state::<NativeState>()
+            .project_inventory_status
+            .lock()
+            .unwrap()
+            .remove(&operation_id);
+    }
+    result
+}
+
+fn update_project_inventory_operation(
+    state: &NativeState,
+    operation_id: &str,
+    update: impl FnOnce(&mut BackgroundOperation),
+) {
+    if let Some(operation) = state
+        .project_inventory_status
+        .lock()
+        .unwrap()
+        .get_mut(operation_id)
+    {
+        update(operation);
+        operation.updated_at = Utc::now().to_rfc3339();
+    }
 }
 
 #[tauri::command]

@@ -1226,7 +1226,7 @@ describe('native application integration', () => {
     expect(localStorage.getItem('pimp-selection-toolbar-position')).toBeNull();
   });
 
-  it.each([100, 700, 3000])(
+  it.each([100, 700, 1000, 3000])(
     'batches thumbnail source lookup once for %i recordings',
     async (count) => {
       mocks.catalogue = {
@@ -1264,6 +1264,7 @@ describe('native application integration', () => {
           ([mediaIds]) => mediaIds.length === count,
         ),
       ).toHaveLength(1);
+      expect(document.querySelector('[value="NaN"]')).toBeNull();
     },
     15_000,
   );
@@ -1738,6 +1739,45 @@ describe('native application integration', () => {
     expect(mocks.cancelBackgroundOperation).toHaveBeenCalledWith(
       'playback-proxy:fixture',
     );
+  });
+
+  it('shows the real Premiere indexing stage without a fabricated percentage', async () => {
+    mocks.listBackgroundOperations.mockResolvedValue([
+      {
+        id: 'project-index:project-1',
+        kind: 'premiere-index',
+        title: 'Premiere project index: Documentary',
+        state: 'running',
+        stage: 'Resolving saved media references',
+        currentItem: 'Documentary.prproj',
+        completedItems: 0,
+        bytesCompleted: 0,
+        counts: {
+          newFiles: 0,
+          duplicateFiles: 0,
+          attentionFiles: 0,
+          failedFiles: 0,
+          attemptedFiles: 0,
+          existingFiles: 0,
+          pendingFiles: 0,
+        },
+        cancellable: false,
+        pausable: false,
+        retryable: false,
+        startedAt: '2026-11-06T00:00:00Z',
+        updatedAt: '2026-11-06T00:00:01Z',
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    const panel = screen.getByRole('region', { name: 'Background Operations' });
+    expect(
+      screen.getByText(
+        /Resolving saved media references · Documentary\.prproj/,
+      ),
+    ).toBeVisible();
+    expect(panel.querySelector('progress')).not.toHaveAttribute('value');
   });
 
   it('renders 63 long planned paths as bounded semantic rows', async () => {
