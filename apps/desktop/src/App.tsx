@@ -154,6 +154,28 @@ const duration = (seconds?: number) =>
   seconds == null
     ? '—'
     : `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`;
+
+const keyboardInputOwner = (target: EventTarget | null) => {
+  const selector = [
+    'input',
+    'textarea',
+    'select',
+    '[contenteditable]:not([contenteditable="false"])',
+    '[role="combobox"]',
+    '[role="textbox"]',
+    '[role="menu"]',
+    '[role="dialog"]',
+    '[aria-modal="true"]',
+  ].join(', ');
+  const element = target instanceof Element ? target : null;
+  const active = document.activeElement;
+  if (element?.closest(selector) || active?.closest(selector)) return true;
+  return Boolean(
+    document.querySelector(
+      '[aria-modal="true"], .combo-popover, [role="menu"]:not([hidden])',
+    ),
+  );
+};
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
@@ -938,6 +960,11 @@ export function App() {
     const used = current.filter(
       (reference) => reference.evidence === 'used-in-saved-timeline',
     );
+    const timelineCoverageKnown = !index.issues.some((issue) =>
+      issue.includes(
+        'Timeline track-item media relationships were not established',
+      ),
+    );
     const logicalCount = (references: typeof current) =>
       new Set(
         references.map(
@@ -946,14 +973,30 @@ export function App() {
       ).size;
     return {
       imported: logicalCount(current),
-      used: logicalCount(used),
-      unused: logicalCount(
-        current.filter(
-          (reference) => reference.evidence === 'imported-into-saved-project',
+      used: timelineCoverageKnown ? logicalCount(used) : undefined,
+      unused: timelineCoverageKnown
+        ? logicalCount(
+            current.filter(
+              (reference) =>
+                reference.evidence === 'imported-into-saved-project',
+            ),
+          )
+        : undefined,
+      unresolved: logicalCount(
+        index.mediaReferences.filter((reference) => !reference.mediaId),
+      ),
+      historical: logicalCount(
+        index.mediaReferences.filter(
+          (reference) =>
+            reference.evidence === 'historical-reference-supported',
         ),
       ),
-      unresolved: logicalCount(
-        current.filter((reference) => !reference.mediaId),
+      unclassified: logicalCount(
+        index.mediaReferences.filter(
+          (reference) =>
+            reference.evidence === 'unclassified-project-reference' ||
+            reference.evidence === 'previously-referenced-in-saved-project',
+        ),
       ),
     };
   }, [projectInventory]);
@@ -1201,10 +1244,15 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (view !== 'Library') return;
       const target = event.target as HTMLElement | null;
-      const editing = Boolean(
-        target?.closest('input, textarea, select, [contenteditable="true"]'),
-      );
+      const editing = keyboardInputOwner(target);
       const key = event.key.toLowerCase();
+      if (editing) {
+        if (event.key === 'Escape' && showShortcutHelp) {
+          event.preventDefault();
+          setShowShortcutHelp(false);
+        }
+        return;
+      }
       if (viewerMediaId && (key === 'k' || event.key === ' ')) {
         event.preventDefault();
         const video = viewerVideoRef.current;
@@ -1217,12 +1265,11 @@ export function App() {
         if (viewerMediaId) closeClipViewer();
         return;
       }
-      if ((event.ctrlKey || event.metaKey) && key === 'f' && !editing) {
+      if ((event.ctrlKey || event.metaKey) && key === 'f') {
         event.preventDefault();
         librarySearchRef.current?.focus();
         return;
       }
-      if (editing) return;
       if ((event.ctrlKey || event.metaKey) && key === 'z') {
         event.preventDefault();
         if (event.shiftKey) redoSelection();
@@ -5298,15 +5345,23 @@ export function App() {
                       </div>
                       <div>
                         <span>Used in timelines</span>
-                        <strong>{premiereSummary.used}</strong>
+                        <strong>{premiereSummary.used ?? 'Unknown'}</strong>
                       </div>
                       <div>
                         <span>Unused imports</span>
-                        <strong>{premiereSummary.unused}</strong>
+                        <strong>{premiereSummary.unused ?? 'Unknown'}</strong>
                       </div>
                       <div>
                         <span>Unresolved</span>
                         <strong>{premiereSummary.unresolved}</strong>
+                      </div>
+                      <div>
+                        <span>Historical evidence</span>
+                        <strong>{premiereSummary.historical}</strong>
+                      </div>
+                      <div>
+                        <span>Unclassified references</span>
+                        <strong>{premiereSummary.unclassified}</strong>
                       </div>
                     </div>
                   )}
@@ -5443,7 +5498,10 @@ export function App() {
                                   : reference.evidence ===
                                       'imported-into-saved-project'
                                     ? 'Imported · unused'
-                                    : 'Previous saved-project evidence'}
+                                    : reference.evidence ===
+                                        'historical-reference-supported'
+                                      ? 'Historical · supported by prior observation'
+                                      : 'Unclassified project reference'}
                                 {' · '}
                                 {reference.mediaId
                                   ? 'Matched to Master Bin ID'

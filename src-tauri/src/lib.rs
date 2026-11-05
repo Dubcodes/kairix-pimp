@@ -5904,8 +5904,16 @@ async fn inventory_project(app: AppHandle, project_id: String) -> Result<Project
         let relative = inventory.main_premiere_project.clone().unwrap_or_default();
         match parsed_index {
             Ok(mut index) => {
-                associate_premiere_media(&mut index, &directory, &settings, &catalogue);
                 let path = premiere_index_path(&app, &project_id)?;
+                if path.is_file() {
+                    if let Ok(previous) = read_json::<PremiereProjectIndex>(&path) {
+                        premiere_index::carry_forward_historical_evidence(
+                            &mut index,
+                            &previous,
+                        );
+                    }
+                }
+                associate_premiere_media(&mut index, &directory, &settings, &catalogue);
                 write_json(&path, &index)?;
                 inventory.premiere_index = Some(index);
             }

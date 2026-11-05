@@ -534,7 +534,7 @@ fn build_index(
                 } else if imported.contains(&path) {
                     "imported-into-saved-project"
                 } else {
-                    "previously-referenced-in-saved-project"
+                    "unclassified-project-reference"
                 }
                 .into(),
                 sequence_ids: used
@@ -599,6 +599,41 @@ fn build_index(
     }
     issues.push("Source and sequence time ranges are not reported because this parser version does not yet verify Premiere time-base fields".into());
     (media, sequences, bins.into_iter().collect(), issues)
+}
+
+pub fn carry_forward_historical_evidence(
+    current: &mut PremiereProjectIndex,
+    previous: &PremiereProjectIndex,
+) -> usize {
+    let positive_history = previous
+        .media_references
+        .iter()
+        .filter(|reference| {
+            matches!(
+                reference.evidence.as_str(),
+                "imported-into-saved-project"
+                    | "used-in-saved-timeline"
+                    | "historical-reference-supported"
+            )
+        })
+        .map(|reference| reference.path.as_str())
+        .collect::<HashSet<_>>();
+    let mut carried = 0;
+    for reference in &mut current.media_references {
+        if reference.evidence == "unclassified-project-reference"
+            && positive_history.contains(reference.path.as_str())
+        {
+            reference.evidence = "historical-reference-supported".into();
+            carried += 1;
+        }
+    }
+    if carried > 0 {
+        current.issues.push(format!(
+            "{carried} historical media reference(s) are supported by a prior positive saved-project observation"
+        ));
+        current.status = "partial".into();
+    }
+    carried
 }
 
 pub fn index_project(
@@ -672,7 +707,7 @@ mod tests {
                 .find(|v| v.path.ends_with("previous.mp4"))
                 .unwrap()
                 .evidence,
-            "previously-referenced-in-saved-project"
+            "unclassified-project-reference"
         );
         assert!(bins.contains(&"Root".into()));
     }
@@ -702,5 +737,44 @@ mod tests {
         assert!(parse_graph(b"<PremiereData><Sequence>").is_err());
         assert!(parse_graph(b"<PremiereData/><PremiereData/>").is_err());
         assert!(decoded_xml(b"not a project").is_err());
+    }
+
+    #[test]
+    fn historical_evidence_requires_a_prior_positive_observation() {
+        let path = r"D:\Old\previous.mp4".to_string();
+        let mut current = PremiereProjectIndex {
+            media_references: vec![PremiereMediaReference {
+                path: path.clone(),
+                evidence: "unclassified-project-reference".into(),
+                ..PremiereMediaReference::default()
+            }],
+            ..PremiereProjectIndex::default()
+        };
+        let arbitrary_prior = current.clone();
+        assert_eq!(
+            carry_forward_historical_evidence(&mut current, &arbitrary_prior),
+            0
+        );
+        assert_eq!(
+            current.media_references[0].evidence,
+            "unclassified-project-reference"
+        );
+
+        let positive_prior = PremiereProjectIndex {
+            media_references: vec![PremiereMediaReference {
+                path,
+                evidence: "used-in-saved-timeline".into(),
+                ..PremiereMediaReference::default()
+            }],
+            ..PremiereProjectIndex::default()
+        };
+        assert_eq!(
+            carry_forward_historical_evidence(&mut current, &positive_prior),
+            1
+        );
+        assert_eq!(
+            current.media_references[0].evidence,
+            "historical-reference-supported"
+        );
     }
 }

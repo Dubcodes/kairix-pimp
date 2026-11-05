@@ -524,6 +524,28 @@ describe('native application integration', () => {
     expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith(
       'portrait-clip',
     );
+    const play = vi.fn().mockResolvedValue(undefined);
+    const pause = vi.fn();
+    Object.defineProperties(player, {
+      paused: { configurable: true, value: true },
+      play: { configurable: true, value: play },
+      pause: { configurable: true, value: pause },
+    });
+    const description = screen.getByRole('textbox', { name: /Description/ });
+    await user.clear(description);
+    await user.type(description, 'K space');
+    fireEvent.keyDown(description, { key: ' ', code: 'Space' });
+    fireEvent.keyDown(description, { key: 'z', ctrlKey: true });
+    expect(description).toHaveValue('K space');
+    expect(play).not.toHaveBeenCalled();
+    expect(pause).not.toHaveBeenCalled();
+    const tagCombo = screen.getByPlaceholderText('Add tags…');
+    tagCombo.focus();
+    fireEvent.keyDown(tagCombo, { key: 'k' });
+    expect(play).not.toHaveBeenCalled();
+    tagCombo.blur();
+    fireEvent.keyDown(window, { key: 'k' });
+    expect(play).toHaveBeenCalledTimes(1);
     Object.defineProperty(player, 'currentTime', {
       configurable: true,
       value: 12.5,
@@ -735,7 +757,7 @@ describe('native application integration', () => {
         sourceFingerprint: 'fixture-hash',
         sourceModifiedMillis: 1,
         indexedAt: '2026-10-28T01:00:00Z',
-        status: 'supported',
+        status: 'partial',
         formatVersion: '42',
         mediaReferences: [
           {
@@ -747,7 +769,13 @@ describe('native application integration', () => {
           },
           {
             path: 'D:\\Historical\\offline.mp4',
-            evidence: 'imported-into-saved-project',
+            evidence: 'historical-reference-supported',
+            sequenceIds: [],
+            timelinePlacements: 0,
+          },
+          {
+            path: 'D:\\Unclassified\\arbitrary.mp4',
+            evidence: 'unclassified-project-reference',
             sequenceIds: [],
             timelinePlacements: 0,
           },
@@ -769,7 +797,9 @@ describe('native application integration', () => {
           },
         ],
         bins: ['Media'],
-        issues: [],
+        issues: [
+          'Timeline track-item media relationships were not established; usage remains unknown',
+        ],
       },
       items: [
         {
@@ -804,6 +834,11 @@ describe('native application integration', () => {
     expect(screen.getByText(/Matched to Master Bin ID/)).toBeVisible();
     expect(screen.getAllByText(/Unresolved/)[0]).toBeVisible();
     expect(screen.getByText('Imported')).toBeVisible();
+    expect(screen.getAllByText('Unknown').length).toBeGreaterThanOrEqual(2);
+    expect(
+      screen.getByText(/Historical · supported by prior observation/),
+    ).toBeVisible();
+    expect(screen.getByText(/Unclassified project reference/)).toBeVisible();
     await user.click(screen.getByRole('button', { name: /Main Edit/ }));
     expect(screen.getByText('Main Edit recordings')).toBeVisible();
 

@@ -19,7 +19,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented Library usability: persistent icon-only sidebar, six deterministic folder sort modes plus accessible custom order, logical video/WAV metadata and counts, clean thumbnail placeholders, themed batch editing and content scroll-to-top
 - Implemented compact floating Library selection workflow: configurable device-local position/actions, all/some/none tag state, bounded selection undo/redo, grid focus/navigation, viewer/search shortcuts and an accessible shortcut reference
 - Implemented same-window Clip Viewer foundation: WebView2 playback controls and error states, responsive portrait/landscape layout, previous/next navigation, catalogue metadata editing, associated-file reveal and explicit device-local thumbnail-frame selection
-- Implemented conservative saved-project observation: bounded stable gzip-XML/XML parsing, canonical object-definition/reference graph, named sequence deduplication, established root/nested bin placement, imported/used/previous path evidence, timeline placement counts, exact canonical-path association and explicit partial/unsupported status; real-file acceptance and verified time ranges remain open
+- Implemented conservative saved-project observation: bounded stable gzip-XML/XML parsing, canonical object-definition/reference graph, named sequence deduplication, established root/nested bin placement, imported/used/unclassified path evidence, timeline placement counts, exact canonical-path association and explicit partial/unsupported status; real-file acceptance and verified time ranges remain open
 - Implemented installed-app P0 corrections: responsive scroll-bounded ingest destination mapping and one validated batched thumbnail-source lookup with near-viewport lazy decoding
 - Implemented visible-thumbnail prioritization: missing near-viewport static images use one bounded fingerprint-keyed request, share the canonical media-ID source across Library and Projects, and complete before automatic hover-preview preparation for that card
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
@@ -47,6 +47,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented thumbnail retry hardening: in-flight-only deduplication, bounded failure backoff, visible/near-static priority ahead of hover work, refresh-safe shared URLs, per-media native generation coordination and protected cache eviction
 - Implemented lightweight date reapproval: exact approved-file stat checks, zero source-content rereads, package-date evidence, immutable serialized plan revisions and stale-plan rejection
 - Implemented managed playback proxies: per-fingerprint deduplication, real time progress, safe FFmpeg cancellation, strict codec/container validation, active-file protection and a separate cache budget
+- Implemented keyboard ownership and conservative Premiere evidence: editable/combo/modal surfaces retain native keys and undo; arbitrary saved-project paths stay unclassified, historical labels require prior positive evidence and incomplete timeline relationships report Unknown
 
 ## Milestone 3 — Premiere extension
 

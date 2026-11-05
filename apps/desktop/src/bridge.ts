@@ -149,6 +149,8 @@ export interface ProjectInventory {
       evidence:
         | 'imported-into-saved-project'
         | 'used-in-saved-timeline'
+        | 'historical-reference-supported'
+        | 'unclassified-project-reference'
         | 'previously-referenced-in-saved-project';
       mediaId?: string;
       sequenceIds: string[];
