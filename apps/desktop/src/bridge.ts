@@ -526,6 +526,11 @@ export const desktopBridge = {
       planId,
       renamedDestinations,
     }),
+  replanIngestDestinations: (planId: string, dateOverride: string) =>
+    invoke<SourceInventory>('replan_ingest_destinations', {
+      planId,
+      dateOverride,
+    }),
   listRemovableVolumes: () =>
     invoke<RemovableVolume[]>('list_removable_volumes'),
   startIngest: (request: {
@@ -652,6 +657,8 @@ export const desktopBridge = {
     invoke<string>('resolve_media_path', { mediaId }),
   resolveMediaPlaybackSource: async (mediaId: string) =>
     convertFileSrc(await invoke<string>('resolve_media_path', { mediaId })),
+  preparePlaybackProxy: async (mediaId: string) =>
+    convertFileSrc(await invoke<string>('prepare_playback_proxy', { mediaId })),
   setMediaThumbnailFrame: (mediaId: string, seconds: number) =>
     invoke<string>('set_media_thumbnail_frame', { mediaId, seconds }),
   revealMediaInExplorer: (mediaId: string) =>

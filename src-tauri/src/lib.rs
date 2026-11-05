@@ -793,6 +793,179 @@ fn reapprove_ingest_destinations(
     Ok(plan.inventory)
 }
 
+#[tauri::command]
+fn replan_ingest_destinations(
+    app: AppHandle,
+    plan_id: String,
+    date_override: String,
+) -> Result<SourceInventory, String> {
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut plan = load_approved_plan(&app, &plan_id)?;
+    if plan.schema_version != 1 || plan.master_bin_path != settings.master_bin_path {
+        return Err("The approved plan is stale; scan the source again".into());
+    }
+    let batch_timestamp = DateTime::parse_from_rfc3339(&plan.batch_timestamp)
+        .map_err(|_| "The approved plan has an invalid batch timestamp; scan again")?
+        .with_timezone(&Local);
+    let allowed = settings
+        .sd_grabber_extensions
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let rebuilt = build_source_inventory_filtered_with_progress(
+        &plan.sources,
+        plan.sd_grabber.then_some(&allowed),
+        !plan.sd_grabber || settings.sd_grabber_search_subfolders,
+        |_, _| Ok(()),
+    )?;
+    let mut rebuilt_by_source = rebuilt
+        .files
+        .into_iter()
+        .map(|file| (file.source_path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    if rebuilt_by_source.len() != plan.files.len() {
+        return Err("The selected source contents changed; scan the source again".into());
+    }
+
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
+    for item in &catalogue.media {
+        hash_index.entry(item.sha256.clone()).or_default().push(item);
+    }
+    let mut selection_hashes = HashMap::<String, String>::new();
+    let mut planned_destinations = HashSet::new();
+    let mut conflicts = Vec::new();
+    for approved in &mut plan.files {
+        let mut inventory = rebuilt_by_source
+            .remove(&approved.inventory.source_path)
+            .ok_or("The selected source contents changed; scan the source again")?;
+        let source = PathBuf::from(&inventory.source_path);
+        let snapshot = fs_safe::snapshot(&source)?;
+        if snapshot.length != approved.source_size
+            || snapshot.modified_millis != approved.source_modified_millis
+        {
+            return Err(format!(
+                "Source changed since approval: {}; scan the source again",
+                source.display()
+            ));
+        }
+        let hash = approved
+            .source_sha256
+            .as_ref()
+            .ok_or("The approved plan predates safe date reapproval; scan the source again")?;
+        let filename = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        inventory.planned_relative_path = planned_relative_path(
+            &settings,
+            &master,
+            &inventory,
+            &Some(date_override.clone()),
+            &batch_timestamp,
+            &filename,
+        )?;
+        approved.existing_media_id = None;
+        if let Some(relative_path) = selection_hashes.get(hash) {
+            inventory.disposition = "already-imported".into();
+            inventory.existing_relative_path = Some(relative_path.clone());
+            inventory.detail = Some("Duplicate recording within this approved selection".into());
+        } else {
+            let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
+            let (disposition, media_id, relative_path, detail) =
+                classify_global_duplicate(&settings, candidates, snapshot.length, hash);
+            inventory.disposition = disposition;
+            inventory.existing_relative_path = relative_path;
+            inventory.detail = detail;
+            approved.existing_media_id = media_id;
+            if inventory.disposition == "new" {
+                selection_hashes.insert(hash.clone(), inventory.planned_relative_path.clone());
+            }
+        }
+        if inventory.disposition != "already-imported" {
+            let destination =
+                fs_safe::resolve_for_create(&master, &inventory.planned_relative_path)?;
+            let unique = planned_destinations
+                .insert(inventory.planned_relative_path.to_ascii_lowercase());
+            if destination.exists() || !unique {
+                let reason = if destination.exists() {
+                    "A different file already occupies the planned destination"
+                } else {
+                    "Two selected files resolve to the same planned destination"
+                };
+                conflicts.push(InventoryConflict {
+                    source_path: inventory.source_path.clone(),
+                    destination_path: inventory.planned_relative_path.clone(),
+                    reason: reason.into(),
+                });
+                inventory.disposition = "attention".into();
+                inventory.detail = Some(format!(
+                    "{reason}. Enter a new filename and approve the revised plan."
+                ));
+            }
+        }
+        approved.inventory = inventory;
+    }
+    if !rebuilt_by_source.is_empty() {
+        return Err("The selected source contents changed; scan the source again".into());
+    }
+
+    plan.id = Uuid::new_v4().to_string();
+    plan.created_at = Utc::now().to_rfc3339();
+    plan.date_override = Some(date_override);
+    plan.inventory.plan_id = plan.id.clone();
+    plan.inventory.files = plan
+        .files
+        .iter()
+        .map(|file| file.inventory.clone())
+        .collect();
+    plan.inventory.conflicts = conflicts;
+    plan.inventory.copy_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .count();
+    plan.inventory.copy_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .map(|file| file.size_bytes)
+        .sum();
+    plan.inventory.already_imported_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .count();
+    plan.inventory.already_imported_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .map(|file| file.size_bytes)
+        .sum();
+    plan.inventory.attention_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .count();
+    plan.inventory.attention_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .map(|file| file.size_bytes)
+        .sum();
+    save_approved_plan(&app, &plan)?;
+    let _ = fs::remove_file(approved_plan_path(&app, &plan_id)?);
+    Ok(plan.inventory)
+}
+
 fn backup_jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(settings_path(app)?
         .parent()
@@ -2856,6 +3029,10 @@ fn destination_date_from_modified(
             batch_timestamp.date_naive() - Duration::days(1),
             batch_timestamp.time(),
         ),
+        Some("original-file-dates") => modified
+            .as_ref()
+            .map(|value| (value.date_naive(), value.time()))
+            .unwrap_or((batch_timestamp.date_naive(), batch_timestamp.time())),
         Some(date) => {
             let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
                 .map_err(|_| "Date override must use YYYY-MM-DD".to_string())?;
@@ -6516,6 +6693,112 @@ fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String
     )?))
 }
 
+fn valid_playback_proxy(path: &Path) -> bool {
+    path.is_file()
+        && path.metadata().is_ok_and(|metadata| metadata.len() > 1_024)
+        && media_tool_command("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
+            .arg(path)
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+fn enforce_playback_proxy_limit(root: &Path, limit: u64, protected: &Path) -> Result<(), String> {
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| format!("Cannot inspect playback proxy cache: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            (metadata.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("mp4")))
+                .then(|| (entry.path(), metadata.len(), metadata.modified().ok()))
+        })
+        .collect::<Vec<_>>();
+    let mut total = entries.iter().map(|entry| entry.1).sum::<u64>();
+    entries.sort_by_key(|entry| entry.2);
+    for (path, size, _) in entries {
+        if total <= limit {
+            break;
+        }
+        if path == protected {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|error| format!("Cannot evict playback proxy: {error}"))?;
+        total = total.saturating_sub(size);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _operation = begin_critical_operation(&state.operations, "playback proxy generation")?;
+        let settings = load_settings_file(&app)?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue.media.iter().find(|item| item.id == media_id)
+            .cloned().ok_or("Unknown media item")?;
+        if !enrichment_video_type(&item.file_type) {
+            return Err("Playback proxies are available only for supported video recordings".into());
+        }
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        let before = fs_safe::snapshot(&source)?;
+        let mut digest = Sha256::new();
+        digest.update(b"pimp-playback-proxy-v1\0");
+        digest.update(item.id.as_bytes());
+        digest.update(item.sha256.as_bytes());
+        digest.update(before.length.to_le_bytes());
+        digest.update([u8::from(before.modified_millis.is_some())]);
+        digest.update(before.modified_millis.unwrap_or_default().to_le_bytes());
+        digest.update(b"1280-h264-aac-crf23");
+        let fingerprint = format!("{:x}", digest.finalize());
+        let root = PathBuf::from(&settings.thumbnail_cache_path).join("playback-proxies");
+        fs::create_dir_all(&root).map_err(|error| format!("Cannot create playback proxy cache: {error}"))?;
+        let destination = root.join(format!("{}-{}.mp4", item.id, &fingerprint[..24]));
+        if valid_playback_proxy(&destination) {
+            enforce_playback_proxy_limit(
+                &root,
+                settings.preview_cache_limit_bytes.max(512 * 1024 * 1024),
+                &destination,
+            )?;
+            return Ok(destination.to_string_lossy().into_owned());
+        }
+        let temporary = root.join(format!(".proxy-{}.mp4", Uuid::new_v4()));
+        let output = media_tool_command("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&source)
+            .args(["-map", "0:v:0", "-map", "0:a?", "-vf", "scale=min(1280\\,iw):-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-n"])
+            .arg(&temporary)
+            .output()
+            .map_err(|error| format!("Could not start FFmpeg playback proxy generation: {error}"))?;
+        if !output.status.success() || !valid_playback_proxy(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("FFmpeg could not create a compatible playback proxy (exit status {})", output.status));
+        }
+        if fs_safe::snapshot(&source)? != before {
+            let _ = fs::remove_file(&temporary);
+            return Err("Source changed while its playback proxy was being generated".into());
+        }
+        if destination.exists() {
+            let _ = fs::remove_file(&temporary);
+        } else {
+            fs::rename(&temporary, &destination).map_err(|error| format!("Cannot commit playback proxy: {error}"))?;
+        }
+        if !valid_playback_proxy(&destination) {
+            return Err("The generated playback proxy failed validation".into());
+        }
+        enforce_playback_proxy_limit(
+            &root,
+            settings.preview_cache_limit_bytes.max(512 * 1024 * 1024),
+            &destination,
+        )?;
+        Ok(destination.to_string_lossy().into_owned())
+    }).await.map_err(|error| format!("Playback proxy worker failed: {error}"))?
+}
+
 fn build_premiere_import_manifest(
     settings: &DeviceSettings,
     catalogue: &Catalogue,
@@ -7599,6 +7882,7 @@ pub fn run() {
             cancel_inventory,
             list_background_operations,
             reapprove_ingest_destinations,
+            replan_ingest_destinations,
             list_removable_volumes,
             start_ingest,
             initialize_ingest_jobs,
@@ -7635,6 +7919,7 @@ pub fn run() {
             open_support_link,
             open_logs_folder,
             resolve_media_path,
+            prepare_playback_proxy,
             export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
@@ -9266,6 +9551,36 @@ mod tests {
             &batch,
         )
         .is_err());
+    }
+
+    #[test]
+    fn every_explicit_ingest_date_choice_overrides_both_saved_modes() {
+        let batch = Local.with_ymd_and_hms(2026, 11, 5, 12, 34, 56).unwrap();
+        let modified = Local.with_ymd_and_hms(2026, 10, 20, 8, 15, 1).unwrap();
+        for saved_mode in ["today", "original-file-dates"] {
+            let mut settings = DeviceSettings::default();
+            settings.ingest_date_organization = saved_mode.into();
+            settings.date_folder_pattern = "yyyymmdd".into();
+            for (choice, expected) in [
+                ("today", "20261105"),
+                ("yesterday", "20261104"),
+                ("2026-10-31", "20261031"),
+                ("original-file-dates", "20261020"),
+            ] {
+                assert_eq!(
+                    destination_date_from_modified(
+                        &settings,
+                        Some(modified),
+                        &Some(choice.into()),
+                        &batch,
+                    )
+                    .unwrap()
+                    .0,
+                    expected,
+                    "saved mode {saved_mode}, explicit choice {choice}",
+                );
+            }
+        }
     }
 
     #[test]

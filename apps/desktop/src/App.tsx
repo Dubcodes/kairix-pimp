@@ -179,7 +179,7 @@ export function App() {
   const [projectNotes, setProjectNotes] = useState('');
   const [projectTags, setProjectTags] = useState<string[]>([]);
   const [sources, setSources] = useState<string[]>([]);
-  const [dateOverride, setDateOverride] = useState('default');
+  const [dateOverride, setDateOverride] = useState('today');
   const [chosenDate, setChosenDate] = useState('');
   const [progress, setProgress] = useState<IngestProgress>();
   const [jobs, setJobs] = useState<IngestJob[]>([]);
@@ -259,6 +259,7 @@ export function App() {
   const [viewerMediaId, setViewerMediaId] = useState<string>();
   const [viewerSource, setViewerSource] = useState<string>();
   const [viewerError, setViewerError] = useState('');
+  const [viewerProxyBusy, setViewerProxyBusy] = useState(false);
   const [thumbnailFrameStatus, setThumbnailFrameStatus] = useState('');
   const [showSelectionDetails, setShowSelectionDetails] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
@@ -317,6 +318,8 @@ export function App() {
   const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
+  const inventoryDateOverride = useRef<string | undefined>(undefined);
+  const dateSelectionRef = useRef({ dateOverride, chosenDate });
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
   const [libraryLocateId, setLibraryLocateId] = useState<string>();
   const settingsRef = useRef(settings);
@@ -487,6 +490,11 @@ export function App() {
           settingsRef.current = loaded;
           savingSettings.setLatest(loaded);
           setSettings(loaded);
+          setDateOverride(
+            loaded.ingestDateOrganization === 'original-file-dates'
+              ? 'original-file-dates'
+              : 'today',
+          );
           setMediaTools(tools);
           setApplicationInfo(loadedApplicationInfo);
           setUpdaterConfiguration(loadedUpdaterConfiguration);
@@ -552,6 +560,10 @@ export function App() {
   }, [settings.density, settings.theme]);
 
   useEffect(() => {
+    dateSelectionRef.current = { dateOverride, chosenDate };
+  }, [dateOverride, chosenDate]);
+
+  useEffect(() => {
     if (!native || sources.length === 0) return;
     let current = true;
     const operationId = crypto.randomUUID();
@@ -561,12 +573,12 @@ export function App() {
       setInventory(undefined);
       setInventoryError('');
     });
+    const selectedDate = dateSelectionRef.current;
     const previewDateOverride =
-      dateOverride === 'default'
-        ? undefined
-        : dateOverride === 'choose'
-          ? chosenDate || undefined
-          : dateOverride;
+      selectedDate.dateOverride === 'choose'
+        ? selectedDate.chosenDate || undefined
+        : selectedDate.dateOverride;
+    inventoryDateOverride.current = previewDateOverride;
     const request = sdGrabberMode
       ? desktopBridge.inventorySdCard(operationId, sources, previewDateOverride)
       : desktopBridge.inventorySources(
@@ -598,12 +610,41 @@ export function App() {
   }, [
     native,
     sources,
-    dateOverride,
-    chosenDate,
     sdGrabberMode,
     settings.sdGrabberExtensions,
     settings.sdGrabberSearchSubfolders,
   ]);
+
+  useEffect(() => {
+    if (!native || !inventory?.planId) return;
+    const nextDateOverride =
+      dateOverride === 'choose' ? chosenDate || undefined : dateOverride;
+    if (!nextDateOverride || inventoryDateOverride.current === nextDateOverride)
+      return;
+    let current = true;
+    inventoryDateOverride.current = nextDateOverride;
+    setInventoryLoading(true);
+    setInventoryError('');
+    void desktopBridge
+      .replanIngestDestinations(inventory.planId, nextDateOverride)
+      .then((result) => {
+        if (!current) return;
+        setInventory(result);
+        setConflicts(result.conflicts ?? []);
+      })
+      .catch((reason) => {
+        if (current) {
+          inventoryDateOverride.current = undefined;
+          setInventoryError(errorText(reason));
+        }
+      })
+      .finally(() => {
+        if (current) setInventoryLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [native, inventory?.planId, dateOverride, chosenDate]);
 
   useEffect(() => {
     if (!native || !configured) return;
@@ -983,6 +1024,7 @@ export function App() {
       if (!current) return;
       setViewerSource(undefined);
       setViewerError('');
+      setViewerProxyBusy(false);
     });
     void desktopBridge
       .resolveMediaPlaybackSource(viewerMediaId)
@@ -1030,6 +1072,23 @@ export function App() {
       );
     } catch (reason) {
       setThumbnailFrameStatus(`Thumbnail failed: ${errorText(reason)}`);
+    }
+  };
+  const createPlaybackProxy = async () => {
+    if (!viewerRecording) return;
+    setViewerProxyBusy(true);
+    try {
+      setViewerSource(
+        await desktopBridge.preparePlaybackProxy(viewerRecording.id),
+      );
+      setViewerError('');
+      setMessage(
+        'Compatible preview ready in the device-local cache. The original recording was unchanged.',
+      );
+    } catch (reason) {
+      setViewerError(`Compatible preview failed: ${errorText(reason)}`);
+    } finally {
+      setViewerProxyBusy(false);
     }
   };
   useEffect(() => {
@@ -1287,12 +1346,7 @@ export function App() {
       const job = await desktopBridge.startIngest({
         jobId,
         sources,
-        dateOverride:
-          dateOverride === 'default'
-            ? undefined
-            : dateOverride === 'choose'
-              ? chosenDate
-              : dateOverride,
+        dateOverride: dateOverride === 'choose' ? chosenDate : dateOverride,
         renamedDestinations,
         batchTags: ingestBatchTags,
         approvedPlanId: inventory.planId,
@@ -2783,12 +2837,13 @@ export function App() {
                       <input
                         type="radio"
                         checked={settings.ingestDateOrganization === 'today'}
-                        onChange={() =>
+                        onChange={() => {
                           setSettings({
                             ...settings,
                             ingestDateOrganization: 'today',
-                          })
-                        }
+                          });
+                          if (!sources.length) setDateOverride('today');
+                        }}
                       />{' '}
                       Use today's date
                     </label>
@@ -2799,12 +2854,14 @@ export function App() {
                           settings.ingestDateOrganization ===
                           'original-file-dates'
                         }
-                        onChange={() =>
+                        onChange={() => {
                           setSettings({
                             ...settings,
                             ingestDateOrganization: 'original-file-dates',
-                          })
-                        }
+                          });
+                          if (!sources.length)
+                            setDateOverride('original-file-dates');
+                        }}
                       />{' '}
                       Use original file dates
                     </label>
@@ -3524,6 +3581,19 @@ export function App() {
                       <div className="clip-player-state" role="alert">
                         <strong>Preview unavailable</strong>
                         <span>{viewerError}</span>
+                        <button
+                          type="button"
+                          disabled={
+                            viewerProxyBusy || !mediaTools?.ffmpegAvailable
+                          }
+                          onClick={() => void createPlaybackProxy()}
+                        >
+                          {!mediaTools?.ffmpegAvailable
+                            ? 'FFmpeg is required for a compatible preview'
+                            : viewerProxyBusy
+                              ? 'Creating compatible preview…'
+                              : 'Create compatible preview'}
+                        </button>
                       </div>
                     ) : viewerSource ? (
                       <video
@@ -4741,33 +4811,36 @@ export function App() {
                 </b>
                 .
               </p>
-              <details>
-                <summary>Change date for this ingest</summary>
-                <label>
-                  Override date
-                  <input
-                    type="date"
-                    value={chosenDate}
-                    onChange={(event) => {
-                      setChosenDate(event.target.value);
-                      setDateOverride(
-                        event.target.value ? 'choose' : 'default',
-                      );
-                    }}
-                  />
-                </label>
+              <fieldset className="ingest-date-choices">
+                <legend>Choose once for this batch</legend>
+                {[
+                  ['today', 'Today'],
+                  ['yesterday', 'Yesterday'],
+                  ['choose', 'Choose date'],
+                  ['original-file-dates', 'Use clip date'],
+                ].map(([value, label]) => (
+                  <label key={value}>
+                    <input
+                      type="radio"
+                      name="ingest-date-choice"
+                      value={value}
+                      checked={dateOverride === value}
+                      onChange={() => setDateOverride(value)}
+                    />
+                    {label}
+                  </label>
+                ))}
                 {dateOverride === 'choose' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setChosenDate('');
-                      setDateOverride('default');
-                    }}
-                  >
-                    Use saved date organisation
-                  </button>
+                  <label>
+                    Date for this batch
+                    <input
+                      type="date"
+                      value={chosenDate}
+                      onChange={(event) => setChosenDate(event.target.value)}
+                    />
+                  </label>
                 )}
-              </details>
+              </fieldset>
               <SearchableComboBox
                 label="Tags for all files in this ingest"
                 mode="multiple"

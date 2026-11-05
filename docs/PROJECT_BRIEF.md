@@ -9,7 +9,7 @@ PIMP does not replace Syncthing. A synchronized **Master Bin** holds original me
 ## Intended workflow
 
 1. Connect camera storage and drag files or folders into PIMP.
-2. Choose exactly **Use today's date** or **Use original file dates** for folder organization.
+2. Keep one of the exact persistent modes **Use today's date** or **Use original file dates**, then choose **Today**, **Yesterday**, **Choose date**, or **Use clip date** for each ingest.
 3. Copy through temporary destinations, verify independent checksums, preserve source media, then catalogue successful copies.
 4. Pair related video/audio only where filename, time, duration, and camera evidence are sufficient; keep pairing reversible.
 5. Organize folders, apply folder-level and clip-level tags, and browse previews/contact sheets.
@@ -50,7 +50,9 @@ Near-viewport missing video thumbnails now receive a bounded fingerprint-keyed g
 
 The Library selection editor is again available as a compact floating toolbar during scrolling. Device-local appearance controls choose its edge position and primary actions. Selection state has a bounded stable-ID/anchor undo stack, keyboard grid navigation and a shortcut reference; text inputs retain native undo. These interactions have component coverage but still require installed WebView2/Narrator acceptance.
 
-The Library interaction milestone adds reserved compact selection controls, explicit available/unavailable filtering, interactive media-tag removal/filtering, an independently scrolling folder panel and a responsive same-window Clip Viewer. The viewer supports WebView2 playback controls, navigation, persistent catalogue metadata edits, associated-file reveal and device-local custom thumbnail frames. Automated UI/native tests do not establish installed codec, scaling or fullscreen compatibility.
+The Library interaction milestone adds reserved compact selection controls, explicit available/unavailable filtering, interactive media-tag removal/filtering, an independently scrolling folder panel and a responsive same-window Clip Viewer. The viewer supports WebView2 playback controls, navigation, persistent catalogue metadata edits, associated-file reveal and device-local custom thumbnail frames. Unsupported native playback can explicitly generate a validated fingerprinted H.264/AAC cache proxy after checking source stability. Proxy conversion cancellation/progress and installed HEVC/WebView2, scaling and fullscreen acceptance remain incomplete.
+
+Ingest again exposes exactly **Today**, **Yesterday**, **Choose date**, and **Use clip date** as per-batch choices. Changing the choice after inventory performs a metadata-only approved-plan reapproval: it re-enumerates the selected source, verifies stored snapshots, reuses the approved SHA-256 values, recomputes package-safe destinations and collision/duplicate classifications, and does not rehash the card. The persistent two-mode setting is unchanged.
 
 Scaffolded but not host-tested: a standalone Premiere UXP panel and explicit schema-1 import-manifest export. Planned, not functional: verified Premiere host integration, Full-edition AI processing, Premiere-aware dependency collection and independently usable archive finalization, destructive cleanup, signed release delivery, supported verified cloud-provider adapters, and Linux/macOS releases. The provider-neutral external-drive backup foundation is implemented but remains below those archive-finalization guarantees. See the [roadmap](DEVELOPMENT_ROADMAP.md) and [testing strategy](TESTING.md) for the exact boundaries.
 

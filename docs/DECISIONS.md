@@ -433,3 +433,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Keep the compact Library selection toolbar fixed above the scrolling grid and store only its device-local position/action visibility in WebView local storage. Retain at most 50 in-memory selection snapshots containing stable media IDs and the range anchor. Keyboard undo/redo applies only to selection and yields to editable controls.
 - **Consequences:** Accidental selection loss is recoverable without undoing metadata or filesystem operations, toolbar preferences never enter synchronized events, and removed media IDs are pruned from history. Installed WebView2 focus, zoom and assistive-technology acceptance remains required.
+
+## ADR-059 — Reapprove date mapping without rehashing and proxy only on demand
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Restore exactly Today, Yesterday, Choose date and Use clip date as request-scoped ingest choices. When an approved inventory exists, re-enumerate its source selection, reject any size/modification change, reuse its stored SHA-256 evidence and issue a replacement approved plan after recomputing package-safe destinations, duplicates and collisions. For Clip Viewer failures, generate only an explicitly requested H.264/AAC proxy in the device cache, fingerprinted by media/source/transform identity, validated with FFprobe and committed only after a source-stability recheck.
+- **Consequences:** Destination-only date changes do not impose another full-card read and cannot silently alter the saved two-mode preference. Unsupported codecs gain a bounded retryable cache fallback without changing originals or prebuilding the Library. Installed HEVC playback plus conversion cancellation and meaningful progress remain required before calling the fallback fully accepted.

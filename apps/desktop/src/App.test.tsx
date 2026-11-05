@@ -63,6 +63,7 @@ const mocks = vi.hoisted(() => ({
     ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
   resolveMediaPath: vi.fn(),
   resolveMediaPlaybackSource: vi.fn(),
+  preparePlaybackProxy: vi.fn(),
   setMediaThumbnailFrame: vi.fn(),
   revealMediaInExplorer: vi.fn(),
   openMediaFolder: vi.fn(),
@@ -73,6 +74,7 @@ const mocks = vi.hoisted(() => ({
   cancelInventory: vi.fn(),
   listBackgroundOperations: vi.fn(),
   reapproveIngestDestinations: vi.fn(),
+  replanIngestDestinations: vi.fn(),
   listRemovableVolumes: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
@@ -158,6 +160,7 @@ vi.mock('./bridge', () => ({
     cancelInventory: mocks.cancelInventory,
     listBackgroundOperations: mocks.listBackgroundOperations,
     reapproveIngestDestinations: mocks.reapproveIngestDestinations,
+    replanIngestDestinations: mocks.replanIngestDestinations,
     listRemovableVolumes: mocks.listRemovableVolumes,
     startIngest: mocks.startIngest,
     cancelIngest: vi.fn(),
@@ -179,6 +182,7 @@ vi.mock('./bridge', () => ({
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
     resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
+    preparePlaybackProxy: mocks.preparePlaybackProxy,
     setMediaThumbnailFrame: mocks.setMediaThumbnailFrame,
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
@@ -348,6 +352,10 @@ describe('native application integration', () => {
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
     mocks.resolveMediaPlaybackSource.mockReset();
+    mocks.preparePlaybackProxy.mockReset();
+    mocks.preparePlaybackProxy.mockResolvedValue(
+      'asset://localhost/playback-proxy.mp4',
+    );
     mocks.resolveMediaPlaybackSource.mockResolvedValue(
       'asset://localhost/clip.mp4',
     );
@@ -398,6 +406,7 @@ describe('native application integration', () => {
     mocks.listBackgroundOperations.mockReset();
     mocks.listBackgroundOperations.mockResolvedValue([]);
     mocks.reapproveIngestDestinations.mockReset();
+    mocks.replanIngestDestinations.mockReset();
     mocks.inventorySdCard.mockImplementation(mocks.inventorySources);
     mocks.listRemovableVolumes.mockReset();
     mocks.listRemovableVolumes.mockResolvedValue([]);
@@ -529,6 +538,14 @@ describe('native application integration', () => {
     fireEvent.error(await screen.findByLabelText('Playback next.mp4'));
     expect(await screen.findByText('Preview unavailable')).toBeVisible();
     expect(screen.getByText(/original media was not changed/i)).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Create compatible preview' }),
+    );
+    expect(mocks.preparePlaybackProxy).toHaveBeenCalledWith('next-clip');
+    expect(await screen.findByLabelText('Playback next.mp4')).toHaveAttribute(
+      'src',
+      'asset://localhost/playback-proxy.mp4',
+    );
 
     await user.click(screen.getByRole('button', { name: 'Back to Library' }));
     expect(
@@ -1280,6 +1297,90 @@ describe('native application integration', () => {
       screen.getByRole('button', { name: 'Start verified ingest' }),
     ).toBeEnabled();
   });
+
+  it.each([
+    ['today', 'Today'],
+    ['original-file-dates', 'Use clip date'],
+  ] as const)(
+    'keeps all one-off date choices consistent when the saved mode is %s',
+    async (savedMode, initialLabel) => {
+      mocks.settings.ingestDateOrganization = savedMode;
+      const sourceInventory = {
+        planId: '00000000-0000-4000-8000-000000000020',
+        files: [
+          {
+            sourcePath: 'E:\\DCIM\\clip.mp4',
+            sourceRelativePath: 'DCIM/clip.mp4',
+            plannedRelativePath: '20261105/DCIM/clip.mp4',
+            sizeBytes: 100,
+            kind: 'video',
+            analysisSupported: true,
+            preserveHierarchy: true,
+          },
+        ],
+        excluded: [],
+        issues: [],
+        totalFileCount: 1,
+        totalBytes: 100,
+        copyFileCount: 1,
+        copyBytes: 100,
+      };
+      mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
+      mocks.inventorySources.mockResolvedValue(sourceInventory);
+      let revision = 20;
+      mocks.replanIngestDestinations.mockImplementation(
+        async (_planId: string, date: string) => ({
+          ...sourceInventory,
+          planId: `00000000-0000-4000-8000-${String(++revision).padStart(12, '0')}`,
+          files: sourceInventory.files.map((file) => ({
+            ...file,
+            plannedRelativePath: `${date}/DCIM/clip.mp4`,
+          })),
+        }),
+      );
+      const user = userEvent.setup();
+      render(<App />);
+      await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+      await user.click(screen.getByRole('button', { name: 'Choose files' }));
+      await screen.findByText('1 of 1 files will be copied (0 KB)');
+
+      expect(screen.getByRole('radio', { name: initialLabel })).toBeChecked();
+      await user.click(screen.getByRole('radio', { name: 'Yesterday' }));
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          'yesterday',
+        ),
+      );
+      await user.click(screen.getByRole('radio', { name: 'Choose date' }));
+      await user.type(
+        screen.getByLabelText('Date for this batch'),
+        '2026-10-31',
+      );
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          '2026-10-31',
+        ),
+      );
+      await user.click(screen.getByRole('radio', { name: 'Use clip date' }));
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          'original-file-dates',
+        ),
+      );
+      await user.click(screen.getByRole('radio', { name: 'Today' }));
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          'today',
+        ),
+      );
+      expect(mocks.inventorySources).toHaveBeenCalledTimes(1);
+      expect(mocks.saveSettings).not.toHaveBeenCalled();
+    },
+  );
 
   it('scans a detected card and clearly separates new and imported files', async () => {
     mocks.saveSettings.mockImplementation(async (settings) => settings);
