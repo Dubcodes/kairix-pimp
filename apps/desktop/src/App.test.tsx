@@ -90,6 +90,7 @@ const mocks = vi.hoisted(() => ({
   openProjectFolder: vi.fn(),
   revealProjectAsset: vi.fn(),
   loadHoverPreview: vi.fn(),
+  loadHoverPreviewStatuses: vi.fn(),
   prepareHoverPreview: vi.fn(),
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
@@ -197,6 +198,7 @@ vi.mock('./bridge', () => ({
     choosePremiereManifestDestination: mocks.choosePremiereManifestDestination,
     exportPremiereManifest: mocks.exportPremiereManifest,
     loadHoverPreview: mocks.loadHoverPreview,
+    loadHoverPreviewStatuses: mocks.loadHoverPreviewStatuses,
     prepareHoverPreview: mocks.prepareHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
@@ -433,6 +435,8 @@ describe('native application integration', () => {
     mocks.revealProjectAsset.mockReset();
     mocks.revealProjectAsset.mockResolvedValue(undefined);
     mocks.loadHoverPreview.mockReset();
+    mocks.loadHoverPreviewStatuses.mockReset();
+    mocks.loadHoverPreviewStatuses.mockResolvedValue([]);
     mocks.prepareHoverPreview.mockReset();
     mocks.prepareHoverPreview.mockResolvedValue(undefined);
     mocks.hoverPreviewCacheUsage.mockReset();
@@ -1143,6 +1147,9 @@ describe('native application integration', () => {
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1),
     );
     await screen.findByLabelText('Move horizontally to preview video frames');
+    expect(
+      screen.getByLabelText('Scrubbable preview ready'),
+    ).toBeInTheDocument();
     const setItem = vi.spyOn(Storage.prototype, 'setItem');
     fireEvent.pointerMove(thumbnail, { clientX: 10 });
     fireEvent.pointerMove(thumbnail, { clientX: 55 });
@@ -1180,6 +1187,9 @@ describe('native application integration', () => {
       expect(mocks.clearHoverPreviewCache).toHaveBeenCalledTimes(1),
     );
     await user.click(screen.getByRole('button', { name: 'Library' }));
+    expect(
+      screen.queryByLabelText('Scrubbable preview ready'),
+    ).not.toBeInTheDocument();
     const refreshedThumbnail = container.querySelector(
       '.media-thumbnail',
     ) as HTMLElement;

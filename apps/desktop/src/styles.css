@@ -2530,7 +2530,7 @@ select:disabled {
 }
 .preview-timecode {
   position: absolute;
-  right: 6px;
+  left: 6px;
   bottom: 6px;
   z-index: 2;
   padding: 2px 5px;
@@ -2538,6 +2538,19 @@ select:disabled {
   color: #fff;
   background: rgb(0 0 0 / 78%);
   font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.preview-ready-indicator {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 3;
+  width: 8px;
+  height: 8px;
+  border: 1px solid rgb(255 255 255 / 80%);
+  border-radius: 50%;
+  background: #268cff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 70%);
   pointer-events: none;
 }
 .project-media-row > span {

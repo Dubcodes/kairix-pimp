@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { PreviewWorkQueue } from './preview-work-queue';
 
 describe('preview work queue', () => {
-  it('prioritizes static thumbnails before interactive and automatic hover work', async () => {
+  it('runs higher-priority queued work first within one lane', async () => {
     const queue = new PreviewWorkQueue();
     const order: string[] = [];
     let release!: () => void;
@@ -56,6 +56,27 @@ describe('preview work queue', () => {
       'automatic',
       'idle',
     ]);
+  });
+
+  it('allows a static lane to progress while hover generation is blocked', async () => {
+    const hoverQueue = new PreviewWorkQueue();
+    const staticQueue = new PreviewWorkQueue();
+    let releaseHover!: () => void;
+    const hover = hoverQueue.schedule(
+      'hover',
+      0,
+      'hover',
+      () => new Promise<void>((resolve) => (releaseHover = resolve)),
+    );
+    const staticRun = vi.fn(async () => 'thumbnail');
+
+    await expect(
+      staticQueue.schedule('static', 0, 'static', staticRun),
+    ).resolves.toBe('thumbnail');
+    expect(staticRun).toHaveBeenCalledOnce();
+
+    releaseHover();
+    await hover;
   });
 
   it('deduplicates a key and bounds queued low-priority work', async () => {

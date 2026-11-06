@@ -65,6 +65,7 @@ struct NativeState {
     tray_available: Mutex<bool>,
     operations: Mutex<OperationCoordinator>,
     preview_generation: Mutex<()>,
+    static_thumbnail_generation: Mutex<()>,
     thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     playback_proxy_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     playback_proxy_status: Mutex<HashMap<String, BackgroundOperation>>,
@@ -6634,18 +6635,36 @@ fn generate_thumbnail_atomic(
         .ok_or("Thumbnail destination has no cache directory")?;
     let temporary = parent.join(format!(".thumbnail-{}.jpg", Uuid::new_v4()));
     let seek = format!("{seek_seconds:.3}");
-    let output = media_tool_command("ffmpeg")
-        .args(["-y", "-ss", &seek, "-i"])
+    let mut child = media_tool_command("ffmpeg")
+        .args(["-y", "-nostdin", "-ss", &seek, "-i"])
         .arg(source)
         .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
         .arg(&temporary)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| format!("Could not start FFmpeg thumbnail generation: {error}"))?;
-    if !output.status.success() || !valid_cached_thumbnail(&temporary) {
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not monitor FFmpeg thumbnail generation: {error}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= StdDuration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&temporary);
+            return Err("FFmpeg thumbnail generation timed out after 60 seconds".into());
+        }
+        std::thread::sleep(StdDuration::from_millis(25));
+    };
+    if !status.success() || !valid_cached_thumbnail(&temporary) {
         let _ = fs::remove_file(&temporary);
         return Err(format!(
             "FFmpeg did not produce a valid thumbnail (exit status {})",
-            output.status
+            status
         ));
     }
     if destination.exists() {
@@ -6806,6 +6825,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                 status.counts.attempted_files += 1;
             }
+            let _static_lane = state.static_thumbnail_generation.lock().unwrap();
             if let Err(error) = generate_thumbnail_atomic(&source, &thumbnail, 0.1) {
                 thumbnail_failed = true;
                 diagnostic_log(
@@ -7977,7 +7997,10 @@ fn set_media_thumbnail_frame(
     let destination = cache.join(&thumbnail_ref);
     let generation_lock = thumbnail_generation_lock(&state, &media_id);
     let _generation_guard = generation_lock.lock().unwrap();
-    generate_thumbnail_atomic(&source, &destination, seconds)?;
+    {
+        let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+        generate_thumbnail_atomic(&source, &destination, seconds)?;
+    }
     if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
         let _ = fs::remove_file(&destination);
         return Err(
@@ -8122,7 +8145,10 @@ async fn prepare_media_thumbnail(
             let master = PathBuf::from(&settings.master_bin_path);
             let source = fs_safe::resolve_existing(&master, &item.relative_path)?;
             let before = fs_safe::snapshot(&source)?;
-            generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
+            {
+                let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+                generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
+            }
             if fs_safe::snapshot(&source)? != before {
                 let _ = fs::remove_file(&thumbnail);
                 return Err("Media changed while its thumbnail was being generated".into());
@@ -8253,6 +8279,41 @@ fn validate_hover_preview(
         }
     }
     Ok(manifest)
+}
+
+#[tauri::command]
+fn load_hover_preview_statuses(
+    app: AppHandle,
+    media_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if media_ids.len() > 10_000 {
+        return Err("Hover preview status request exceeds the 10,000 item safety limit".into());
+    }
+    let requested = media_ids.into_iter().collect::<HashSet<_>>();
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let root = hover_preview_root(&settings)?;
+    let mut ready = Vec::new();
+    for item in catalogue.media.iter().filter(|item| {
+        requested.contains(&item.id)
+            && matches!(
+                item.file_type.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
+            )
+    }) {
+        let Ok(source) = fs_safe::resolve_existing(&master, &item.relative_path) else {
+            continue;
+        };
+        let Ok(snapshot) = fs_safe::snapshot(&source) else {
+            continue;
+        };
+        let fingerprint = hover_preview_fingerprint(item, &snapshot);
+        if validate_hover_preview(&root.join(&fingerprint), &fingerprint).is_ok() {
+            ready.push(item.id.clone());
+        }
+    }
+    Ok(ready)
 }
 
 fn read_hover_preview(
@@ -8755,6 +8816,7 @@ pub fn run() {
             load_thumbnail,
             load_thumbnail_sources,
             prepare_media_thumbnail,
+            load_hover_preview_statuses,
             load_hover_preview,
             prepare_hover_preview,
             hover_preview_cache_usage,

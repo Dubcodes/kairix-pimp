@@ -157,4 +157,8 @@ export class PreviewWorkQueue {
   }
 }
 
+// Static images and multi-frame hover previews intentionally have independent
+// single-active lanes. A slow hover encode must never occupy the only slot that
+// can make the Library usable.
+export const staticThumbnailWorkQueue = new PreviewWorkQueue(128);
 export const previewWorkQueue = new PreviewWorkQueue();

@@ -65,6 +65,7 @@ import { hoverPreviewRequestCache } from './hover-preview-cache';
 import { idlePreviewScheduler } from './idle-preview-scheduler';
 import {
   previewWorkQueue,
+  staticThumbnailWorkQueue,
   type PreviewPriority,
   type PreviewQueueStatus,
 } from './preview-work-queue';
@@ -133,12 +134,12 @@ const requestStaticThumbnail = (
   cacheGeneration: number,
 ) => {
   const requestKey = `${cacheGeneration}:${key}`;
-  previewWorkQueue.promote(
+  staticThumbnailWorkQueue.promote(
     staticThumbnailQueueKey(key, cacheGeneration),
     priority,
   );
   return staticThumbnailRequests.request(requestKey, () =>
-    previewWorkQueue.schedule(
+    staticThumbnailWorkQueue.schedule(
       staticThumbnailQueueKey(key, cacheGeneration),
       priority,
       'Static thumbnail',
@@ -248,9 +249,14 @@ export function App() {
   const [thumbnailSourceRequestCount, setThumbnailSourceRequestCount] =
     useState(0);
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
+  const [previewReadyIds, setPreviewReadyIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [previewMemoryUsage, setPreviewMemoryUsage] = useState(0);
   const [previewQueueStatus, setPreviewQueueStatus] =
     useState<PreviewQueueStatus>(previewWorkQueue.status);
+  const [staticThumbnailQueueStatus, setStaticThumbnailQueueStatus] =
+    useState<PreviewQueueStatus>(staticThumbnailWorkQueue.status);
   const [previewCacheEpoch, setPreviewCacheEpoch] = useState(0);
   const [clearingPreviewCache, setClearingPreviewCache] = useState(false);
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
@@ -395,6 +401,10 @@ export function App() {
         setPreviewQueueStatus(status);
         setPreviewMemoryUsage(hoverPreviewRequestCache.usageBytes);
       }),
+    [],
+  );
+  useEffect(
+    () => staticThumbnailWorkQueue.subscribe(setStaticThumbnailQueueStatus),
     [],
   );
   useEffect(() => {
@@ -880,6 +890,33 @@ export function App() {
           );
       });
   }, [catalogue.media, native]);
+  useEffect(() => {
+    if (!native) return;
+    const mediaIds = catalogue.media.map((item) => item.id);
+    let current = true;
+    void desktopBridge
+      .loadHoverPreviewStatuses(mediaIds)
+      .then((ready) => {
+        if (current) setPreviewReadyIds(new Set(ready));
+      })
+      .catch((reason) => {
+        if (current)
+          void desktopBridge.logUiError(
+            `Hover preview status loading failed: ${errorText(reason)}`,
+          );
+      });
+    return () => {
+      current = false;
+    };
+  }, [catalogue.media, native, previewCacheEpoch]);
+  const receivePreparedPreview = useCallback((mediaId: string) => {
+    setPreviewReadyIds((current) => {
+      if (current.has(mediaId)) return current;
+      const next = new Set(current);
+      next.add(mediaId);
+      return next;
+    });
+  }, []);
   const receivePreparedThumbnail = useCallback(
     (mediaId: string, source: string) => {
       const version = ++preparedThumbnailVersion.current;
@@ -1858,6 +1895,7 @@ export function App() {
     setError('');
     previewWorkQueue.clearQueued();
     hoverPreviewRequestCache.invalidate();
+    setPreviewReadyIds(new Set());
     setPreviewMemoryUsage(0);
     setPreviewCacheEpoch((value) => value + 1);
     try {
@@ -3401,6 +3439,13 @@ export function App() {
                     <span>{size(previewMemoryUsage)} in memory</span>
                     <span>{size(previewCacheUsage)} on disk</span>
                     <span role="status">
+                      {staticThumbnailQueueStatus.active
+                        ? `Generating static thumbnail · ${staticThumbnailQueueStatus.queued} queued`
+                        : staticThumbnailQueueStatus.queued
+                          ? `${staticThumbnailQueueStatus.queued} static thumbnails queued`
+                          : 'Static thumbnail queue idle'}
+                    </span>
+                    <span role="status">
                       {previewQueueStatus.active
                         ? `Preparing ${previewQueueStatus.activeLabel ?? 'preview'} · ${previewQueueStatus.queued} queued`
                         : previewQueueStatus.queued
@@ -4201,6 +4246,8 @@ export function App() {
                             fileType={item.fileType}
                             thumbnailSource={thumbnailSources[item.id]}
                             sourceAvailable={item.available}
+                            previewReady={previewReadyIds.has(item.id)}
+                            onPreviewPrepared={receivePreparedPreview}
                             onThumbnailPrepared={receivePreparedThumbnail}
                             previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
                             previewCacheEpoch={previewCacheEpoch}
@@ -5763,6 +5810,8 @@ export function App() {
                                   fileType={item.fileType}
                                   thumbnailSource={thumbnailSources[item.id]}
                                   sourceAvailable={item.available}
+                                  previewReady={previewReadyIds.has(item.id)}
+                                  onPreviewPrepared={receivePreparedPreview}
                                   previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
                                   previewCacheEpoch={previewCacheEpoch}
                                   onThumbnailPrepared={receivePreparedThumbnail}
@@ -6146,6 +6195,8 @@ function MediaThumbnail({
   preloading = 'visible-nearby',
   allowBackgroundPreparation = true,
   onThumbnailPrepared,
+  previewReady = false,
+  onPreviewPrepared,
 }: {
   mediaId: string;
   fileType: string;
@@ -6158,6 +6209,8 @@ function MediaThumbnail({
   preloading?: DeviceSettings['previewPreloading'];
   allowBackgroundPreparation?: boolean;
   onThumbnailPrepared?: (mediaId: string, source: string) => void;
+  previewReady?: boolean;
+  onPreviewPrepared?: (mediaId: string) => void;
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
   const [showThumbnail, setShowThumbnail] = useState(
@@ -6221,12 +6274,14 @@ function MediaThumbnail({
           if (
             generation === requestGeneration.current &&
             result.mediaId === mediaId
-          )
+          ) {
             setPreviewEntry({
               key: previewKey,
               epoch: previewCacheEpoch,
               preview: result,
             });
+            onPreviewPrepared?.(mediaId);
+          }
         })
         .catch(() => undefined);
     },
@@ -6237,6 +6292,7 @@ function MediaThumbnail({
       previewCacheEpoch,
       previewEligible,
       previewKey,
+      onPreviewPrepared,
     ],
   );
   useEffect(() => {
@@ -6289,7 +6345,7 @@ function MediaThumbnail({
         } else if (previewKey) {
           nearby = false;
           if (retryTimer != null) window.clearTimeout(retryTimer);
-          previewWorkQueue.cancel(
+          staticThumbnailWorkQueue.cancel(
             staticThumbnailQueueKey(previewKey, previewCacheEpoch),
           );
         }
@@ -6314,7 +6370,7 @@ function MediaThumbnail({
       nearObserver.disconnect();
       visibleObserver.disconnect();
       if (previewKey)
-        previewWorkQueue.cancel(
+        staticThumbnailWorkQueue.cancel(
           staticThumbnailQueueKey(previewKey, previewCacheEpoch),
         );
     };
@@ -6359,6 +6415,7 @@ function MediaThumbnail({
             .schedule(`prepare:${previewKey}`, 4, fileType.toUpperCase(), () =>
               desktopBridge.prepareHoverPreview(mediaId),
             )
+            .then(() => onPreviewPrepared?.(mediaId))
             .catch(() => undefined);
         else if (
           !isNearby &&
@@ -6368,12 +6425,14 @@ function MediaThumbnail({
         )
           void idlePreviewScheduler
             .schedule(`prepare:${previewKey}`, () =>
-              previewWorkQueue.schedule(
-                `prepare:${previewKey}`,
-                5,
-                fileType.toUpperCase(),
-                () => desktopBridge.prepareHoverPreview(mediaId),
-              ),
+              previewWorkQueue
+                .schedule(
+                  `prepare:${previewKey}`,
+                  5,
+                  fileType.toUpperCase(),
+                  () => desktopBridge.prepareHoverPreview(mediaId),
+                )
+                .then(() => onPreviewPrepared?.(mediaId)),
             )
             .catch(() => undefined);
       },
@@ -6404,6 +6463,7 @@ function MediaThumbnail({
     preview,
     previewEligible,
     previewKey,
+    onPreviewPrepared,
     requestPreview,
     thumbnailSource,
   ]);
@@ -6470,6 +6530,13 @@ function MediaThumbnail({
         />
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>
+      )}
+      {previewReady && (
+        <span
+          className="preview-ready-indicator"
+          title="Scrubbable preview ready"
+          aria-label="Scrubbable preview ready"
+        />
       )}
       {isHovering &&
         displayedIndex != null &&

@@ -693,6 +693,8 @@ export const desktopBridge = {
     });
     return path ? convertFileSrc(path) : undefined;
   },
+  loadHoverPreviewStatuses: (mediaIds: string[]) =>
+    invoke<string[]>('load_hover_preview_statuses', { mediaIds }),
   loadHoverPreview: (mediaId: string) =>
     invoke<HoverPreview>('load_hover_preview', { mediaId }),
   prepareHoverPreview: (mediaId: string) =>
