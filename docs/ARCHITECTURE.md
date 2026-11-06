@@ -65,6 +65,8 @@ Native transient operation records expose the actual lifetime and stage of stati
 
 External-drive inspection is divided into metadata-only quick inventory, explicit full-content SHA-256 verification and optional deep analysis. Metadata equality never becomes content identity. The planned volume-scoped admission controller, priorities, measured-throughput rules and slow-drive backoff are defined in [Resource-aware media processing](RESOURCE_MANAGEMENT.md); destructive archive operations remain unavailable.
 
+A priority-aware global derivative gate serializes FFmpeg across playback proxies, custom/static thumbnails and hover generation while retaining their separate request queues. Foreground playback and visible thumbnails outrank queued background enrichment/preparation after the current child exits. Playback proxies use two-second keyframes, `fastdecode` and `+faststart`; their versioned fingerprint prevents reuse of the older transform. Only a finalized, FFprobe-validated proxy is exposed.
+
 ## Metadata, search, and Syncthing
 
 The synchronized Master Bin contains portable relative paths, stable IDs and device-partitioned append-only schema-2 event logs. Devices never write another device's stream. A deterministic topological replay respects device sequence and observed-vector edges, then applies stable ordering only to concurrent events. Integrity observations are retained by device. The legacy snapshot is retained for recovery but is no longer operational state.

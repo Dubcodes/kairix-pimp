@@ -496,3 +496,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Store a device-local Library thumbnail width from 160–360 logical pixels. Use CSS auto-fill columns and stable 16:9 media boxes, while density continues to control surrounding spacing rather than derivative generation. Give the folder tree and media panel independent overflow within the available workspace height, and place Scroll to top at the lower-right of the media area.
 - **Consequences:** Wide windows can show more than three columns without stretching every card, resizing/sidebar changes reflow automatically, and zooming tiles never regenerates cache files. Folder and media scrolling no longer depend on a fixed sticky-panel maximum. High-DPI and installed small/ultrawide window acceptance remain manual.
+
+## ADR-068 — Serialize derivative FFmpeg and optimize proxy seek points
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Keep static and hover request lanes independent, but admit only one derivative FFmpeg process globally. Order waiters as playback/custom-frame work, visible static thumbnails, interactive hover work and finally background hover/enrichment; never interrupt the active child merely to reorder the queue. Encode playback proxies with `fastdecode`, a forced keyframe every two seconds, H.264 yuv420p/AAC and `+faststart`, and version the transform fingerprint so old proxies are never mistaken for the new profile. Record source-resolution, metadata, first-frame, playing, seek and proxy-generation timings device-locally.
+- **Consequences:** Slow disks do not receive simultaneous thumbnail/hover/proxy decoders, while visible work runs before queued background work after the current safe boundary. A 12-second synthetic 1080p benchmark reduced seven-second proxy seek from about 171–172 ms to 136 ms, kept encode time within 15 ms, and increased output size by about 18%; installed production footage may behave differently. Incremental playback of an incomplete proxy remains rejected because only finalized, probed output is trusted.

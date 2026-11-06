@@ -527,6 +527,7 @@ describe('native application integration', () => {
     ).toHaveClass('portrait');
     const player = await screen.findByLabelText('Playback portrait.mp4');
     expect(player).toHaveAttribute('src', 'asset://localhost/clip.mp4');
+    expect(player).toHaveAttribute('playsinline');
     expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith(
       'portrait-clip',
     );
@@ -580,10 +581,16 @@ describe('native application integration', () => {
       screen.getByRole('button', { name: 'Create compatible preview' }),
     );
     expect(mocks.preparePlaybackProxy).toHaveBeenCalledWith('next-clip');
-    expect(await screen.findByLabelText('Playback next.mp4')).toHaveAttribute(
+    const proxyPlayer = await screen.findByLabelText('Playback next.mp4');
+    expect(proxyPlayer).toHaveAttribute(
       'src',
       'asset://localhost/playback-proxy.mp4',
     );
+    fireEvent.loadedMetadata(proxyPlayer);
+    fireEvent.loadedData(proxyPlayer);
+    fireEvent.playing(proxyPlayer);
+    fireEvent.seeking(proxyPlayer);
+    fireEvent.seeked(proxyPlayer);
 
     await user.click(screen.getByRole('button', { name: 'Back to Library' }));
     expect(
@@ -592,6 +599,10 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('checkbox', { name: 'Select next.mp4' }),
     ).toBeChecked();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Diagnostics' }));
+    expect(screen.getByText(/first frame \d+ ms/)).toBeVisible();
+    expect(screen.getByText(/proxy \d+ ms/)).toBeVisible();
   });
 
   it('separates active, completed and attention jobs and clears one completed entry', async () => {

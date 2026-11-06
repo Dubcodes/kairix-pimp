@@ -21,7 +21,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration as StdDuration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -68,6 +68,7 @@ struct NativeState {
     static_thumbnail_generation: Mutex<()>,
     static_thumbnail_status: Mutex<HashMap<String, BackgroundOperation>>,
     hover_preview_status: Mutex<HashMap<String, BackgroundOperation>>,
+    derivative_admission: DerivativeAdmission,
     thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     playback_proxy_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     playback_proxy_status: Mutex<HashMap<String, BackgroundOperation>>,
@@ -92,6 +93,44 @@ struct OperationCoordinator {
 struct OperationPermit<'a> {
     coordinator: &'a Mutex<OperationCoordinator>,
     name: &'static str,
+}
+
+#[derive(Default)]
+struct DerivativeAdmission {
+    state: Mutex<DerivativeAdmissionState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct DerivativeAdmissionState {
+    active: bool,
+    waiting: [usize; 4],
+}
+
+struct DerivativePermit<'a> {
+    admission: &'a DerivativeAdmission,
+}
+
+impl DerivativeAdmission {
+    fn acquire(&self, priority: usize) -> DerivativePermit<'_> {
+        let priority = priority.min(3);
+        let mut state = self.state.lock().unwrap();
+        state.waiting[priority] += 1;
+        while state.active || state.waiting[..priority].iter().any(|count| *count > 0) {
+            state = self.ready.wait(state).unwrap();
+        }
+        state.waiting[priority] -= 1;
+        state.active = true;
+        DerivativePermit { admission: self }
+    }
+}
+
+impl Drop for DerivativePermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock().unwrap();
+        state.active = false;
+        self.admission.ready.notify_all();
+    }
 }
 
 impl Drop for OperationPermit<'_> {
@@ -6908,6 +6947,7 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 status.counts.attempted_files += 1;
             }
             let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+            let _admission = state.derivative_admission.acquire(3);
             if let Err(error) = generate_thumbnail_atomic(&source, &thumbnail, 0.1) {
                 thumbnail_failed = true;
                 diagnostic_log(
@@ -7423,6 +7463,10 @@ fn run_playback_proxy_generation(
             "23",
             "-pix_fmt",
             "yuv420p",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*2)",
+            "-tune",
+            "fastdecode",
             "-c:a",
             "aac",
             "-b:a",
@@ -7543,13 +7587,13 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
         let source_probe = probe_playback_media(&source)?;
         let duration_millis = probe_duration_millis(&source_probe);
         let mut digest = Sha256::new();
-        digest.update(b"pimp-playback-proxy-v1\0");
+        digest.update(b"pimp-playback-proxy-v2\0");
         digest.update(item.id.as_bytes());
         digest.update(item.sha256.as_bytes());
         digest.update(before.length.to_le_bytes());
         digest.update([u8::from(before.modified_millis.is_some())]);
         digest.update(before.modified_millis.unwrap_or_default().to_le_bytes());
-        digest.update(b"1280-h264-aac-crf23");
+        digest.update(b"1280-h264-aac-crf23-fastdecode-2s-keyframes");
         let fingerprint = format!("{:x}", digest.finalize());
         let operation_id = format!("playback-proxy:{}", &fingerprint[..24]);
         let generation = {
@@ -7611,13 +7655,16 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
                 updated_at: now,
             },
         );
-        let generated = run_playback_proxy_generation(
-            &state,
-            &operation_id,
-            &source,
-            &temporary,
-            duration_millis,
-        );
+        let generated = {
+            let _admission = state.derivative_admission.acquire(0);
+            run_playback_proxy_generation(
+                &state,
+                &operation_id,
+                &source,
+                &temporary,
+                duration_millis,
+            )
+        };
         if let Err(error) = generated {
             let _ = fs::remove_file(&temporary);
             fail_playback_proxy_status(&state, &operation_id, &error);
@@ -8081,6 +8128,7 @@ fn set_media_thumbnail_frame(
     let _generation_guard = generation_lock.lock().unwrap();
     {
         let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(0);
         generate_thumbnail_atomic(&source, &destination, seconds)?;
     }
     if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
@@ -8237,6 +8285,7 @@ async fn prepare_media_thumbnail(
             let before = fs_safe::snapshot(&source)?;
             {
                 let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+                let _admission = state.derivative_admission.acquire(1);
                 operation.set_stage("Extracting representative frame");
                 generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
             }
@@ -8581,6 +8630,7 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             None,
         );
         let _guard = state.preview_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(2);
         preview_operation.set_stage("Generating and validating scrub frames");
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
@@ -8622,6 +8672,7 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
             None,
         );
         let _guard = state.preview_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(3);
         preview_operation.set_stage("Generating and validating scrub frames");
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
@@ -8960,6 +9011,32 @@ mod tests {
             assert_eq!(running.stage, "Extracting representative frame");
         }
         assert!(statuses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn derivative_admission_serializes_ffmpeg_and_prioritizes_foreground_waiters() {
+        let admission = Arc::new(DerivativeAdmission::default());
+        let active = admission.acquire(2);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let low_admission = admission.clone();
+        let low_sender = sender.clone();
+        let low = std::thread::spawn(move || {
+            let _permit = low_admission.acquire(3);
+            low_sender.send("background").unwrap();
+        });
+        let foreground_admission = admission.clone();
+        let foreground = std::thread::spawn(move || {
+            let _permit = foreground_admission.acquire(0);
+            sender.send("foreground").unwrap();
+        });
+        while admission.state.lock().unwrap().waiting.iter().sum::<usize>() < 2 {
+            std::thread::yield_now();
+        }
+        drop(active);
+        assert_eq!(receiver.recv().unwrap(), "foreground");
+        assert_eq!(receiver.recv().unwrap(), "background");
+        foreground.join().unwrap();
+        low.join().unwrap();
     }
 
     #[test]

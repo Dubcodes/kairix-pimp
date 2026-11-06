@@ -22,7 +22,7 @@ Deep analysis covers FFprobe, thumbnail/preview generation and future optional l
 
 ## Device-local resource policy
 
-Each attached volume will have a device-local policy and observed performance history. The initial conservative policy is one sequential content reader per volume, one static-thumbnail FFmpeg process and one hover-preview FFmpeg process globally. Before starting a derivative read, the governor must consider:
+Each attached volume will have a device-local policy and observed performance history. The initial implemented derivative admission gate permits one FFmpeg derivative process globally and orders waiting work as foreground playback/custom frames, visible static thumbnails, interactive hover work, then background hover/enrichment. The static and hover queues remain logically independent, but they do not run simultaneous high-bandwidth decoders. Before starting a derivative read, the future volume-aware governor must additionally consider:
 
 - active ingest, restore, backup or integrity verification;
 - explicit foreground playback/preview activity;
@@ -44,7 +44,7 @@ CPU and RAM readings are measurements only when supplied by a supported host API
 5. Hover-preview preparation and enrichment.
 6. Optional idle deep analysis.
 
-Separate derivative lanes do not grant unlimited I/O. A future shared admission controller will issue volume-scoped read permits and may pause the lower-priority lane between files. It must not terminate a promotion, leave a child process uncollected, or report cancellation before the worker has stopped.
+Separate derivative lanes do not grant unlimited I/O. The shared global admission controller now serializes FFmpeg and prioritizes foreground waiters after the active process exits safely. A future extension will issue volume-scoped read permits, incorporate ingest/copy throughput and may pause the lower-priority lane between files. It must not terminate a promotion, leave a child process uncollected, or report cancellation before the worker has stopped.
 
 ## Required evidence and acceptance
 

@@ -52,7 +52,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented keyboard ownership and conservative Premiere evidence: editable/combo/modal surfaces retain native keys and undo; arbitrary saved-project paths stay unclassified, historical labels require prior positive evidence and incomplete timeline relationships report Unknown
 - Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, and saved-Premiere folder/read/resolve stages remain device-local; a unified resource governor remains future work
 - Implemented native derivative observability: active static/hover workers join Background Operations and one real primary operation drives supported window-title/taskbar state; installed Windows acceptance remains open
-- Documented resource-aware external-drive inspection: metadata-only quick inventory, explicit SHA-256 verification and budgeted deep analysis with planned volume-scoped serialization/backoff; shared admission control remains implementation work
+- Implemented initial derivative admission control: one priority-aware FFmpeg process globally prevents static/hover/proxy readers from competing; volume-aware ingest/copy throttling and slow-drive backoff remain future work
 
 ## Milestone 3 — Premiere extension
 

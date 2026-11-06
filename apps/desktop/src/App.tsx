@@ -308,9 +308,18 @@ export function App() {
   const [viewerSource, setViewerSource] = useState<string>();
   const [viewerError, setViewerError] = useState('');
   const [viewerProxyBusy, setViewerProxyBusy] = useState(false);
+  const [viewerPlaybackMetrics, setViewerPlaybackMetrics] = useState<{
+    sourceResolvedMs?: number;
+    metadataMs?: number;
+    firstFrameMs?: number;
+    playingMs?: number;
+    lastSeekMs?: number;
+    proxyGenerationMs?: number;
+  }>({});
   const [thumbnailFrameStatus, setThumbnailFrameStatus] = useState('');
   const [showSelectionDetails, setShowSelectionDetails] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const [diagnosticNow, setDiagnosticNow] = useState(() => Date.now());
   const [selectionToolbarPosition, setSelectionToolbarPosition] =
     useState<SelectionToolbarPosition>(() => {
       const saved = localStorage.getItem('pimp-selection-toolbar-position');
@@ -364,6 +373,8 @@ export function App() {
   const libraryPanelRef = useRef<HTMLDivElement>(null);
   const librarySearchRef = useRef<HTMLInputElement>(null);
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
+  const viewerPlaybackStartedAt = useRef(0);
+  const viewerSeekStartedAt = useRef(0);
   const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
@@ -423,13 +434,22 @@ export function App() {
     );
   }, [settings.previewRamCacheLimitBytes]);
   useEffect(() => {
-    if (!native || view !== 'Settings' || settingsSection !== 'Appearance')
+    if (
+      !native ||
+      view !== 'Settings' ||
+      !['Appearance', 'Diagnostics'].includes(settingsSection)
+    )
       return;
     void desktopBridge
       .hoverPreviewCacheUsage()
       .then(setPreviewCacheUsage)
       .catch(() => undefined);
   }, [native, settingsSection, view]);
+  useEffect(() => {
+    if (view !== 'Settings' || settingsSection !== 'Diagnostics') return;
+    const timer = window.setInterval(() => setDiagnosticNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [settingsSection, view]);
   useEffect(() => {
     const preservePendingSettings = (event: BeforeUnloadEvent) => {
       if (!savingSettings.hasUnsavedChanges()) return;
@@ -1228,9 +1248,11 @@ export function App() {
     : [];
   useEffect(() => {
     if (!viewerMediaId || !viewerRecording?.available || !native) return;
+    viewerPlaybackStartedAt.current = performance.now();
     let current = true;
     void Promise.resolve().then(() => {
       if (!current) return;
+      setViewerPlaybackMetrics({});
       setViewerSource(undefined);
       setViewerError('');
       setViewerProxyBusy(false);
@@ -1238,7 +1260,15 @@ export function App() {
     void desktopBridge
       .resolveMediaPlaybackSource(viewerMediaId)
       .then((source) => {
-        if (current) setViewerSource(source);
+        if (current) {
+          setViewerSource(source);
+          setViewerPlaybackMetrics((metrics) => ({
+            ...metrics,
+            sourceResolvedMs: Math.round(
+              performance.now() - viewerPlaybackStartedAt.current,
+            ),
+          }));
+        }
       })
       .catch((reason) => {
         if (current) setViewerError(errorText(reason));
@@ -1295,10 +1325,16 @@ export function App() {
   const createPlaybackProxy = async () => {
     if (!viewerRecording) return;
     setViewerProxyBusy(true);
+    const proxyStartedAt = performance.now();
     try {
       setViewerSource(
         await desktopBridge.preparePlaybackProxy(viewerRecording.id),
       );
+      viewerPlaybackStartedAt.current = performance.now();
+      setViewerPlaybackMetrics({
+        sourceResolvedMs: 0,
+        proxyGenerationMs: Math.round(performance.now() - proxyStartedAt),
+      });
       setViewerError('');
       setMessage(
         'Compatible preview ready in the device-local cache. The original recording was unchanged.',
@@ -1934,6 +1970,9 @@ export function App() {
         `FFmpeg: ${mediaTools?.ffmpegAvailable ? 'available' : 'unavailable'}`,
         `FFprobe: ${mediaTools?.ffprobeAvailable ? 'available' : 'unavailable'}`,
         `Thumbnail source batches: ${thumbnailSourceRequestCount}`,
+        `Static thumbnail queue: ${staticThumbnailQueueStatus.active ? 1 : 0} active, ${staticThumbnailQueueStatus.queued} queued`,
+        `Hover preview queue: ${previewQueueStatus.active ? 1 : 0} active, ${previewQueueStatus.queued} queued`,
+        `Playback timings (ms): ${JSON.stringify(viewerPlaybackMetrics)}`,
       ].join('\r\n'),
     );
     setMessage('Diagnostic summary copied without personal file paths.');
@@ -2328,6 +2367,22 @@ export function App() {
     (operation) =>
       !['completed', 'cancelled', 'failed'].includes(operation.state),
   );
+  const primaryBackgroundOperation = activeBackgroundOperations[0];
+  const primaryOperationElapsedSeconds = primaryBackgroundOperation
+    ? Math.max(
+        0,
+        Math.round(
+          (diagnosticNow -
+            new Date(primaryBackgroundOperation.startedAt).getTime()) /
+            1000,
+        ),
+      )
+    : undefined;
+  const primaryOperationThroughput =
+    primaryBackgroundOperation?.bytesCompleted && primaryOperationElapsedSeconds
+      ? primaryBackgroundOperation.bytesCompleted /
+        primaryOperationElapsedSeconds
+      : undefined;
   const updateBlockingJobs = jobs.filter((job) => !jobIsClearableHistory(job));
   const updateBlockingBackupJobs = backupJobs.filter((job) =>
     ['prepared', 'copying', 'verifying'].includes(job.state),
@@ -3719,6 +3774,92 @@ export function App() {
                       <dt>Thumbnail source batches</dt>
                       <dd>{thumbnailSourceRequestCount}</dd>
                     </div>
+                    <div>
+                      <dt>Active native workers</dt>
+                      <dd>{activeBackgroundOperations.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Static-thumbnail lane</dt>
+                      <dd>
+                        {staticThumbnailQueueStatus.active
+                          ? '1 active'
+                          : 'Idle'}{' '}
+                        · {staticThumbnailQueueStatus.queued} queued
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Hover-preview lane</dt>
+                      <dd>
+                        {previewQueueStatus.active ? '1 active' : 'Idle'} ·{' '}
+                        {previewQueueStatus.queued} queued
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Active FFmpeg work</dt>
+                      <dd>
+                        {
+                          activeBackgroundOperations.filter((operation) =>
+                            [
+                              'static-thumbnail',
+                              'hover-preview',
+                              'playback-proxy',
+                              'media-enrichment',
+                            ].includes(operation.kind),
+                          ).length
+                        }{' '}
+                        reported workers
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Current operation</dt>
+                      <dd>
+                        {primaryBackgroundOperation
+                          ? `${primaryBackgroundOperation.title} · ${primaryBackgroundOperation.stage} · ${primaryOperationElapsedSeconds}s elapsed`
+                          : 'Idle'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Measured throughput</dt>
+                      <dd>
+                        {primaryOperationThroughput
+                          ? `${size(primaryOperationThroughput)}/s`
+                          : 'Unavailable for the current operation'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Preview caches</dt>
+                      <dd>
+                        {size(previewMemoryUsage)} RAM /{' '}
+                        {size(
+                          settings.previewRamCacheLimitBytes ||
+                            128 * 1024 * 1024,
+                        )}{' '}
+                        budget · {size(previewCacheUsage)} disk /{' '}
+                        {size(settings.previewCacheLimitBytes)} budget
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Last playback timings</dt>
+                      <dd>
+                        Resolve {viewerPlaybackMetrics.sourceResolvedMs ?? '—'}{' '}
+                        ms · metadata {viewerPlaybackMetrics.metadataMs ?? '—'}{' '}
+                        ms · first frame{' '}
+                        {viewerPlaybackMetrics.firstFrameMs ?? '—'} ms · playing{' '}
+                        {viewerPlaybackMetrics.playingMs ?? '—'} ms · seek{' '}
+                        {viewerPlaybackMetrics.lastSeekMs ?? '—'} ms
+                        {viewerPlaybackMetrics.proxyGenerationMs != null
+                          ? ` · proxy ${viewerPlaybackMetrics.proxyGenerationMs} ms`
+                          : ''}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Recent processing errors</dt>
+                      <dd>
+                        {backgroundOperations.filter(
+                          (operation) => operation.error,
+                        ).length || 'None reported'}
+                      </dd>
+                    </div>
                   </dl>
                   <div className="scan-actions">
                     <button
@@ -3868,7 +4009,52 @@ export function App() {
                         src={viewerSource}
                         controls
                         preload="metadata"
+                        playsInline
                         aria-label={`Playback ${viewerRecording.originalFilename}`}
+                        onLoadedMetadata={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            metadataMs:
+                              metrics.metadataMs ??
+                              Math.round(
+                                performance.now() -
+                                  viewerPlaybackStartedAt.current,
+                              ),
+                          }))
+                        }
+                        onLoadedData={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            firstFrameMs:
+                              metrics.firstFrameMs ??
+                              Math.round(
+                                performance.now() -
+                                  viewerPlaybackStartedAt.current,
+                              ),
+                          }))
+                        }
+                        onPlaying={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            playingMs:
+                              metrics.playingMs ??
+                              Math.round(
+                                performance.now() -
+                                  viewerPlaybackStartedAt.current,
+                              ),
+                          }))
+                        }
+                        onSeeking={() => {
+                          viewerSeekStartedAt.current = performance.now();
+                        }}
+                        onSeeked={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            lastSeekMs: Math.round(
+                              performance.now() - viewerSeekStartedAt.current,
+                            ),
+                          }))
+                        }
                         onError={() =>
                           setViewerError(
                             'WebView2 could not play this file or codec. The original media was not changed.',
