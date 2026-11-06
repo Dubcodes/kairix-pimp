@@ -35,4 +35,6 @@ Use only repository-local or OS-provided synthetic removable-drive fixtures. Cov
 
 Until those native tests and installed-Windows acceptance pass, the product must expose only the verified-copy completion report and this design—not a cleanup control or destructive command.
 
+The volume governor now provides non-destructive groundwork for that later state machine. A future cleanup review/revalidation must atomically acquire exclusive source-volume access at every safe unit so scanning, hashing, ingest and a replaced/reconnected card cannot race its evidence. This milestone does not add a cleanup permit class, eligibility transition or deletion command.
+
 The SD Card Grabber intentionally stops at copy, independent verification and catalogue registration. Global duplicate recognition, an approved ingest plan or a successful copy is not cleanup authorization. The disabled Settings control is informational until every gate in this document has a separately reviewed implementation and disposable-removable-media acceptance evidence.

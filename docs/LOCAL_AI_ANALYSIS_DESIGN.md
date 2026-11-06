@@ -63,7 +63,7 @@ Observations are immutable evidence for one pipeline run. Summaries are separate
 ## Scheduling, storage and safety
 
 - Jobs use the existing device-local persistent-job pattern with queued, running, paused, interrupted, failed and completed states.
-- A resource governor limits concurrent decoders, CPU threads, RAM, VRAM and temporary disk. Interactive ingest, verification and foreground preview work has higher priority.
+- The implemented device-local volume governor and global FFmpeg gate are the required lower scheduling boundary. Future Full workers use the lowest optional-analysis priority, acquire media/cache volume permits and yield at stage/sample boundaries; CPU-thread, RAM and VRAM budgets still require measured worker integration. Interactive ingest, verification and foreground preview work remains higher priority.
 - Intermediate sampled frames and model caches are device-local, capacity-limited and rebuildable. Portable results contain relative media identity and model provenance, never absolute paths.
 - Before and after each decode stage, the worker verifies the expected media identity/snapshot. A changed or unavailable file pauses for review.
 - Cancellation occurs at bounded stage/sample boundaries. Completed transcript or observation shards remain reusable after restart.

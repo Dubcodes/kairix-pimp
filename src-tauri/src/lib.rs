@@ -3,16 +3,17 @@ mod catalogue;
 mod discovery;
 mod fs_safe;
 mod premiere_index;
+mod resource_governor;
 
 use backup::BackupJob;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use catalogue::{
     Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
 };
-use premiere_index::PremiereProjectIndex;
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
+use premiere_index::PremiereProjectIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -82,6 +83,33 @@ struct NativeState {
     inventory_cancelled: Mutex<HashSet<String>>,
     inventory_status: Mutex<Option<BackgroundOperation>>,
     project_inventory_status: Mutex<HashMap<String, BackgroundOperation>>,
+    volume_governor: resource_governor::VolumeGovernor,
+    system_load_sample: Mutex<Option<SystemLoadSample>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SystemLoadSample {
+    idle_ticks: u64,
+    total_ticks: u64,
+    cpu_load_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemActivityEvidence {
+    input_idle_seconds: Option<u64>,
+    cpu_load_percent: Option<f64>,
+    available_memory_bytes: Option<u64>,
+    idle_boost_eligible: bool,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceGovernorStatus {
+    #[serde(flatten)]
+    governor: resource_governor::GovernorSnapshot,
+    system_activity: SystemActivityEvidence,
 }
 
 #[derive(Default)]
@@ -222,6 +250,16 @@ struct DeviceSettings {
     sd_grabber_remember_devices: bool,
     #[serde(default)]
     sd_grabber_recognized_device_ids: Vec<String>,
+    #[serde(default = "default_resource_profile")]
+    resource_profile: String,
+    #[serde(default = "default_true")]
+    gentle_scanning: bool,
+    #[serde(default = "default_true")]
+    increase_processing_while_idle: bool,
+    #[serde(default = "default_resource_idle_delay_minutes")]
+    resource_idle_delay_minutes: u16,
+    #[serde(default)]
+    background_processing_paused: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -352,6 +390,12 @@ fn default_preview_preloading() -> String {
 fn default_sd_grabber_extensions() -> Vec<String> {
     vec!["mp4".into(), "wav".into()]
 }
+fn default_resource_profile() -> String {
+    "balanced".into()
+}
+fn default_resource_idle_delay_minutes() -> u16 {
+    10
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -395,6 +439,11 @@ impl Default for DeviceSettings {
             sd_grabber_search_subfolders: true,
             sd_grabber_remember_devices: true,
             sd_grabber_recognized_device_ids: vec![],
+            resource_profile: default_resource_profile(),
+            gentle_scanning: true,
+            increase_processing_while_idle: true,
+            resource_idle_delay_minutes: default_resource_idle_delay_minutes(),
+            background_processing_paused: false,
         }
     }
 }
@@ -1072,7 +1121,10 @@ fn replan_ingest_destinations_blocking(
     let catalogue = load_catalogue_file(&settings)?;
     let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
     for item in &catalogue.media {
-        hash_index.entry(item.sha256.clone()).or_default().push(item);
+        hash_index
+            .entry(item.sha256.clone())
+            .or_default()
+            .push(item);
     }
     let mut selection_hashes = HashMap::<String, String>::new();
     let mut planned_destinations = HashSet::new();
@@ -1104,8 +1156,14 @@ fn replan_ingest_destinations_blocking(
             inventory.detail = Some("Duplicate recording within this approved selection".into());
         } else {
             let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
-            let (disposition, media_id, relative_path, detail) =
-                classify_global_duplicate(&settings, candidates, approved.source_size, hash);
+            let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
+                &settings,
+                candidates,
+                approved.source_size,
+                hash,
+                Some(&state),
+                None,
+            );
             inventory.disposition = disposition;
             inventory.existing_relative_path = relative_path;
             inventory.detail = detail;
@@ -1117,8 +1175,8 @@ fn replan_ingest_destinations_blocking(
         if inventory.disposition != "already-imported" {
             let destination =
                 fs_safe::resolve_for_create(&master, &inventory.planned_relative_path)?;
-            let unique = planned_destinations
-                .insert(inventory.planned_relative_path.to_ascii_lowercase());
+            let unique =
+                planned_destinations.insert(inventory.planned_relative_path.to_ascii_lowercase());
             if destination.exists() || !unique {
                 let reason = if destination.exists() {
                     "A different file already occupies the planned destination"
@@ -1268,6 +1326,22 @@ async fn start_project_backup(
     let project_name = project.name.clone();
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let worker_state = worker_app.state::<NativeState>();
+        configure_volume_governor(&worker_state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let destination_volume = volume_resource_id(&destination)?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Project backup: {project_name}"),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(destination_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
         let mut job = backup::plan_backup(&project_id, &project_name, &source, &destination)?;
         save_backup_job(&worker_app, &job)?;
         if let Err(error) =
@@ -1279,8 +1353,17 @@ async fn start_project_backup(
                 job.updated_at = Utc::now().to_rfc3339();
                 save_backup_job(&worker_app, &job)?;
             }
+            if likely_io_error(&error) {
+                volume_permit.record_error(error.clone());
+            }
             return Err(error);
         }
+        volume_permit.add_bytes_for(&source_volume, job.manifest.source_bytes, 0);
+        volume_permit.add_bytes_for(
+            &destination_volume,
+            job.manifest.source_bytes,
+            job.manifest.source_bytes,
+        );
         Ok(job)
     })
     .await
@@ -1312,6 +1395,23 @@ async fn retry_project_backup(
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut job = job;
+        let worker_state = worker_app.state::<NativeState>();
+        let settings = load_settings_file(&worker_app)?;
+        configure_volume_governor(&worker_state, &settings);
+        let source_volume = volume_resource_id(Path::new(&job.source_root))?;
+        let destination_volume = volume_resource_id(Path::new(&job.destination_root))?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Retry project backup: {}", job.project_name),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(destination_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
         job.error = None;
         if let Err(error) =
             backup::execute_backup(&mut job, |snapshot| save_backup_job(&worker_app, snapshot))
@@ -1322,8 +1422,17 @@ async fn retry_project_backup(
                 job.updated_at = Utc::now().to_rfc3339();
                 save_backup_job(&worker_app, &job)?;
             }
+            if likely_io_error(&error) {
+                volume_permit.record_error(error.clone());
+            }
             return Err(error);
         }
+        volume_permit.add_bytes_for(&source_volume, job.manifest.source_bytes, 0);
+        volume_permit.add_bytes_for(
+            &destination_volume,
+            job.manifest.source_bytes,
+            job.manifest.source_bytes,
+        );
         Ok(job)
     })
     .await
@@ -1347,12 +1456,30 @@ async fn verify_project_backup(
     };
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let worker_state = worker_app.state::<NativeState>();
+        let settings = load_settings_file(&worker_app)?;
+        configure_volume_governor(&worker_state, &settings);
+        let destination_volume = volume_resource_id(Path::new(&job.destination_root))?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Verify project backup: {}", job.project_name),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![resource_governor::VolumeNeed::read(
+                    destination_volume.clone(),
+                )],
+            ),
+            || false,
+        )?;
         match backup::verify_backup(&job) {
             Ok(()) => {
                 job.state = "verified".into();
                 job.error = None;
             }
             Err(error) => {
+                if likely_io_error(&error) {
+                    volume_permit.record_error(error.clone());
+                }
                 job.state = "needs-attention".into();
                 job.error = Some(error.clone());
                 job.updated_at = Utc::now().to_rfc3339();
@@ -1360,6 +1487,7 @@ async fn verify_project_backup(
                 return Err(error);
             }
         }
+        volume_permit.add_bytes_for(&destination_volume, job.manifest.source_bytes, 0);
         job.updated_at = Utc::now().to_rfc3339();
         save_backup_job(&worker_app, &job)?;
         Ok(job)
@@ -1384,8 +1512,43 @@ async fn test_project_backup_restore(
             .find(|job| job.id == job_id)
             .ok_or("Backup job no longer exists")?
     };
+    let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        backup::restore_backup_test(&job, Path::new(&restore_root))
+        let worker_state = worker_app.state::<NativeState>();
+        let settings = load_settings_file(&worker_app)?;
+        configure_volume_governor(&worker_state, &settings);
+        let source_volume = volume_resource_id(Path::new(&job.destination_root))?;
+        let destination_volume = volume_resource_id(Path::new(&restore_root))?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Restore test: {}", job.project_name),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(destination_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
+        let result = backup::restore_backup_test(&job, Path::new(&restore_root));
+        match result {
+            Ok(result) => {
+                volume_permit.add_bytes_for(&source_volume, result.bytes_verified, 0);
+                volume_permit.add_bytes_for(
+                    &destination_volume,
+                    result.bytes_verified,
+                    result.bytes_verified,
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                if likely_io_error(&error) {
+                    volume_permit.record_error(error.clone());
+                }
+                Err(error)
+            }
+        }
     })
     .await
     .map_err(|error| format!("Restore-test worker failed: {error}"))?
@@ -1723,8 +1886,10 @@ fn append_events(settings: &DeviceSettings, events: Vec<CatalogueEvent>) -> Resu
 }
 
 #[tauri::command]
-fn load_settings(app: AppHandle) -> Result<DeviceSettings, String> {
-    load_settings_file(&app)
+fn load_settings(app: AppHandle, state: State<'_, NativeState>) -> Result<DeviceSettings, String> {
+    let settings = load_settings_file(&app)?;
+    configure_volume_governor(&state, &settings);
+    Ok(settings)
 }
 
 fn preserve_device_identity(current: &str, requested: &str) -> Result<String, String> {
@@ -1770,6 +1935,15 @@ fn save_settings(
     }
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
+    }
+    if !matches!(
+        settings.resource_profile.as_str(),
+        "quiet" | "balanced" | "performance"
+    ) {
+        return Err("Choose a supported resource profile".into());
+    }
+    if !(1..=120).contains(&settings.resource_idle_delay_minutes) {
+        return Err("Idle processing delay must be between 1 and 120 minutes".into());
     }
     if !(160..=360).contains(&settings.library_thumbnail_width) {
         return Err("Library thumbnail width must be between 160 and 360 pixels".into());
@@ -1869,6 +2043,7 @@ fn save_settings(
         .map_err(|e| format!("Cannot create thumbnail cache: {e}"))?;
     settings.initialized_catalogue_path = next_catalogue;
     write_json(&settings_path(&app)?, &settings)?;
+    configure_volume_governor(&state, &settings);
     let autostart_result = if settings.start_with_windows {
         app.autolaunch().enable()
     } else {
@@ -2347,6 +2522,8 @@ fn classify_global_duplicate(
     candidates: &[&MediaItem],
     expected_size: u64,
     source_hash: &str,
+    governor: Option<&NativeState>,
+    cancellable_operation_id: Option<&str>,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     // Stored size observations are useful lookup hints, but they are not
     // authoritative and older compatible records may not contain one. The
@@ -2385,7 +2562,44 @@ fn classify_global_duplicate(
                 continue;
             }
         };
+        let mut volume_permit = if let Some(state) = governor {
+            configure_volume_governor(state, settings);
+            let volume_id = match volume_resource_id(&candidate) {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(format!("{} volume is unavailable: {error}", item.relative_path));
+                    continue;
+                }
+            };
+            match state.volume_governor.acquire(
+                    resource_governor::Request::new(
+                        format!("Duplicate verification: {}", item.original_filename),
+                        resource_governor::PRIORITY_RECOVERY,
+                        false,
+                        vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+                    ),
+                    || {
+                        cancellable_operation_id
+                            .is_some_and(|id| inventory_was_cancelled(state, id))
+                    },
+                ) {
+                Ok(permit) => Some((permit, volume_id)),
+                Err(error) => {
+                    failures.push(format!("{} verification was not admitted: {error}", item.relative_path));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let hash = sha256(&candidate);
+        if let Some((permit, volume_id)) = volume_permit.as_mut() {
+            if hash.is_ok() {
+                permit.add_bytes_for(volume_id, expected_size, 0);
+            } else if let Err(error) = &hash {
+                permit.record_error(error.clone());
+            }
+        }
         let after = fs_safe::snapshot(&candidate);
         if hash.as_deref() == Ok(source_hash) && after.as_ref() == Ok(&before) {
             return (
@@ -2438,6 +2652,7 @@ fn create_approved_inventory(
 ) -> Result<SourceInventory, String> {
     check_inventory_cancelled(state, operation_id)?;
     let settings = load_settings_file(&app)?;
+    configure_volume_governor(state, &settings);
     if sd_grabber && !settings.sd_grabber_enabled {
         return Err("Enable SD Card Grabber in Settings before scanning a card".into());
     }
@@ -2550,7 +2765,27 @@ fn create_approved_inventory(
     for (index, file) in inventory.files.iter().enumerate() {
         check_inventory_cancelled(state, operation_id)?;
         let source = PathBuf::from(&file.source_path);
+        let volume_id = volume_resource_id(&source)?;
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.stage = "Waiting for source-volume access".into();
+            operation.current_item = source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+        });
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Approved source inventory: {}", source.display()),
+                resource_governor::PRIORITY_FOREGROUND,
+                false,
+                vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+            ),
+            || inventory_was_cancelled(state, operation_id),
+        )?;
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.stage = "Calculating checksums".into();
+        });
         let hash = sha256_inventory(&source, state, operation_id, &mut bytes_read)?;
+        volume_permit.add_bytes_for(&volume_id, file.size_bytes, 0);
         source_hashes.push(hash);
         update_inventory_operation(state, operation_id, |operation| {
             operation.completed_items = index + 1;
@@ -2582,8 +2817,14 @@ fn create_approved_inventory(
             file.detail = Some("Duplicate recording within this approved selection".into());
         } else {
             let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
-            let (disposition, media_id, relative_path, detail) =
-                classify_global_duplicate(&settings, candidates, snapshot.length, hash);
+            let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
+                &settings,
+                candidates,
+                snapshot.length,
+                hash,
+                Some(state),
+                Some(operation_id),
+            );
             file.disposition = disposition;
             file.existing_relative_path = relative_path;
             file.detail = detail;
@@ -2861,6 +3102,7 @@ fn removable_volumes() -> Vec<RemovableVolume> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+        GetVolumeNameForVolumeMountPointW,
     };
     use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
     let mut volumes = Vec::new();
@@ -2917,6 +3159,25 @@ fn removable_volumes() -> Vec<RemovableVolume> {
             .position(|value| *value == 0)
             .unwrap_or(filesystem.len());
         let filesystem = String::from_utf16_lossy(&filesystem[..filesystem_end]);
+        let mut volume_name = vec![0_u16; 261];
+        let stable_identity = (unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                volume_name.as_mut_ptr(),
+                volume_name.len() as u32,
+            )
+        } != 0)
+            .then(|| {
+                let end = volume_name
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(volume_name.len());
+                format!(
+                    "volume-guid:{}",
+                    String::from_utf16_lossy(&volume_name[..end]).to_ascii_lowercase()
+                )
+            })
+            .unwrap_or_else(|| format!("volume:{serial:08x}:{filesystem}:{capacity}"));
         volumes.push(RemovableVolume {
             root_path: root.clone(),
             label: {
@@ -2927,7 +3188,7 @@ fn removable_volumes() -> Vec<RemovableVolume> {
                     value
                 }
             },
-            identity: format!("volume:{serial:08x}:{filesystem}:{capacity}"),
+            identity: stable_identity,
             capacity_bytes: capacity,
             available_bytes: available,
         });
@@ -2949,7 +3210,8 @@ fn list_removable_volumes() -> Vec<RemovableVolume> {
 fn volume_identity_for_path(path: &Path) -> Result<Option<String>, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetDiskFreeSpaceExW, GetVolumeInformationW, GetVolumePathNameW,
+        GetDiskFreeSpaceExW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+        GetVolumePathNameW,
     };
     let wide = path
         .as_os_str()
@@ -2985,6 +3247,24 @@ fn volume_identity_for_path(path: &Path) -> Result<Option<String>, String> {
             std::io::Error::last_os_error()
         ));
     }
+    let mut volume_name = vec![0_u16; 261];
+    if unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            root.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        )
+    } != 0
+    {
+        let end = volume_name
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(volume_name.len());
+        return Ok(Some(format!(
+            "volume-guid:{}",
+            String::from_utf16_lossy(&volume_name[..end]).to_ascii_lowercase()
+        )));
+    }
     let mut capacity = 0_u64;
     if unsafe {
         GetDiskFreeSpaceExW(
@@ -3014,6 +3294,154 @@ fn volume_identity_for_path(path: &Path) -> Result<Option<String>, String> {
 #[cfg(not(target_os = "windows"))]
 fn volume_identity_for_path(_path: &Path) -> Result<Option<String>, String> {
     Ok(None)
+}
+
+fn volume_resource_id(path: &Path) -> Result<String, String> {
+    if let Some(identity) = volume_identity_for_path(path)? {
+        return Ok(identity);
+    }
+    let existing = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .ok_or("Cannot identify volume for a rootless path")?
+    };
+    let canonical = fs::canonicalize(existing)
+        .map_err(|error| format!("Cannot resolve volume for {}: {error}", path.display()))?;
+    let root = canonical
+        .components()
+        .next()
+        .ok_or("Cannot identify filesystem root")?;
+    Ok(format!("filesystem:{}", root.as_os_str().to_string_lossy()))
+}
+
+fn likely_io_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "cannot read",
+        "cannot write",
+        "source read",
+        "staging write",
+        "flush",
+        "i/o error",
+        "os error",
+        "disconnected",
+        "unavailable",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+#[cfg(target_os = "windows")]
+fn system_activity_evidence(
+    state: &NativeState,
+    settings: &DeviceSettings,
+) -> SystemActivityEvidence {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::{
+            SystemInformation::{GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX},
+            Threading::GetSystemTimes,
+        },
+        UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+    };
+
+    let mut last_input = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    let input_idle_seconds = (unsafe { GetLastInputInfo(&mut last_input) } != 0).then(|| {
+        let now = unsafe { GetTickCount64() } as u32;
+        u64::from(now.wrapping_sub(last_input.dwTime)) / 1_000
+    });
+
+    let mut idle = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let times_available = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } != 0;
+    let ticks =
+        |value: FILETIME| (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    let cpu_load_percent = if times_available {
+        let idle_ticks = ticks(idle);
+        let total_ticks = ticks(kernel).saturating_add(ticks(user));
+        let mut previous = state.system_load_sample.lock().unwrap();
+        let calculated = previous.as_ref().and_then(|prior| {
+            let total_delta = total_ticks.saturating_sub(prior.total_ticks);
+            let idle_delta = idle_ticks.saturating_sub(prior.idle_ticks);
+            (total_delta > 0).then(|| {
+                (100.0 * (total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64)
+                    .clamp(0.0, 100.0)
+            })
+        });
+        let retained =
+            calculated.or_else(|| previous.as_ref().and_then(|sample| sample.cpu_load_percent));
+        *previous = Some(SystemLoadSample {
+            idle_ticks,
+            total_ticks,
+            cpu_load_percent: retained,
+        });
+        retained
+    } else {
+        None
+    };
+
+    let mut memory = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let available_memory_bytes =
+        (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullAvailPhys);
+    let required_idle = u64::from(settings.resource_idle_delay_minutes) * 60;
+    let eligible = settings.increase_processing_while_idle
+        && input_idle_seconds.is_some_and(|seconds| seconds >= required_idle)
+        && cpu_load_percent.is_some_and(|percent| percent <= 50.0)
+        && available_memory_bytes.is_some_and(|bytes| bytes >= 2 * 1024 * 1024 * 1024);
+    let reason = if !settings.increase_processing_while_idle {
+        "Idle processing boost is disabled".into()
+    } else if input_idle_seconds.is_none_or(|seconds| seconds < required_idle) {
+        "Waiting for the configured input-idle period".into()
+    } else if cpu_load_percent.is_none() {
+        "Waiting for a supported CPU-load sample".into()
+    } else if cpu_load_percent.is_some_and(|percent| percent > 50.0) {
+        "System CPU load is above the idle-processing threshold".into()
+    } else if available_memory_bytes.is_none_or(|bytes| bytes < 2 * 1024 * 1024 * 1024) {
+        "Available memory is below the idle-processing threshold".into()
+    } else {
+        "Input, CPU, and memory evidence allow controlled idle processing".into()
+    };
+    SystemActivityEvidence {
+        input_idle_seconds,
+        cpu_load_percent,
+        available_memory_bytes,
+        idle_boost_eligible: eligible,
+        reason,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_activity_evidence(
+    _state: &NativeState,
+    _settings: &DeviceSettings,
+) -> SystemActivityEvidence {
+    SystemActivityEvidence {
+        reason: "Supported Windows activity evidence is unavailable on this platform".into(),
+        ..Default::default()
+    }
+}
+
+fn configure_volume_governor(
+    state: &NativeState,
+    settings: &DeviceSettings,
+) -> SystemActivityEvidence {
+    let activity = system_activity_evidence(state, settings);
+    state.volume_governor.configure(
+        resource_governor::Profile::parse(&settings.resource_profile),
+        activity.idle_boost_eligible,
+        settings.background_processing_paused,
+        settings.gentle_scanning,
+    );
+    activity
 }
 
 fn sha256(path: &Path) -> Result<String, String> {
@@ -3191,14 +3619,7 @@ fn list_background_operations(
             .values()
             .cloned(),
     );
-    operations.extend(
-        state
-            .hover_preview_status
-            .lock()
-            .unwrap()
-            .values()
-            .cloned(),
-    );
+    operations.extend(state.hover_preview_status.lock().unwrap().values().cloned());
     let discovery = state.discovery_status.lock().unwrap().clone();
     if discovery.running {
         operations.push(BackgroundOperation {
@@ -3645,6 +4066,21 @@ fn copy_verified(
     approved_hash: &str,
     source_volume_identity: Option<&str>,
 ) -> Result<VerifiedCopy, String> {
+    configure_volume_governor(state, settings);
+    let source_volume = volume_resource_id(source)?;
+    let destination_volume = volume_resource_id(Path::new(&settings.master_bin_path))?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            format!("Verified ingest: {}", source.display()),
+            resource_governor::PRIORITY_FOREGROUND,
+            false,
+            vec![
+                resource_governor::VolumeNeed::read(source_volume.clone()),
+                resource_governor::VolumeNeed::write(destination_volume.clone()),
+            ],
+        ),
+        || state.cancelled_jobs.lock().unwrap().contains(job_id),
+    )?;
     if let Some(expected_volume) = source_volume_identity {
         if volume_identity_for_path(source)?.as_deref() != Some(expected_volume) {
             return Err("The source volume changed after approval; rescan the card".into());
@@ -3755,8 +4191,15 @@ fn copy_verified(
         Ok(copied_source_hash)
     })();
     match operation {
-        Ok(hash) => Ok(VerifiedCopy { hash, journal_path }),
+        Ok(hash) => {
+            volume_permit.add_bytes_for(&source_volume, before.length.saturating_mul(2), 0);
+            volume_permit.add_bytes_for(&destination_volume, before.length, before.length);
+            Ok(VerifiedCopy { hash, journal_path })
+        }
         Err(error) => {
+            if error != "__cancelled__" && likely_io_error(&error) {
+                volume_permit.record_error(error.clone());
+            }
             let _ = fs::remove_file(&temp);
             journal.status = if error == "__cancelled__" {
                 "cancelled".into()
@@ -4552,8 +4995,7 @@ fn start_ingest(
             existing.approved_plan_lineage_id.as_deref() == Some(plan_lineage.as_str())
                 || (existing.approved_plan_lineage_id.is_none()
                     && existing.approved_plan_id.as_deref() == Some(plan_id))
-        })
-        {
+        }) {
             return Err("This approved ingest plan has already been used".into());
         }
         jobs.push(job.clone());
@@ -6049,11 +6491,8 @@ async fn inventory_project(app: AppHandle, project_id: String) -> Result<Project
         let task_operation_id = operation_id.clone();
         let task_app = app.clone();
         let (mut inventory, parsed_index) = tauri::async_runtime::spawn_blocking(move || {
-            let inventory = inventory_project_directory(
-                &task_project_id,
-                &project_name,
-                &task_directory,
-            )?;
+            let inventory =
+                inventory_project_directory(&task_project_id, &project_name, &task_directory)?;
             update_project_inventory_operation(
                 &task_app.state::<NativeState>(),
                 &task_operation_id,
@@ -6257,6 +6696,19 @@ fn get_discovery_status(
     load_discovery_status(&app, &state)
 }
 
+#[tauri::command]
+fn get_resource_governor_status(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<ResourceGovernorStatus, String> {
+    let settings = load_settings_file(&app)?;
+    let system_activity = configure_volume_governor(&state, &settings);
+    Ok(ResourceGovernorStatus {
+        governor: state.volume_governor.snapshot(),
+        system_activity,
+    })
+}
+
 fn load_discovery_status(app: &AppHandle, state: &NativeState) -> Result<DiscoveryStatus, String> {
     let current = state.discovery_status.lock().unwrap().clone();
     if current.running || current.last_completed_at.is_some() {
@@ -6292,6 +6744,7 @@ async fn rescan(app: AppHandle, full: Option<bool>) -> Result<RescanResult, Stri
 
 fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<RescanResult, String> {
     let settings = load_settings_file(&app)?;
+    configure_volume_governor(state, &settings);
     let master = PathBuf::from(&settings.master_bin_path);
     let _discovery_guard = state
         .discovery_write
@@ -6385,9 +6838,49 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
             status.pending = result.pending;
             continue;
         }
-        let hash = match sha256(path) {
-            Ok(hash) => hash,
+        if !full {
+            // Quick inventory deliberately stops at directory/file metadata.
+            // A later explicit full verification is required before content
+            // identity or registration can be established.
+            result.pending += 1;
+            status.pending = result.pending;
+            continue;
+        }
+        let volume_id = match volume_resource_id(path) {
+            Ok(volume_id) => volume_id,
             Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
+            }
+        };
+        let mut volume_permit = match state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Library verification: {relative}"),
+                if full {
+                    resource_governor::PRIORITY_EXPLICIT_SCAN
+                } else {
+                    resource_governor::PRIORITY_MAINTENANCE
+                },
+                !full,
+                vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+            ),
+            || false,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
+            }
+        };
+        let hash = match sha256(path) {
+            Ok(hash) => {
+                volume_permit.add_bytes_for(&volume_id, snapshot.length, 0);
+                hash
+            }
+            Err(_) => {
+                volume_permit.record_error(format!("Could not read {relative}"));
                 result.errors += 1;
                 status.errors = result.errors;
                 continue;
@@ -6532,8 +7025,26 @@ fn verify_media_integrity(
         .ok_or("Unknown media item")?;
     let path =
         fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?;
+    configure_volume_governor(&state, &settings);
+    let volume_id = volume_resource_id(&path)?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            format!("Verify {}", item.original_filename),
+            resource_governor::PRIORITY_EXPLICIT_SCAN,
+            false,
+            vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+        ),
+        || false,
+    )?;
     let snapshot = fs_safe::snapshot(&path)?;
-    let observed_sha256 = sha256(&path)?;
+    let observed_sha256 = match sha256(&path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            volume_permit.record_error(error.clone());
+            return Err(error);
+        }
+    };
+    volume_permit.add_bytes_for(&volume_id, snapshot.length, 0);
     let matches = observed_sha256 == item.sha256;
     if fs_safe::snapshot(&path)? != snapshot {
         return Err("Media changed while its integrity was being verified".into());
@@ -6557,7 +7068,7 @@ fn verify_media_integrity(
     Ok(matches)
 }
 #[tauri::command]
-async fn enrich_media(app: AppHandle) -> Result<usize, String> {
+async fn enrich_media(app: AppHandle, explicit_request: Option<bool>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
         let _operation = begin_critical_operation(&state.operations, "media enrichment")?;
@@ -6581,7 +7092,7 @@ async fn enrich_media(app: AppHandle) -> Result<usize, String> {
             started_at: now.clone(),
             updated_at: now,
         });
-        run_enrichment(&app, &state)
+        run_enrichment(&app, &state, explicit_request.unwrap_or(true))
     })
     .await
     .map_err(|error| format!("Media enrichment worker failed: {error}"))?
@@ -6623,7 +7134,7 @@ fn kick_enrichment_worker(app: AppHandle) {
             *state.enrichment_requested.lock().unwrap() = false;
         }
         if let Ok(_operation) = begin_critical_operation(&state.operations, "media enrichment") {
-            if let Err(error) = run_enrichment(&app, &state) {
+            if let Err(error) = run_enrichment(&app, &state, false) {
                 if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                     status.state = "failed".into();
                     status.stage = "Enrichment failed".into();
@@ -6801,8 +7312,13 @@ fn generate_thumbnail_atomic(
     Ok(())
 }
 
-fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String> {
+fn run_enrichment(
+    app: &AppHandle,
+    state: &NativeState,
+    explicit_request: bool,
+) -> Result<usize, String> {
     let settings = load_settings_file(&app)?;
+    configure_volume_governor(state, &settings);
     let _enrichment_guard = state.enrichment_write.lock().unwrap();
     let master = PathBuf::from(&settings.master_bin_path);
     let cache = PathBuf::from(&settings.thumbnail_cache_path);
@@ -6881,6 +7397,53 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                 continue;
             }
         };
+        let source_volume = match volume_resource_id(&source) {
+            Ok(value) => value,
+            Err(_) => {
+                processed += 1;
+                continue;
+            }
+        };
+        let cache_volume = match volume_resource_id(&cache) {
+            Ok(value) => value,
+            Err(_) => {
+                processed += 1;
+                continue;
+            }
+        };
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.stage = "Waiting for source and cache volumes".into();
+            status.updated_at = Utc::now().to_rfc3339();
+        }
+        let mut volume_permit = match state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Background enrichment: {}", item.original_filename),
+                if explicit_request {
+                    resource_governor::PRIORITY_EXPLICIT_SCAN
+                } else {
+                    resource_governor::PRIORITY_BACKGROUND_DERIVATIVE
+                },
+                !explicit_request,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
+                ],
+            ),
+            || false,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                processed += 1;
+                continue;
+            }
+        };
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.stage = format!(
+                "Generating thumbnails and metadata ({}/{total})",
+                processed + 1
+            );
+            status.updated_at = Utc::now().to_rfc3339();
+        }
         let thumbnail_ref = format!("{}.jpg", item.id);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
             continue;
@@ -6957,6 +7520,10 @@ fn run_enrichment(app: &AppHandle, state: &NativeState) -> Result<usize, String>
                     &format!("{}: {error}", item.relative_path),
                 );
             }
+        }
+        volume_permit.add_bytes_for(&source_volume, source_before.length, 0);
+        if let Ok(metadata) = thumbnail.metadata() {
+            volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
             if needs_thumbnail {
@@ -7209,9 +7776,9 @@ fn playback_proxy_probe_is_valid(probe: &PlaybackProbe) -> bool {
 }
 
 fn valid_playback_proxy(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.file_type().is_file() && metadata.len() > 1_024
-    }) && probe_playback_media(path).is_ok_and(|probe| playback_proxy_probe_is_valid(&probe))
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 1_024)
+        && probe_playback_media(path).is_ok_and(|probe| playback_proxy_probe_is_valid(&probe))
 }
 
 fn playback_proxy_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
@@ -7256,7 +7823,7 @@ fn enforce_playback_proxy_limit(
                     .path()
                     .extension()
                     .is_some_and(|value| value.eq_ignore_ascii_case("mp4")))
-                .then(|| (entry.path(), metadata.len(), metadata.modified().ok()))
+            .then(|| (entry.path(), metadata.len(), metadata.modified().ok()))
         })
         .collect::<Vec<_>>();
     let mut total = entries.iter().map(|entry| entry.1).sum::<u64>();
@@ -7400,10 +7967,7 @@ fn protect_playback_temporary<'a>(
     }
 }
 
-fn cleanup_abandoned_playback_temporaries(
-    state: &NativeState,
-    root: &Path,
-) -> Result<(), String> {
+fn cleanup_abandoned_playback_temporaries(state: &NativeState, root: &Path) -> Result<(), String> {
     let active = state.playback_proxy_temporaries.lock().unwrap().clone();
     for entry in fs::read_dir(root)
         .map_err(|error| format!("Cannot inspect playback proxy cache: {error}"))?
@@ -7481,11 +8045,10 @@ fn run_playback_proxy_generation(
         .arg(temporary)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = ManagedChild(
-        command
-            .spawn()
-            .map_err(|error| format!("Could not start FFmpeg playback proxy generation: {error}"))?,
-    );
+    let mut child =
+        ManagedChild(command.spawn().map_err(|error| {
+            format!("Could not start FFmpeg playback proxy generation: {error}")
+        })?);
     state
         .playback_proxy_processes
         .lock()
@@ -7519,7 +8082,8 @@ fn run_playback_proxy_generation(
             if let Some(value) = playback_progress_millis(&line) {
                 processed = processed.max(value);
                 update_playback_proxy_status(state, operation_id, |operation| {
-                    operation.completed_items = usize::try_from(processed / 1_000).unwrap_or(usize::MAX);
+                    operation.completed_items =
+                        usize::try_from(processed / 1_000).unwrap_or(usize::MAX);
                 });
             }
         }
@@ -7577,10 +8141,16 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
         let _operation = begin_critical_operation(&state.operations, "playback proxy generation")?;
         let settings = load_settings_file(&app)?;
         let catalogue = load_catalogue_file(&settings)?;
-        let item = catalogue.media.iter().find(|item| item.id == media_id)
-            .cloned().ok_or("Unknown media item")?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .cloned()
+            .ok_or("Unknown media item")?;
         if !enrichment_video_type(&item.file_type) {
-            return Err("Playback proxies are available only for supported video recordings".into());
+            return Err(
+                "Playback proxies are available only for supported video recordings".into(),
+            );
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
         let before = fs_safe::snapshot(&source)?;
@@ -7655,6 +8225,35 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
                 updated_at: now,
             },
         );
+        configure_volume_governor(&state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let cache_volume = volume_resource_id(&root)?;
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            operation.state = "queued".into();
+            operation.stage = "Waiting for source and cache volumes".into();
+        });
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Playback proxy: {}", item.original_filename),
+                resource_governor::PRIORITY_FOREGROUND,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
+                ],
+            ),
+            || {
+                state
+                    .playback_proxy_cancelled
+                    .lock()
+                    .unwrap()
+                    .contains(&operation_id)
+            },
+        )?;
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            operation.state = "running".into();
+            operation.stage = "Transcoding H.264/AAC preview".into();
+        });
         let generated = {
             let _admission = state.derivative_admission.acquire(0);
             run_playback_proxy_generation(
@@ -7675,6 +8274,10 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
             let error = "The generated playback proxy failed codec/container validation";
             fail_playback_proxy_status(&state, &operation_id, error);
             return Err(error.into());
+        }
+        volume_permit.add_bytes_for(&source_volume, before.length, 0);
+        if let Ok(metadata) = temporary.metadata() {
+            volume_permit.add_bytes_for(&cache_volume, metadata.len(), metadata.len());
         }
         let after = match fs_safe::snapshot(&source) {
             Ok(snapshot) => snapshot,
@@ -7723,12 +8326,18 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
             operation.cancellable = false;
         });
         Ok(destination.to_string_lossy().into_owned())
-    }).await.map_err(|error| format!("Playback proxy worker failed: {error}"))?
+    })
+    .await
+    .map_err(|error| format!("Playback proxy worker failed: {error}"))?
 }
 
 #[tauri::command]
 fn release_playback_proxy(state: State<'_, NativeState>, media_id: String) {
-    state.active_playback_proxies.lock().unwrap().remove(&media_id);
+    state
+        .active_playback_proxies
+        .lock()
+        .unwrap()
+        .remove(&media_id);
 }
 
 #[tauri::command]
@@ -8126,10 +8735,29 @@ fn set_media_thumbnail_frame(
     let destination = cache.join(&thumbnail_ref);
     let generation_lock = thumbnail_generation_lock(&state, &media_id);
     let _generation_guard = generation_lock.lock().unwrap();
+    configure_volume_governor(&state, &settings);
+    let source_volume = volume_resource_id(&source)?;
+    let cache_volume = volume_resource_id(&cache)?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            format!("Custom thumbnail: {}", item.original_filename),
+            resource_governor::PRIORITY_FOREGROUND,
+            false,
+            vec![
+                resource_governor::VolumeNeed::read(source_volume.clone()),
+                resource_governor::VolumeNeed::write(cache_volume.clone()),
+            ],
+        ),
+        || false,
+    )?;
     {
         let _static_lane = state.static_thumbnail_generation.lock().unwrap();
         let _admission = state.derivative_admission.acquire(0);
         generate_thumbnail_atomic(&source, &destination, seconds)?;
+    }
+    volume_permit.add_bytes_for(&source_volume, before.length, 0);
+    if let Ok(metadata) = destination.metadata() {
+        volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
     }
     if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
         let _ = fs::remove_file(&destination);
@@ -8283,11 +8911,31 @@ async fn prepare_media_thumbnail(
             let master = PathBuf::from(&settings.master_bin_path);
             let source = fs_safe::resolve_existing(&master, &item.relative_path)?;
             let before = fs_safe::snapshot(&source)?;
+            configure_volume_governor(&state, &settings);
+            let source_volume = volume_resource_id(&source)?;
+            let cache_volume = volume_resource_id(&cache)?;
+            operation.set_stage("Waiting for source and cache volumes");
+            let mut volume_permit = state.volume_governor.acquire(
+                resource_governor::Request::new(
+                    format!("Visible thumbnail: {}", item.original_filename),
+                    resource_governor::PRIORITY_VISIBLE,
+                    false,
+                    vec![
+                        resource_governor::VolumeNeed::read(source_volume.clone()),
+                        resource_governor::VolumeNeed::write(cache_volume.clone()),
+                    ],
+                ),
+                || false,
+            )?;
             {
                 let _static_lane = state.static_thumbnail_generation.lock().unwrap();
                 let _admission = state.derivative_admission.acquire(1);
                 operation.set_stage("Extracting representative frame");
                 generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
+            }
+            volume_permit.add_bytes_for(&source_volume, before.length, 0);
+            if let Ok(metadata) = thumbnail.metadata() {
+                volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
             }
             if fs_safe::snapshot(&source)? != before {
                 let _ = fs::remove_file(&thumbnail);
@@ -8629,9 +9277,6 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             "Waiting for preview worker",
             None,
         );
-        let _guard = state.preview_generation.lock().unwrap();
-        let _admission = state.derivative_admission.acquire(2);
-        preview_operation.set_stage("Generating and validating scrub frames");
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -8649,7 +9294,38 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             return Err("Hover previews are available only for supported video files".into());
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
-        generate_hover_preview(&settings, item, &source)
+        configure_volume_governor(&state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let cache_root = hover_preview_root(&settings)?;
+        let cache_volume = volume_resource_id(&cache_root)?;
+        preview_operation.set_stage("Waiting for source and cache volumes");
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Interactive hover preview: {}", item.original_filename),
+                resource_governor::PRIORITY_INTERACTIVE_PREVIEW,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume),
+                ],
+            ),
+            || false,
+        )?;
+        let _guard = state.preview_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(2);
+        preview_operation.set_stage("Generating and validating scrub frames");
+        let result = generate_hover_preview(&settings, item, &source);
+        if result.is_ok() {
+            volume_permit.add_bytes_for(
+                &source_volume,
+                source
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default(),
+                0,
+            );
+        }
+        result
     })
     .await
     .map_err(|error| format!("Hover preview task failed: {error}"))?
@@ -8671,9 +9347,6 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
             "Waiting for preview worker",
             None,
         );
-        let _guard = state.preview_generation.lock().unwrap();
-        let _admission = state.derivative_admission.acquire(3);
-        preview_operation.set_stage("Generating and validating scrub frames");
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -8691,7 +9364,38 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
             return Err("Hover previews are available only for supported video files".into());
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
-        ensure_hover_preview(&settings, item, &source).map(|_| ())
+        configure_volume_governor(&state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let cache_root = hover_preview_root(&settings)?;
+        let cache_volume = volume_resource_id(&cache_root)?;
+        preview_operation.set_stage("Waiting for source and cache volumes");
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Background hover preview: {}", item.original_filename),
+                resource_governor::PRIORITY_BACKGROUND_DERIVATIVE,
+                true,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume),
+                ],
+            ),
+            || false,
+        )?;
+        let _guard = state.preview_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(3);
+        preview_operation.set_stage("Generating and validating scrub frames");
+        let result = ensure_hover_preview(&settings, item, &source).map(|_| ());
+        if result.is_ok() {
+            volume_permit.add_bytes_for(
+                &source_volume,
+                source
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default(),
+                0,
+            );
+        }
+        result
     })
     .await
     .map_err(|error| format!("Hover preview preparation task failed: {error}"))?
@@ -8813,7 +9517,9 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => restore_main_window(app, "tray menu"),
                     "quit" => {
-                        cancel_all_playback_proxy_processes(&app.state::<NativeState>());
+                        let state = app.state::<NativeState>();
+                        state.volume_governor.shutdown();
+                        cancel_all_playback_proxy_processes(&state);
                         app.exit(0);
                     }
                     _ => {}
@@ -8863,6 +9569,7 @@ pub fn run() {
                             let _ = close_window.hide();
                         } else {
                             let state = app.state::<NativeState>();
+                            state.volume_governor.shutdown();
                             cancel_all_playback_proxy_processes(&state);
                             let inventory_operation = {
                                 state
@@ -8956,6 +9663,7 @@ pub fn run() {
             reveal_project_asset,
             rescan,
             get_discovery_status,
+            get_resource_governor_status,
             log_ui_error,
             verify_media_integrity,
             enrich_media,
@@ -9029,7 +9737,15 @@ mod tests {
             let _permit = foreground_admission.acquire(0);
             sender.send("foreground").unwrap();
         });
-        while admission.state.lock().unwrap().waiting.iter().sum::<usize>() < 2 {
+        while admission
+            .state
+            .lock()
+            .unwrap()
+            .waiting
+            .iter()
+            .sum::<usize>()
+            < 2
+        {
             std::thread::yield_now();
         }
         drop(active);
@@ -9109,22 +9825,12 @@ mod tests {
             .unwrap()
             .format("%Y-%m-%d")
             .to_string();
-        let mxf_path = replan_approved_relative_path(
-            &settings,
-            &root,
-            &mxf,
-            "original-file-dates",
-            &batch,
-        )
-        .unwrap();
-        let xml_path = replan_approved_relative_path(
-            &settings,
-            &root,
-            &xml,
-            "original-file-dates",
-            &batch,
-        )
-        .unwrap();
+        let mxf_path =
+            replan_approved_relative_path(&settings, &root, &mxf, "original-file-dates", &batch)
+                .unwrap();
+        let xml_path =
+            replan_approved_relative_path(&settings, &root, &xml, "original-file-dates", &batch)
+                .unwrap();
         assert!(mxf_path.starts_with(&expected_date));
         assert!(xml_path.starts_with(&expected_date));
         assert!(mxf_path.ends_with("PRIVATE/AVCHD/BDMV/STREAM/clip.mxf"));
@@ -9156,23 +9862,16 @@ mod tests {
         let first = approved_file_for_replan("card-a/clip.mp4", 1_767_268_800_000, None);
         let second = approved_file_for_replan("card-b/clip.mp4", 1_767_441_600_000, None);
         let batch = Local::now();
-        let first_path = replan_approved_relative_path(
-            &settings,
-            &root,
-            &first,
-            "original-file-dates",
-            &batch,
-        )
-        .unwrap();
-        let second_path = replan_approved_relative_path(
-            &settings,
-            &root,
-            &second,
-            "original-file-dates",
-            &batch,
-        )
-        .unwrap();
-        assert_ne!(Path::new(&first_path).components().next(), Path::new(&second_path).components().next());
+        let first_path =
+            replan_approved_relative_path(&settings, &root, &first, "original-file-dates", &batch)
+                .unwrap();
+        let second_path =
+            replan_approved_relative_path(&settings, &root, &second, "original-file-dates", &batch)
+                .unwrap();
+        assert_ne!(
+            Path::new(&first_path).components().next(),
+            Path::new(&second_path).components().next()
+        );
         assert!(first_path.ends_with("card-a/clip.mp4"));
         assert!(second_path.ends_with("card-b/clip.mp4"));
         fs::remove_dir_all(root).unwrap();
@@ -9224,8 +9923,14 @@ mod tests {
 
     #[test]
     fn playback_proxy_progress_parses_ffmpeg_machine_output() {
-        assert_eq!(playback_progress_millis("out_time_us=13450000"), Some(13_450));
-        assert_eq!(playback_progress_millis("out_time=00:02:14.250000"), Some(134_250));
+        assert_eq!(
+            playback_progress_millis("out_time_us=13450000"),
+            Some(13_450)
+        );
+        assert_eq!(
+            playback_progress_millis("out_time=00:02:14.250000"),
+            Some(134_250)
+        );
         assert_eq!(playback_progress_millis("progress=continue"), None);
     }
 
@@ -9317,18 +10022,19 @@ mod tests {
             .unwrap()
             .insert(operation_id.into(), operation.clone());
         let output = root.join("managed.mp4");
-        run_playback_proxy_generation(&state, operation_id, &source, &output, Some(1_000))
-            .unwrap();
+        run_playback_proxy_generation(&state, operation_id, &source, &output, Some(1_000)).unwrap();
         assert!(valid_playback_proxy(&output));
         assert_eq!(sha256(&source).unwrap(), source_hash);
         assert!(state.playback_proxy_processes.lock().unwrap().is_empty());
 
         let cancel_id = "playback-proxy:cancel-test";
-        state
-            .playback_proxy_status
-            .lock()
-            .unwrap()
-            .insert(cancel_id.into(), BackgroundOperation { id: cancel_id.into(), ..operation });
+        state.playback_proxy_status.lock().unwrap().insert(
+            cancel_id.into(),
+            BackgroundOperation {
+                id: cancel_id.into(),
+                ..operation
+            },
+        );
         state
             .playback_proxy_cancelled
             .lock()
@@ -10015,6 +10721,8 @@ mod tests {
             &[&catalogue.media[0]],
             fs::metadata(&incoming).unwrap().len(),
             &hash,
+            None,
+            None,
         );
         assert_eq!(verified.0, "already-imported");
         assert_eq!(verified.1.as_deref(), Some(item.id.as_str()));
@@ -10028,6 +10736,8 @@ mod tests {
                 &[&catalogue.media[0]],
                 fs::metadata(&incoming).unwrap().len(),
                 &hash,
+                None,
+                None,
             )
             .0,
             "already-imported"
@@ -10041,6 +10751,8 @@ mod tests {
                 &[&catalogue.media[0]],
                 fs::metadata(&incoming).unwrap().len(),
                 &different_hash,
+                None,
+                None,
             )
             .0,
             "new"
@@ -10054,6 +10766,8 @@ mod tests {
                 &[&catalogue.media[0]],
                 fs::metadata(&incoming).unwrap().len(),
                 &hash,
+                None,
+                None,
             )
             .0,
             "attention"
@@ -10065,6 +10779,8 @@ mod tests {
                 &[&catalogue.media[0]],
                 fs::metadata(&incoming).unwrap().len(),
                 &hash,
+                None,
+                None,
             )
             .0,
             "attention"
@@ -10621,6 +11337,32 @@ mod tests {
         assert!(!settings.sidebar_collapsed);
         assert_eq!(settings.library_folder_sort, "newest");
         assert!(settings.library_folder_order.is_empty());
+        assert_eq!(settings.resource_profile, "balanced");
+        assert!(settings.gentle_scanning);
+        assert!(settings.increase_processing_while_idle);
+        assert_eq!(settings.resource_idle_delay_minutes, 10);
+        assert!(!settings.background_processing_paused);
+    }
+
+    #[test]
+    fn legacy_settings_receive_conservative_resource_defaults() {
+        let mut value = serde_json::to_value(DeviceSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "resourceProfile",
+            "gentleScanning",
+            "increaseProcessingWhileIdle",
+            "resourceIdleDelayMinutes",
+            "backgroundProcessingPaused",
+        ] {
+            object.remove(key);
+        }
+        let settings: DeviceSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.resource_profile, "balanced");
+        assert!(settings.gentle_scanning);
+        assert!(settings.increase_processing_while_idle);
+        assert_eq!(settings.resource_idle_delay_minutes, 10);
+        assert!(!settings.background_processing_paused);
     }
 
     #[test]

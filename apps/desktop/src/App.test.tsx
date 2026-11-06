@@ -48,6 +48,11 @@ const mocks = vi.hoisted(() => ({
     sdGrabberSearchSubfolders: true,
     sdGrabberRememberDevices: true,
     sdGrabberRecognizedDeviceIds: [],
+    resourceProfile: 'balanced' as const,
+    gentleScanning: true,
+    increaseProcessingWhileIdle: true,
+    resourceIdleDelayMinutes: 10,
+    backgroundProcessingPaused: false,
   } as DeviceSettings,
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
@@ -77,6 +82,8 @@ const mocks = vi.hoisted(() => ({
   cancelInventory: vi.fn(),
   cancelBackgroundOperation: vi.fn(),
   listBackgroundOperations: vi.fn(),
+  getResourceGovernorStatus: vi.fn(),
+  verifyMediaIntegrity: vi.fn(),
   reapproveIngestDestinations: vi.fn(),
   replanIngestDestinations: vi.fn(),
   listRemovableVolumes: vi.fn(),
@@ -165,6 +172,7 @@ vi.mock('./bridge', () => ({
     cancelInventory: mocks.cancelInventory,
     cancelBackgroundOperation: mocks.cancelBackgroundOperation,
     listBackgroundOperations: mocks.listBackgroundOperations,
+    getResourceGovernorStatus: mocks.getResourceGovernorStatus,
     reapproveIngestDestinations: mocks.reapproveIngestDestinations,
     replanIngestDestinations: mocks.replanIngestDestinations,
     listRemovableVolumes: mocks.listRemovableVolumes,
@@ -185,6 +193,7 @@ vi.mock('./bridge', () => ({
     revealProjectAsset: mocks.revealProjectAsset,
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
+    verifyMediaIntegrity: mocks.verifyMediaIntegrity,
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
     resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
@@ -318,6 +327,11 @@ describe('native application integration', () => {
       sdGrabberSearchSubfolders: true,
       sdGrabberRememberDevices: true,
       sdGrabberRecognizedDeviceIds: [],
+      resourceProfile: 'balanced',
+      gentleScanning: true,
+      increaseProcessingWhileIdle: true,
+      resourceIdleDelayMinutes: 10,
+      backgroundProcessingPaused: false,
     };
     mocks.saveSettings.mockReset();
     mocks.loadCatalogue.mockReset();
@@ -418,6 +432,28 @@ describe('native application integration', () => {
     mocks.cancelBackgroundOperation.mockReset();
     mocks.cancelBackgroundOperation.mockResolvedValue(undefined);
     mocks.listBackgroundOperations.mockReset();
+    mocks.getResourceGovernorStatus.mockReset();
+    mocks.getResourceGovernorStatus.mockResolvedValue({
+      profile: 'balanced',
+      idleBoostActive: false,
+      backgroundPaused: false,
+      shutdown: false,
+      activeBackgroundWorkers: 0,
+      queuedWorkers: 0,
+      averageWaitMillis: 0,
+      volumes: [],
+      waiting: [],
+      recentErrors: [],
+      systemActivity: {
+        inputIdleSeconds: 0,
+        cpuLoadPercent: 10,
+        availableMemoryBytes: 8 * 1024 * 1024 * 1024,
+        idleBoostEligible: false,
+        reason: 'Waiting for the configured input-idle period',
+      },
+    });
+    mocks.verifyMediaIntegrity.mockReset();
+    mocks.verifyMediaIntegrity.mockResolvedValue(true);
     mocks.listBackgroundOperations.mockResolvedValue([]);
     mocks.reapproveIngestDestinations.mockReset();
     mocks.replanIngestDestinations.mockReset();
@@ -1249,6 +1285,40 @@ describe('native application integration', () => {
     expect(localStorage.getItem('pimp-selection-toolbar-position')).toBeNull();
   });
 
+  it('persists enforceable resource profiles and gentle-drive controls', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Resource Management' }),
+    );
+    await user.click(screen.getByRole('radio', { name: /Performance/ }));
+    await user.click(
+      screen.getByRole('switch', {
+        name: /Gentle scanning for older drives/,
+      }),
+    );
+    await user.click(
+      screen.getByRole('switch', {
+        name: /Pause automatic background processing/,
+      }),
+    );
+    await waitFor(() =>
+      expect(mocks.saveSettings.mock.calls.at(-1)?.[0]).toEqual(
+        expect.objectContaining({
+          resourceProfile: 'performance',
+          gentleScanning: false,
+          backgroundProcessingPaused: true,
+        }),
+      ),
+    );
+    expect(screen.getByText(/stable volume identity/i)).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Generate missing thumbnails' }),
+    ).toBeEnabled();
+  });
+
   it.each([100, 700, 1000, 3000])(
     'batches thumbnail source lookup once for %i recordings',
     async (count) => {
@@ -1402,7 +1472,9 @@ describe('native application integration', () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      await screen.findByRole('button', { name: /Scan for new files/ }),
+      await screen.findByRole('button', {
+        name: /Quick inventory \(no content reads\)/,
+      }),
     );
     expect(mocks.rescan).toHaveBeenCalledWith(false);
     expect(

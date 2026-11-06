@@ -22,16 +22,20 @@ Deep analysis covers FFprobe, thumbnail/preview generation and future optional l
 
 ## Device-local resource policy
 
-Each attached volume will have a device-local policy and observed performance history. The initial implemented derivative admission gate permits one FFmpeg derivative process globally and orders waiting work as foreground playback/custom frames, visible static thumbnails, interactive hover work, then background hover/enrichment. The static and hover queues remain logically independent, but they do not run simultaneous high-bandwidth decoders. Before starting a derivative read, the future volume-aware governor must additionally consider:
+Each observed volume has device-local activity and performance evidence. The implemented volume governor prefers the Windows volume GUID, falls back conservatively where unavailable, atomically sorts/merges source and destination needs, and admits one full-content reader or writer per volume. This prevents deadlock and drive-letter reuse from silently sharing prior identity. It coordinates approved source hashing, verified ingest copy/rechecks, explicit Library verification, project backup/restore verification, playback proxies, thumbnails, hover previews and enrichment. Separate logical volumes that may share one physical device remain conservatively disclosed because Windows does not always provide a reliable grouping relationship.
+
+The existing derivative gate still permits one FFmpeg process globally and orders waiting work as foreground playback/custom frames, visible static thumbnails, interactive hover work, then background hover/enrichment. Resource profiles affect actual background admission across independent volumes: Quiet and active Balanced admit one background worker, active Performance admits two, and a safely eligible idle boost permits one additional worker. Gentle scanning adds admission spacing; pause holds automatic work at the next file/process boundary while explicit ingest, verification, playback and visible thumbnails remain available. Before starting work, the implemented governor considers:
 
 - active ingest, restore, backup or integrity verification;
 - explicit foreground playback/preview activity;
 - whether another worker is reading the same volume;
 - recent throughput, read latency and retry/error rate;
-- user pause and per-volume throughput allowance;
-- free temporary/cache space and system memory pressure.
+- user pause and profile/gentle admission spacing;
+- supported Windows input-idle, CPU-load and available-memory evidence before idle expansion.
 
-Slow or failing volumes back off exponentially at file boundaries. The worker never spins on a disconnected drive. It resumes only from durable evidence and revalidates volume/file identity. Sequential reads are preferred; concurrent full-file hashing of one physical drive is prohibited by default.
+Explicit per-volume byte-rate caps, reserved temporary/cache space, GPU load and battery policy are not yet enforced. They remain visible limitations rather than settings that only appear to work.
+
+Slow or failing volumes back off exponentially with a bounded delay after reported I/O failures. The worker never spins on a disconnected drive. It resumes only from durable evidence and revalidates volume/file identity. Sequential reads are preferred; concurrent full-file hashing of one identified volume is prohibited.
 
 CPU and RAM readings are measurements only when supplied by a supported host API. Disk throughput is calculated from bytes actually read over elapsed monotonic time. PIMP must label heuristics as estimates and must not infer physical-device saturation from queue length alone.
 
@@ -44,8 +48,10 @@ CPU and RAM readings are measurements only when supplied by a supported host API
 5. Hover-preview preparation and enrichment.
 6. Optional idle deep analysis.
 
-Separate derivative lanes do not grant unlimited I/O. The shared global admission controller now serializes FFmpeg and prioritizes foreground waiters after the active process exits safely. A future extension will issue volume-scoped read permits, incorporate ingest/copy throughput and may pause the lower-priority lane between files. It must not terminate a promotion, leave a child process uncollected, or report cancellation before the worker has stopped.
+Separate derivative lanes do not grant unlimited I/O. The global FFmpeg gate and volume permits are both required. Priority is applied only at safe admission boundaries; active copies, promotions and child processes are not preempted. Queue aging advances lower-priority work after bounded completed admissions. Cancellation while waiting removes the request, shutdown wakes waiters, and RAII release prevents abandoned volume ownership.
+
+Quick Library inventory enumerates paths, sizes and timestamps only. It retains candidates as pending and never silently hashes or registers them. Explicit full verification performs SHA-256 under a volume permit. Approved ingest inventory remains an explicit content-verification workflow because the reviewed hash is required before safe copy.
 
 ## Required evidence and acceptance
 
-Implementation requires synthetic tests for unchanged quick scans avoiding content reads, repeated hash-request coalescing, disconnect/reconnect, bounded backoff, cancellation, per-volume serialization and measured byte counters. Installed acceptance must use disposable fast and deliberately slow external media under concurrent ingest/playback. Record drive type, connection, corpus, elapsed time, throughput, process count, CPU/RAM and worker states. No production card or Master Bin deletion is part of this acceptance.
+Automated synthetic tests cover per-volume serialization, independent volumes, reused drive-letter identities, atomic source/destination acquisition, foreground ordering, profile/idle transitions, cancellation, shutdown, bounded error backoff and measured byte counters. Installed acceptance must still use disposable fast and deliberately slow external media under concurrent ingest/playback, disconnect/reconnect and safe pause/resume. Record drive type, connection, corpus, elapsed time, throughput, process count, CPU/RAM and worker states. No production card or Master Bin deletion is part of this acceptance.

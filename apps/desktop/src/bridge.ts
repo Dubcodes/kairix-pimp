@@ -62,6 +62,11 @@ export interface DeviceSettings {
   sdGrabberSearchSubfolders: boolean;
   sdGrabberRememberDevices: boolean;
   sdGrabberRecognizedDeviceIds: string[];
+  resourceProfile: 'quiet' | 'balanced' | 'performance';
+  gentleScanning: boolean;
+  increaseProcessingWhileIdle: boolean;
+  resourceIdleDelayMinutes: number;
+  backgroundProcessingPaused: boolean;
 }
 export interface AppInfo {
   version: string;
@@ -349,6 +354,41 @@ export interface BackgroundOperation {
   startedAt: string;
   updatedAt: string;
 }
+export interface ResourceGovernorStatus {
+  profile: 'quiet' | 'balanced' | 'performance';
+  idleBoostActive: boolean;
+  backgroundPaused: boolean;
+  shutdown: boolean;
+  activeBackgroundWorkers: number;
+  queuedWorkers: number;
+  averageWaitMillis: number;
+  volumes: Array<{
+    volumeId: string;
+    activeReaders: number;
+    activeWriters: number;
+    bytesRead: number;
+    bytesWritten: number;
+    observedBytesPerSecond?: number;
+    completedOperations: number;
+    ioErrors: number;
+    backingOff: boolean;
+  }>;
+  waiting: Array<{
+    operation: string;
+    priority: number;
+    waitMillis: number;
+    reason: string;
+    volumeIds: string[];
+  }>;
+  recentErrors: string[];
+  systemActivity: {
+    inputIdleSeconds?: number;
+    cpuLoadPercent?: number;
+    availableMemoryBytes?: number;
+    idleBoostEligible: boolean;
+    reason: string;
+  };
+}
 export type IngestJobState =
   | 'queued'
   | 'copying'
@@ -442,6 +482,11 @@ export const emptySettings = (): DeviceSettings => ({
   sdGrabberSearchSubfolders: true,
   sdGrabberRememberDevices: true,
   sdGrabberRecognizedDeviceIds: [],
+  resourceProfile: 'balanced',
+  gentleScanning: true,
+  increaseProcessingWhileIdle: true,
+  resourceIdleDelayMinutes: 10,
+  backgroundProcessingPaused: false,
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],
@@ -646,6 +691,8 @@ export const desktopBridge = {
     invoke<void>('reveal_project_asset', { projectId, relativePath }),
   rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
   getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
+  getResourceGovernorStatus: () =>
+    invoke<ResourceGovernorStatus>('get_resource_governor_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
   appInfo: () => invoke<AppInfo>('app_info'),
   updaterConfiguration: () =>
@@ -659,7 +706,8 @@ export const desktopBridge = {
   openLogsFolder: () => invoke<void>('open_logs_folder'),
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),
-  enrichMedia: () => invoke<number>('enrich_media'),
+  enrichMedia: (explicitRequest = true) =>
+    invoke<number>('enrich_media', { explicitRequest }),
   mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
   resolveMediaPath: (mediaId: string) =>
     invoke<string>('resolve_media_path', { mediaId }),

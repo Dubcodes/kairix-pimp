@@ -50,9 +50,9 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented lightweight date reapproval: exact approved-file stat checks, zero source-content rereads, package-date evidence, immutable serialized plan revisions and stale-plan rejection
 - Implemented managed playback proxies: per-fingerprint deduplication, real time progress, safe FFmpeg cancellation, strict codec/container validation, active-file protection and a separate cache budget
 - Implemented keyboard ownership and conservative Premiere evidence: editable/combo/modal surfaces retain native keys and undo; arbitrary saved-project paths stay unclassified, historical labels require prior positive evidence and incomplete timeline relationships report Unknown
-- Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, and saved-Premiere folder/read/resolve stages remain device-local; a unified resource governor remains future work
+- Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, saved-Premiere folder/read/resolve stages and volume-governor evidence remain device-local
 - Implemented native derivative observability: active static/hover workers join Background Operations and one real primary operation drives supported window-title/taskbar state; installed Windows acceptance remains open
-- Implemented initial derivative admission control: one priority-aware FFmpeg process globally prevents static/hover/proxy readers from competing; volume-aware ingest/copy throttling and slow-drive backoff remain future work
+- Implemented volume-aware admission: stable Windows volume identity, atomic multi-volume permits, one full-content accessor per volume, independent-volume profile limits, safe pause, gentle pacing, measured local diagnostics and bounded error backoff now cover ingest, verification, backup/restore and derivatives; installed slow/removable-drive acceptance and reliable physical-disk grouping remain open
 
 ## Milestone 3 — Premiere extension
 

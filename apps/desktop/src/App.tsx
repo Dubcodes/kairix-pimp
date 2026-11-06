@@ -60,6 +60,7 @@ import {
   type ProvisionalMetadataPatch,
   type SourceInventory,
   type RemovableVolume,
+  type ResourceGovernorStatus,
   type UpdaterConfiguration,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
@@ -101,6 +102,7 @@ type SettingsSection =
   | 'General'
   | 'Library & Storage'
   | 'Ingest & Discovery'
+  | 'Resource Management'
   | 'Appearance'
   | 'Updates'
   | 'About & Support'
@@ -230,6 +232,8 @@ export function App() {
   const [backgroundOperations, setBackgroundOperations] = useState<
     BackgroundOperation[]
   >([]);
+  const [resourceStatus, setResourceStatus] =
+    useState<ResourceGovernorStatus>();
   const [completedJobsOpen, setCompletedJobsOpen] = useState(false);
   const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   const [startingIngest, setStartingIngest] = useState(false);
@@ -472,7 +476,7 @@ export function App() {
         if (result.registered > 0 || result.changed > 0) {
           await refresh();
           void desktopBridge
-            .enrichMedia()
+            .enrichMedia(announce)
             .then(refresh)
             .catch(() => undefined);
         }
@@ -759,6 +763,25 @@ export function App() {
   }, [configured, native]);
 
   useEffect(() => {
+    if (!native || !configured) return;
+    let current = true;
+    const refresh = () => {
+      void desktopBridge
+        .getResourceGovernorStatus()
+        .then((status) => {
+          if (current) setResourceStatus(status);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 1_000);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [configured, native]);
+
+  useEffect(() => {
     if (!native || !configured || !('__TAURI_INTERNALS__' in window)) return;
     const activeOperations = backgroundOperations.filter((operation) =>
       ['queued', 'running', 'cancelling'].includes(operation.state),
@@ -808,7 +831,7 @@ export function App() {
   useEffect(() => {
     if (!native || !configured) return;
     void desktopBridge
-      .enrichMedia()
+      .enrichMedia(false)
       .catch((reason) =>
         desktopBridge.logUiError(
           `Startup thumbnail repair failed: ${errorText(reason)}`,
@@ -891,7 +914,7 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [configured, native]);
   useEffect(() => {
-    if (!native || !configured) return;
+    if (!native || !configured || settings.backgroundProcessingPaused) return;
     let stabilityTimer: number | undefined;
     const startupTimer = window.setTimeout(() => {
       void runDiscovery().then((result) => {
@@ -910,7 +933,7 @@ export function App() {
       window.clearTimeout(startupTimer);
       if (stabilityTimer !== undefined) window.clearTimeout(stabilityTimer);
     };
-  }, [configured, native, runDiscovery]);
+  }, [configured, native, runDiscovery, settings.backgroundProcessingPaused]);
 
   useEffect(() => {
     const preventDefaultContextMenu = (event: MouseEvent) => {
@@ -1972,6 +1995,9 @@ export function App() {
         `Thumbnail source batches: ${thumbnailSourceRequestCount}`,
         `Static thumbnail queue: ${staticThumbnailQueueStatus.active ? 1 : 0} active, ${staticThumbnailQueueStatus.queued} queued`,
         `Hover preview queue: ${previewQueueStatus.active ? 1 : 0} active, ${previewQueueStatus.queued} queued`,
+        `Resource profile: ${resourceStatus?.profile ?? settings.resourceProfile}`,
+        `Volume admission: ${resourceStatus?.volumes.reduce((total, volume) => total + volume.activeReaders, 0) ?? 0} readers, ${resourceStatus?.volumes.reduce((total, volume) => total + volume.activeWriters, 0) ?? 0} writers, ${resourceStatus?.queuedWorkers ?? 0} waiting`,
+        `Volume bytes: ${resourceStatus?.volumes.reduce((total, volume) => total + volume.bytesRead, 0) ?? 0} read, ${resourceStatus?.volumes.reduce((total, volume) => total + volume.bytesWritten, 0) ?? 0} written`,
         `Playback timings (ms): ${JSON.stringify(viewerPlaybackMetrics)}`,
       ].join('\r\n'),
     );
@@ -2420,6 +2446,7 @@ export function App() {
     'General',
     'Library & Storage',
     'Ingest & Discovery',
+    'Resource Management',
     'Appearance',
     'Updates',
     'About & Support',
@@ -2561,6 +2588,14 @@ export function App() {
               <span>Completed {completedJobs.length}</span>
               <span>Needs attention {needsAttentionJobs.length}</span>
             </div>
+            <p className="job-complete-status" role="status">
+              Resource profile:{' '}
+              {resourceStatus?.profile ?? settings.resourceProfile}
+              {resourceStatus?.backgroundPaused ? ' · background paused' : ''}
+              {resourceStatus?.waiting[0]
+                ? ` · ${resourceStatus.waiting[0].operation}: ${resourceStatus.waiting[0].reason}`
+                : ' · no resource waits'}
+            </p>
             {visibleBackgroundOperations.map((operation) => (
               <article className="job-card" key={operation.id}>
                 <header>
@@ -3090,7 +3125,7 @@ export function App() {
                           disabled={busy || discoveryStatus.running}
                           onClick={doRescan}
                         >
-                          Scan for new files
+                          Quick inventory (no content reads)
                         </button>
                         <button
                           disabled={busy || discoveryStatus.running}
@@ -3269,6 +3304,178 @@ export function App() {
                   >
                     {busy ? 'Saving…' : 'Save ingest preferences'}
                   </button>
+                </>
+              )}
+
+              {activeSettingsSection === 'Resource Management' && (
+                <>
+                  <fieldset className="settings-subsection">
+                    <legend>Processing profile</legend>
+                    {(
+                      [
+                        [
+                          'quiet',
+                          'Quiet',
+                          'Spaces background admissions apart and permits one background worker across volumes.',
+                        ],
+                        [
+                          'balanced',
+                          'Balanced — recommended',
+                          'Keeps foreground work responsive with one background worker during normal activity.',
+                        ],
+                        [
+                          'performance',
+                          'Performance',
+                          'Allows two background workers when they use independent volumes; each volume remains serialized.',
+                        ],
+                      ] as const
+                    ).map(([value, label, description]) => (
+                      <label key={value}>
+                        <input
+                          type="radio"
+                          name="resource-profile"
+                          checked={settings.resourceProfile === value}
+                          onChange={() =>
+                            void persistPreference({ resourceProfile: value })
+                          }
+                        />{' '}
+                        <strong>{label}</strong>
+                        <small>{description}</small>
+                      </label>
+                    ))}
+                  </fieldset>
+                  <ToggleField
+                    label="Gentle scanning for older drives"
+                    description="Adds a safe delay between automatic background admissions. Full-file access remains limited to one worker per volume."
+                    checked={settings.gentleScanning}
+                    onChange={(gentleScanning) =>
+                      void persistPreference({ gentleScanning })
+                    }
+                  />
+                  <ToggleField
+                    label="Pause automatic background processing"
+                    description="Pauses automatic discovery, enrichment, and preview preparation at safe file boundaries. Ingest, explicit verification, playback, and visible thumbnails remain available."
+                    checked={settings.backgroundProcessingPaused}
+                    onChange={(backgroundProcessingPaused) =>
+                      void persistPreference({ backgroundProcessingPaused })
+                    }
+                  />
+                  <ToggleField
+                    label="Increase processing while safely idle"
+                    description="Allows controlled extra work only after the idle delay and when supported Windows CPU and memory evidence also indicate capacity. Input inactivity alone is insufficient."
+                    checked={settings.increaseProcessingWhileIdle}
+                    onChange={(increaseProcessingWhileIdle) =>
+                      void persistPreference({ increaseProcessingWhileIdle })
+                    }
+                  />
+                  <label>
+                    Idle delay (minutes)
+                    <input
+                      type="number"
+                      min="1"
+                      max="120"
+                      value={settings.resourceIdleDelayMinutes}
+                      onChange={(event) =>
+                        void persistPreference({
+                          resourceIdleDelayMinutes: Number(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                  <div className="settings-explainer" role="status">
+                    <strong>Current scheduler</strong>
+                    <p>
+                      {resourceStatus
+                        ? `${resourceStatus.activeBackgroundWorkers} active background worker(s), ${resourceStatus.queuedWorkers} waiting · ${resourceStatus.volumes.length} observed volume(s)`
+                        : 'Loading device-local resource status…'}
+                    </p>
+                    <p>
+                      PIMP uses stable volume identity where Windows supplies
+                      it. Physical-drive grouping behind separate logical
+                      volumes is not inferred when Windows cannot prove the
+                      relationship.
+                    </p>
+                    <p>
+                      Idle boost:{' '}
+                      {resourceStatus?.systemActivity.idleBoostEligible
+                        ? 'active'
+                        : 'inactive'}{' '}
+                      ·{' '}
+                      {resourceStatus?.systemActivity.reason ??
+                        'Waiting for native activity evidence'}
+                    </p>
+                  </div>
+                  <fieldset className="settings-subsection">
+                    <legend>Manual processing</legend>
+                    <p>
+                      Manual work moves ahead of automatic preparation but never
+                      bypasses volume serialization, source validation, or
+                      no-overwrite rules.
+                    </p>
+                    <div className="scan-actions">
+                      <button
+                        disabled={busy}
+                        onClick={() =>
+                          void desktopBridge
+                            .enrichMedia()
+                            .then((count) =>
+                              setMessage(
+                                `Technical metadata and missing static thumbnails processed for ${count} recording(s).`,
+                              ),
+                            )
+                            .catch((reason) => setError(errorText(reason)))
+                        }
+                      >
+                        Generate missing thumbnails
+                      </button>
+                      <button
+                        disabled={selected.length === 0}
+                        onClick={() =>
+                          void Promise.all(
+                            selected.map((mediaId) =>
+                              desktopBridge.loadHoverPreview(mediaId),
+                            ),
+                          )
+                            .then(() =>
+                              setMessage(
+                                `Prepared scrubbable previews for ${selected.length} selected recording(s).`,
+                              ),
+                            )
+                            .catch((reason) => setError(errorText(reason)))
+                        }
+                      >
+                        Prepare selected previews
+                      </button>
+                      <button
+                        disabled={selected.length === 0}
+                        onClick={() =>
+                          void Promise.all(
+                            selected.map((mediaId) =>
+                              desktopBridge.verifyMediaIntegrity(mediaId),
+                            ),
+                          )
+                            .then(() =>
+                              setMessage(
+                                `Integrity verification completed for ${selected.length} selected recording(s).`,
+                              ),
+                            )
+                            .catch((reason) => setError(errorText(reason)))
+                        }
+                      >
+                        Verify selected media
+                      </button>
+                      <button
+                        disabled={discoveryStatus.running}
+                        onClick={doRescan}
+                      >
+                        Quick Library inventory
+                      </button>
+                    </div>
+                  </fieldset>
+                  <small>
+                    GPU, battery, and explicit throughput caps are omitted until
+                    the native host can enforce and measure them reliably.
+                  </small>
                 </>
               )}
 
@@ -3779,6 +3986,64 @@ export function App() {
                       <dd>{activeBackgroundOperations.length}</dd>
                     </div>
                     <div>
+                      <dt>Resource profile</dt>
+                      <dd>
+                        {resourceStatus?.profile ?? settings.resourceProfile}
+                        {resourceStatus?.backgroundPaused
+                          ? ' · background paused'
+                          : ''}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Volume admission</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `${resourceStatus.volumes.reduce((total, volume) => total + volume.activeReaders, 0)} reader(s) · ${resourceStatus.volumes.reduce((total, volume) => total + volume.activeWriters, 0)} writer(s) · ${resourceStatus.queuedWorkers} waiting`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Volume bytes</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `${size(resourceStatus.volumes.reduce((total, volume) => total + volume.bytesRead, 0))} read · ${size(resourceStatus.volumes.reduce((total, volume) => total + volume.bytesWritten, 0))} written`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Admission wait</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `${resourceStatus.averageWaitMillis} ms average · ${resourceStatus.waiting[0]?.reason ?? 'No queued work'}`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Volume I/O errors</dt>
+                      <dd>
+                        {resourceStatus
+                          ? resourceStatus.volumes.reduce(
+                              (total, volume) => total + volume.ioErrors,
+                              0,
+                            ) || 'None reported'
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>System activity evidence</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `CPU ${resourceStatus.systemActivity.cpuLoadPercent?.toFixed(1) ?? '—'}% · input idle ${resourceStatus.systemActivity.inputIdleSeconds ?? '—'}s · ${size(resourceStatus.systemActivity.availableMemoryBytes ?? 0)} memory available`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Idle processing</dt>
+                      <dd>
+                        {resourceStatus?.systemActivity.reason ?? 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
                       <dt>Static-thumbnail lane</dt>
                       <dd>
                         {staticThumbnailQueueStatus.active
@@ -3933,7 +4198,7 @@ export function App() {
                   ? discoveryStatus.totalFiles > 0
                     ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
                     : `Scanning · ${discoveryStatus.filesProcessed} processed`
-                  : 'Scan for new files'}
+                  : 'Quick inventory (no content reads)'}
               </button>
             </section>
             {viewerRecording && (

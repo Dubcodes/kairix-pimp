@@ -30,6 +30,8 @@ The update client keeps at most one check and one installation attempt in flight
 
 The native host authorizes installation through one short operation coordinator. Authorization fails while durable ingest work is unresolved, a backup job is active, or a scan, integrity verification, backup/restore verification, FFmpeg/FFprobe enrichment, hover-preview generation/preparation, preview-cache clear, or ingest start/resume/retry is in progress. Once installation is authorized, those operations cannot start. The coordinator mutex is held only while acquiring/releasing permits and checking durable state; it is never held during long filesystem or process work.
 
+Volume permits sit inside those already-gated operations and do not weaken updater exclusion. Application shutdown wakes queued volume waiters before child/process cleanup. A future signed installed-upgrade acceptance pass must preserve the new device-local resource profile and recoverable jobs as well as existing identity/catalogue data.
+
 ## Protected configuration checklist
 
 1. Generate a password-protected pair on a secured operator machine: `npm run tauri -- signer generate --write-keys <secure-private-key-path>`.
