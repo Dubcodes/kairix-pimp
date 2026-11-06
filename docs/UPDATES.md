@@ -2,6 +2,8 @@
 
 Kairix PIMP uses three deliberately separate distribution paths.
 
+The current `0.1.1-6` pull-request build remains a short-lived unsigned acceptance artifact. Thumbnail/background/layout work in the development branch does not change the public `0.1.1-5` release and must receive a new monotonically increasing version after review; no release or live-channel mutation is authorized by this milestone. Protected updater credentials and a real installed higher-version Windows acceptance pass remain outstanding.
+
 ## Development builds
 
 Pull requests run the complete automated checks and create short-lived, unsigned MSI and NSIS Actions artifacts. These builds never receive the updater public key or private signing material, never publish a GitHub Release and never update the approved Beta manifest.

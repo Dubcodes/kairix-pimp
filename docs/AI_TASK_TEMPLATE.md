@@ -13,6 +13,8 @@ Work only in the existing repository. Do not use `git worktree add`, create an e
 
 Read AGENTS.md, README.md, and the relevant files in docs/, especially PROJECT_BRIEF.md, ARCHITECTURE.md, DOMAIN_RULES.md, DECISIONS.md, and TESTING.md. Inspect current code/tests and verify Git branch, status, remotes, and worktrees before editing. Preserve unrelated user changes.
 
+For external-drive scanning or expensive media workers, also read RESOURCE_MANAGEMENT.md. For cleanup, read SOURCE_CLEANUP_DESIGN.md and keep deletion disabled unless its separately reviewed safety state machine and installed disposable-media acceptance are complete.
+
 ## Objective
 
 <Describe the user outcome and why it matters.>

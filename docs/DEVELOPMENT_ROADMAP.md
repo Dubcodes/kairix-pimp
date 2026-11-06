@@ -45,10 +45,14 @@ UI implemented and component-test covered: application shell, primary navigation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
 - Implemented Library reliability repair: correct Windows Shell parent/child reveal boundary, selection-keyed description persistence with failure/stale-response handling, and bounded regeneration of missing/invalid/evicted thumbnail JPEGs
 - Implemented thumbnail retry hardening: in-flight-only deduplication, bounded failure backoff, visible/near-static priority ahead of hover work, refresh-safe shared URLs, per-media native generation coordination and protected cache eviction
+- Implemented independent derivative lanes: static and hover work use separate single-active queues/native admission, static FFmpeg has a bounded timeout, and validated hover readiness is shown without per-card filesystem checks
+- Implemented responsive Library sizing: persistent 160–360 pixel tiles, auto-fill columns, stable 16:9 cards, independent folder/media scrolling and lower-right media scroll control
 - Implemented lightweight date reapproval: exact approved-file stat checks, zero source-content rereads, package-date evidence, immutable serialized plan revisions and stale-plan rejection
 - Implemented managed playback proxies: per-fingerprint deduplication, real time progress, safe FFmpeg cancellation, strict codec/container validation, active-file protection and a separate cache budget
 - Implemented keyboard ownership and conservative Premiere evidence: editable/combo/modal surfaces retain native keys and undo; arbitrary saved-project paths stay unclassified, historical labels require prior positive evidence and incomplete timeline relationships report Unknown
 - Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, and saved-Premiere folder/read/resolve stages remain device-local; a unified resource governor remains future work
+- Implemented native derivative observability: active static/hover workers join Background Operations and one real primary operation drives supported window-title/taskbar state; installed Windows acceptance remains open
+- Documented resource-aware external-drive inspection: metadata-only quick inventory, explicit SHA-256 verification and budgeted deep analysis with planned volume-scoped serialization/backoff; shared admission control remains implementation work
 
 ## Milestone 3 — Premiere extension
 

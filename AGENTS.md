@@ -12,6 +12,7 @@ Read this file, `README.md`, and the documents relevant to the task. At minimum 
 - `docs/DECISIONS.md` before changing an established technical direction.
 - `docs/TESTING.md` for the verification matrix and exact commands.
 - `docs/SYNCTHING_DESIGN.md` for synchronization-sensitive changes.
+- `docs/RESOURCE_MANAGEMENT.md` for external-drive scanning and worker-budget changes.
 
 Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 

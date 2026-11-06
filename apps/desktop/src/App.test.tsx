@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => ({
     checkForUpdates: true,
     theme: 'graphite' as const,
     density: 'comfortable' as const,
+    libraryThumbnailWidth: 240,
     showAttachedAudioSeparately: false,
     sidebarCollapsed: false,
     libraryFolderSort: 'newest' as const,
@@ -306,6 +307,7 @@ describe('native application integration', () => {
       checkForUpdates: true,
       theme: 'graphite',
       density: 'comfortable',
+      libraryThumbnailWidth: 240,
       showAttachedAudioSeparately: false,
       sidebarCollapsed: false,
       libraryFolderSort: 'newest',
@@ -2023,6 +2025,27 @@ describe('native application integration', () => {
     expect(screen.getByLabelText('Layout density')).toHaveValue('compact');
   });
 
+  it('persists Library thumbnail size without regenerating media', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Media library' });
+
+    fireEvent.change(screen.getByLabelText('Thumbnail size'), {
+      target: { value: '320' },
+    });
+
+    await waitFor(() =>
+      expect(mocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ libraryThumbnailWidth: 320 }),
+      ),
+    );
+    expect(mocks.prepareMediaThumbnail).not.toHaveBeenCalled();
+    expect(mocks.prepareHoverPreview).not.toHaveBeenCalled();
+    expect(screen.getByText('320px')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+  });
+
   it('keeps a failed preference visible and retryable', async () => {
     mocks.saveSettings
       .mockRejectedValueOnce(new Error('settings file temporarily unavailable'))
@@ -2383,7 +2406,7 @@ describe('native application integration', () => {
       screen.getByRole('menu', { name: 'Recording context menu' }),
     ).toBeVisible();
 
-    const content = document.querySelector('main') as HTMLElement;
+    const content = document.querySelector('.library-panel') as HTMLElement;
     const scrollTo = vi.fn();
     Object.defineProperty(content, 'scrollTop', {
       configurable: true,

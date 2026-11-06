@@ -44,6 +44,7 @@ export interface DeviceSettings {
     | 'system'
     | 'high-contrast';
   density: 'comfortable' | 'compact';
+  libraryThumbnailWidth: number;
   showAttachedAudioSeparately: boolean;
   sidebarCollapsed?: boolean;
   libraryFolderSort?:
@@ -430,6 +431,7 @@ export const emptySettings = (): DeviceSettings => ({
   checkForUpdates: true,
   theme: 'graphite',
   density: 'comfortable',
+  libraryThumbnailWidth: 240,
   showAttachedAudioSeparately: false,
   sidebarCollapsed: false,
   libraryFolderSort: 'newest',

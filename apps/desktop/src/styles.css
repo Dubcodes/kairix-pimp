@@ -503,15 +503,14 @@ header h1 {
 .content-grid {
   display: grid;
   grid-template-columns: 235px 1fr;
-  min-height: calc(100vh - 155px);
+  height: calc(100vh - 155px);
+  min-height: 0;
+  overflow: hidden;
 }
 .folder-panel {
   border-right: 1px solid #222925;
   padding: 20px 14px;
-  align-self: start;
-  position: sticky;
-  top: 0;
-  max-height: calc(100vh - 155px);
+  min-height: 0;
   overflow-y: auto;
 }
 .folder-panel h3 {
@@ -593,6 +592,9 @@ header h1 {
 }
 .library-panel {
   padding: 20px 25px 90px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
 }
 .section-head {
   display: flex;
@@ -607,6 +609,22 @@ header h1 {
 .section-head span {
   font-size: 10px;
   color: #69736c;
+}
+.thumbnail-size-control {
+  display: grid;
+  grid-template-columns: auto minmax(90px, 150px) 42px;
+  gap: 8px;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+.thumbnail-size-control input {
+  min-width: 90px;
+  accent-color: var(--accent);
+}
+.thumbnail-size-control output {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 .view-switch {
   display: flex;
@@ -628,7 +646,10 @@ header h1 {
 }
 .cards {
   display: grid;
-  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  grid-template-columns: repeat(
+    auto-fill,
+    minmax(min(100%, var(--library-thumbnail-width, 240px)), 1fr)
+  );
   gap: 14px;
   user-select: none;
 }
@@ -649,7 +670,7 @@ article.selected {
   box-shadow: 0 0 0 1px var(--accent-strong);
 }
 .thumb {
-  height: 132px;
+  aspect-ratio: 16 / 9;
   position: relative;
   background: linear-gradient(
     135deg,
@@ -882,6 +903,9 @@ article footer span {
   left: calc(50% + 36px);
 }
 .scroll-top {
+  position: absolute;
+  right: 22px;
+  bottom: 88px;
   pointer-events: auto;
 }
 .library-hidden {
@@ -2065,6 +2089,22 @@ select:disabled {
 }
 
 @media (max-width: 780px) {
+  .content-grid {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+  .library-panel {
+    padding-inline: 14px;
+  }
+  .section-head {
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .thumbnail-size-control {
+    grid-template-columns: 1fr 38px;
+  }
+  .thumbnail-size-control > span {
+    grid-column: 1 / -1;
+  }
   .batch,
   .selection-toolbar.bottom-left,
   .selection-toolbar.bottom-center {
@@ -2688,9 +2728,4 @@ select:disabled {
 .backup-job .status.failed,
 .backup-job .status.interrupted {
   color: var(--danger);
-}
-@media (max-width: 1150px) {
-  .cards {
-    grid-template-columns: repeat(2, minmax(180px, 1fr));
-  }
 }

@@ -66,6 +66,8 @@ struct NativeState {
     operations: Mutex<OperationCoordinator>,
     preview_generation: Mutex<()>,
     static_thumbnail_generation: Mutex<()>,
+    static_thumbnail_status: Mutex<HashMap<String, BackgroundOperation>>,
+    hover_preview_status: Mutex<HashMap<String, BackgroundOperation>>,
     thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     playback_proxy_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     playback_proxy_status: Mutex<HashMap<String, BackgroundOperation>>,
@@ -159,6 +161,8 @@ struct DeviceSettings {
     theme: String,
     #[serde(default = "default_density")]
     density: String,
+    #[serde(default = "default_library_thumbnail_width")]
+    library_thumbnail_width: u16,
     #[serde(default)]
     show_attached_audio_separately: bool,
     #[serde(default)]
@@ -287,6 +291,9 @@ fn default_theme() -> String {
 fn default_density() -> String {
     "comfortable".into()
 }
+fn default_library_thumbnail_width() -> u16 {
+    240
+}
 fn default_library_folder_sort() -> String {
     "newest".into()
 }
@@ -338,6 +345,7 @@ impl Default for DeviceSettings {
             check_for_updates: true,
             theme: default_theme(),
             density: default_density(),
+            library_thumbnail_width: default_library_thumbnail_width(),
             show_attached_audio_separately: false,
             sidebar_collapsed: false,
             library_folder_sort: default_library_folder_sort(),
@@ -617,6 +625,61 @@ struct BackgroundOperation {
     error: Option<String>,
     started_at: String,
     updated_at: String,
+}
+
+struct TransientOperationGuard<'a> {
+    statuses: &'a Mutex<HashMap<String, BackgroundOperation>>,
+    id: String,
+}
+
+impl TransientOperationGuard<'_> {
+    fn set_stage(&self, stage: &str) {
+        if let Some(operation) = self.statuses.lock().unwrap().get_mut(&self.id) {
+            operation.state = "running".into();
+            operation.stage = stage.into();
+            operation.updated_at = Utc::now().to_rfc3339();
+        }
+    }
+}
+
+impl Drop for TransientOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.statuses.lock().unwrap().remove(&self.id);
+    }
+}
+
+fn begin_transient_operation<'a>(
+    statuses: &'a Mutex<HashMap<String, BackgroundOperation>>,
+    id: String,
+    kind: &str,
+    title: &str,
+    stage: &str,
+    current_item: Option<String>,
+) -> TransientOperationGuard<'a> {
+    let now = Utc::now().to_rfc3339();
+    statuses.lock().unwrap().insert(
+        id.clone(),
+        BackgroundOperation {
+            id: id.clone(),
+            kind: kind.into(),
+            title: title.into(),
+            state: "queued".into(),
+            stage: stage.into(),
+            current_item,
+            completed_items: 0,
+            total_items: None,
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: now.clone(),
+            updated_at: now,
+        },
+    );
+    TransientOperationGuard { statuses, id }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1668,6 +1731,9 @@ fn save_settings(
     }
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
+    }
+    if !(160..=360).contains(&settings.library_thumbnail_width) {
+        return Err("Library thumbnail width must be between 160 and 360 pixels".into());
     }
     if !matches!(
         settings.thumbnail_hold_frame.as_str(),
@@ -3073,6 +3139,22 @@ fn list_background_operations(
     operations.extend(
         state
             .project_inventory_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
+    operations.extend(
+        state
+            .static_thumbnail_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
+    operations.extend(
+        state
+            .hover_preview_status
             .lock()
             .unwrap()
             .values()
@@ -8142,11 +8224,20 @@ async fn prepare_media_thumbnail(
         }
         let thumbnail = cache.join(&thumbnail_ref);
         if !valid_cached_thumbnail(&thumbnail) {
+            let operation = begin_transient_operation(
+                &state.static_thumbnail_status,
+                format!("static-thumbnail:{}:{}", item.id, Uuid::new_v4()),
+                "static-thumbnail",
+                "Generating static thumbnail",
+                "Waiting for thumbnail worker",
+                Some(item.original_filename.clone()),
+            );
             let master = PathBuf::from(&settings.master_bin_path);
             let source = fs_safe::resolve_existing(&master, &item.relative_path)?;
             let before = fs_safe::snapshot(&source)?;
             {
                 let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+                operation.set_stage("Extracting representative frame");
                 generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
             }
             if fs_safe::snapshot(&source)? != before {
@@ -8481,7 +8572,16 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
         let _operation = begin_critical_operation(&state.operations, "hover preview generation")?;
+        let preview_operation = begin_transient_operation(
+            &state.hover_preview_status,
+            format!("hover-preview:{media_id}:{}", Uuid::new_v4()),
+            "hover-preview",
+            "Preparing hover preview",
+            "Waiting for preview worker",
+            None,
+        );
         let _guard = state.preview_generation.lock().unwrap();
+        preview_operation.set_stage("Generating and validating scrub frames");
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -8513,7 +8613,16 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
         if has_active_ingest(&snapshot_jobs(&app, &state)?) {
             return Err("Background preview preparation is deferred while ingest is active".into());
         }
+        let preview_operation = begin_transient_operation(
+            &state.hover_preview_status,
+            format!("hover-preview:{media_id}:{}", Uuid::new_v4()),
+            "hover-preview",
+            "Preparing hover preview",
+            "Waiting for preview worker",
+            None,
+        );
         let _guard = state.preview_generation.lock().unwrap();
+        preview_operation.set_stage("Generating and validating scrub frames");
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -8829,6 +8938,29 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_operations_expose_authoritative_worker_lifetime() {
+        let statuses = Mutex::new(HashMap::new());
+        {
+            let operation = begin_transient_operation(
+                &statuses,
+                "thumbnail:test".into(),
+                "static-thumbnail",
+                "Generating static thumbnail",
+                "Waiting for thumbnail worker",
+                Some("clip.mp4".into()),
+            );
+            let queued = statuses.lock().unwrap()["thumbnail:test"].clone();
+            assert_eq!(queued.state, "queued");
+            assert_eq!(queued.current_item.as_deref(), Some("clip.mp4"));
+            operation.set_stage("Extracting representative frame");
+            let running = statuses.lock().unwrap()["thumbnail:test"].clone();
+            assert_eq!(running.state, "running");
+            assert_eq!(running.stage, "Extracting representative frame");
+        }
+        assert!(statuses.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn active_backup_jobs_become_explicitly_interrupted_after_restart() {
@@ -10681,11 +10813,16 @@ mod tests {
         value.as_object_mut().unwrap().remove("sidebarCollapsed");
         value.as_object_mut().unwrap().remove("libraryFolderSort");
         value.as_object_mut().unwrap().remove("libraryFolderOrder");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("libraryThumbnailWidth");
         let settings: DeviceSettings = serde_json::from_value(value).unwrap();
         assert_eq!(settings.ingest_date_organization, "original-file-dates");
         assert!(!settings.sidebar_collapsed);
         assert_eq!(settings.library_folder_sort, "newest");
         assert!(settings.library_folder_order.is_empty());
+        assert_eq!(settings.library_thumbnail_width, 240);
     }
 
     #[test]

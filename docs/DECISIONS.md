@@ -482,3 +482,17 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Give ordinary static thumbnails and multi-frame hover previews independent single-active frontend queues and native FFmpeg admission lanes. Static visible/near-visible work keeps its own bounded priority queue and retry backoff; clearing hover data never cancels it. Bound static extraction to 60 seconds and remove its cache-local temporary on timeout. Determine the preview-ready indicator with one batched fingerprint-and-manifest validation per catalogue revision, then update it directly after successful preparation.
 - **Consequences:** A long hover encode or a saturated 64-entry hover queue cannot starve missing Library images, while the application still runs at most one FFmpeg process for each derivative class. Two lanes may run concurrently and installed slow-drive measurements are still required before adding shared physical-drive throttling. The blue indicator represents validated device-local evidence, disappears on cache clear, and requires no filesystem access during React rendering.
+
+## ADR-066 — Project authoritative worker state into native Windows progress
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Register static-thumbnail and hover-preview worker lifetimes in the native Background Operations projection. Select one active native operation for the window title and Tauri-supported Windows taskbar progress; show a determinate percentage only from that operation's measured byte/item total, otherwise use the indeterminate state. Clear the native state when work ends and show an error state for durable ingest attention when no worker is active.
+- **Consequences:** Clip conversion, scans, project indexing, backups, thumbnails and hover preparation share one observable device-local model without synchronized progress churn. Unrelated jobs are never averaged into a fabricated percentage. Installed Windows title/taskbar behavior still requires acceptance with the packaged app.
+
+## ADR-067 — Persist responsive Library tile width separately from density
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Store a device-local Library thumbnail width from 160–360 logical pixels. Use CSS auto-fill columns and stable 16:9 media boxes, while density continues to control surrounding spacing rather than derivative generation. Give the folder tree and media panel independent overflow within the available workspace height, and place Scroll to top at the lower-right of the media area.
+- **Consequences:** Wide windows can show more than three columns without stretching every card, resizing/sidebar changes reflow automatically, and zooming tiles never regenerates cache files. Folder and media scrolling no longer depend on a fixed sticky-panel maximum. High-DPI and installed small/ultrawide window acceptance remain manual.

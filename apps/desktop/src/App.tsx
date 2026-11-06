@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
+import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import {
   Archive,
   ArrowLeft,
@@ -353,6 +361,7 @@ export function App() {
   const descriptionSaveGeneration = useRef(0);
   const selectionKeyRef = useRef('');
   const contentRef = useRef<HTMLElement>(null);
+  const libraryPanelRef = useRef<HTMLDivElement>(null);
   const librarySearchRef = useRef<HTMLInputElement>(null);
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const libraryScrollPosition = useRef(0);
@@ -728,6 +737,53 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [configured, native]);
+
+  useEffect(() => {
+    if (!native || !configured || !('__TAURI_INTERNALS__' in window)) return;
+    const activeOperations = backgroundOperations.filter((operation) =>
+      ['queued', 'running', 'cancelling'].includes(operation.state),
+    );
+    const activeIngest = jobs.find((job) =>
+      ['queued', 'copying', 'verifying'].includes(job.state),
+    );
+    const primary = activeOperations[0];
+    let title = 'Kairix PIMP';
+    let status = ProgressBarStatus.None;
+    let progress: number | undefined;
+    if (primary) {
+      const measured = primary.bytesTotal
+        ? (primary.bytesCompleted / primary.bytesTotal) * 100
+        : primary.totalItems
+          ? (primary.completedItems / primary.totalItems) * 100
+          : undefined;
+      title = `Kairix PIMP — ${primary.title}${measured == null ? '' : ` ${Math.round(measured)}%`}`;
+      status =
+        measured == null
+          ? ProgressBarStatus.Indeterminate
+          : ProgressBarStatus.Normal;
+      progress = measured == null ? undefined : Math.round(measured);
+    } else if (activeIngest) {
+      const measured = activeIngest.bytesTotal
+        ? (activeIngest.bytesTransferred / activeIngest.bytesTotal) * 100
+        : undefined;
+      title = `Kairix PIMP — Ingest${measured == null ? '' : ` ${Math.round(measured)}%`}`;
+      status =
+        measured == null
+          ? ProgressBarStatus.Indeterminate
+          : ProgressBarStatus.Normal;
+      progress = measured == null ? undefined : Math.round(measured);
+    } else if (
+      jobs.some((job) =>
+        ['failed', 'interrupted', 'needs-attention'].includes(job.state),
+      )
+    ) {
+      title = 'Kairix PIMP — Needs attention';
+      status = ProgressBarStatus.Error;
+    }
+    const appWindow = getCurrentWindow();
+    void appWindow.setTitle(title).catch(() => undefined);
+    void appWindow.setProgressBar({ status, progress }).catch(() => undefined);
+  }, [backgroundOperations, configured, jobs, native]);
 
   useEffect(() => {
     if (!native || !configured) return;
@@ -1199,14 +1255,16 @@ export function App() {
     };
   }, [native, viewerMediaId]);
   const openClipViewer = (mediaId: string) => {
-    libraryScrollPosition.current = contentRef.current?.scrollTop ?? 0;
+    libraryScrollPosition.current = libraryPanelRef.current?.scrollTop ?? 0;
     replaceSelection([mediaId], mediaId);
     setViewerMediaId(mediaId);
   };
   const closeClipViewer = () => {
     setViewerMediaId(undefined);
     const top = libraryScrollPosition.current;
-    window.requestAnimationFrame(() => contentRef.current?.scrollTo?.({ top }));
+    window.requestAnimationFrame(() =>
+      libraryPanelRef.current?.scrollTo?.({ top }),
+    );
   };
   const navigateClipViewer = (offset: -1 | 1) => {
     const next = filtered[viewerIndex + offset];
@@ -1377,16 +1435,6 @@ export function App() {
       window.removeEventListener('keydown', closeOnEscape);
     };
   }, [contextMenu]);
-  useEffect(() => {
-    const content = contentRef.current;
-    if (!content) return;
-    const updateScrollControl = () =>
-      setShowScrollTop(content.scrollTop >= 480);
-    updateScrollControl();
-    content.addEventListener('scroll', updateScrollControl, { passive: true });
-    return () => content.removeEventListener('scroll', updateScrollControl);
-  }, []);
-
   const saveConfiguration = async () => {
     setError('');
     setBusy(true);
@@ -4110,12 +4158,34 @@ export function App() {
                   </div>
                 ))}
               </div>
-              <div className="library-panel">
+              <div
+                className="library-panel"
+                ref={libraryPanelRef}
+                onScroll={(event) =>
+                  setShowScrollTop(event.currentTarget.scrollTop >= 480)
+                }
+              >
                 <div className="section-head">
                   <div>
                     <h2>Media library</h2>
                     <span>{filtered.length} persisted items</span>
                   </div>
+                  <label className="thumbnail-size-control">
+                    <span>Thumbnail size</span>
+                    <input
+                      type="range"
+                      min="160"
+                      max="360"
+                      step="20"
+                      value={settings.libraryThumbnailWidth}
+                      onChange={(event) =>
+                        void persistPreference({
+                          libraryThumbnailWidth: Number(event.target.value),
+                        })
+                      }
+                    />
+                    <output>{settings.libraryThumbnailWidth}px</output>
+                  </label>
                 </div>
                 {!filtered.length ? (
                   <div className="empty">
@@ -4139,6 +4209,11 @@ export function App() {
                 ) : (
                   <div
                     className="cards"
+                    style={
+                      {
+                        '--library-thumbnail-width': `${settings.libraryThumbnailWidth}px`,
+                      } as CSSProperties
+                    }
                     role="listbox"
                     aria-label="Media library"
                     aria-multiselectable="true"
@@ -4389,7 +4464,7 @@ export function App() {
                   aria-label="Scroll Library to top"
                   title="Scroll to top"
                   onClick={() =>
-                    contentRef.current?.scrollTo({
+                    libraryPanelRef.current?.scrollTo({
                       top: 0,
                       behavior: window.matchMedia?.(
                         '(prefers-reduced-motion: reduce)',
