@@ -72,6 +72,8 @@ const mocks = vi.hoisted(() => ({
     ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
   catalogueListener: undefined as (() => void) | undefined,
   resolveMediaPath: vi.fn(),
+  startNativeMediaDrag: vi.fn(),
+  startNativeFolderDrag: vi.fn(),
   resolveMediaPlaybackSource: vi.fn(),
   preparePlaybackProxy: vi.fn(),
   releasePlaybackProxy: vi.fn(),
@@ -204,6 +206,8 @@ vi.mock('./bridge', () => ({
     verifyMediaIntegrity: mocks.verifyMediaIntegrity,
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
+    startNativeMediaDrag: mocks.startNativeMediaDrag,
+    startNativeFolderDrag: mocks.startNativeFolderDrag,
     resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
     preparePlaybackProxy: mocks.preparePlaybackProxy,
     releasePlaybackProxy: mocks.releasePlaybackProxy,
@@ -385,6 +389,10 @@ describe('native application integration', () => {
     });
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
+    mocks.startNativeMediaDrag.mockReset();
+    mocks.startNativeMediaDrag.mockResolvedValue(false);
+    mocks.startNativeFolderDrag.mockReset();
+    mocks.startNativeFolderDrag.mockResolvedValue(false);
     mocks.resolveMediaPlaybackSource.mockReset();
     mocks.preparePlaybackProxy.mockReset();
     mocks.preparePlaybackProxy.mockResolvedValue(
@@ -2660,6 +2668,30 @@ describe('native application integration', () => {
 
     await user.keyboard('{Control>}a{/Control}');
     expect(screen.getByText('3 selected')).toBeVisible();
+    const mediaDragTransfer = { effectAllowed: 'none' };
+    expect(
+      fireEvent.dragStart(screen.getByRole('option', { name: /two.mp4/ }), {
+        dataTransfer: mediaDragTransfer,
+      }),
+    ).toBe(false);
+    await waitFor(() =>
+      expect(mocks.startNativeMediaDrag).toHaveBeenCalledWith([
+        'media-1',
+        'media-2',
+        'media-3',
+      ]),
+    );
+    expect(mediaDragTransfer.effectAllowed).toBe('copy');
+    const folderDragTransfer = { effectAllowed: 'none' };
+    expect(
+      fireEvent.dragStart(screen.getByRole('button', { name: /20261024/ }), {
+        dataTransfer: folderDragTransfer,
+      }),
+    ).toBe(false);
+    await waitFor(() =>
+      expect(mocks.startNativeFolderDrag).toHaveBeenCalledWith('20261024'),
+    );
+    expect(folderDragTransfer.effectAllowed).toBe('copy');
     expect(
       screen.getByRole('toolbar', { name: 'Selected recordings' }),
     ).toBeVisible();

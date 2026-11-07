@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent,
 } from 'react';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import {
@@ -1899,6 +1900,45 @@ export function App() {
     } catch (reason) {
       setError(errorText(reason));
     }
+  };
+  const startMediaDrag = (
+    event: DragEvent<HTMLElement>,
+    recording: Catalogue['media'][number],
+  ) => {
+    event.preventDefault();
+    if (!native || !recording.available) return;
+    const mediaIds = selected.includes(recording.id)
+      ? selected
+      : [recording.id];
+    event.dataTransfer.effectAllowed = 'copy';
+    setError('');
+    void desktopBridge
+      .startNativeMediaDrag(mediaIds)
+      .then((dropped) => {
+        if (dropped)
+          setMessage(
+            `${mediaIds.length} original recording${mediaIds.length === 1 ? '' : 's'} handed to the destination as a copy-only Windows drag.`,
+          );
+      })
+      .catch((reason) => setError(errorText(reason)));
+  };
+  const startFolderDrag = (
+    event: DragEvent<HTMLElement>,
+    relativePath: string,
+  ) => {
+    event.preventDefault();
+    if (!native) return;
+    event.dataTransfer.effectAllowed = 'copy';
+    setError('');
+    void desktopBridge
+      .startNativeFolderDrag(relativePath)
+      .then((dropped) => {
+        if (dropped)
+          setMessage(
+            'Original Library folder handed to the destination as a copy-only Windows drag.',
+          );
+      })
+      .catch((reason) => setError(errorText(reason)));
   };
   const copySelectedPaths = async () => {
     const recordings = selectedPhysicalIds
@@ -4605,6 +4645,14 @@ export function App() {
                   <div className="folder-row" key={name}>
                     <button
                       className={`folder ${folder === name ? 'active' : ''}`}
+                      draggable={native}
+                      title="Drag this physical folder to another Windows application"
+                      onDragStart={(event) =>
+                        startFolderDrag(
+                          event,
+                          name === 'Master Bin root' ? '' : name,
+                        )
+                      }
                       onClick={() => setFolder(name)}
                     >
                       <Folder size={16} />
@@ -4711,8 +4759,15 @@ export function App() {
                         }}
                         role="option"
                         data-media-id={item.id}
+                        draggable={native && item.available}
+                        title={
+                          item.available
+                            ? 'Drag the original file to another Windows application'
+                            : undefined
+                        }
                         tabIndex={0}
                         aria-selected={selected.includes(item.id)}
+                        onDragStart={(event) => startMediaDrag(event, item)}
                         onMouseDown={(event) => {
                           const target = event.target as HTMLElement;
                           if (
@@ -4822,6 +4877,7 @@ export function App() {
                           <input
                             className="media-select"
                             type="checkbox"
+                            draggable={false}
                             checked={selected.includes(item.id)}
                             aria-label={`Select ${item.originalFilename}`}
                             onPointerDown={(event) => event.stopPropagation()}

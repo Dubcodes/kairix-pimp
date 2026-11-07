@@ -130,6 +130,19 @@ card, unbounded memory growth, stalled ingest, or FFmpeg/cache-clear errors as a
 failed acceptance item. This procedure remains outstanding until run against the
 installed PR #6 test build.
 
+## Native outbound-drag acceptance
+
+Use generated disposable MP4 files beneath a disposable configured Master Bin;
+record hashes before and after every case. Drag one card into an empty Explorer
+folder, then multiple explicitly selected cards and one real Library folder.
+Confirm the destination receives copies, the source paths and hashes remain
+unchanged, and cancelling over a prohibited target creates nothing. Repeat with
+spaces, Unicode and a supported long path, then verify unavailable or changed
+catalogue entries are rejected. Finally drag the generated MP4 into a disposable
+Premiere Pro 26.0.2 project and confirm Premiere recognizes the original media
+without modifying it. Record the Windows/Premiere versions and result. Rust and
+jsdom tests do not satisfy this installed cross-process acceptance gate.
+
 ## Signed automatic-update acceptance
 
 Do not mark automatic updates operational from unit tests or a successful signing

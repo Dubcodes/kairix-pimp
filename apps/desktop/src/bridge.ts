@@ -716,6 +716,10 @@ export const desktopBridge = {
   mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
   resolveMediaPath: (mediaId: string) =>
     invoke<string>('resolve_media_path', { mediaId }),
+  startNativeMediaDrag: (mediaIds: string[]) =>
+    invoke<boolean>('start_native_media_drag', { mediaIds }),
+  startNativeFolderDrag: (relativePath: string) =>
+    invoke<boolean>('start_native_folder_drag', { relativePath }),
   resolveMediaPlaybackSource: async (mediaId: string) =>
     convertFileSrc(await invoke<string>('resolve_media_path', { mediaId })),
   preparePlaybackProxy: async (mediaId: string) =>

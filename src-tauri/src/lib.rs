@@ -32,7 +32,53 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 #[cfg(target_os = "windows")]
+use windows::{
+    core::{implement, PCWSTR},
+    Win32::{
+        Foundation::{
+            DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK,
+        },
+        System::{
+            Com::IDataObject,
+            Ole::{
+                DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
+                DROPEFFECT, DROPEFFECT_COPY,
+            },
+            SystemServices::MK_LBUTTON,
+        },
+        UI::Shell::{Common::ITEMIDLIST, ILFree, SHCreateDataObject, SHParseDisplayName},
+    },
+};
+
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+const MAX_NATIVE_DRAG_ITEMS: usize = 500;
+
+#[cfg(target_os = "windows")]
+#[implement(IDropSource)]
+struct NativeDropSource;
+
+#[cfg(target_os = "windows")]
+impl IDropSource_Impl for NativeDropSource_Impl {
+    fn QueryContinueDrag(
+        &self,
+        escape_pressed: windows::core::BOOL,
+        key_state: windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS,
+    ) -> windows::core::HRESULT {
+        if escape_pressed.as_bool() {
+            DRAGDROP_S_CANCEL
+        } else if (key_state.0 & MK_LBUTTON.0) == 0 {
+            DRAGDROP_S_DROP
+        } else {
+            S_OK
+        }
+    }
+
+    fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
 
 fn should_suppress_child_console(is_windows: bool, debug_build: bool) -> bool {
     is_windows && !debug_build
@@ -7731,6 +7777,192 @@ fn resolve_catalogue_media_path(
     Ok(path)
 }
 
+fn resolve_native_drag_media_paths(
+    master_bin: &Path,
+    catalogue: &Catalogue,
+    media_ids: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    if media_ids.is_empty() {
+        return Err("Select at least one locally available recording to drag".into());
+    }
+    if media_ids.len() > MAX_NATIVE_DRAG_ITEMS {
+        return Err(format!(
+            "A native drag is limited to {MAX_NATIVE_DRAG_ITEMS} recordings"
+        ));
+    }
+    let master = master_bin
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    let mut seen = HashSet::new();
+    let mut paths = Vec::with_capacity(media_ids.len());
+    for media_id in media_ids {
+        if !seen.insert(media_id) {
+            continue;
+        }
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == *media_id)
+            .ok_or_else(|| format!("Unknown selected media item: {media_id}"))?;
+        fs_safe::validate_relative(&item.relative_path)?;
+        let path = fs_safe::resolve_existing(&master, &item.relative_path)?;
+        if !path.is_file() {
+            return Err(format!(
+                "{} is not a locally available recording",
+                item.original_filename
+            ));
+        }
+        let snapshot = fs_safe::snapshot(&path)?;
+        if item
+            .observed_size
+            .is_some_and(|observed| observed != snapshot.length)
+            || item.observed_modified_millis.is_some_and(|observed| {
+                snapshot.modified_millis.map(|value| value as u64) != Some(observed)
+            })
+        {
+            return Err(format!(
+                "{} changed since it was catalogued; rescan before dragging it",
+                item.original_filename
+            ));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn resolve_native_drag_folder(master_bin: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let master = master_bin
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    let folder = if relative_path.is_empty() {
+        master.clone()
+    } else {
+        fs_safe::validate_relative(relative_path)?;
+        fs_safe::resolve_existing(&master, relative_path)?
+    };
+    if !folder.is_dir() {
+        return Err("The selected Library folder is not available locally".into());
+    }
+    Ok(folder)
+}
+
+#[cfg(target_os = "windows")]
+struct OleInitialization;
+
+#[cfg(target_os = "windows")]
+impl OleInitialization {
+    fn initialize() -> Result<Self, String> {
+        unsafe { OleInitialize(None) }
+            .map_err(|error| format!("Windows OLE drag initialization failed: {error}"))?;
+        Ok(Self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for OleInitialization {
+    fn drop(&mut self) {
+        unsafe { OleUninitialize() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct ShellItemIds(Vec<*mut ITEMIDLIST>);
+
+#[cfg(target_os = "windows")]
+impl Drop for ShellItemIds {
+    fn drop(&mut self) {
+        for item in self.0.drain(..) {
+            unsafe { ILFree(Some(item)) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_native_file_drag(paths: &[PathBuf]) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let _ole = OleInitialization::initialize()?;
+    let mut item_ids = ShellItemIds(Vec::with_capacity(paths.len()));
+    for path in paths {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut item = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut item, 0, None) }.map_err(
+            |error| {
+                format!(
+                    "Windows Shell could not represent {} for dragging: {error}",
+                    path.display()
+                )
+            },
+        )?;
+        if item.is_null() {
+            return Err(format!(
+                "Windows Shell returned no drag identity for {}",
+                path.display()
+            ));
+        }
+        item_ids.0.push(item);
+    }
+    let absolute_items = item_ids
+        .0
+        .iter()
+        .map(|item| *item as *const ITEMIDLIST)
+        .collect::<Vec<_>>();
+    let data_object: IDataObject = unsafe { SHCreateDataObject(None, Some(&absolute_items), None) }
+        .map_err(|error| format!("Windows could not create the file drag payload: {error}"))?;
+    let drop_source: IDropSource = NativeDropSource.into();
+    let mut completed_effect = DROPEFFECT(0);
+    let result = unsafe {
+        DoDragDrop(
+            &data_object,
+            &drop_source,
+            DROPEFFECT_COPY,
+            &mut completed_effect,
+        )
+    };
+    if result == DRAGDROP_S_CANCEL {
+        return Ok(false);
+    }
+    if result != DRAGDROP_S_DROP {
+        return Err(format!("Windows file drag failed: {result:?}"));
+    }
+    Ok((completed_effect.0 & DROPEFFECT_COPY.0) != 0)
+}
+
+#[tauri::command]
+fn start_native_media_drag(app: AppHandle, media_ids: Vec<String>) -> Result<bool, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let paths = resolve_native_drag_media_paths(
+        Path::new(&settings.master_bin_path),
+        &catalogue,
+        &media_ids,
+    )?;
+    #[cfg(target_os = "windows")]
+    return run_native_file_drag(&paths);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = paths;
+        Err("Native file dragging is available only in the Windows build".into())
+    }
+}
+
+#[tauri::command]
+fn start_native_folder_drag(app: AppHandle, relative_path: String) -> Result<bool, String> {
+    let settings = load_settings_file(&app)?;
+    let path = resolve_native_drag_folder(Path::new(&settings.master_bin_path), &relative_path)?;
+    #[cfg(target_os = "windows")]
+    return run_native_file_drag(&[path]);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("Native folder dragging is available only in the Windows build".into())
+    }
+}
+
 fn compatible_windows_handoff_path(value: &str) -> String {
     let Some(without_prefix) = value.strip_prefix(r"\\?\") else {
         return value.to_string();
@@ -9818,6 +10050,8 @@ pub fn run() {
             open_support_link,
             open_logs_folder,
             resolve_media_path,
+            start_native_media_drag,
+            start_native_folder_drag,
             prepare_playback_proxy,
             release_playback_proxy,
             export_premiere_manifest,
@@ -11820,6 +12054,86 @@ mod tests {
         );
         fs::remove_file(&path).unwrap();
         assert!(resolve_catalogue_media_path(&settings, &media_id)
+            .unwrap_err()
+            .contains("not available locally"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_drag_resolution_is_bounded_canonical_and_identity_checked() {
+        let root = temporary("native-drag-paths");
+        let master = root.join("Master Bin");
+        let first = master.join("20261108").join("clip one.mp4");
+        let second = master.join("kōrero 音声").join("clip two.mp4");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, b"first synthetic clip").unwrap();
+        fs::write(&second, b"second synthetic clip").unwrap();
+        let first_item = new_media(
+            &first,
+            "20261108/clip one.mp4".into(),
+            None,
+            sha256(&first).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let second_item = new_media(
+            &second,
+            "kōrero 音声/clip two.mp4".into(),
+            None,
+            sha256(&second).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let ids = vec![first_item.id.clone(), second_item.id.clone()];
+        let catalogue = Catalogue {
+            media: vec![first_item, second_item],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_native_drag_media_paths(&master, &catalogue, &ids).unwrap(),
+            vec![
+                first.canonicalize().unwrap(),
+                second.canonicalize().unwrap()
+            ]
+        );
+        assert!(resolve_native_drag_media_paths(
+            &master,
+            &catalogue,
+            &vec![ids[0].clone(); MAX_NATIVE_DRAG_ITEMS + 1]
+        )
+        .unwrap_err()
+        .contains("limited"));
+        fs::write(&first, b"changed synthetic clip bytes").unwrap();
+        assert!(
+            resolve_native_drag_media_paths(&master, &catalogue, &ids[..1])
+                .unwrap_err()
+                .contains("changed since it was catalogued")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_folder_drag_resolves_only_existing_master_bin_directories() {
+        let root = temporary("native-folder-drag");
+        let master = root.join("master");
+        let nested = master.join("Card A").join("PRIVATE");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(master.join("not-a-folder.mp4"), b"clip").unwrap();
+        assert_eq!(
+            resolve_native_drag_folder(&master, "Card A/PRIVATE").unwrap(),
+            nested.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_native_drag_folder(&master, "").unwrap(),
+            master.canonicalize().unwrap()
+        );
+        assert!(resolve_native_drag_folder(&master, "../outside").is_err());
+        assert!(resolve_native_drag_folder(&master, "not-a-folder.mp4")
             .unwrap_err()
             .contains("not available locally"));
         fs::remove_dir_all(root).unwrap();

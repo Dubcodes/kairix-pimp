@@ -692,6 +692,13 @@ article.selected {
   border-color: var(--accent-strong);
   box-shadow: 0 0 0 1px var(--accent-strong);
 }
+.cards article[draggable='true'] {
+  cursor: grab;
+}
+.cards article[draggable='true']:active,
+.folder[draggable='true']:active {
+  cursor: grabbing;
+}
 .thumb {
   aspect-ratio: 16 / 9;
   position: relative;
