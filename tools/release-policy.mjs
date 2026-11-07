@@ -88,9 +88,16 @@ export function validateRepositoryVersions(root, expected, classification) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [command, expected, classification] = process.argv.slice(2);
+  if (command === 'compare') {
+    const comparison = compareVersions(expected, classification);
+    process.stdout.write(
+      comparison < 0 ? 'older\n' : comparison > 0 ? 'newer\n' : 'equal\n',
+    );
+    process.exit(0);
+  }
   if (command !== 'validate') {
     throw new Error(
-      'Usage: node tools/release-policy.mjs validate <version> <classification>',
+      'Usage: node tools/release-policy.mjs validate <version> <classification> or compare <candidate> <current>',
     );
   }
   validateRepositoryVersions(process.cwd(), expected, classification);

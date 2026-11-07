@@ -5,6 +5,7 @@ This file supplies release notes to the protected promotion workflows. Source ve
 ## Highlights
 
 - Approved user builds are promoted as permanent GitHub Releases with NSIS/MSI installers, SHA-256 evidence, source identity and an explicit Development or Stable classification.
+- Release and updater publication are serialized; immutable signed assets are verified on retry and channel manifests reject rollback or same-version replacement.
 - Settings can select Development or Stable signed update channels and can check after startup, every six hours, or manually. Update installation still fails closed without the protected public key and signature.
 - Static thumbnails use deterministic portable identities beneath the shared catalogue at `.pimp/thumbnails/v1`. Valid legacy local thumbnails migrate incrementally; hover previews and playback proxies remain local.
 - Static asset references survive card unmount and ordinary catalogue refresh so returning to earlier recordings does not deliberately restore placeholders or rerun FFmpeg.

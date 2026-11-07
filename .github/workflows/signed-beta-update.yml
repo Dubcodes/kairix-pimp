@@ -13,6 +13,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: signed-update-publication
+  cancel-in-progress: false
+
 jobs:
   publish-signed-update:
     if: github.event_name == 'workflow_dispatch' || github.event.release.draft == false
@@ -71,7 +75,8 @@ jobs:
           }
           cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_development_release_and_fails_closed_without_a_public_key
           if ($LASTEXITCODE -ne 0) { throw 'Updater public key is invalid.' }
-          $assets = gh release view $env:RELEASE_TAG --json isPrerelease,assets | ConvertFrom-Json
+          $assets = gh release view $env:RELEASE_TAG --json isPrerelease,publishedAt,assets | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($assets.publishedAt)) { throw 'The selected release has no immutable publication time.' }
           $classification = if ($assets.isPrerelease) { 'Development' } else { 'Stable' }
           $classificationArgument = $classification.ToLowerInvariant()
           node tools/release-policy.mjs validate $version $classificationArgument
@@ -97,7 +102,8 @@ jobs:
           "classification=$classification" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           $channelTarget = if ($classification -eq 'Stable') { 'stable-channel' } else { 'development-channel' }
           "channel_target=$channelTarget" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "release_date=$((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_date=$([DateTimeOffset]::Parse($assets.publishedAt).ToUniversalTime().ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "pub_date=$([DateTimeOffset]::Parse($assets.publishedAt).ToUniversalTime().ToString('o'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Build signed NSIS updater payload
         env:
@@ -108,6 +114,49 @@ jobs:
           PIMP_RELEASE_CLASSIFICATION: ${{ steps.identity.outputs.classification }}
           PIMP_RELEASE_DATE: ${{ steps.identity.outputs.release_date }}
         run: npm run tauri -- build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":"v1Compatible"}}'
+
+      - name: Resolve immutable versioned signed assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+        run: |
+          $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
+          if (-not $artifact -or $artifact.Length -eq 0) { throw 'Signed updater payload is missing or empty.' }
+          $signaturePath = "$($artifact.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw 'Updater signature is missing.' }
+          $checksumPath = 'src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+          "$hash  $($artifact.Name)" | Set-Content $checksumPath
+          $protectedNames = @($artifact.Name, "$($artifact.Name).sig", 'UPDATER-SHA256SUMS.txt')
+          $release = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
+          $existing = @($release.assets | Where-Object { $protectedNames -contains $_.name })
+          if ($existing.Count -ne 0 -and $existing.Count -ne $protectedNames.Count) {
+            throw 'The release contains an incomplete signed updater asset set; refusing an ambiguous retry.'
+          }
+          if ($existing.Count -eq 0) {
+            gh release upload $env:RELEASE_TAG $artifact.FullName $signaturePath $checksumPath
+            if ($LASTEXITCODE -ne 0) { throw 'Publishing versioned signed updater assets failed.' }
+          } else {
+            $resolved = New-Item -ItemType Directory -Force existing-signed-assets
+            foreach ($name in $protectedNames) {
+              gh release download $env:RELEASE_TAG --pattern $name --dir $resolved
+              if ($LASTEXITCODE -ne 0) { throw "Could not retrieve existing immutable asset $name." }
+            }
+            $existingArtifact = Join-Path $resolved $artifact.Name
+            $existingSignature = "$existingArtifact.sig"
+            $existingChecksum = Join-Path $resolved 'UPDATER-SHA256SUMS.txt'
+            $existingHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $existingArtifact).Hash.ToLowerInvariant()
+            $checksumText = Get-Content -LiteralPath $existingChecksum -Raw
+            if (-not $checksumText.Contains("$existingHash  $($artifact.Name)")) {
+              throw 'Existing updater checksum evidence does not match its immutable payload.'
+            }
+            cargo run --quiet --manifest-path src-tauri/Cargo.toml --example verify_update -- $existingArtifact $existingSignature $env:PIMP_UPDATER_PUBLIC_KEY '${{ steps.identity.outputs.version }}'
+            if ($LASTEXITCODE -ne 0) { throw 'Existing updater assets fail signature verification.' }
+            Copy-Item -LiteralPath $existingArtifact -Destination $artifact.FullName -Force
+            Copy-Item -LiteralPath $existingSignature -Destination $signaturePath -Force
+            Copy-Item -LiteralPath $existingChecksum -Destination $checksumPath -Force
+          }
 
       - name: Verify signature and construct manifest
         shell: pwsh
@@ -120,37 +169,23 @@ jobs:
           if (-not (Test-Path -LiteralPath $signaturePath)) { throw 'Updater signature is missing.' }
           cargo run --quiet --manifest-path src-tauri/Cargo.toml --example verify_update -- $artifact.FullName $signaturePath $env:PIMP_UPDATER_PUBLIC_KEY '${{ steps.identity.outputs.version }}'
           if ($LASTEXITCODE -ne 0) { throw 'Independent signature verification failed.' }
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
-          "$hash  $($artifact.Name)" | Set-Content src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt
           $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
           $url = "https://github.com/Dubcodes/kairix-pimp/releases/download/$env:RELEASE_TAG/$([Uri]::EscapeDataString($artifact.Name))"
+          $platforms = [ordered]@{
+            '${{ steps.identity.outputs.channel_target }}' = [ordered]@{ signature = $signature; url = $url }
+          }
+          if ('${{ steps.identity.outputs.classification }}' -eq 'Stable') {
+            $platforms['development-channel'] = [ordered]@{ signature = $signature; url = $url }
+          }
           $manifest = [ordered]@{
             version = '${{ steps.identity.outputs.version }}'
             notes = Get-Content docs/BETA_RELEASE_NOTES.md -Raw
-            pub_date = (Get-Date).ToUniversalTime().ToString('o')
-            platforms = [ordered]@{
-              '${{ steps.identity.outputs.channel_target }}' = [ordered]@{ signature = $signature; url = $url }
-            }
+            pub_date = '${{ steps.identity.outputs.pub_date }}'
+            platforms = $platforms
             classification = '${{ steps.identity.outputs.classification }}'
             size = $artifact.Length
           }
           $manifest | ConvertTo-Json -Depth 6 | Set-Content src-tauri/target/release/bundle/latest.json
-
-      - name: Publish versioned signed assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $artifact = Get-ChildItem src-tauri/target/release/bundle/nsis/*.nsis.zip -File | Select-Object -First 1
-          $existing = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
-          $protectedNames = @($artifact.Name, "$($artifact.Name).sig", 'UPDATER-SHA256SUMS.txt')
-          if (@($existing.assets | Where-Object { $protectedNames -contains $_.name }).Count -gt 0) {
-            throw 'Versioned signed updater assets already exist and will not be overwritten.'
-          }
-          gh release upload $env:RELEASE_TAG $artifact.FullName "$($artifact.FullName).sig" src-tauri/target/release/bundle/UPDATER-SHA256SUMS.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Publishing versioned signed updater assets failed.' }
-          $remote = gh release view $env:RELEASE_TAG --json assets --jq ".assets[] | select(.name == `"$($artifact.Name)`") | .size"
-          if (-not $remote -or [long]$remote -ne $artifact.Length) { throw 'Published updater payload size does not match.' }
 
       - name: Verify published signed payload before channel promotion
         shell: pwsh
@@ -177,17 +212,29 @@ jobs:
         run: |
           $manifest = 'src-tauri/target/release/bundle/latest.json'
           $channel = '${{ steps.identity.outputs.channel_target }}'
-          gh release view $channel *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $channel $manifest --clobber
-          } else {
-            gh release create $channel $manifest --prerelease --latest=false --title "Kairix PIMP approved $channel" --notes 'Machine-readable signed update channel.'
-          }
-          if ('${{ steps.identity.outputs.classification }}' -eq 'Stable') {
-            gh release view development-channel *> $null
+          function Publish-Channel([string]$target) {
+            $current = New-Item -ItemType Directory -Force "channel-$target"
+            gh release view $target *> $null
             if ($LASTEXITCODE -eq 0) {
-              gh release upload development-channel $manifest --clobber
+              gh release download $target --pattern latest.json --dir $current
+              if ($LASTEXITCODE -ne 0) { throw "Could not read the current $target manifest." }
+              $currentManifest = Get-Content (Join-Path $current 'latest.json') -Raw | ConvertFrom-Json
+              $comparison = node tools/release-policy.mjs compare '${{ steps.identity.outputs.version }}' $currentManifest.version
+              if ($LASTEXITCODE -ne 0) { throw "Could not compare the candidate with the current $target version." }
+              if ($comparison -eq 'older') { throw "Refusing to roll $target back from $($currentManifest.version)." }
+              if ($comparison -eq 'equal') {
+                $candidateHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifest).Hash
+                $currentHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $current 'latest.json')).Hash
+                if ($candidateHash -ne $currentHash) { throw "The existing $target manifest uses this version with different bytes." }
+                return
+              }
+              gh release upload $target $manifest --clobber
             } else {
-              gh release create development-channel $manifest --prerelease --latest=false --title 'Kairix PIMP approved development channel' --notes 'Machine-readable signed update channel.'
+              gh release create $target $manifest --prerelease --latest=false --title "Kairix PIMP approved $target" --notes 'Machine-readable signed update channel.'
             }
+            if ($LASTEXITCODE -ne 0) { throw "Could not publish the verified $target manifest." }
+          }
+          Publish-Channel $channel
+          if ('${{ steps.identity.outputs.classification }}' -eq 'Stable') {
+            Publish-Channel 'development-channel'
           }

@@ -23,6 +23,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: public-windows-release-publication
+  cancel-in-progress: false
+
 jobs:
   publish-approved-release:
     if: github.ref == 'refs/heads/main'
@@ -80,13 +84,18 @@ jobs:
           }
           $tag = "v$version"
           $remoteTag = git ls-remote --tags origin "refs/tags/$tag"
-          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) { throw "Tag $tag already exists." }
+          $tagExists = -not [string]::IsNullOrWhiteSpace($remoteTag)
+          if ($tagExists) {
+            $tagSha = ($remoteTag -split "`t")[0]
+            if ($tagSha -ne $head) { throw "Tag $tag already names a different source commit." }
+          }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "short_sha=$($head.Substring(0,12))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "classification=${{ inputs.classification }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "release_date=$((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Run complete verification
         run: |
@@ -154,16 +163,42 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ steps.identity.outputs.tag }}'
-          git tag $tag '${{ steps.identity.outputs.sha }}'
-          git push origin "refs/tags/$tag"
+          if ('${{ steps.identity.outputs.tag_exists }}' -ne 'true') {
+            git tag $tag '${{ steps.identity.outputs.sha }}'
+            git push origin "refs/tags/$tag"
+          }
           $assets = Get-ChildItem release-assets -File
           $classification = '${{ steps.identity.outputs.classification }}'
           $displayVersion = node -e "const v=process.argv[1].split('.'); console.log(v[2]==='0'?v.slice(0,2).join('.'):process.argv[1])" '${{ steps.identity.outputs.version }}'
           $title = "Kairix PIMP Light $displayVersion — $($classification.Substring(0,1).ToUpper())$($classification.Substring(1))"
-          gh release create $tag --verify-tag --draft --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title $title
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft public release.' }
-          gh release upload $tag $assets.FullName
-          if ($LASTEXITCODE -ne 0) { throw 'Could not upload every public beta asset; the release remains a draft.' }
+          $release = gh release view $tag --json isDraft 2>$null | ConvertFrom-Json
+          if ($LASTEXITCODE -eq 0) {
+            if (-not $release.isDraft) { throw 'The version is already publicly released and is immutable.' }
+            gh release edit $tag --notes-file docs/BETA_RELEASE_NOTES.md --title $title
+          } else {
+            gh release create $tag --verify-tag --draft --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title $title
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the draft public release.' }
+          $published = gh release view $tag --json assets | ConvertFrom-Json
+          foreach ($asset in $assets) {
+            $remote = @($published.assets | Where-Object { $_.name -eq $asset.Name })
+            if ($remote.Count -eq 0) {
+              gh release upload $tag $asset.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Could not upload $($asset.Name); the release remains a draft." }
+            } elseif ($remote.Count -ne 1 -or [long]$remote[0].size -ne $asset.Length) {
+              throw "Existing draft asset $($asset.Name) is not the reviewed file; refusing replacement."
+            }
+          }
+          $readback = New-Item -ItemType Directory -Force release-readback
+          gh release download $tag --dir $readback
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read back the draft release assets.' }
+          foreach ($asset in $assets) {
+            $remotePath = Join-Path $readback $asset.Name
+            if (-not (Test-Path -LiteralPath $remotePath)) { throw "Draft asset $($asset.Name) is missing." }
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash
+            $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $remotePath).Hash
+            if ($localHash -ne $remoteHash) { throw "Draft asset $($asset.Name) differs from the reviewed bytes." }
+          }
           $published = gh release view $tag --json assets | ConvertFrom-Json
           foreach ($asset in $assets) {
             $remote = @($published.assets | Where-Object { $_.name -eq $asset.Name -and [long]$_.size -eq $asset.Length })
