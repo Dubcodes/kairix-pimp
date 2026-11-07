@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex},
@@ -224,6 +224,8 @@ struct DeviceSettings {
     startup_page: String,
     #[serde(default = "default_true")]
     check_for_updates: bool,
+    #[serde(default = "default_update_channel")]
+    update_channel: String,
     #[serde(default = "default_theme")]
     theme: String,
     #[serde(default = "default_density")]
@@ -393,6 +395,9 @@ fn default_sd_grabber_extensions() -> Vec<String> {
 fn default_resource_profile() -> String {
     "balanced".into()
 }
+fn default_update_channel() -> String {
+    "development".into()
+}
 fn default_resource_idle_delay_minutes() -> u16 {
     10
 }
@@ -426,6 +431,7 @@ impl Default for DeviceSettings {
             close_to_tray: true,
             startup_page: default_startup_page(),
             check_for_updates: true,
+            update_channel: default_update_channel(),
             theme: default_theme(),
             density: default_density(),
             library_thumbnail_width: default_library_thumbnail_width(),
@@ -810,9 +816,11 @@ struct MediaToolsStatus {
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     version: String,
+    display_version: String,
     build_commit: String,
     edition: String,
-    release_channel: String,
+    release_classification: String,
+    release_date: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -821,6 +829,7 @@ struct UpdaterConfiguration {
     configured: bool,
     channel: String,
     endpoint: String,
+    target: String,
     reason: Option<String>,
 }
 
@@ -1935,6 +1944,9 @@ fn save_settings(
     }
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
+    }
+    if !matches!(settings.update_channel.as_str(), "development" | "stable") {
+        return Err("Choose the Development or Stable update channel".into());
     }
     if !matches!(
         settings.resource_profile.as_str(),
@@ -7076,7 +7088,7 @@ async fn enrich_media(app: AppHandle, explicit_request: Option<bool>) -> Result<
         *state.enrichment_status.lock().unwrap() = Some(BackgroundOperation {
             id: "media-enrichment".into(),
             kind: "media-enrichment".into(),
-            title: "Technical metadata and thumbnail generation".into(),
+            title: "Shared thumbnail migration and media enrichment".into(),
             state: "queued".into(),
             stage: "Waiting for background capacity".into(),
             current_item: None,
@@ -7110,7 +7122,7 @@ fn kick_enrichment_worker(app: AppHandle) {
     *state.enrichment_status.lock().unwrap() = Some(BackgroundOperation {
         id: "media-enrichment".into(),
         kind: "media-enrichment".into(),
-        title: "Technical metadata and thumbnail generation".into(),
+        title: "Shared thumbnail migration and media enrichment".into(),
         state: "queued".into(),
         stage: "Waiting for background capacity".into(),
         current_item: None,
@@ -7166,66 +7178,142 @@ fn thumbnail_generation_lock(state: &NativeState, media_id: &str) -> Arc<Mutex<(
         .clone()
 }
 
-fn enforce_thumbnail_cache_limit(
-    cache: &Path,
-    limit_bytes: u64,
-    protected: Option<&Path>,
-) -> Result<u64, String> {
-    if limit_bytes == 0 || !cache.is_dir() {
-        return Ok(0);
-    }
-    let mut entries = fs::read_dir(cache)
-        .map_err(|error| format!("Cannot inspect thumbnail cache: {error}"))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !entry.file_type().ok()?.is_file() {
-                return None;
-            }
-            let metadata = entry.metadata().ok()?;
-            (metadata.is_file()
-                && path
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("jpg")))
-            .then(|| (metadata.modified().ok(), path, metadata.len()))
-        })
-        .collect::<Vec<_>>();
-    let mut total = entries.iter().map(|entry| entry.2).sum::<u64>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let mut removed = 0;
-    for (_, path, size) in entries {
-        if total <= limit_bytes {
-            break;
-        }
-        if protected.is_some_and(|protected| path == protected) {
-            continue;
-        }
-        fs::remove_file(&path)
-            .map_err(|error| format!("Cannot evict thumbnail {}: {error}", path.display()))?;
-        total = total.saturating_sub(size);
-        removed += 1;
-    }
-    Ok(removed)
-}
-
 fn valid_cached_thumbnail(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() < 4 || metadata.len() > 10 * 1024 * 1024 {
+    if !metadata.file_type().is_file()
+        || metadata.len() < 4
+        || metadata.len() > 10 * 1024 * 1024
+    {
         return false;
     }
     let Ok(mut file) = File::open(path) else {
         return false;
     };
     let mut header = [0_u8; 3];
-    file.read_exact(&mut header).is_ok() && header == [0xFF, 0xD8, 0xFF]
+    let mut footer = [0_u8; 2];
+    file.read_exact(&mut header).is_ok()
+        && header == [0xFF, 0xD8, 0xFF]
+        && file.seek(SeekFrom::End(-2)).is_ok()
+        && file.read_exact(&mut footer).is_ok()
+        && footer == [0xFF, 0xD9]
 }
 
-fn thumbnail_reference_is_available(cache: &Path, item: &MediaItem) -> bool {
-    item.thumbnail_path.as_deref() == Some(&format!("{}.jpg", item.id))
-        && valid_cached_thumbnail(&cache.join(format!("{}.jpg", item.id)))
+fn static_thumbnail_reference(item: &MediaItem, seek_seconds: f64) -> String {
+    let mut identity = Sha256::new();
+    identity.update(b"kairix-static-thumbnail-v1\0");
+    identity.update(item.sha256.as_bytes());
+    identity.update(b"\0jpeg-q4-scale640\0");
+    identity.update(format!("{seek_seconds:.3}").as_bytes());
+    format!("{:x}.jpg", identity.finalize())
+}
+
+fn legacy_static_thumbnail_reference(item: &MediaItem) -> String {
+    let mut identity = Sha256::new();
+    identity.update(b"kairix-static-thumbnail-v1\0");
+    identity.update(item.sha256.as_bytes());
+    identity.update(b"\0legacy-selected-frame-unknown\0");
+    identity.update(item.id.as_bytes());
+    format!("{:x}.jpg", identity.finalize())
+}
+
+fn selected_static_thumbnail_reference(item: &MediaItem) -> String {
+    match item.thumbnail_path.as_deref() {
+        Some(reference) if reference == format!("{}.jpg", item.id) => {
+            legacy_static_thumbnail_reference(item)
+        }
+        Some(reference) if catalogue::safe_cache_reference(reference) => reference.to_string(),
+        _ => static_thumbnail_reference(item, 0.1),
+    }
+}
+
+fn shared_thumbnail_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
+    let catalogue = catalogue_dir(settings)?
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve shared catalogue: {error}"))?;
+    let root = catalogue.join("thumbnails").join("v1");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Cannot create shared thumbnail store: {error}"))?;
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("Cannot inspect shared thumbnail store: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("Shared thumbnail store is not a real directory".into());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve shared thumbnail store: {error}"))?;
+    if !root.starts_with(&catalogue) {
+        return Err("Shared thumbnail store resolves outside the catalogue".into());
+    }
+    Ok(root)
+}
+
+fn validated_legacy_static_thumbnail(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+) -> Option<PathBuf> {
+    if settings.thumbnail_cache_path.trim().is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(&settings.thumbnail_cache_path)
+        .canonicalize()
+        .ok()?;
+    let candidate = root.join(format!("{}.jpg", item.id));
+    let candidate = candidate.canonicalize().ok()?;
+    (candidate.starts_with(&root) && valid_cached_thumbnail(&candidate)).then_some(candidate)
+}
+
+fn migrate_legacy_static_thumbnail(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+    destination: &Path,
+) -> Result<bool, String> {
+    if valid_cached_thumbnail(destination) {
+        return Ok(true);
+    }
+    if destination.exists() {
+        return Err("Shared thumbnail identity is occupied by invalid or incompatible bytes".into());
+    }
+    let Some(legacy) = validated_legacy_static_thumbnail(settings, item) else {
+        return Ok(false);
+    };
+    let parent = destination.parent().ok_or("Invalid shared thumbnail path")?;
+    let temporary = parent.join(format!(".migrate-{}-{}.jpg", settings.device_id, Uuid::new_v4()));
+    fs::copy(&legacy, &temporary)
+        .map_err(|error| format!("Cannot stage legacy thumbnail migration: {error}"))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Cannot flush migrated thumbnail: {error}"))?;
+    if !valid_cached_thumbnail(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err("Legacy thumbnail failed JPEG validation during migration".into());
+    }
+    match fs::rename(&temporary, destination) {
+        Ok(()) => Ok(true),
+        Err(_) if valid_cached_thumbnail(destination) => {
+            let _ = fs::remove_file(&temporary);
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(format!("Cannot publish migrated shared thumbnail: {error}"))
+        }
+    }
+}
+
+fn thumbnail_reference_is_available(
+    settings: &DeviceSettings,
+    shared: &Path,
+    item: &MediaItem,
+) -> bool {
+    let reference = selected_static_thumbnail_reference(item);
+    let destination = shared.join(reference);
+    valid_cached_thumbnail(&destination)
+        || migrate_legacy_static_thumbnail(settings, item, &destination).unwrap_or(false)
 }
 
 fn enrichment_video_type(file_type: &str) -> bool {
@@ -7260,7 +7348,7 @@ fn generate_thumbnail_atomic(
     source: &Path,
     destination: &Path,
     seek_seconds: f64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     validate_thumbnail_frame(seek_seconds, None)?;
     let parent = destination
         .parent()
@@ -7302,14 +7390,22 @@ fn generate_thumbnail_atomic(
     if destination.exists() {
         if valid_cached_thumbnail(destination) {
             let _ = fs::remove_file(&temporary);
-            return Ok(());
+            return Ok(false);
         }
-        fs::remove_file(destination)
-            .map_err(|error| format!("Cannot replace invalid cached thumbnail: {error}"))?;
+        let _ = fs::remove_file(&temporary);
+        return Err("Thumbnail identity is occupied by invalid or incompatible bytes".into());
     }
-    fs::rename(&temporary, destination)
-        .map_err(|error| format!("Cannot commit generated thumbnail: {error}"))?;
-    Ok(())
+    match fs::rename(&temporary, destination) {
+        Ok(()) => Ok(true),
+        Err(_) if valid_cached_thumbnail(destination) => {
+            let _ = fs::remove_file(&temporary);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(format!("Cannot commit generated thumbnail: {error}"))
+        }
+    }
 }
 
 fn run_enrichment(
@@ -7321,8 +7417,7 @@ fn run_enrichment(
     configure_volume_governor(state, &settings);
     let _enrichment_guard = state.enrichment_write.lock().unwrap();
     let master = PathBuf::from(&settings.master_bin_path);
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let shared = shared_thumbnail_root(&settings)?;
     let catalogue = load_catalogue_file(&settings)?;
     let total = catalogue
         .media
@@ -7330,7 +7425,7 @@ fn run_enrichment(
         .filter(|item| {
             enrichment_video_type(&item.file_type)
                 && (item.technical.codec.is_none()
-                    || !thumbnail_reference_is_available(&cache, item))
+                    || !thumbnail_reference_is_available(&settings, &shared, item))
         })
         .count();
     let existing = catalogue
@@ -7339,7 +7434,7 @@ fn run_enrichment(
         .filter(|item| {
             enrichment_video_type(&item.file_type)
                 && item.technical.codec.is_some()
-                && thumbnail_reference_is_available(&cache, item)
+                && thumbnail_reference_is_available(&settings, &shared, item)
         })
         .count();
     if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
@@ -7359,7 +7454,8 @@ fn run_enrichment(
     let mut processed = 0_usize;
     for item in &catalogue.media {
         let potentially_eligible = enrichment_video_type(&item.file_type)
-            && (item.technical.codec.is_none() || !thumbnail_reference_is_available(&cache, item));
+            && (item.technical.codec.is_none()
+                || !thumbnail_reference_is_available(&settings, &shared, item));
         if !potentially_eligible {
             continue;
         }
@@ -7367,7 +7463,7 @@ fn run_enrichment(
         let _generation_guard = generation_lock.lock().unwrap();
         if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
             status.stage = format!(
-                "Generating thumbnails and metadata ({}/{total})",
+                "Migrating or generating shared thumbnails and metadata ({}/{total})",
                 processed + 1
             );
             status.current_item = Some(item.original_filename.clone());
@@ -7404,7 +7500,7 @@ fn run_enrichment(
                 continue;
             }
         };
-        let cache_volume = match volume_resource_id(&cache) {
+        let cache_volume = match volume_resource_id(&shared) {
             Ok(value) => value,
             Err(_) => {
                 processed += 1;
@@ -7439,16 +7535,16 @@ fn run_enrichment(
         };
         if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
             status.stage = format!(
-                "Generating thumbnails and metadata ({}/{total})",
+                "Migrating or generating shared thumbnails and metadata ({}/{total})",
                 processed + 1
             );
             status.updated_at = Utc::now().to_rfc3339();
         }
-        let thumbnail_ref = format!("{}.jpg", item.id);
+        let thumbnail_ref = selected_static_thumbnail_reference(item);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
             continue;
         }
-        let thumbnail = cache.join(&thumbnail_ref);
+        let thumbnail = shared.join(&thumbnail_ref);
         let needs_probe = item.technical.codec.is_none();
         let needs_thumbnail = !valid_cached_thumbnail(&thumbnail);
         if !needs_thumbnail {
@@ -7505,20 +7601,24 @@ fn run_enrichment(
             }
         }
         let mut thumbnail_failed = false;
+        let mut published_thumbnail = false;
         if needs_thumbnail {
             if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
                 status.counts.attempted_files += 1;
             }
             let _static_lane = state.static_thumbnail_generation.lock().unwrap();
             let _admission = state.derivative_admission.acquire(3);
-            if let Err(error) = generate_thumbnail_atomic(&source, &thumbnail, 0.1) {
-                thumbnail_failed = true;
-                diagnostic_log(
-                    app,
-                    "ERROR",
-                    "thumbnail-generation",
-                    &format!("{}: {error}", item.relative_path),
-                );
+            match generate_thumbnail_atomic(&source, &thumbnail, 0.1) {
+                Ok(published) => published_thumbnail = published,
+                Err(error) => {
+                    thumbnail_failed = true;
+                    diagnostic_log(
+                        app,
+                        "ERROR",
+                        "thumbnail-generation",
+                        &format!("{}: {error}", item.relative_path),
+                    );
+                }
             }
         }
         volume_permit.add_bytes_for(&source_volume, source_before.length, 0);
@@ -7526,7 +7626,7 @@ fn run_enrichment(
             volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
-            if needs_thumbnail {
+            if published_thumbnail {
                 let _ = fs::remove_file(&thumbnail);
             }
             processed += 1;
@@ -7596,7 +7696,6 @@ fn run_enrichment(
     if changed > 0 {
         let _ = app.emit("catalogue-changed", ());
     }
-    enforce_thumbnail_cache_limit(&cache, settings.thumbnail_cache_limit_bytes, None)?;
     if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
         status.state = "completed".into();
         status.stage = "Thumbnail and metadata pass complete".into();
@@ -8652,19 +8751,49 @@ fn open_logs_folder(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn app_info(app: AppHandle) -> AppInfo {
+    let version = app.package_info().version.to_string();
+    let display_version = version
+        .strip_suffix(".0")
+        .filter(|value| value.matches('.').count() == 1)
+        .unwrap_or(&version)
+        .to_string();
+    let release_classification = if option_env!("PIMP_RELEASE_CLASSIFICATION")
+        .is_some_and(|value| value.eq_ignore_ascii_case("stable"))
+    {
+        "Stable"
+    } else {
+        "Development"
+    };
     AppInfo {
-        version: app.package_info().version.to_string(),
+        version,
+        display_version,
         build_commit: option_env!("PIMP_BUILD_COMMIT")
             .unwrap_or("development")
             .to_string(),
         edition: "Kairix PIMP Light".into(),
-        release_channel: "Beta".into(),
+        release_classification: release_classification.into(),
+        release_date: option_env!("PIMP_RELEASE_DATE")
+            .unwrap_or("Unpublished development build")
+            .into(),
     }
 }
 
-fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfiguration {
+fn updater_configuration_for_key(
+    public_key: Option<&str>,
+    requested_channel: &str,
+) -> UpdaterConfiguration {
     const ENDPOINT: &str =
-        "https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json";
+        "https://github.com/Dubcodes/kairix-pimp/releases/download/{{target}}/latest.json";
+    let channel = if requested_channel == "stable" {
+        "Stable"
+    } else {
+        "Development"
+    };
+    let target = if requested_channel == "stable" {
+        "stable-channel"
+    } else {
+        "development-channel"
+    };
     let key = public_key.map(str::trim).filter(|key| !key.is_empty());
     let configured = key.is_some_and(|key| {
         BASE64
@@ -8675,8 +8804,9 @@ fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfigurati
     });
     UpdaterConfiguration {
         configured,
-        channel: "Beta".into(),
+        channel: channel.into(),
         endpoint: ENDPOINT.into(),
+        target: target.into(),
         reason: (!configured).then(|| match key {
             Some(_) => "The embedded updater public key is invalid. Use the reviewed NSIS installer from GitHub Releases.".into(),
             None => "Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.".into(),
@@ -8685,8 +8815,11 @@ fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfigurati
 }
 
 #[tauri::command]
-fn updater_configuration() -> UpdaterConfiguration {
-    updater_configuration_for_key(option_env!("PIMP_UPDATER_PUBLIC_KEY"))
+fn updater_configuration(app: AppHandle) -> UpdaterConfiguration {
+    let channel = load_settings_file(&app)
+        .map(|settings| settings.update_channel)
+        .unwrap_or_else(|_| default_update_channel());
+    updater_configuration_for_key(option_env!("PIMP_UPDATER_PUBLIC_KEY"), &channel)
 }
 
 #[tauri::command]
@@ -8726,18 +8859,14 @@ fn set_media_thumbnail_frame(
     validate_thumbnail_frame(seconds, item.technical.duration_seconds)?;
     let source = resolve_catalogue_media_path(&settings, &media_id)?;
     let before = fs_safe::snapshot(&source)?;
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    let cache = cache
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
-    let thumbnail_ref = format!("{}.jpg", item.id);
-    let destination = cache.join(&thumbnail_ref);
+    let shared = shared_thumbnail_root(&settings)?;
+    let thumbnail_ref = static_thumbnail_reference(&item, seconds);
+    let destination = shared.join(&thumbnail_ref);
     let generation_lock = thumbnail_generation_lock(&state, &media_id);
     let _generation_guard = generation_lock.lock().unwrap();
     configure_volume_governor(&state, &settings);
     let source_volume = volume_resource_id(&source)?;
-    let cache_volume = volume_resource_id(&cache)?;
+    let cache_volume = volume_resource_id(&shared)?;
     let mut volume_permit = state.volume_governor.acquire(
         resource_governor::Request::new(
             format!("Custom thumbnail: {}", item.original_filename),
@@ -8750,17 +8879,19 @@ fn set_media_thumbnail_frame(
         ),
         || false,
     )?;
-    {
+    let published_thumbnail = {
         let _static_lane = state.static_thumbnail_generation.lock().unwrap();
         let _admission = state.derivative_admission.acquire(0);
-        generate_thumbnail_atomic(&source, &destination, seconds)?;
-    }
+        generate_thumbnail_atomic(&source, &destination, seconds)?
+    };
     volume_permit.add_bytes_for(&source_volume, before.length, 0);
     if let Ok(metadata) = destination.metadata() {
         volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
     }
     if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
-        let _ = fs::remove_file(&destination);
+        if published_thumbnail {
+            let _ = fs::remove_file(&destination);
+        }
         return Err(
             "Source changed while selecting the thumbnail frame; retry after writes finish".into(),
         );
@@ -8776,15 +8907,8 @@ fn set_media_thumbnail_frame(
             }],
         )?;
     }
-    enforce_thumbnail_cache_limit(
-        &cache,
-        settings.thumbnail_cache_limit_bytes,
-        Some(&destination),
-    )?;
-    let bytes = fs::read(&destination)
-        .map_err(|error| format!("Cannot load selected thumbnail: {error}"))?;
     let _ = app.emit("catalogue-changed", ());
-    Ok(format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)))
+    Ok(destination.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -8796,26 +8920,23 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
         .iter()
         .find(|item| item.id == media_id)
         .ok_or("Unknown media item")?;
-    let Some(reference) = &item.thumbnail_path else {
-        return Ok(None);
-    };
-    if !catalogue::safe_cache_reference(reference) || reference != &format!("{}.jpg", item.id) {
+    let reference = selected_static_thumbnail_reference(item);
+    if !catalogue::safe_cache_reference(&reference) {
         return Err("Catalogue contains an unsafe thumbnail reference".into());
     }
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    let cache = cache
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
-    let path = cache.join(reference);
+    let shared = shared_thumbnail_root(&settings)?;
+    let path = shared.join(&reference);
+    if !path.exists() && !migrate_legacy_static_thumbnail(&settings, item, &path)? {
+        return Ok(None);
+    }
     if !path.is_file() {
         return Ok(None);
     }
     let path = path
         .canonicalize()
         .map_err(|error| format!("Cannot resolve thumbnail: {error}"))?;
-    if !path.starts_with(&cache) {
-        return Err("Thumbnail resolved outside the configured cache".into());
+    if !path.starts_with(&shared) {
+        return Err("Thumbnail resolved outside the shared thumbnail store".into());
     }
     let metadata = path.metadata().map_err(|e| e.to_string())?;
     if metadata.len() > 10 * 1024 * 1024 {
@@ -8842,29 +8963,28 @@ fn load_thumbnail_sources(
     let requested = media_ids.into_iter().collect::<HashSet<_>>();
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    let cache = cache
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
+    let shared = shared_thumbnail_root(&settings)?;
     let mut sources = HashMap::new();
     for item in catalogue
         .media
         .iter()
         .filter(|item| requested.contains(&item.id))
     {
-        let Some(reference) = &item.thumbnail_path else {
-            continue;
-        };
-        if !catalogue::safe_cache_reference(reference) || reference != &format!("{}.jpg", item.id) {
+        let reference = selected_static_thumbnail_reference(item);
+        if !catalogue::safe_cache_reference(&reference) {
             continue;
         }
-        let path = cache.join(reference);
-        let Ok(path) = path.canonicalize() else {
-            continue;
-        };
-        if path.starts_with(&cache) && valid_cached_thumbnail(&path) {
-            sources.insert(item.id.clone(), path.to_string_lossy().into_owned());
+        let path = shared.join(&reference);
+        if let Ok(path) = path.canonicalize() {
+            if path.starts_with(&shared) && valid_cached_thumbnail(&path) {
+                sources.insert(item.id.clone(), path.to_string_lossy().into_owned());
+                continue;
+            }
+        }
+        // Keep the old image visible while the background enrichment worker
+        // incrementally publishes its validated shared equivalent.
+        if let Some(legacy) = validated_legacy_static_thumbnail(&settings, item) {
+            sources.insert(item.id.clone(), legacy.to_string_lossy().into_owned());
         }
     }
     Ok(sources)
@@ -8892,9 +9012,8 @@ async fn prepare_media_thumbnail(
         if !enrichment_video_type(&item.file_type) {
             return Ok(None);
         }
-        let cache = PathBuf::from(&settings.thumbnail_cache_path);
-        fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-        let thumbnail_ref = format!("{}.jpg", item.id);
+        let cache = shared_thumbnail_root(&settings)?;
+        let thumbnail_ref = selected_static_thumbnail_reference(&item);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
             return Err("Media identity is not safe for the thumbnail cache".into());
         }
@@ -8927,18 +9046,20 @@ async fn prepare_media_thumbnail(
                 ),
                 || false,
             )?;
-            {
+            let published_thumbnail = {
                 let _static_lane = state.static_thumbnail_generation.lock().unwrap();
                 let _admission = state.derivative_admission.acquire(1);
                 operation.set_stage("Extracting representative frame");
-                generate_thumbnail_atomic(&source, &thumbnail, 0.1)?;
-            }
+                generate_thumbnail_atomic(&source, &thumbnail, 0.1)?
+            };
             volume_permit.add_bytes_for(&source_volume, before.length, 0);
             if let Ok(metadata) = thumbnail.metadata() {
                 volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
             }
             if fs_safe::snapshot(&source)? != before {
-                let _ = fs::remove_file(&thumbnail);
+                if published_thumbnail {
+                    let _ = fs::remove_file(&thumbnail);
+                }
                 return Err("Media changed while its thumbnail was being generated".into());
             }
         }
@@ -8965,11 +9086,6 @@ async fn prepare_media_thumbnail(
             )?;
             let _ = app.emit("catalogue-changed", ());
         }
-        enforce_thumbnail_cache_limit(
-            &cache,
-            settings.thumbnail_cache_limit_bytes,
-            Some(&thumbnail),
-        )?;
         if !valid_cached_thumbnail(&thumbnail) {
             return Ok(None);
         }
@@ -10881,29 +10997,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_thumbnail_cache_evicts_oldest_files_only() {
-        let root = temporary("thumbnail-limit");
-        let cache = root.join("cache");
-        fs::create_dir_all(cache.join("hover-previews/keep")).unwrap();
-        fs::write(cache.join("a.jpg"), vec![1_u8; 8]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(cache.join("b.jpg"), vec![2_u8; 8]).unwrap();
-        fs::write(cache.join("hover-previews/keep/frame.jpg"), b"preview").unwrap();
-        assert_eq!(enforce_thumbnail_cache_limit(&cache, 8, None).unwrap(), 1);
-        assert!(!cache.join("a.jpg").exists());
-        assert!(cache.join("b.jpg").is_file());
-        assert!(cache.join("hover-previews/keep/frame.jpg").is_file());
-        fs::write(cache.join("older.jpg"), vec![3_u8; 8]).unwrap();
-        let protected = cache.join("visible.jpg");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(&protected, vec![4_u8; 8]).unwrap();
-        enforce_thumbnail_cache_limit(&cache, 8, Some(&protected)).unwrap();
-        assert!(protected.is_file());
-        assert!(!cache.join("older.jpg").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn thumbnail_generation_locks_are_per_media_identity() {
         let state = NativeState::default();
         let first = thumbnail_generation_lock(&state, "media-a");
@@ -10919,24 +11012,52 @@ mod tests {
     fn missing_empty_and_invalid_thumbnail_cache_entries_require_regeneration() {
         let (root, _, _, mut catalogue) = completion_fixture("thumbnail-validity");
         let cache = root.join("cache");
+        let master = root.join("master");
         fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(master.join(".pimp")).unwrap();
+        let settings = DeviceSettings {
+            master_bin_path: master.to_string_lossy().into_owned(),
+            thumbnail_cache_path: cache.to_string_lossy().into_owned(),
+            ..DeviceSettings::default()
+        };
         let mut item = catalogue.media.remove(0);
         item.id = "media-a".into();
         item.thumbnail_path = Some("media-a.jpg".into());
-        let thumbnail = cache.join("media-a.jpg");
-        assert!(!thumbnail_reference_is_available(&cache, &item));
-        fs::write(&thumbnail, []).unwrap();
-        assert!(!thumbnail_reference_is_available(&cache, &item));
-        fs::write(&thumbnail, b"not-a-jpeg").unwrap();
-        assert!(!thumbnail_reference_is_available(&cache, &item));
-        fs::write(&thumbnail, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
-        assert!(thumbnail_reference_is_available(&cache, &item));
-        fs::remove_file(&thumbnail).unwrap();
-        assert!(!thumbnail_reference_is_available(&cache, &item));
-        item.thumbnail_path = Some("different.jpg".into());
-        fs::write(&thumbnail, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
-        assert!(!thumbnail_reference_is_available(&cache, &item));
+        let shared = shared_thumbnail_root(&settings).unwrap();
+        let reference = selected_static_thumbnail_reference(&item);
+        let thumbnail = shared.join(&reference);
+        assert!(!thumbnail_reference_is_available(&settings, &shared, &item));
+        let legacy = cache.join("media-a.jpg");
+        fs::write(&legacy, b"not-a-jpeg").unwrap();
+        assert!(!thumbnail_reference_is_available(&settings, &shared, &item));
+        fs::write(&legacy, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert!(thumbnail_reference_is_available(&settings, &shared, &item));
+        assert!(valid_cached_thumbnail(&thumbnail));
+        fs::write(&thumbnail, b"corrupt").unwrap();
+        assert!(!thumbnail_reference_is_available(&settings, &shared, &item));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_thumbnail_identity_is_content_and_transform_deterministic() {
+        let (_, _, _, mut catalogue) = completion_fixture("thumbnail-identity");
+        let mut first = catalogue.media.remove(0);
+        let mut same_content = first.clone();
+        same_content.id = "another-device-id".into();
+        same_content.relative_path = "another/root/clip.mp4".into();
+        assert_eq!(
+            static_thumbnail_reference(&first, 0.1),
+            static_thumbnail_reference(&same_content, 0.1)
+        );
+        assert_ne!(
+            static_thumbnail_reference(&first, 0.1),
+            static_thumbnail_reference(&first, 5.0)
+        );
+        first.thumbnail_path = Some(format!("{}.jpg", first.id));
+        assert_ne!(
+            selected_static_thumbnail_reference(&first),
+            static_thumbnail_reference(&first, 0.1)
+        );
     }
 
     #[test]
@@ -11342,6 +11463,7 @@ mod tests {
         assert!(settings.increase_processing_while_idle);
         assert_eq!(settings.resource_idle_delay_minutes, 10);
         assert!(!settings.background_processing_paused);
+        assert_eq!(settings.update_channel, "development");
     }
 
     #[test]
@@ -11354,6 +11476,7 @@ mod tests {
             "increaseProcessingWhileIdle",
             "resourceIdleDelayMinutes",
             "backgroundProcessingPaused",
+            "updateChannel",
         ] {
             object.remove(key);
         }
@@ -11363,6 +11486,7 @@ mod tests {
         assert!(settings.increase_processing_while_idle);
         assert_eq!(settings.resource_idle_delay_minutes, 10);
         assert!(!settings.background_processing_paused);
+        assert_eq!(settings.update_channel, "development");
     }
 
     #[test]
@@ -11387,10 +11511,14 @@ mod tests {
     }
 
     #[test]
-    fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-6");
-        let configuration = updater_configuration();
-        assert_eq!(configuration.channel, "Beta");
+    fn updater_is_a_higher_development_release_and_fails_closed_without_a_public_key() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        let configuration = updater_configuration_for_key(
+            option_env!("PIMP_UPDATER_PUBLIC_KEY"),
+            "development",
+        );
+        assert_eq!(configuration.channel, "Development");
+        assert_eq!(configuration.target, "development-channel");
         assert!(configuration.endpoint.starts_with("https://"));
         if option_env!("PIMP_UPDATER_PUBLIC_KEY").is_none() {
             assert!(!configuration.configured);
@@ -11401,11 +11529,14 @@ mod tests {
                 "release builds must reject an invalid embedded updater public key"
             );
         }
-        assert!(!updater_configuration_for_key(Some("not-a-minisign-key")).configured);
+        assert!(!updater_configuration_for_key(Some("not-a-minisign-key"), "stable").configured);
         let encoded_public_key = BASE64.encode(
             "untrusted comment: minisign public key\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n",
         );
-        assert!(updater_configuration_for_key(Some(&encoded_public_key)).configured);
+        let stable = updater_configuration_for_key(Some(&encoded_public_key), "stable");
+        assert!(stable.configured);
+        assert_eq!(stable.channel, "Stable");
+        assert_eq!(stable.target, "stable-channel");
     }
 
     #[test]

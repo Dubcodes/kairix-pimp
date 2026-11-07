@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
     closeToTray: true,
     startupPage: 'Library' as const,
     checkForUpdates: true,
+    updateChannel: 'development' as const,
     theme: 'graphite' as const,
     density: 'comfortable' as const,
     libraryThumbnailWidth: 240,
@@ -68,6 +69,7 @@ const mocks = vi.hoisted(() => ({
   rescan: vi.fn(),
   discoveryListener: undefined as
     ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
+  catalogueListener: undefined as (() => void) | undefined,
   resolveMediaPath: vi.fn(),
   resolveMediaPlaybackSource: vi.fn(),
   preparePlaybackProxy: vi.fn(),
@@ -143,7 +145,10 @@ vi.mock('./bridge', () => ({
       mocks.discoveryListener = handler;
       return () => undefined;
     }),
-    onCatalogueChanged: vi.fn(async () => () => undefined),
+    onCatalogueChanged: vi.fn(async (handler) => {
+      mocks.catalogueListener = handler;
+      return () => undefined;
+    }),
     getDiscoveryStatus: vi.fn(async () => ({
       running: false,
       full: false,
@@ -157,9 +162,11 @@ vi.mock('./bridge', () => ({
     logUiError: vi.fn(),
     appInfo: vi.fn(async () => ({
       version: '0.1.1-1',
+      displayVersion: '0.1.1-1',
       buildCommit: 'test-commit',
       edition: 'Kairix PIMP Light',
-      releaseChannel: 'Beta',
+      releaseClassification: 'Development',
+      releaseDate: '2026-11-07',
     })),
     openSupportLink: mocks.openSupportLink,
     openLogsFolder: vi.fn(),
@@ -314,6 +321,7 @@ describe('native application integration', () => {
       closeToTray: true,
       startupPage: 'Library',
       checkForUpdates: true,
+      updateChannel: 'development',
       theme: 'graphite',
       density: 'comfortable',
       libraryThumbnailWidth: 240,
@@ -361,6 +369,7 @@ describe('native application integration', () => {
     );
     mocks.updateIngestFileMetadata.mockReset();
     mocks.jobListener = undefined;
+    mocks.catalogueListener = undefined;
     mocks.refreshMediaAvailability.mockReset();
     mocks.refreshMediaAvailability.mockResolvedValue(false);
     mocks.rescan.mockReset();
@@ -396,9 +405,10 @@ describe('native application integration', () => {
     mocks.updaterConfiguration.mockReset();
     mocks.updaterConfiguration.mockResolvedValue({
       configured: false,
-      channel: 'Beta',
+      channel: 'Development',
       endpoint:
-        'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/{{target}}/latest.json',
+      target: 'development-channel',
       reason:
         'Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.',
     });
@@ -601,7 +611,7 @@ describe('native application integration', () => {
       12.5,
     );
     expect(
-      await screen.findByText(/frame choice is device-local/i),
+      await screen.findByText(/saved to the shared catalogue/i),
     ).toBeVisible();
 
     await user.click(screen.getByRole('button', { name: 'Next' }));
@@ -1362,6 +1372,76 @@ describe('native application integration', () => {
     15_000,
   );
 
+  it('retains a valid static thumbnail when a catalogue refresh has no replacement source', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'persistent-thumbnail',
+          relativePath: '20261107/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'persistent-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-07',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100 },
+          thumbnailPath: 'persistent.jpg',
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-07T00:00:00Z',
+    };
+    let suppliedSource = false;
+    mocks.loadThumbnailSources.mockImplementation(async (mediaIds) => {
+      if (!suppliedSource && mediaIds.includes('persistent-thumbnail')) {
+        suppliedSource = true;
+        return {
+          'persistent-thumbnail': 'asset://localhost/persistent.jpg',
+        };
+      }
+      return {};
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        document.querySelector('img[src="asset://localhost/persistent.jpg"]'),
+      ).not.toBeNull(),
+    );
+    mocks.catalogue = {
+      ...mocks.catalogue,
+      media: [...mocks.catalogue.media],
+      updatedAt: '2026-11-07T00:01:00Z',
+    };
+    mocks.catalogueSignature.mockResolvedValue('refreshed-signature');
+    await act(async () => mocks.catalogueListener?.());
+    await waitFor(() =>
+      expect(
+        mocks.loadThumbnailSources.mock.calls.filter(([ids]) =>
+          ids.includes('persistent-thumbnail'),
+        ),
+      ).toHaveLength(2),
+    );
+    expect(
+      document.querySelector('img[src="asset://localhost/persistent.jpg"]'),
+    ).not.toBeNull();
+  });
+
+  it('gives Library and ordinary pages distinct scroll ownership', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    expect(
+      (await screen.findByRole('heading', { name: 'Library' })).closest('main'),
+    ).toHaveClass('library-main');
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(
+      screen.getByRole('heading', { name: 'Settings' }).closest('main'),
+    ).toHaveClass('page-main');
+  });
+
   it('persists sidebar collapse and accessible logical folder ordering', async () => {
     mocks.catalogue = {
       media: [
@@ -2067,7 +2147,7 @@ describe('native application integration', () => {
       'Ingest',
     );
     await user.click(
-      screen.getByRole('switch', { name: /Check for beta updates/ }),
+      screen.getByRole('switch', { name: /Check for updates automatically/ }),
     );
     await user.click(screen.getByRole('button', { name: 'Appearance' }));
     await user.click(screen.getByRole('radio', { name: /Midnight/ }));
@@ -2176,7 +2256,7 @@ describe('native application integration', () => {
   it('reports checking, available and up-to-date states for a configured signer', async () => {
     mocks.updaterConfiguration.mockResolvedValue({
       configured: true,
-      channel: 'Beta',
+      channel: 'Development',
       endpoint: 'https://example.invalid/latest.json',
     });
     mocks.settings = { ...mocks.settings, checkForUpdates: false };
@@ -2188,20 +2268,23 @@ describe('native application integration', () => {
     mocks.checkApprovedBetaUpdate.mockReturnValueOnce(pending.promise);
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      screen.getByText('Checking for a signed Beta update…'),
+      screen.getByText('Checking the signed Development channel…'),
     ).toBeVisible();
     await act(async () => pending.resolve(null));
     expect(
-      await screen.findByText(/No newer signed Beta was available/),
+      await screen.findByText(
+        /No newer signed Development release was available/,
+      ),
     ).toBeVisible();
 
     mocks.checkApprovedBetaUpdate.mockResolvedValueOnce({
       currentVersion: '0.1.1-2',
       version: '0.1.1-4',
+      classification: 'Development',
     });
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      await screen.findByText('Signed Beta 0.1.1-4 is available.'),
+      await screen.findByText('Development 0.1.1-4 is available.'),
     ).toBeVisible();
 
     mocks.checkApprovedBetaUpdate.mockRejectedValueOnce(

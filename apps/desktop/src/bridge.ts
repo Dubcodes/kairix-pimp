@@ -36,6 +36,7 @@ export interface DeviceSettings {
   closeToTray: boolean;
   startupPage: 'Ingest' | 'Library' | 'Projects' | 'Archive';
   checkForUpdates: boolean;
+  updateChannel: 'development' | 'stable';
   theme:
     | 'graphite'
     | 'adobe-dark'
@@ -70,14 +71,17 @@ export interface DeviceSettings {
 }
 export interface AppInfo {
   version: string;
+  displayVersion: string;
   buildCommit: string;
   edition: string;
-  releaseChannel: string;
+  releaseClassification: 'Development' | 'Stable';
+  releaseDate: string;
 }
 export interface UpdaterConfiguration {
   configured: boolean;
-  channel: 'Beta';
+  channel: 'Development' | 'Stable';
   endpoint: string;
+  target: 'development-channel' | 'stable-channel';
   reason?: string;
 }
 export interface MediaItem {
@@ -469,6 +473,7 @@ export const emptySettings = (): DeviceSettings => ({
   closeToTray: true,
   startupPage: 'Library',
   checkForUpdates: true,
+  updateChannel: 'development',
   theme: 'graphite',
   density: 'comfortable',
   libraryThumbnailWidth: 240,
@@ -717,8 +722,10 @@ export const desktopBridge = {
     convertFileSrc(await invoke<string>('prepare_playback_proxy', { mediaId })),
   releasePlaybackProxy: (mediaId: string) =>
     invoke<void>('release_playback_proxy', { mediaId }),
-  setMediaThumbnailFrame: (mediaId: string, seconds: number) =>
-    invoke<string>('set_media_thumbnail_frame', { mediaId, seconds }),
+  setMediaThumbnailFrame: async (mediaId: string, seconds: number) =>
+    convertFileSrc(
+      await invoke<string>('set_media_thumbnail_frame', { mediaId, seconds }),
+    ),
   revealMediaInExplorer: (mediaId: string) =>
     invoke<void>('reveal_media_in_explorer', { mediaId }),
   openMediaFolder: (mediaId: string) =>

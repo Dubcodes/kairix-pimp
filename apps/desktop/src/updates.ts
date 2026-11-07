@@ -11,6 +11,7 @@ export interface AvailableUpdate {
   date?: string;
   notes?: string;
   sizeBytes?: number;
+  classification: 'Development' | 'Stable';
 }
 
 let pendingUpdate: Update | null = null;
@@ -36,17 +37,37 @@ export async function checkApprovedBetaUpdate(): Promise<AvailableUpdate | null>
     if (!configuration.configured) {
       throw new Error(
         configuration.reason ??
-          'Signed Beta updates are not configured in this build.',
+          'Signed updates are not configured in this build.',
       );
     }
-    if (configuration.channel !== 'Beta') {
-      throw new Error(
-        'This build is not configured for the approved Beta channel.',
-      );
-    }
-    const update = await check({ timeout: 30_000 });
+    const update = await check({
+      timeout: 30_000,
+      target: configuration.target,
+    });
     pendingUpdate = update;
     if (!update) return null;
+    const declaredClassification = update.rawJson.classification;
+    let classification: AvailableUpdate['classification'];
+    if (
+      declaredClassification === undefined &&
+      update.version.startsWith('0.')
+    ) {
+      classification = 'Development';
+    } else if (
+      declaredClassification === 'Development' ||
+      declaredClassification === 'Stable'
+    ) {
+      classification = declaredClassification;
+    } else {
+      await closePendingUpdate();
+      throw new Error(
+        'The signed update manifest has no valid release classification.',
+      );
+    }
+    if (configuration.channel === 'Stable' && classification !== 'Stable') {
+      await closePendingUpdate();
+      throw new Error('The Stable channel rejected a Development release.');
+    }
     return {
       currentVersion: update.currentVersion,
       version: update.version,
@@ -56,6 +77,7 @@ export async function checkApprovedBetaUpdate(): Promise<AvailableUpdate | null>
         typeof update.rawJson.size === 'number'
           ? update.rawJson.size
           : undefined,
+      classification,
     };
   })();
   checkInFlight = operation;
@@ -76,7 +98,7 @@ export async function installApprovedBetaUpdate(
     throw new Error('An approved update installation is already in progress.');
   }
   if (!pendingUpdate) {
-    throw new Error('Check for a signed Beta update before installing.');
+    throw new Error('Check for a signed update before installing.');
   }
   const update = pendingUpdate;
   const operation = (async () => {

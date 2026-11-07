@@ -53,6 +53,9 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, saved-Premiere folder/read/resolve stages and volume-governor evidence remain device-local
 - Implemented native derivative observability: active static/hover workers join Background Operations and one real primary operation drives supported window-title/taskbar state; installed Windows acceptance remains open
 - Implemented volume-aware admission: stable Windows volume identity, atomic multi-volume permits, one full-content accessor per volume, independent-volume profile limits, safe pause, gentle pacing, measured local diagnostics and bounded error backoff now cover ingest, verification, backup/restore and derivatives; installed slow/removable-drive acceptance and reliable physical-disk grouping remain open
+- Implemented release transition: source `0.2.0` with explicit Development/Stable classification, integer SemVer policy, permanent protected public-release promotion, separate signed channel targets and user-selectable automatic checking. Owner key/environment provisioning and installed signed upgrade acceptance remain open.
+- Implemented shared static thumbnails: deterministic source/transform identities under the shared catalogue, atomic no-overwrite publication, legacy local-JPEG migration and retained stable frontend URLs. Hover previews/proxies remain local; real two-device arrival/conflict and 1,000-record installed scrolling acceptance remain open.
+- Implemented scroll ownership correction: Library parent overflow is disabled and folder/media panels own the remaining viewport; other workspaces retain conditional natural scrolling. Installed high-DPI/narrow/ultrawide acceptance remains open.
 
 ## Milestone 3 — Premiere extension
 

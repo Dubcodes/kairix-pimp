@@ -89,7 +89,8 @@ textarea {
 .app-shell {
   display: grid;
   grid-template-columns: 224px 1fr;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   transition: grid-template-columns 160ms ease;
 }
 .app-shell.sidebar-collapsed {
@@ -102,6 +103,8 @@ textarea {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 .brand {
   display: flex;
@@ -145,8 +148,11 @@ textarea {
 }
 .sidebar nav {
   display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
   flex-direction: column;
   gap: 5px;
+  overflow-y: auto;
 }
 .sidebar nav button {
   border: 0;
@@ -255,8 +261,22 @@ textarea {
 main {
   min-width: 0;
   height: 100vh;
-  overflow-y: auto;
   scroll-behavior: smooth;
+}
+main.page-main {
+  overflow-y: auto;
+}
+main.library-main {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+main.library-main > header,
+main.library-main > .toolbar,
+main.library-main > .notice,
+main.library-main > .error {
+  flex: 0 0 auto;
 }
 header {
   height: 98px;
@@ -503,9 +523,12 @@ header h1 {
 .content-grid {
   display: grid;
   grid-template-columns: 235px 1fr;
-  height: calc(100vh - 155px);
   min-height: 0;
   overflow: hidden;
+}
+.library-main > .content-grid {
+  flex: 1 1 auto;
+  height: auto;
 }
 .folder-panel {
   border-right: 1px solid #222925;
@@ -915,6 +938,11 @@ article footer span {
   padding: 20px 28px 34px;
   display: grid;
   gap: 18px;
+}
+.library-main > .clip-viewer {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 .clip-viewer-header {
   display: grid;

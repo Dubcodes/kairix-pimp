@@ -218,7 +218,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 ## ADR-028 — Fail-closed signed Beta update channel
 
 - **Date:** 2026-10-26
-- **Status:** Accepted
+- **Status:** Superseded by ADR-070 for channel naming and version policy; signature and fail-closed requirements retained
 - **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. Beta builds use a numeric SemVer prerelease component (for example `0.1.1-1`) so the same version remains valid for Windows MSI packaging; the release channel remains explicitly Beta. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
 - **Release-candidate clarification:** The host now owns an update-installation gate. It atomically checks durable job state before installation and prevents start, resume or retry until the updater returns or restarts the process. Public-key syntax is validated in the native configuration response. Version `0.1.1-4` is a completed-ingest and preview-cache correction candidate; it is not evidence of a completed signed upgrade.
 - **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.
@@ -413,12 +413,12 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Decision:** Treat a catalogue thumbnail reference as a hint and require the expected cache-owned file to be a bounded non-empty JPEG before display or reuse. Regenerate only missing/invalid candidates through a cache-local temporary file and atomic rename, expose attempted/generated/existing/failed/pending counts, and retry on later startup passes. At the Explorer boundary only, convert short legacy-safe extended drive/UNC paths and invoke `SHOpenFolderAndSelectItems` with the containing-folder PIDL plus child PIDL.
 - **Consequences:** Eviction and damaged cache files self-heal without rebuilding every thumbnail or touching originals. Long or legacy-unsafe Shell paths fail with a precise limitation instead of mutating canonical filesystem paths. Automated API-boundary tests do not replace installed Explorer/WebView2 acceptance.
 
-## ADR-056 — Keep clip playback in-window and custom frames device-local
+## ADR-056 — Keep clip playback in-window and custom frames cache-owned
 
 - **Date:** 2026-11-04
 - **Status:** Accepted
-- **Decision:** Resolve Clip Viewer playback from a known catalogue ID through the native root boundary and use WebView2's media element before considering bounded on-demand proxies. Keep selection/filter state in the Library view. Generate a manually chosen thumbnail with FFmpeg only on explicit request, validate source stability and cache-owned JPEG output, and persist the JPEG only in the device cache. Do not publish a selected timestamp as synchronized authoritative metadata in this milestone.
-- **Consequences:** Common codecs gain practical offline playback without another window or source mutation, while unsupported codecs fail visibly. A custom frame survives on that device until cache eviction/regeneration but does not follow the recording to another device. Installed WebView2 codec, keyboard, fullscreen, scaling and portrait acceptance remains required.
+- **Decision:** Resolve Clip Viewer playback from a known catalogue ID through the native root boundary and use WebView2's media element before considering bounded on-demand proxies. Keep selection/filter state in the Library view. Generate a manually chosen thumbnail with FFmpeg only on explicit request and validate source stability plus JPEG output. ADR-071 supersedes the original device-local placement: the selected frame now creates a distinct shared static derivative while the playback proxy remains local.
+- **Consequences:** Common codecs gain practical offline playback without another window or source mutation, while unsupported codecs fail visibly. A custom frame can follow the catalogue to another synchronized device without becoming authoritative media evidence. Installed WebView2 codec, keyboard, fullscreen, scaling and portrait acceptance remains required.
 
 ## ADR-057 — Index only bounded stable saved-project snapshots
 
@@ -510,3 +510,17 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Add one device-local governor beneath existing durable jobs and the global derivative gate. Prefer Windows volume GUID identity, atomically acquire sorted source/destination needs, allow one full-content accessor per identified volume, apply explicit priority only between safe units, and retain bounded aging, cancellation, shutdown, byte/wait metrics and I/O-error backoff. Quiet/Balanced/Performance and gentle/pause settings change actual admission. Idle expansion requires input inactivity plus supported CPU and available-memory evidence; input inactivity alone is insufficient. Quick Library inventory becomes metadata-only.
 - **Consequences:** Ingest, verification, backup/restore and derivatives no longer compete invisibly on the same identified volume, while independent volumes can proceed within the selected profile. Existing job journals and promotion boundaries remain authoritative. Windows cannot always prove that separate logical volumes share physical hardware, FFmpeg byte-rate caps are not enforceable through this boundary, and installed slow-drive/disconnect testing remains required.
+
+## ADR-070 — Classify protected SemVer releases explicitly
+
+- **Date:** 2026-11-07
+- **Status:** Accepted
+- **Decision:** Store valid three-component SemVer everywhere, display a zero patch without the technical suffix, and compare integer components rather than decimals or strings. Reserve whole-major versions for protected Stable promotion, but require explicit classification rather than inferring trust from the number. Publish approved Development and Stable builds as immutable GitHub Releases and expose independently signed channel manifests only after read-back verification.
+- **Consequences:** `1.22` correctly follows `1.3`, legacy `0.1.1-5` remains comparable, and current source can advance to `0.2` without falsely claiming `1.0`. Stable and Development users have distinct fail-closed channels. Owner key/environment provisioning and a real installed A-to-B signed upgrade remain release gates.
+
+## ADR-071 — Share deterministic static thumbnails, keep heavy derivatives local
+
+- **Date:** 2026-11-07
+- **Status:** Accepted
+- **Decision:** Store static JPEG derivatives beneath the selected shared catalogue at `thumbnails/v1`, named by source SHA-256 plus seek/format/transform version. Validate and flush unique temporary files, atomically promote without replacement, reuse a concurrent valid winner, and migrate validated legacy local JPEGs incrementally. Retain frontend asset references across ordinary refreshes. Keep hover previews, playback proxies and decoded presentation memory device-local and bounded.
+- **Consequences:** Syncthing-connected devices can display the same static thumbnail without repeated FFmpeg decoding, including before media arrives. Shared derivatives are not authoritative, are not silently evicted, and require a future explicit cleanup design. Custom frames now synchronize as distinct immutable derivatives. Real two-device conflict, arrival-order, free-space and installed 1,000-record scrolling acceptance remain outstanding.

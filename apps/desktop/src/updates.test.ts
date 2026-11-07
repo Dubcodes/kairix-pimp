@@ -79,7 +79,31 @@ it('reports an approved higher beta returned by the configured updater', async (
     date: '2026-10-26T00:00:00Z',
     notes: 'Signed beta',
     sizeBytes: undefined,
+    classification: 'Development',
   });
+  expect(mocks.check).toHaveBeenCalledWith({
+    timeout: 30_000,
+    target: undefined,
+  });
+});
+
+it('rejects a development-classified manifest on the Stable channel', async () => {
+  const close = vi.fn();
+  mocks.configuration.mockResolvedValue({
+    configured: true,
+    channel: 'Stable',
+    target: 'stable-channel',
+  });
+  mocks.check.mockResolvedValue({
+    currentVersion: '1.0.0',
+    version: '1.1.0',
+    rawJson: { classification: 'Development' },
+    close,
+  });
+  await expect(checkApprovedBetaUpdate()).rejects.toThrow(
+    'Stable channel rejected a Development release',
+  );
+  expect(close).toHaveBeenCalledOnce();
 });
 
 it('clears a closed pending update when the next check fails', async () => {
@@ -101,7 +125,7 @@ it('clears a closed pending update when the next check fails', async () => {
   await expect(checkApprovedBetaUpdate()).rejects.toThrow('offline');
   expect(close).toHaveBeenCalledOnce();
   await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
-    'Check for a signed Beta update before installing.',
+    'Check for a signed update before installing.',
   );
 });
 
@@ -115,7 +139,7 @@ it.each(['manifest is malformed', 'signature verification failed'])(
     mocks.check.mockRejectedValue(new Error(message));
     await expect(checkApprovedBetaUpdate()).rejects.toThrow(message);
     await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
-      'Check for a signed Beta update before installing.',
+      'Check for a signed update before installing.',
     );
   },
 );
@@ -160,7 +184,7 @@ it('coalesces overlapping checks into one updater request', async () => {
 
 it('refuses installation until an approved update has been checked', async () => {
   await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
-    'Check for a signed Beta update before installing.',
+    'Check for a signed update before installing.',
   );
 });
 
@@ -218,7 +242,7 @@ it('surfaces interrupted updater installation without reporting success', async 
   expect(mocks.beginInstallation).toHaveBeenCalledOnce();
   expect(mocks.endInstallation).toHaveBeenCalledOnce();
   await expect(installApprovedBetaUpdate(vi.fn())).rejects.toThrow(
-    'Check for a signed Beta update before installing.',
+    'Check for a signed update before installing.',
   );
 });
 

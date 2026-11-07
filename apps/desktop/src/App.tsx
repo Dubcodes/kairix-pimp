@@ -975,8 +975,10 @@ export function App() {
               )
                 continue;
               if (sources[mediaId]) next[mediaId] = sources[mediaId];
-              else delete next[mediaId];
             }
+            const retainedIds = new Set(catalogue.media.map((item) => item.id));
+            for (const mediaId of Object.keys(next))
+              if (!retainedIds.has(mediaId)) delete next[mediaId];
             return next;
           });
         }
@@ -1339,7 +1341,7 @@ export function App() {
       }));
       setPreviewCacheEpoch((current) => current + 1);
       setThumbnailFrameStatus(
-        'Thumbnail saved in this device’s cache. The frame choice is device-local.',
+        'Thumbnail saved to the shared catalogue. Other devices can reuse it after synchronization.',
       );
     } catch (reason) {
       setThumbnailFrameStatus(`Thumbnail failed: ${errorText(reason)}`);
@@ -1984,7 +1986,8 @@ export function App() {
       [
         `${applicationInfo?.edition ?? 'Kairix PIMP Light'} ${applicationInfo?.version ?? 'unknown'}`,
         `Build: ${applicationInfo?.buildCommit ?? 'unknown'}`,
-        `Channel: ${applicationInfo?.releaseChannel ?? 'Beta'}`,
+        `Classification: ${applicationInfo?.releaseClassification ?? 'Development'}`,
+        `Update channel: ${updaterConfiguration?.channel ?? 'Development'}`,
         `Device: ${settings.deviceId}`,
         `Catalogue items: ${catalogue.media.length}`,
         `Last scan: ${discoveryStatus.lastCompletedAt ?? 'never'}`,
@@ -2029,7 +2032,9 @@ export function App() {
       return;
     }
     setCheckingUpdate(true);
-    setUpdateStatus('Checking for a signed Beta update…');
+    setUpdateStatus(
+      `Checking the signed ${updaterConfiguration.channel} channel…`,
+    );
     setError('');
     try {
       const update = await checkApprovedBetaUpdate();
@@ -2038,8 +2043,8 @@ export function App() {
       setAvailableUpdate(update ?? undefined);
       setUpdateStatus(
         update
-          ? `Signed Beta ${update.version} is available.`
-          : `No newer signed Beta was available at ${checkedAt}.`,
+          ? `${update.classification} ${update.version} is available.`
+          : `No newer signed ${updaterConfiguration.channel} release was available at ${checkedAt}.`,
       );
     } catch (reason) {
       setUpdateStatus(`Update check failed: ${errorText(reason)}`);
@@ -2060,6 +2065,11 @@ export function App() {
     }
     automaticUpdateCheckStarted.current = true;
     void checkForUpdates();
+    const timer = window.setInterval(
+      () => void checkForUpdates(),
+      6 * 60 * 60 * 1_000,
+    );
+    return () => window.clearInterval(timer);
   }, [
     applicationInfo,
     checkForUpdates,
@@ -2532,7 +2542,10 @@ export function App() {
           </span>
         </div>
       </aside>
-      <main ref={contentRef}>
+      <main
+        ref={contentRef}
+        className={view === 'Library' ? 'library-main' : 'page-main'}
+      >
         <header>
           <div>
             <p>
@@ -2987,13 +3000,34 @@ export function App() {
                     </select>
                   </label>
                   <ToggleField
-                    label="Check for beta updates"
-                    description="Check the approved signed Beta channel; never install PR artifacts."
+                    label="Check for updates automatically"
+                    description="Check after startup and every six hours without delaying normal use."
                     checked={settings.checkForUpdates ?? true}
                     onChange={(checkForUpdates) =>
                       void persistPreference({ checkForUpdates })
                     }
                   />
+                  <label>
+                    Update channel
+                    <select
+                      value={settings.updateChannel ?? 'development'}
+                      onChange={(event) =>
+                        void persistPreference({
+                          updateChannel: event.target
+                            .value as DeviceSettings['updateChannel'],
+                        })
+                      }
+                    >
+                      <option value="development">Development</option>
+                      <option value="stable">Stable</option>
+                    </select>
+                    <small>
+                      Development receives approved ongoing releases and newer
+                      stable milestones. Stable receives only formally approved
+                      stable releases and stable hotfixes. Changing channel
+                      never downgrades PIMP.
+                    </small>
+                  </label>
                 </>
               )}
 
@@ -3054,7 +3088,7 @@ export function App() {
                     />
                   )}
                   <PathField
-                    label="Thumbnail cache (device-local)"
+                    label="Local derivative cache (hover previews and proxies)"
                     value={settings.thumbnailCachePath}
                     placeholder="Automatic local cache"
                     onChange={(thumbnailCachePath) =>
@@ -3062,23 +3096,6 @@ export function App() {
                     }
                     onBrowse={() => chooseSettingFolder('thumbnailCachePath')}
                   />
-                  <label>
-                    Thumbnail cache limit (GB)
-                    <input
-                      type="number"
-                      min="1"
-                      value={Math.round(
-                        settings.thumbnailCacheLimitBytes / 1024 / 1024 / 1024,
-                      )}
-                      onChange={(event) =>
-                        setSettings({
-                          ...settings,
-                          thumbnailCacheLimitBytes:
-                            Number(event.target.value) * 1024 * 1024 * 1024,
-                        })
-                      }
-                    />
-                  </label>
                   {configured && (
                     <div className="scan-status" role="status">
                       <h3>Library discovery</h3>
@@ -3794,11 +3811,16 @@ export function App() {
                 <>
                   <div className="info-card">
                     <strong>
-                      {applicationInfo?.edition ?? 'Kairix PIMP Light'}
+                      {applicationInfo?.edition ?? 'Kairix PIMP Light'}{' '}
+                      {applicationInfo?.displayVersion ?? 'unknown'} —{' '}
+                      {applicationInfo?.releaseClassification ?? 'Development'}
                     </strong>
-                    <span>Version {applicationInfo?.version ?? 'unknown'}</span>
                     <span>
-                      Channel {applicationInfo?.releaseChannel ?? 'Beta'}
+                      Update channel{' '}
+                      {updaterConfiguration?.channel ?? 'Development'}
+                    </span>
+                    <span>
+                      Release date {applicationInfo?.releaseDate ?? 'unknown'}
                     </span>
                     <span>
                       Build {applicationInfo?.buildCommit ?? 'development'}
@@ -3816,6 +3838,8 @@ export function App() {
                       <>
                         <span>
                           {availableUpdate.version}
+                          {' — '}
+                          {availableUpdate.classification}
                           {availableUpdate.sizeBytes
                             ? ` · ${size(availableUpdate.sizeBytes)}`
                             : ''}
@@ -3835,7 +3859,7 @@ export function App() {
                     )}
                   </div>
                   <div className="info-card">
-                    <strong>Latest manually downloadable beta</strong>
+                    <strong>Latest approved public release</strong>
                     <span>
                       Check the permanent public GitHub Releases page.
                     </span>
@@ -3895,8 +3919,8 @@ export function App() {
                   </div>
                   {updaterConfiguration?.configured ? (
                     <small>
-                      Only the approved Beta manifest and artifacts with a valid
-                      Tauri signature can install.
+                      Only the selected approved channel manifest and artifacts
+                      with a valid Tauri signature can install.
                     </small>
                   ) : (
                     <small>
@@ -3915,7 +3939,12 @@ export function App() {
                     <strong>Kairix PIMP Light</strong>
                     <span>Production Ingest &amp; Media Processor</span>
                     <span>
-                      Version {applicationInfo?.version ?? 'unknown'} · Beta
+                      Version {applicationInfo?.displayVersion ?? 'unknown'} ·{' '}
+                      {applicationInfo?.releaseClassification ?? 'Development'}
+                    </span>
+                    <span>
+                      Build {applicationInfo?.buildCommit ?? 'unknown'} ·{' '}
+                      {applicationInfo?.releaseDate ?? 'unpublished'}
                     </span>
                     <p>
                       Complete non-AI media ingest and catalogue edition. The

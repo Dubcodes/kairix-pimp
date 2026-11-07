@@ -1,52 +1,47 @@
-# Windows beta distribution and signed updates
+# Windows releases and signed updates
 
-Kairix PIMP uses three deliberately separate distribution paths.
+Kairix PIMP separates internal CI builds from approved public releases. Pull requests may create short-lived unsigned MSI and NSIS artifacts for verification, but anything offered to users must be promoted as a permanent [GitHub Release](https://github.com/Dubcodes/kairix-pimp/releases). The historical public beta remains `v0.1.1-5`; source version `0.2.0` is the next Development line and is not public until the protected promotion succeeds.
 
-The current `0.1.1-6` pull-request build remains a short-lived unsigned acceptance artifact. Thumbnail/background/layout work in the development branch does not change the public `0.1.1-5` release and must receive a new monotonically increasing version after review; no release or live-channel mutation is authorized by this milestone. Protected updater credentials and a real installed higher-version Windows acceptance pass remain outstanding.
+## Version and classification policy
 
-## Development builds
+Repository metadata uses three-component SemVer. The UI hides a zero patch (`1.22.0` is shown as `1.22`), and components are compared as integers, so `1.22` is newer than `1.3`.
 
-Pull requests run the complete automated checks and create short-lived, unsigned MSI and NSIS Actions artifacts. These builds never receive the updater public key or private signing material, never publish a GitHub Release and never update the approved Beta manifest.
+- Stable milestones use a whole major number such as `1.0.0` or `2.0.0` and require an explicit protected Stable approval.
+- Intermediate releases such as `1.1.0`, `1.2.0`, and the current transitional `0.2.0` are Development releases.
+- Numeric shape never promotes a build by itself. A release carries an explicit `Development` or `Stable` classification.
+- Legacy prerelease versions such as `0.1.1-5` remain parseable for upgrade comparison.
 
-## Public manual beta releases
+`npm run release:validate -- <version> <classification>` verifies package, desktop, Cargo and Tauri metadata plus the classification rules.
 
-An authorized `Publish public Windows beta` dispatch runs only from current `main` and uses the protected `public-beta-release` environment. It repeats the complete checks, verifies package/Cargo/Tauri versions, builds both Windows installers, records SHA-256 checksums and creates a permanent public GitHub prerelease. The plainly named per-user NSIS installer is recommended; the MSI is an alternative.
+## Public promotion
 
-These installers are not Authenticode signed, so Windows may display a SmartScreen warning. Tauri updater signatures authenticate automatic-update payloads inside PIMP; they are not Windows executable code signatures.
+The protected **Publish approved public Windows release** workflow accepts an exact version and classification, runs the full JavaScript and Rust verification matrix, verifies that the selected source is current `main`, builds both installers, checks package identity and SHA-256 evidence, and creates a draft release before read-back verification. It refuses an existing tag or release. A Development promotion becomes a prerelease; Stable additionally requires the exact `APPROVE STABLE <version>` phrase and the `stable-release` protected environment. No pull-request workflow receives signing secrets.
 
-Manual publication does not require private updater credentials. If the repository-level `PIMP_UPDATER_PUBLIC_KEY` variable is absent, the installer remains a valid manual beta but reports automatic updates as unavailable. If the variable is present, packaging validates its Tauri/minisign syntax and embeds that exact public key.
+Public release assets include the recommended plainly named per-user NSIS installer, MSI alternative, `SHA256SUMS.txt`, `BUILD-INFO.txt`, release notes and classification. Installers are currently not Authenticode signed, so Windows SmartScreen may warn. Tauri updater signatures authenticate updater payloads; they are distinct from Windows code signing.
 
-## Approved signed automatic updates
+## Development and Stable channels
 
-Installed applications check only:
+Installed builds select a device-local channel:
 
-`https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json`
+- **Development** follows `development-channel` and may receive approved Development releases or a newer Stable milestone.
+- **Stable** follows `stable-channel` and rejects a manifest classified Development.
 
-The protected `Publish signed automatic beta update` workflow accepts an existing reviewed prerelease tag. It verifies that the tag commit is reachable from `main`, that the version matches, that nonempty public installers and checksums already exist, and that the configured public key is valid. The `beta-release` environment alone supplies `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+The Tauri endpoint is `https://github.com/Dubcodes/kairix-pimp/releases/download/{{target}}/latest.json`; the native host supplies the selected channel target only after validating the embedded public key. Channel changes never bypass Tauri version ordering and therefore cannot downgrade the application. Existing settings default conservatively to Development because all current testers are on development-era builds.
 
-Before signing, the workflow verifies package, desktop, Cargo and Tauri versions; the selected tag's reachability from `main`; and the existing manual installer's source identity and SHA-256 evidence. It builds the official Tauri NSIS updater payload, independently verifies its signature with the embedded public key, refuses to replace an existing versioned signed asset, uploads the payload/signature/checksum, reads the published bytes back, and verifies their hash and signature again. Only then does it update `beta-channel/latest.json`. A failure before that final step cannot advertise a missing or unverified payload. Replacing the fixed GitHub asset may briefly make the endpoint unavailable, which is a fail-closed check error rather than an unsigned or partial update. Pull requests cannot invoke the protected environment or receive signing secrets.
+When enabled, PIMP checks shortly after startup and every six hours, with a manual check always available. Offline failures, timeouts, malformed classifications and missing signing configuration fail closed without blocking normal use. The update client keeps one check and one installation attempt in flight. A failed or interrupted download is discarded and must be checked and signature-verified again.
 
-The update client keeps at most one check and one installation attempt in flight. A failed configuration preflight, offline request, malformed manifest or invalid signature clears the pending updater resource. A failed/interrupted download is not reused; the next attempt performs a fresh signed check. The UI reports the Windows installer launch and requires the reopened application version to confirm the restart rather than claiming a restart succeeded.
+The protected **Publish signed automatic update** workflow runs for an approved published release or an explicit existing tag. It verifies source reachability, version/classification agreement, public installer checksums and build identity before signing. It refuses to overwrite versioned updater assets, downloads them again after publication, compares SHA-256 and independently verifies the signature, then promotes the channel manifest last. Stable promotion also advances Development to that same newer Stable release.
 
-The native host authorizes installation through one short operation coordinator. Authorization fails while durable ingest work is unresolved, a backup job is active, or a scan, integrity verification, backup/restore verification, FFmpeg/FFprobe enrichment, hover-preview generation/preparation, preview-cache clear, or ingest start/resume/retry is in progress. Once installation is authorized, those operations cannot start. The coordinator mutex is held only while acquiring/releasing permits and checking durable state; it is never held during long filesystem or process work.
+The native operation gate refuses installation while ingest, backup, verification, discovery, enrichment or derivative filesystem work is active. PIMP does not claim success until the updater hands off to the installer; the reopened version remains the confirmation boundary.
 
-Volume permits sit inside those already-gated operations and do not weaken updater exclusion. Application shutdown wakes queued volume waiters before child/process cleanup. A future signed installed-upgrade acceptance pass must preserve the new device-local resource profile and recoverable jobs as well as existing identity/catalogue data.
+## Owner configuration checklist
 
-## Protected configuration checklist
+1. Generate a password-protected Tauri signing pair on a secured operator machine: `npm run tauri -- signer generate --write-keys <secure-private-key-path>`.
+2. Add repository variable `PIMP_UPDATER_PUBLIC_KEY` with the complete public-key value.
+3. Configure protected environments `public-beta-release`, `stable-release`, and `beta-release`; require owner review, prevent self-review where available, and restrict deployments to trusted `main` revisions.
+4. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` only to `beta-release`.
+5. Never place private material in Git, workflow inputs, issues, prompts, release assets or logs.
+6. Promote and manually install the first reviewed public-key-enabled NSIS build. Keyless legacy installations cannot authenticate an update and require this one-time bootstrap.
+7. Promote a higher signed Development release and complete the installed A-to-B acceptance matrix, including tamper rejection, interrupted-download retry, critical-operation refusal, restart, and preservation of settings, device ID, catalogue and recoverable jobs.
 
-1. Generate a password-protected pair on a secured operator machine: `npm run tauri -- signer generate --write-keys <secure-private-key-path>`.
-2. In repository Actions variables, create `PIMP_UPDATER_PUBLIC_KEY` using the complete base64 public-key value produced by Tauri. Public keys are not secret; keeping it repository-scoped makes the manual bootstrap and later signed payload use the same value.
-3. Create GitHub environments `public-beta-release` and `beta-release`. Require an owner review, prevent self-review where the plan supports it, restrict both to `main`, and restrict `beta-release` to authorized maintainers.
-4. In `beta-release` only, add secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
-5. Never paste private material into commits, issues, workflow inputs, prompts, release assets or logs.
-6. Publish a reviewed manual beta from `main`, install it, and confirm Settings → Updates says the signed Beta channel is configured.
-7. Merge and publish a higher numeric-prerelease version, then dispatch the signed update workflow for that existing release tag.
-8. Download the manifest, payload and signature and independently verify them before installed-app acceptance.
-
-## One-time bootstrap
-
-Builds such as `0.1.1-2` that lack the approved public key cannot securely accept an automatic update. Install the public-key-enabled reviewed NSIS beta manually once. Never weaken signature enforcement or offer an unsigned payload to those builds.
-
-A real higher-version installed-Windows update must then demonstrate check, release notes, progress, signature acceptance, tamper rejection, interrupted download, fresh-check retry, install, restart, version change and preservation of device identity, roots, catalogue and recoverable ingest/backup jobs. It must also exercise the operation gate against active ingest, backup, scan, verification, enrichment and preview work. Until that pass succeeds, describe automatic updates as configured but not operational.
-
-The Tauri configuration declares the fixed endpoint and requires signed versions. The native builder supplies the validated compile-time public key; the runtime configuration command validates the same value before the UI is allowed to make a network check. An empty or malformed key always fails closed.
+The code and protected workflows are ready for owner configuration, but no signing credentials were available in this milestone and no installed signed upgrade was performed. Automatic updating must remain described as unverified operationally until that acceptance pass succeeds.

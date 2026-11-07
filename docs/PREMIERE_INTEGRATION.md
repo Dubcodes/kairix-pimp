@@ -71,7 +71,7 @@ For host acceptance, use a new disposable project and generated MP4/WAV files on
 
 Use UDT's Logs and App Logs for any unsupported method, transaction, permission or import failure. Correct only against documented Premiere UXP APIs; never inspect or rewrite `.prproj` internals.
 
-The `0.1.1-6` pull-request workflow publishes the exact developer source above as a distinctly named ZIP artifact. Extract it before adding `manifest.json` to UDT. This ZIP is **not** a `.ccx` and must never be renamed to one.
+The pull-request Windows workflow publishes the exact developer source above as a versioned, distinctly named ZIP artifact. Extract it before adding `manifest.json` to UDT. This ZIP is **not** a `.ccx` and must never be renamed to one.
 
 The plugin ID must be replaced with a valid Adobe Developer Distribution ID before Marketplace publication. No local server, account credential or network permission is used in this proof of concept.
 
