@@ -8137,6 +8137,22 @@ fn playback_proxy_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
     Ok(canonical_root)
 }
 
+fn playback_proxy_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pimp-playback-proxy-v2\0");
+    digest.update(item.id.as_bytes());
+    digest.update(item.sha256.as_bytes());
+    digest.update(snapshot.length.to_le_bytes());
+    digest.update([u8::from(snapshot.modified_millis.is_some())]);
+    digest.update(snapshot.modified_millis.unwrap_or_default().to_le_bytes());
+    digest.update(b"1280-h264-aac-crf23-fastdecode-2s-keyframes");
+    format!("{:x}", digest.finalize())
+}
+
+fn playback_proxy_path(root: &Path, item: &MediaItem, fingerprint: &str) -> PathBuf {
+    root.join(format!("{}-{}.mp4", item.id, &fingerprint[..24]))
+}
+
 fn enforce_playback_proxy_limit(
     root: &Path,
     limit: u64,
@@ -8465,6 +8481,42 @@ fn run_playback_proxy_generation(
 }
 
 #[tauri::command]
+async fn resolve_media_playback_source(
+    app: AppHandle,
+    media_id: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let settings = load_settings_file(&app)?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or("Unknown media item")?;
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        if !enrichment_video_type(&item.file_type) {
+            return Ok(source.to_string_lossy().into_owned());
+        }
+        let snapshot = fs_safe::snapshot(&source)?;
+        let fingerprint = playback_proxy_fingerprint(item, &snapshot);
+        let root = playback_proxy_root(&settings)?;
+        let proxy = playback_proxy_path(&root, item, &fingerprint);
+        if valid_playback_proxy(&proxy) {
+            state
+                .active_playback_proxies
+                .lock()
+                .unwrap()
+                .insert(media_id, proxy.clone());
+            return Ok(proxy.to_string_lossy().into_owned());
+        }
+        Ok(source.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| format!("Playback source resolution task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
@@ -8486,15 +8538,7 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
         let before = fs_safe::snapshot(&source)?;
         let source_probe = probe_playback_media(&source)?;
         let duration_millis = probe_duration_millis(&source_probe);
-        let mut digest = Sha256::new();
-        digest.update(b"pimp-playback-proxy-v2\0");
-        digest.update(item.id.as_bytes());
-        digest.update(item.sha256.as_bytes());
-        digest.update(before.length.to_le_bytes());
-        digest.update([u8::from(before.modified_millis.is_some())]);
-        digest.update(before.modified_millis.unwrap_or_default().to_le_bytes());
-        digest.update(b"1280-h264-aac-crf23-fastdecode-2s-keyframes");
-        let fingerprint = format!("{:x}", digest.finalize());
+        let fingerprint = playback_proxy_fingerprint(&item, &before);
         let operation_id = format!("playback-proxy:{}", &fingerprint[..24]);
         let generation = {
             let mut generations = state.playback_proxy_generations.lock().unwrap();
@@ -8511,7 +8555,7 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
             .remove(&operation_id);
         let root = playback_proxy_root(&settings)?;
         cleanup_abandoned_playback_temporaries(&state, &root)?;
-        let destination = root.join(format!("{}-{}.mp4", item.id, &fingerprint[..24]));
+        let destination = playback_proxy_path(&root, &item, &fingerprint);
         if valid_playback_proxy(&destination) {
             state
                 .active_playback_proxies
@@ -10125,6 +10169,7 @@ pub fn run() {
             open_support_link,
             open_logs_folder,
             resolve_media_path,
+            resolve_media_playback_source,
             start_native_media_drag,
             start_native_folder_drag,
             prepare_playback_proxy,
@@ -10371,6 +10416,40 @@ mod tests {
             r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"}],"format":{"format_name":"mov,mp4","duration":"0"}}"#,
         );
         assert!(!playback_proxy_probe_is_valid(&unfinished));
+    }
+
+    #[test]
+    fn cached_playback_proxy_identity_tracks_source_snapshot() {
+        let root = temporary("playback-proxy-identity");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"synthetic clip").unwrap();
+        let item = new_media(
+            &source,
+            "clip.mp4".into(),
+            None,
+            sha256(&source).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        let fingerprint = playback_proxy_fingerprint(&item, &snapshot);
+        assert_eq!(fingerprint, playback_proxy_fingerprint(&item, &snapshot));
+        let changed = fs_safe::FileSnapshot {
+            length: snapshot.length + 1,
+            modified_millis: snapshot.modified_millis,
+        };
+        assert_ne!(
+            fingerprint,
+            playback_proxy_fingerprint(&item, &changed)
+        );
+        assert!(playback_proxy_path(&root, &item, &fingerprint)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("{}-", item.id)));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

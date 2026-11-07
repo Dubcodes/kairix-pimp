@@ -658,6 +658,16 @@ describe('native application integration', () => {
     await user.click(screen.getByRole('button', { name: 'Diagnostics' }));
     expect(screen.getByText(/first frame \d+ ms/)).toBeVisible();
     expect(screen.getByText(/proxy \d+ ms/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    mocks.resolveMediaPlaybackSource.mockResolvedValueOnce(
+      'asset://localhost/playback-proxy.mp4',
+    );
+    fireEvent.doubleClick(screen.getByText('next.mp4').closest('article')!);
+    expect(await screen.findByLabelText('Playback next.mp4')).toHaveAttribute(
+      'src',
+      'asset://localhost/playback-proxy.mp4',
+    );
+    expect(mocks.preparePlaybackProxy).toHaveBeenCalledTimes(1);
   });
 
   it('separates active, completed and attention jobs and clears one completed entry', async () => {

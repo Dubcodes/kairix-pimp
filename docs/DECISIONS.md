@@ -545,3 +545,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Replace the full-stream `fps` hover filter with at most eight sequential targeted input seeks at 320-pixel width. Preserve the first actual `showinfo` timestamp emitted for each retained JPEG, clamp the final request inside the media duration, use one 60-second deadline for the complete entry and invalidate old cache identities through schema/fingerprint version 3. Keep one FFmpeg child and one source-volume reader active at a time.
 - **Consequences:** A disposable 600-second, 1280×720 H.264 fixture on the development machine completed eight sparse samples in 1,286 ms versus 2,838 ms for the previous full-stream filter (about 55% less elapsed time). The same 120-second synthetic clip favored the old single process (711 ms versus 1,323 ms), so sparse generation is a long-media optimization, not a universal performance claim. The conservative eight-frame cap reduces optional work and RAM; installed 4K/production-codec and slow-drive acceptance remains required. Failed entries regenerate once under the existing queue/backoff policy.
+
+## ADR-075 — Prefer an existing finalized playback proxy during source resolution
+
+- **Date:** 2026-11-08
+- **Status:** Accepted
+- **Decision:** Give Clip Viewer a purpose-built native source resolver. Canonicalize the original and derive the existing source/transform fingerprint; if that exact proxy exists and FFprobe again proves the finalized H.264/yuv420/AAC MP4 contract, protect and return it. Otherwise return the original path without generating work. Keep explicit proxy generation as the fallback after WebView2 reports an unsupported source.
+- **Consequences:** Reopening an already proxied HEVC or otherwise unsupported clip no longer repeats the original playback failure or asks for another generation click. Resolution can incur one local FFprobe, but never a source transcode. Partial, stale and invalid cache files remain unavailable. Automated tests prove identity and UI reuse, not installed WebView2 first-frame latency; representative H.264/HEVC acceptance remains required.
