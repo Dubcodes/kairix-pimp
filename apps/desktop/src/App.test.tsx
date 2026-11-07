@@ -9,6 +9,7 @@ import {
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Catalogue, DeviceSettings, IngestJob } from './bridge';
+import { previewWorkQueue } from './preview-work-queue';
 import { resetLastHoveredRatioMemoryCache } from './thumbnail-hold';
 
 const mocks = vi.hoisted(() => ({
@@ -1184,12 +1185,17 @@ describe('native application integration', () => {
         'data:image/jpeg;base64,last',
       ],
     });
+    mocks.loadHoverPreviewStatuses.mockResolvedValue(['hover-video']);
     const user = userEvent.setup();
     const { container } = render(<App />);
     await screen.findByRole('option', { name: /hover.mp4/ });
     const thumbnail = container.querySelector(
       '.media-thumbnail',
     ) as HTMLElement;
+    await screen.findByText('Scrubbable preview stored on this device');
+    expect(
+      screen.queryByLabelText('Scrubbable preview ready'),
+    ).not.toBeInTheDocument();
     vi.spyOn(thumbnail, 'getBoundingClientRect').mockReturnValue({
       left: 0,
       width: 100,
@@ -1256,6 +1262,61 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it('loads a stored hover preview without waiting behind the generation queue', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'cached-hover',
+          relativePath: '20261108/cached.mp4',
+          originalFilename: 'cached.mp4',
+          sha256: 'cached-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-08',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100, durationSeconds: 10 },
+          thumbnailPath: 'cached.jpg',
+          available: true,
+          needsReview: false,
+          observedSize: 100,
+          observedModifiedMillis: 123,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-08T00:00:00Z',
+    };
+    mocks.loadHoverPreviewStatuses.mockResolvedValue(['cached-hover']);
+    mocks.loadHoverPreview.mockResolvedValue({
+      mediaId: 'cached-hover',
+      durationSeconds: 10,
+      frameTimes: [0],
+      frames: ['data:image/jpeg;base64,cached'],
+    });
+    let releaseGeneration!: () => void;
+    const blockedGeneration = previewWorkQueue.schedule(
+      'test:blocked-generation',
+      4,
+      'blocked generation',
+      () =>
+        new Promise<void>((resolve) => {
+          releaseGeneration = resolve;
+        }),
+    );
+    const { container } = render(<App />);
+    await screen.findByText('Scrubbable preview stored on this device');
+    fireEvent.pointerEnter(
+      container.querySelector('.media-thumbnail') as HTMLElement,
+    );
+    await waitFor(() => expect(mocks.loadHoverPreview).toHaveBeenCalledOnce());
+    expect(
+      screen.getByLabelText('Scrubbable preview ready'),
+    ).toBeInTheDocument();
+    releaseGeneration();
+    await blockedGeneration;
   });
 
   it('persists device-local preview preparation and RAM allowance controls', async () => {
@@ -1428,6 +1489,68 @@ describe('native application integration', () => {
     expect(
       document.querySelector('img[src="asset://localhost/persistent.jpg"]'),
     ).not.toBeNull();
+  });
+
+  it('renders an existing static source before viewport observation and after folder remount', async () => {
+    const originalObserver = globalThis.IntersectionObserver;
+    class InertIntersectionObserver {
+      constructor() {}
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = '0px';
+      thresholds = [0];
+    }
+    globalThis.IntersectionObserver =
+      InertIntersectionObserver as unknown as typeof IntersectionObserver;
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'mounted-thumbnail',
+          relativePath: '20261108/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'mounted-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-08',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100 },
+          thumbnailPath: 'mounted.jpg',
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-08T00:00:00Z',
+    };
+    mocks.loadThumbnailSources.mockResolvedValue({
+      'mounted-thumbnail': 'asset://localhost/mounted.jpg',
+    });
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+      await waitFor(() =>
+        expect(
+          document.querySelector('img[src="asset://localhost/mounted.jpg"]'),
+        ).not.toBeNull(),
+      );
+      await user.click(screen.getByRole('button', { name: /20261108/ }));
+      expect(
+        document.querySelector('img[src="asset://localhost/mounted.jpg"]'),
+      ).not.toBeNull();
+      await user.click(screen.getByRole('button', { name: /All media/ }));
+      expect(
+        document.querySelector('img[src="asset://localhost/mounted.jpg"]'),
+      ).not.toBeNull();
+    } finally {
+      globalThis.IntersectionObserver = originalObserver;
+    }
   });
 
   it('gives Library and ordinary pages distinct scroll ownership', async () => {

@@ -9,6 +9,7 @@ interface PreviewRequestEntry {
 export class HoverPreviewRequestCache {
   private entries = new Map<string, PreviewRequestEntry>();
   private generation = 0;
+  private listeners = new Set<(usageBytes: number) => void>();
 
   private usage = 0;
 
@@ -20,6 +21,7 @@ export class HoverPreviewRequestCache {
   configure(limitBytes: number) {
     this.limitBytes = Math.max(1, limitBytes);
     this.evictToBudget();
+    this.emit();
   }
 
   request(key: string, loader: () => Promise<HoverPreview>) {
@@ -56,6 +58,7 @@ export class HoverPreviewRequestCache {
         entry.bytes = approximatePreviewBytes(preview);
         this.usage += entry.bytes;
         this.evictToBudget(key);
+        this.emit();
         return preview;
       })
       .catch((error: unknown) => {
@@ -70,6 +73,7 @@ export class HoverPreviewRequestCache {
     this.generation += 1;
     this.entries.clear();
     this.usage = 0;
+    this.emit();
   }
 
   private deleteEntry(key: string) {
@@ -77,6 +81,7 @@ export class HoverPreviewRequestCache {
     if (!entry) return;
     this.usage = Math.max(0, this.usage - entry.bytes);
     this.entries.delete(key);
+    this.emit();
   }
 
   private evictToBudget(keep?: string) {
@@ -93,6 +98,16 @@ export class HoverPreviewRequestCache {
 
   get usageBytes() {
     return this.usage;
+  }
+
+  subscribe(listener: (usageBytes: number) => void) {
+    this.listeners.add(listener);
+    listener(this.usage);
+    return () => this.listeners.delete(listener);
+  }
+
+  private emit() {
+    for (const listener of this.listeners) listener(this.usage);
   }
 }
 

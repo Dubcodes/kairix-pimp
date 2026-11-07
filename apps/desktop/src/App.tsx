@@ -261,7 +261,7 @@ export function App() {
   const [thumbnailSourceRequestCount, setThumbnailSourceRequestCount] =
     useState(0);
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
-  const [previewReadyIds, setPreviewReadyIds] = useState<Set<string>>(
+  const [previewStoredIds, setPreviewStoredIds] = useState<Set<string>>(
     () => new Set(),
   );
   const [previewMemoryUsage, setPreviewMemoryUsage] = useState(0);
@@ -419,14 +419,16 @@ export function App() {
     settingsRef.current = settings;
     savingSettings.setLatest(settings);
   }, [savingSettings, settings]);
-  useEffect(
-    () =>
-      previewWorkQueue.subscribe((status) => {
-        setPreviewQueueStatus(status);
-        setPreviewMemoryUsage(hoverPreviewRequestCache.usageBytes);
-      }),
-    [],
-  );
+  useEffect(() => {
+    const unsubscribeQueue = previewWorkQueue.subscribe(setPreviewQueueStatus);
+    const unsubscribeMemory = hoverPreviewRequestCache.subscribe(
+      setPreviewMemoryUsage,
+    );
+    return () => {
+      unsubscribeQueue();
+      unsubscribeMemory();
+    };
+  }, []);
   useEffect(
     () => staticThumbnailWorkQueue.subscribe(setStaticThumbnailQueueStatus),
     [],
@@ -998,7 +1000,7 @@ export function App() {
     void desktopBridge
       .loadHoverPreviewStatuses(mediaIds)
       .then((ready) => {
-        if (current) setPreviewReadyIds(new Set(ready));
+        if (current) setPreviewStoredIds(new Set(ready));
       })
       .catch((reason) => {
         if (current)
@@ -1011,7 +1013,7 @@ export function App() {
     };
   }, [catalogue.media, native, previewCacheEpoch]);
   const receivePreparedPreview = useCallback((mediaId: string) => {
-    setPreviewReadyIds((current) => {
+    setPreviewStoredIds((current) => {
       if (current.has(mediaId)) return current;
       const next = new Set(current);
       next.add(mediaId);
@@ -2011,7 +2013,7 @@ export function App() {
     setError('');
     previewWorkQueue.clearQueued();
     hoverPreviewRequestCache.invalidate();
-    setPreviewReadyIds(new Set());
+    setPreviewStoredIds(new Set());
     setPreviewMemoryUsage(0);
     setPreviewCacheEpoch((value) => value + 1);
     try {
@@ -4801,7 +4803,7 @@ export function App() {
                             fileType={item.fileType}
                             thumbnailSource={thumbnailSources[item.id]}
                             sourceAvailable={item.available}
-                            previewReady={previewReadyIds.has(item.id)}
+                            previewStored={previewStoredIds.has(item.id)}
                             onPreviewPrepared={receivePreparedPreview}
                             onThumbnailPrepared={receivePreparedThumbnail}
                             previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
@@ -6365,7 +6367,7 @@ export function App() {
                                   fileType={item.fileType}
                                   thumbnailSource={thumbnailSources[item.id]}
                                   sourceAvailable={item.available}
-                                  previewReady={previewReadyIds.has(item.id)}
+                                  previewStored={previewStoredIds.has(item.id)}
                                   onPreviewPrepared={receivePreparedPreview}
                                   previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
                                   previewCacheEpoch={previewCacheEpoch}
@@ -6750,7 +6752,7 @@ function MediaThumbnail({
   preloading = 'visible-nearby',
   allowBackgroundPreparation = true,
   onThumbnailPrepared,
-  previewReady = false,
+  previewStored = false,
   onPreviewPrepared,
 }: {
   mediaId: string;
@@ -6764,11 +6766,11 @@ function MediaThumbnail({
   preloading?: DeviceSettings['previewPreloading'];
   allowBackgroundPreparation?: boolean;
   onThumbnailPrepared?: (mediaId: string, source: string) => void;
-  previewReady?: boolean;
+  previewStored?: boolean;
   onPreviewPrepared?: (mediaId: string) => void;
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
-  const [showThumbnail, setShowThumbnail] = useState(
+  const [nearViewport, setNearViewport] = useState(
     () => typeof IntersectionObserver === 'undefined',
   );
   const [previewEntry, setPreviewEntry] = useState<{
@@ -6817,12 +6819,7 @@ function MediaThumbnail({
       previewWorkQueue.promote(`load:${previewKey}`, priority);
       const generation = ++requestGeneration.current;
       const request = hoverPreviewRequestCache.request(previewKey, () =>
-        previewWorkQueue.schedule(
-          `load:${previewKey}`,
-          priority,
-          fileType.toUpperCase(),
-          () => desktopBridge.loadHoverPreview(mediaId),
-        ),
+        desktopBridge.loadHoverPreview(mediaId),
       );
       void request
         .then((result) => {
@@ -6841,7 +6838,6 @@ function MediaThumbnail({
         .catch(() => undefined);
     },
     [
-      fileType,
       mediaId,
       preview,
       previewCacheEpoch,
@@ -6895,14 +6891,19 @@ function MediaThumbnail({
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
           nearby = true;
-          setShowThumbnail(true);
-          request(1);
-        } else if (previewKey) {
-          nearby = false;
-          if (retryTimer != null) window.clearTimeout(retryTimer);
-          staticThumbnailWorkQueue.cancel(
-            staticThumbnailQueueKey(previewKey, previewCacheEpoch),
+          setNearViewport(true);
+          setFailedImageSource((failed) =>
+            failed === thumbnailSource ? undefined : failed,
           );
+          request(1);
+        } else {
+          nearby = false;
+          setNearViewport(false);
+          if (retryTimer != null) window.clearTimeout(retryTimer);
+          if (previewKey)
+            staticThumbnailWorkQueue.cancel(
+              staticThumbnailQueueKey(previewKey, previewCacheEpoch),
+            );
         }
       },
       { rootMargin: '400px' },
@@ -7075,23 +7076,28 @@ function MediaThumbnail({
           : undefined
       }
     >
-      {imageSource && (displayedFrame || showThumbnail) ? (
+      {imageSource ? (
         <img
           src={imageSource}
           alt=""
-          loading="lazy"
+          loading={nearViewport ? 'eager' : 'lazy'}
           decoding="async"
           onError={() => setFailedImageSource(imageSource)}
         />
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>
       )}
-      {previewReady && (
+      {preview && (
         <span
           className="preview-ready-indicator"
           title="Scrubbable preview ready"
           aria-label="Scrubbable preview ready"
         />
+      )}
+      {!preview && previewStored && (
+        <span className="sr-only">
+          Scrubbable preview stored on this device
+        </span>
       )}
       {isHovering &&
         displayedIndex != null &&

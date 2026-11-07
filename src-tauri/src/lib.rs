@@ -9395,15 +9395,6 @@ fn generate_hover_preview(
 async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
-        let _operation = begin_critical_operation(&state.operations, "hover preview generation")?;
-        let preview_operation = begin_transient_operation(
-            &state.hover_preview_status,
-            format!("hover-preview:{media_id}:{}", Uuid::new_v4()),
-            "hover-preview",
-            "Preparing hover preview",
-            "Waiting for preview worker",
-            None,
-        );
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -9413,7 +9404,8 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             .media
             .iter()
             .find(|item| item.id == media_id)
-            .ok_or("Unknown media item")?;
+            .ok_or("Unknown media item")?
+            .clone();
         if !matches!(
             item.file_type.to_ascii_lowercase().as_str(),
             "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
@@ -9421,9 +9413,36 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             return Err("Hover previews are available only for supported video files".into());
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        let snapshot = fs_safe::snapshot(&source)?;
+        let fingerprint = hover_preview_fingerprint(&item, &snapshot);
+        let cache_root = hover_preview_root(&settings)?;
+        let cached_directory = cache_root.join(&fingerprint);
+        if cached_directory.is_dir() {
+            let cached_operation = begin_transient_operation(
+                &state.hover_preview_status,
+                format!("hover-preview-load:{media_id}:{}", Uuid::new_v4()),
+                "hover-preview-load",
+                "Loading cached hover preview",
+                "Validating stored scrub frames",
+                None,
+            );
+            if let Ok(preview) = read_hover_preview(&cached_directory, &fingerprint) {
+                cached_operation.set_stage("Scrub frames loaded and ready");
+                return Ok(preview);
+            }
+        }
+
+        let _operation = begin_critical_operation(&state.operations, "hover preview generation")?;
+        let preview_operation = begin_transient_operation(
+            &state.hover_preview_status,
+            format!("hover-preview:{media_id}:{}", Uuid::new_v4()),
+            "hover-preview",
+            "Generating hover preview",
+            "Waiting for preview worker",
+            None,
+        );
         configure_volume_governor(&state, &settings);
         let source_volume = volume_resource_id(&source)?;
-        let cache_root = hover_preview_root(&settings)?;
         let cache_volume = volume_resource_id(&cache_root)?;
         preview_operation.set_stage("Waiting for source and cache volumes");
         let mut volume_permit = state.volume_governor.acquire(
@@ -9433,7 +9452,7 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
                 false,
                 vec![
                     resource_governor::VolumeNeed::read(source_volume.clone()),
-                    resource_governor::VolumeNeed::write(cache_volume),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
                 ],
             ),
             || false,
@@ -9441,15 +9460,12 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
         let _guard = state.preview_generation.lock().unwrap();
         let _admission = state.derivative_admission.acquire(2);
         preview_operation.set_stage("Generating and validating scrub frames");
-        let result = generate_hover_preview(&settings, item, &source);
+        let result = generate_hover_preview(&settings, &item, &source);
         if result.is_ok() {
             volume_permit.add_bytes_for(
-                &source_volume,
-                source
-                    .metadata()
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default(),
+                &cache_volume,
                 0,
+                preview_cache_usage(&cached_directory),
             );
         }
         result
@@ -9503,7 +9519,7 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
                 true,
                 vec![
                     resource_governor::VolumeNeed::read(source_volume.clone()),
-                    resource_governor::VolumeNeed::write(cache_volume),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
                 ],
             ),
             || false,
@@ -9511,18 +9527,18 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
         let _guard = state.preview_generation.lock().unwrap();
         let _admission = state.derivative_admission.acquire(3);
         preview_operation.set_stage("Generating and validating scrub frames");
-        let result = ensure_hover_preview(&settings, item, &source).map(|_| ());
-        if result.is_ok() {
-            volume_permit.add_bytes_for(
-                &source_volume,
-                source
-                    .metadata()
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default(),
-                0,
-            );
+        let result = ensure_hover_preview(&settings, item, &source);
+        match result {
+            Ok((directory, _)) => {
+                volume_permit.add_bytes_for(
+                    &cache_volume,
+                    0,
+                    preview_cache_usage(&directory),
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
-        result
     })
     .await
     .map_err(|error| format!("Hover preview preparation task failed: {error}"))?
