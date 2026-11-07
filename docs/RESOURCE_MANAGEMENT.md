@@ -37,7 +37,7 @@ Explicit per-volume byte-rate caps, reserved temporary/cache space, GPU load and
 
 Slow or failing volumes back off exponentially with a bounded delay after reported I/O failures. The worker never spins on a disconnected drive. It resumes only from durable evidence and revalidates volume/file identity. Sequential reads are preferred; concurrent full-file hashing of one identified volume is prohibited.
 
-CPU and RAM readings are measurements only when supplied by a supported host API. Disk throughput is calculated from bytes actually read over elapsed monotonic time. PIMP must label heuristics as estimates and must not infer physical-device saturation from queue length alone.
+CPU and RAM readings are measurements only when supplied by a supported host API. Disk throughput is calculated from bytes actually read over elapsed monotonic time. Full-content hashing/copy verification reports known streamed bytes. FFmpeg does not expose source bytes read through the current integration, so thumbnails, hover previews and playback proxies report completed output bytes but do not add the source's logical file length to measured-read counters. PIMP must label heuristics as estimates and must not infer physical-device saturation from queue length alone.
 
 ## Scheduling priorities
 

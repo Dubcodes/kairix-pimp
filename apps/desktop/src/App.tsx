@@ -166,6 +166,21 @@ const duration = (seconds?: number) =>
   seconds == null
     ? '—'
     : `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`;
+const enrichmentVideoType = (fileType: string) =>
+  [
+    'mp4',
+    'mov',
+    'm4v',
+    'mxf',
+    'mts',
+    'm2ts',
+    'avi',
+    'h264',
+    'h265',
+    'hevc',
+    'r3d',
+    'braw',
+  ].includes(fileType.toLocaleLowerCase());
 
 const keyboardInputOwner = (target: EventTarget | null) => {
   const selector = [
@@ -266,6 +281,7 @@ export function App() {
     () => new Set(),
   );
   const [previewMemoryUsage, setPreviewMemoryUsage] = useState(0);
+  const [previewMemoryCount, setPreviewMemoryCount] = useState(0);
   const [previewQueueStatus, setPreviewQueueStatus] =
     useState<PreviewQueueStatus>(previewWorkQueue.status);
   const [staticThumbnailQueueStatus, setStaticThumbnailQueueStatus] =
@@ -423,7 +439,10 @@ export function App() {
   useEffect(() => {
     const unsubscribeQueue = previewWorkQueue.subscribe(setPreviewQueueStatus);
     const unsubscribeMemory = hoverPreviewRequestCache.subscribe(
-      setPreviewMemoryUsage,
+      (usageBytes, readyEntries) => {
+        setPreviewMemoryUsage(usageBytes);
+        setPreviewMemoryCount(readyEntries);
+      },
     );
     return () => {
       unsubscribeQueue();
@@ -2055,6 +2074,7 @@ export function App() {
     hoverPreviewRequestCache.invalidate();
     setPreviewStoredIds(new Set());
     setPreviewMemoryUsage(0);
+    setPreviewMemoryCount(0);
     setPreviewCacheEpoch((value) => value + 1);
     try {
       setPreviewCacheUsage(await desktopBridge.clearHoverPreviewCache());
@@ -2064,6 +2084,7 @@ export function App() {
     } finally {
       hoverPreviewRequestCache.invalidate();
       setPreviewMemoryUsage(0);
+      setPreviewMemoryCount(0);
       setPreviewCacheEpoch((value) => value + 1);
       setClearingPreviewCache(false);
     }
@@ -3805,8 +3826,14 @@ export function App() {
                   </label>
                   <div className="info-card">
                     <strong>Hover preview cache</strong>
-                    <span>{size(previewMemoryUsage)} in memory</span>
-                    <span>{size(previewCacheUsage)} on disk</span>
+                    <span>
+                      {previewMemoryCount} loaded · {size(previewMemoryUsage)}
+                      {' in memory'}
+                    </span>
+                    <span>
+                      {previewStoredIds.size} stored · {size(previewCacheUsage)}
+                      {' on disk'}
+                    </span>
                     <span role="status">
                       {staticThumbnailQueueStatus.active
                         ? `Generating static thumbnail · ${staticThumbnailQueueStatus.queued} queued`
@@ -4053,6 +4080,26 @@ export function App() {
                       <dd>{thumbnailSourceRequestCount}</dd>
                     </div>
                     <div>
+                      <dt>Static thumbnails in current scope</dt>
+                      <dd>
+                        {
+                          filtered.filter(
+                            (item) => thumbnailSources[item.id] != null,
+                          ).length
+                        }{' '}
+                        ready ·{' '}
+                        {
+                          filtered.filter(
+                            (item) =>
+                              item.available &&
+                              thumbnailSources[item.id] == null &&
+                              enrichmentVideoType(item.fileType),
+                          ).length
+                        }{' '}
+                        missing
+                      </dd>
+                    </div>
+                    <div>
                       <dt>Active native workers</dt>
                       <dd>{activeBackgroundOperations.length}</dd>
                     </div>
@@ -4165,12 +4212,14 @@ export function App() {
                     <div>
                       <dt>Preview caches</dt>
                       <dd>
-                        {size(previewMemoryUsage)} RAM /{' '}
+                        {previewMemoryCount} loaded · {size(previewMemoryUsage)}
+                        {' RAM / '}
                         {size(
                           settings.previewRamCacheLimitBytes ||
                             128 * 1024 * 1024,
                         )}{' '}
-                        budget · {size(previewCacheUsage)} disk /{' '}
+                        budget · {previewStoredIds.size} stored ·{' '}
+                        {size(previewCacheUsage)} disk /{' '}
                         {size(settings.previewCacheLimitBytes)} budget
                       </dd>
                     </div>

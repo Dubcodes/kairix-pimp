@@ -7667,7 +7667,6 @@ fn run_enrichment(
                 }
             }
         }
-        volume_permit.add_bytes_for(&source_volume, source_before.length, 0);
         if let Ok(metadata) = thumbnail.metadata() {
             volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
         }
@@ -8606,9 +8605,8 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
             fail_playback_proxy_status(&state, &operation_id, error);
             return Err(error.into());
         }
-        volume_permit.add_bytes_for(&source_volume, before.length, 0);
         if let Ok(metadata) = temporary.metadata() {
-            volume_permit.add_bytes_for(&cache_volume, metadata.len(), metadata.len());
+            volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
         }
         let after = match fs_safe::snapshot(&source) {
             Ok(snapshot) => snapshot,
@@ -9116,7 +9114,6 @@ fn set_media_thumbnail_frame(
         let _admission = state.derivative_admission.acquire(0);
         generate_thumbnail_atomic(&source, &destination, seconds)?
     };
-    volume_permit.add_bytes_for(&source_volume, before.length, 0);
     if let Ok(metadata) = destination.metadata() {
         volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
     }
@@ -9295,7 +9292,6 @@ async fn prepare_media_thumbnail(
                 operation.set_stage("Extracting representative frame");
                 generate_thumbnail_atomic(&source, &thumbnail, 0.1)?
             };
-            volume_permit.add_bytes_for(&source_volume, before.length, 0);
             if let Ok(metadata) = thumbnail.metadata() {
                 volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
             }
@@ -9348,7 +9344,7 @@ fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
 
 fn hover_preview_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"pimp-hover-preview-v2\0");
+    digest.update(b"pimp-hover-preview-v3-sparse-seek\0");
     digest.update(item.id.as_bytes());
     digest.update(b"\0");
     digest.update(item.sha256.as_bytes());
@@ -9376,13 +9372,93 @@ fn hover_preview_frame_times(duration_seconds: f64) -> Result<Vec<f64>, String> 
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return Err("Hover preview requires a known positive duration".into());
     }
-    let count = ((duration_seconds * 2.0).floor() as usize).clamp(1, 16);
+    let count = ((duration_seconds * 2.0).floor() as usize).clamp(1, 8);
     if count == 1 {
         return Ok(vec![duration_seconds / 2.0]);
     }
     Ok((0..count)
         .map(|index| duration_seconds * index as f64 / (count - 1) as f64)
         .collect())
+}
+
+fn hover_preview_seek_time(sample_time: f64, duration_seconds: f64) -> f64 {
+    if duration_seconds <= 0.2 {
+        return duration_seconds / 2.0;
+    }
+    sample_time.clamp(0.0, duration_seconds - 0.1)
+}
+
+fn generate_hover_preview_frame(
+    source: &Path,
+    destination: &Path,
+    seek_seconds: f64,
+    timeout: StdDuration,
+) -> Result<f64, String> {
+    let seek = format!("{seek_seconds:.6}");
+    let mut child = ManagedChild(
+        media_tool_command("ffmpeg")
+            .args(["-v", "info", "-nostdin", "-copyts", "-ss", &seek, "-i"])
+            .arg(source)
+            .args([
+                "-an",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=320:-2:force_original_aspect_ratio=decrease,showinfo",
+                "-q:v",
+                "7",
+                "-n",
+            ])
+            .arg(destination)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("FFmpeg is unavailable for hover previews: {error}"))?,
+    );
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or("FFmpeg hover-preview diagnostics are unavailable")?;
+    let diagnostics = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = BufReader::new(stderr).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().map_err(|error| {
+            format!("Could not monitor FFmpeg hover-preview generation: {error}")
+        })? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            let _ = diagnostics.join();
+            return Err("FFmpeg hover-preview generation timed out after 60 seconds".into());
+        }
+        std::thread::sleep(StdDuration::from_millis(25));
+    };
+    let (read_result, diagnostics) = diagnostics
+        .join()
+        .map_err(|_| "FFmpeg hover-preview diagnostics worker failed")?;
+    read_result
+        .map_err(|error| format!("Cannot read FFmpeg hover-preview diagnostics: {error}"))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&diagnostics);
+        return Err(format!(
+            "FFmpeg could not generate a hover-preview frame: {}",
+            detail.trim()
+        ));
+    }
+    if !valid_cached_thumbnail(destination) {
+        return Err("FFmpeg produced an invalid hover-preview frame".into());
+    }
+    parse_hover_preview_frame_times(&diagnostics)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "FFmpeg did not report the sampled hover-preview timestamp".into())
 }
 
 fn validate_hover_preview(
@@ -9395,7 +9471,7 @@ fn validate_hover_preview(
             .map_err(|error| format!("Cannot read hover preview manifest: {error}"))?,
     )
     .map_err(|error| format!("Invalid hover preview manifest: {error}"))?;
-    if manifest.version != 2 || manifest.fingerprint != expected_fingerprint {
+    if manifest.version != 3 || manifest.fingerprint != expected_fingerprint {
         return Err("Hover preview cache fingerprint does not match the source".into());
     }
     if manifest.frame_files.len() != manifest.frame_times.len() || manifest.frame_files.is_empty() {
@@ -9521,6 +9597,14 @@ fn evict_hover_preview_cache(root: &Path, budget: u64, keep: &Path) -> Result<()
     Ok(())
 }
 
+struct UnpublishedHoverPreview(PathBuf);
+
+impl Drop for UnpublishedHoverPreview {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn ensure_hover_preview(
     settings: &DeviceSettings,
     item: &MediaItem,
@@ -9545,40 +9629,31 @@ fn ensure_hover_preview(
 
     let temporary = root.join(format!(".generating-{}", Uuid::new_v4()));
     fs::create_dir(&temporary).map_err(|error| format!("Cannot stage hover preview: {error}"))?;
-    let output_pattern = temporary.join("frame-%03d.jpg");
-    let filter = format!(
-        "fps={}/{duration_seconds},scale=320:-2:force_original_aspect_ratio=decrease,showinfo",
-        frame_times.len()
-    );
-    let output = media_tool_command("ffmpeg")
-        .args(["-v", "info", "-nostdin", "-i"])
-        .arg(source)
-        .args(["-an", "-vf", &filter, "-frames:v"])
-        .arg(frame_times.len().to_string())
-        .args(["-q:v", "7"])
-        .arg(&output_pattern)
-        .output()
-        .map_err(|error| format!("FFmpeg is unavailable for hover previews: {error}"));
-    let output = match output {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
+    let _unpublished = UnpublishedHoverPreview(temporary.clone());
+    let generation_started = Instant::now();
+    let generation_timeout = StdDuration::from_secs(60);
+    let mut actual_frame_times = Vec::with_capacity(frame_times.len());
+    for (index, sample_time) in frame_times.iter().enumerate() {
+        let remaining = generation_timeout.saturating_sub(generation_started.elapsed());
+        if remaining.is_zero() {
             let _ = fs::remove_dir_all(&temporary);
-            return Err(format!(
-                "FFmpeg could not generate a hover preview: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            return Err("FFmpeg hover-preview generation timed out after 60 seconds".into());
         }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&temporary);
-            return Err(error);
-        }
-    };
-    let actual_frame_times = parse_hover_preview_frame_times(&output.stderr);
-    if actual_frame_times.len() != frame_times.len() {
-        let _ = fs::remove_dir_all(&temporary);
-        return Err("FFmpeg did not report every sampled hover-preview timestamp".into());
+        let destination = temporary.join(format!("frame-{:03}.jpg", index + 1));
+        let actual_time = match generate_hover_preview_frame(
+            source,
+            &destination,
+            hover_preview_seek_time(*sample_time, duration_seconds),
+            remaining,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&temporary);
+                return Err(error);
+            }
+        };
+        actual_frame_times.push(actual_time);
     }
-    drop(output);
     if fs_safe::snapshot(source)? != before {
         let _ = fs::remove_dir_all(&temporary);
         return Err("Source changed while generating its hover preview".into());
@@ -9595,7 +9670,7 @@ fn ensure_hover_preview(
         return Err("FFmpeg produced an incomplete hover preview".into());
     }
     let manifest = HoverPreviewManifest {
-        version: 2,
+        version: 3,
         media_id: item.id.clone(),
         fingerprint: fingerprint.clone(),
         duration_seconds,
@@ -12953,9 +13028,11 @@ mod tests {
         assert_eq!(hover_preview_frame_times(0.4).unwrap().len(), 1);
         assert_eq!(hover_preview_frame_times(3.0).unwrap().len(), 6);
         let long = hover_preview_frame_times(600.0).unwrap();
-        assert_eq!(long.len(), 16);
+        assert_eq!(long.len(), 8);
         assert_eq!(long.first().copied(), Some(0.0));
         assert_eq!(long.last().copied(), Some(600.0));
+        assert_eq!(hover_preview_seek_time(600.0, 600.0), 599.9);
+        assert_eq!(hover_preview_seek_time(0.1, 0.1), 0.05);
         assert!(hover_preview_frame_times(0.0).is_err());
     }
 
@@ -12984,7 +13061,7 @@ mod tests {
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
         let manifest = HoverPreviewManifest {
-            version: 2,
+            version: 3,
             media_id: "media-a".into(),
             fingerprint: "fingerprint-a".into(),
             duration_seconds: 5.0,
@@ -13048,6 +13125,20 @@ mod tests {
         assert!(unrelated_cache_directory.exists());
         assert_eq!(fs::read(master_media).unwrap(), b"original-media");
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn unpublished_hover_preview_guard_removes_partial_directory() {
+        let root = temporary("hover-preview-partial-cleanup");
+        let partial = root.join(".generating-test");
+        fs::create_dir_all(&partial).unwrap();
+        fs::write(partial.join("frame-001.jpg"), b"partial").unwrap();
+        {
+            let _guard = UnpublishedHoverPreview(partial.clone());
+            assert!(partial.is_dir());
+        }
+        assert!(!partial.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

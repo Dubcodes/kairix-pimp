@@ -9,7 +9,9 @@ interface PreviewRequestEntry {
 export class HoverPreviewRequestCache {
   private entries = new Map<string, PreviewRequestEntry>();
   private generation = 0;
-  private listeners = new Set<(usageBytes: number) => void>();
+  private listeners = new Set<
+    (usageBytes: number, readyEntries: number) => void
+  >();
 
   private usage = 0;
 
@@ -100,14 +102,18 @@ export class HoverPreviewRequestCache {
     return this.usage;
   }
 
-  subscribe(listener: (usageBytes: number) => void) {
+  get readySize() {
+    return [...this.entries.values()].filter((entry) => !entry.pending).length;
+  }
+
+  subscribe(listener: (usageBytes: number, readyEntries: number) => void) {
     this.listeners.add(listener);
-    listener(this.usage);
+    listener(this.usage, this.readySize);
     return () => this.listeners.delete(listener);
   }
 
   private emit() {
-    for (const listener of this.listeners) listener(this.usage);
+    for (const listener of this.listeners) listener(this.usage, this.readySize);
   }
 }
 
