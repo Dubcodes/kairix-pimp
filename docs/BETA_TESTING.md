@@ -1,8 +1,8 @@
 # Windows beta installation and acceptance
 
-## Pull-request test build 0.1.1-6
+## Current Development candidate 0.2
 
-The preview/Premiere milestone uses an unsigned, short-lived `0.1.1-6` Actions artifact from PR #5. It is distinguishable from the permanent `0.1.1-5` public prerelease and does not replace it. Download the installer artifact and its `SHA256SUMS.txt` from the successful **Windows beta installer** run, verify the preferred per-user NSIS Setup hash, then install over `0.1.1-5`. Confirm the About version changes while device ID, configured roots, catalogue, recoverable jobs and device-local settings remain present.
+Current source is internal version `0.2.0`, displayed as `0.2 — Development`. Pull-request artifacts remain unsigned internal verification output; an approved tester build should instead be promoted to a permanent GitHub Development Release. Until that promotion succeeds, `v0.1.1-5` remains the latest public beta. For upgrade acceptance, verify the NSIS Setup against `SHA256SUMS.txt` and `BUILD-INFO.txt`, then confirm device ID, configured roots, catalogue, shared thumbnails, recoverable jobs and device-local settings remain present.
 
 The same run publishes a separately named **Premiere Companion developer source** artifact. It is unpackaged source for UXP Developer Tool, not a `.ccx`. Follow `PREMIERE_INTEGRATION.md` and use only a disposable Premiere project with synthetic MP4/WAV media.
 
@@ -50,31 +50,39 @@ the installed application, not `npm run dev`.
 - [ ] Drag a fixture folder into Ingest and retain the source fixtures.
 - [ ] Review the pre-copy inventory count, bytes, hierarchy-preserved files,
       exclusions and any issues before starting the ingest.
+- [ ] During a large-card review, confirm **Background Operations** advances through enumeration, inspection, checksums and duplicate checks while Library navigation remains responsive; cancel and confirm card reads settle without starting a copy.
+- [ ] Start another inventory while one is active and confirm only the newest review completes and no overlapping sustained card reads remain.
 - [ ] Confirm background byte/file progress and independently verified results.
 - [ ] While copying, add tags, project assignments, a description and favourite.
 - [ ] Close and reopen PIMP; confirm catalogue and job state persist.
 - [ ] Interrupt a multi-file job, reopen, reconnect its source and explicitly retry.
 - [ ] Re-ingest a duplicate and confirm existing metadata is retained.
 - [ ] Search the Library and confirm generated thumbnails when FFmpeg is present.
-- [ ] Open the reported approximately 684-record Library, record time-to-responsive
+- [ ] Open a disposable approximately 1,000-record Library, record time-to-responsive
       and confirm scrolling/navigation remains responsive while near-visible thumbnails load.
+- [ ] After a reviewed large-card inventory, rapidly switch Today, Yesterday and a chosen date. Confirm only the latest plan is active, no new files appear, and Process Monitor shows metadata checks rather than another full source-content read.
 - [ ] Hover several local videos, scrub across the frames, move the pointer away
       and confirm the static thumbnail returns without audio or console windows.
-- [ ] Exercise click, Ctrl+click, Shift+click and Ctrl+A selection; batch add and
-      remove tags/projects, set a description and favourite state.
-- [ ] Copy multiple CRLF-separated paths for manual Premiere import and confirm
-      the right-click actions match the visible selection actions.
+- [ ] Open synthetic HEVC footage, generate the H.264/AAC fallback, record processed/total time and throughput, then cancel another conversion and confirm FFmpeg exits before retry. Repeat once while quitting PIMP and check for no orphan process or source change.
+- [ ] While the Clip Viewer is open, type K and Space and use Ctrl+Z in descriptions and tag search. Confirm text editing wins; after focus leaves the editor, confirm K/Space controls playback.
+- [ ] Index a disposable Premiere project and confirm Background Operations shows the real folder/project/reference stage without inventing a percentage.
+- [ ] Exercise thumbnail checkboxes by mouse and keyboard plus click, Ctrl+click,
+      Shift+click and Ctrl+A; confirm deselecting one checkbox preserves the rest,
+      then batch-edit tags/projects, description and favourite state.
+- [ ] Use **Copy file paths** and confirm it produces CRLF-separated text only;
+      it must not claim that Premiere imported the media.
 - [ ] Confirm **Reveal in Explorer** visibly selects disposable files whose names contain spaces, commas and Unicode, including an attached WAV; repeat with an already-open Explorer window and confirm an offline file reports an error.
 - [ ] Remove FFmpeg/FFprobe from `PATH`, restart, and confirm the warning while
       verified ingest and ordinary catalogue use remain functional.
 - [ ] Confirm no source file was renamed, changed or deleted.
+- [ ] Close PIMP during inventory and during copy, then relaunch; confirm a clean shutdown or recoverable interrupted job with no promoted unverified file. Record any Windows crash/event evidence rather than inferring a cause.
 - [ ] Safely simulate a removed source and an unavailable/full destination where
       practical; confirm the job fails with a recovery action plus technical detail.
 
 Record the Windows version, installer filename, commit SHA, FFmpeg version and
 result of every item. A browser test is not evidence for a native checklist item.
 
-## Approximately 700-record responsiveness measurement
+## Approximately 700–1,000-record responsiveness measurement
 
 This pass is intentionally manual because jsdom timings do not measure WebView2,
 native IPC, FFmpeg, Windows scheduling or installed-process memory. Do not point
@@ -84,7 +92,7 @@ retain the generated source until the pass is complete.
 
 1. Install the exact CI artifact under test and record Windows version, CPU,
    installed RAM, storage type, installer name, commit and FFmpeg version.
-2. Populate the disposable catalogue by ingesting approximately 700 generated
+2. Populate the disposable catalogue by ingesting 700–1,000 generated
    short video fixtures. Wait for discovery/enrichment to settle, quit from the
    tray, and reopen from the installed shortcut.
 3. Start a stopwatch with the shortcut launch. Record time until the main window
@@ -120,7 +128,20 @@ Record raw timings and memory/CPU observations rather than “fast” or “resp
 Treat input stalls longer than two seconds, thumbnail batch counts growing per
 card, unbounded memory growth, stalled ingest, or FFmpeg/cache-clear errors as a
 failed acceptance item. This procedure remains outstanding until run against the
-installed `0.1.1-5` release.
+installed PR #6 test build.
+
+## Native outbound-drag acceptance
+
+Use generated disposable MP4 files beneath a disposable configured Master Bin;
+record hashes before and after every case. Drag one card into an empty Explorer
+folder, then multiple explicitly selected cards and one real Library folder.
+Confirm the destination receives copies, the source paths and hashes remain
+unchanged, and cancelling over a prohibited target creates nothing. Repeat with
+spaces, Unicode and a supported long path, then verify unavailable or changed
+catalogue entries are rejected. Finally drag the generated MP4 into a disposable
+Premiere Pro 26.0.2 project and confirm Premiere recognizes the original media
+without modifying it. Record the Windows/Premiere versions and result. Rust and
+jsdom tests do not satisfy this installed cross-process acceptance gate.
 
 ## Signed automatic-update acceptance
 

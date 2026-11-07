@@ -5,6 +5,7 @@ const require = createRequire(import.meta.url);
 const manifestCore = require('./manifest-core.cjs') as {
   validate(value: unknown): { items: Array<{ mediaId: string }> };
   normalizePath(path: string): string;
+  compatibleHostPath(path: string): string;
   groupByBin(
     items: Array<{ binPath: string }>,
     preserve: boolean,
@@ -80,5 +81,20 @@ describe('Premiere interchange manifest', () => {
     expect(manifestCore.normalizePath('C:\\MASTER\\Clip.MP4')).toBe(
       'c:/master/clip.mp4',
     );
+    expect(
+      manifestCore.normalizePath(
+        String.raw`\\?\C:\Master\Unicode カード\Clip 1.MP4`,
+      ),
+    ).toBe('c:/master/unicode カード/clip 1.mp4');
+    expect(
+      manifestCore.compatibleHostPath(String.raw`\\server\share\clip 1.mp4`),
+    ).toBe(String.raw`\\server\share\clip 1.mp4`);
+    expect(
+      manifestCore.compatibleHostPath(
+        String.raw`\\?\UNC\server\share\clip 1.mp4`,
+      ),
+    ).toBe(String.raw`\\?\UNC\server\share\clip 1.mp4`);
+    const longPath = '\\\\?\\C:\\Master\\' + `${'x'.repeat(260)}\\clip.mp4`;
+    expect(manifestCore.compatibleHostPath(longPath)).toBe(longPath);
   });
 });

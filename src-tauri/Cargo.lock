@@ -2015,11 +2015,13 @@ dependencies = [
 
 [[package]]
 name = "kairix-pimp"
-version = "0.1.1-6"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "flate2",
  "minisign-verify",
+ "quick-xml",
  "serde",
  "serde_json",
  "sha2",
@@ -2033,6 +2035,9 @@ dependencies = [
  "tauri-plugin-updater",
  "uuid",
  "walkdir",
+ "windows",
+ "windows-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
