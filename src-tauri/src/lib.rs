@@ -8964,6 +8964,17 @@ fn load_thumbnail_sources(
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
     let shared = shared_thumbnail_root(&settings)?;
+    Ok(thumbnail_sources_for_items(
+        &settings, &catalogue, &shared, &requested,
+    ))
+}
+
+fn thumbnail_sources_for_items(
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+    shared: &Path,
+    requested: &HashSet<String>,
+) -> HashMap<String, String> {
     let mut sources = HashMap::new();
     for item in catalogue
         .media
@@ -8987,7 +8998,7 @@ fn load_thumbnail_sources(
             sources.insert(item.id.clone(), legacy.to_string_lossy().into_owned());
         }
     }
-    Ok(sources)
+    sources
 }
 
 #[tauri::command]
@@ -11058,6 +11069,51 @@ mod tests {
             selected_static_thumbnail_reference(&first),
             static_thumbnail_reference(&first, 0.1)
         );
+    }
+
+    #[test]
+    fn synchronized_thumbnail_is_reused_on_an_independent_device_without_source_media() {
+        let (root, _, _, mut catalogue) = completion_fixture("thumbnail-cross-device");
+        let item = catalogue.media.remove(0);
+        let reference = selected_static_thumbnail_reference(&item);
+        let device_a = root.join("device-a");
+        let device_b = root.join("device-b");
+        let shared_a = device_a.join("catalogue").join("thumbnails").join("v1");
+        let shared_b = device_b.join("catalogue").join("thumbnails").join("v1");
+        fs::create_dir_all(&shared_a).unwrap();
+        fs::create_dir_all(&shared_b).unwrap();
+        fs::create_dir_all(device_a.join("master")).unwrap();
+        fs::create_dir_all(device_b.join("master")).unwrap();
+        let source_a = device_a.join("master").join(&item.relative_path);
+        fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+        fs::write(&source_a, b"source").unwrap();
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
+        fs::write(shared_a.join(&reference), jpeg).unwrap();
+        fs::copy(shared_a.join(&reference), shared_b.join(&reference)).unwrap();
+
+        let settings_b = DeviceSettings {
+            master_bin_path: device_b.join("master").to_string_lossy().into_owned(),
+            shared_catalogue_path: device_b.join("catalogue").to_string_lossy().into_owned(),
+            catalogue_in_master_bin: false,
+            ..DeviceSettings::default()
+        };
+        let requested = HashSet::from([item.id.clone()]);
+        let sources = thumbnail_sources_for_items(
+            &settings_b,
+            &Catalogue {
+                media: vec![item.clone()],
+                ..Catalogue::default()
+            },
+            &shared_b.canonicalize().unwrap(),
+            &requested,
+        );
+
+        assert!(!device_b.join("master").join(&item.relative_path).exists());
+        assert_eq!(
+            sources.get(&item.id).map(PathBuf::from),
+            Some(shared_b.join(reference).canonicalize().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
