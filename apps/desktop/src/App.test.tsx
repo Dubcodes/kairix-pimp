@@ -89,6 +89,7 @@ const mocks = vi.hoisted(() => ({
   cancelBackgroundOperation: vi.fn(),
   listBackgroundOperations: vi.fn(),
   getResourceGovernorStatus: vi.fn(),
+  logUiError: vi.fn(),
   verifyMediaIntegrity: vi.fn(),
   reapproveIngestDestinations: vi.fn(),
   replanIngestDestinations: vi.fn(),
@@ -163,7 +164,7 @@ vi.mock('./bridge', () => ({
       pending: 0,
       errors: 0,
     })),
-    logUiError: vi.fn(),
+    logUiError: mocks.logUiError,
     appInfo: vi.fn(async () => ({
       version: '0.1.1-1',
       displayVersion: '0.1.1-1',
@@ -2945,7 +2946,7 @@ describe('native application integration', () => {
     expect(description).toHaveValue('Keep this draft');
   });
 
-  it('falls back to a file-type placeholder when a thumbnail URL breaks', async () => {
+  it('retries a broken static thumbnail twice before falling back with diagnostics', async () => {
     mocks.catalogue = {
       media: [
         {
@@ -2983,7 +2984,29 @@ describe('native application integration', () => {
     expect(fireEvent.dragStart(image)).toBe(false);
     expect(mocks.startNativeMediaDrag).not.toHaveBeenCalled();
     fireEvent.error(image);
+    const retryOne = await waitFor(() => {
+      const candidate = document.querySelector(
+        'img[src="asset://localhost/media-1.jpg?pimp_retry=1"]',
+      );
+      expect(candidate).not.toBeNull();
+      return candidate as HTMLImageElement;
+    });
+    fireEvent.error(retryOne);
+    const retryTwo = await waitFor(
+      () => {
+        const candidate = document.querySelector(
+          'img[src="asset://localhost/media-1.jpg?pimp_retry=2"]',
+        );
+        expect(candidate).not.toBeNull();
+        return candidate as HTMLImageElement;
+      },
+      { timeout: 2_000 },
+    );
+    fireEvent.error(retryTwo);
     expect(await screen.findByText('MP4')).toBeVisible();
+    expect(mocks.logUiError).toHaveBeenCalledWith(
+      'Static thumbnail failed after bounded retries for media media-1',
+    );
   });
 
   it('prepares one missing visible thumbnail and reuses it in Projects', async () => {

@@ -9257,6 +9257,9 @@ fn set_media_thumbnail_frame(
         )?;
     }
     let _ = app.emit("catalogue-changed", ());
+    app.asset_protocol_scope()
+        .allow_file(&destination)
+        .map_err(|error| format!("Cannot authorize validated thumbnail: {error}"))?;
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -9313,9 +9316,20 @@ fn load_thumbnail_sources(
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
     let shared = shared_thumbnail_root(&settings)?;
-    Ok(thumbnail_sources_for_items(
+    let sources = thumbnail_sources_for_items(
         &settings, &catalogue, &shared, &requested,
-    ))
+    );
+    // The static config deliberately grants no filesystem glob. Only native-
+    // validated JPEGs are exposed to the WebView, one exact file at a time.
+    // This supports a user-selected shared catalogue without granting the
+    // WebView access to the rest of that volume or Master Bin.
+    let asset_scope = app.asset_protocol_scope();
+    for path in sources.values() {
+        asset_scope
+            .allow_file(path)
+            .map_err(|error| format!("Cannot authorize validated thumbnail: {error}"))?;
+    }
+    Ok(sources)
 }
 
 fn thumbnail_sources_for_items(
@@ -9448,6 +9462,9 @@ async fn prepare_media_thumbnail(
         if !valid_cached_thumbnail(&thumbnail) {
             return Ok(None);
         }
+        app.asset_protocol_scope()
+            .allow_file(&thumbnail)
+            .map_err(|error| format!("Cannot authorize validated thumbnail: {error}"))?;
         Ok(Some(thumbnail.to_string_lossy().into_owned()))
     })
     .await
@@ -11498,6 +11515,17 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &different));
         let _first_guard = first.lock().unwrap();
         assert!(different.try_lock().is_ok());
+    }
+
+    #[test]
+    fn packaged_webview_enables_only_runtime_scoped_thumbnail_assets() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &config["app"]["security"];
+        assert_eq!(security["assetProtocol"]["enable"], true);
+        assert_eq!(security["assetProtocol"]["scope"], serde_json::json!([]));
+        let csp = security["csp"].as_str().unwrap();
+        assert!(csp.contains("img-src 'self' asset: http://asset.localhost data:"));
     }
 
     #[test]

@@ -7011,6 +7011,11 @@ function MediaThumbnail({
   const latestHoveredRatio = useRef(lastHoveredRatio);
   const [isHovering, setIsHovering] = useState(false);
   const [failedImageSource, setFailedImageSource] = useState<string>();
+  const [staticImageRetry, setStaticImageRetry] = useState<{
+    source: string;
+    attempt: number;
+  }>();
+  const staticImageRetryTimer = useRef<number | undefined>(undefined);
   const requestGeneration = useRef(0);
   const staticRequestGeneration = useRef(0);
   const releasePreview = useCallback(() => {
@@ -7027,6 +7032,12 @@ function MediaThumbnail({
   useEffect(() => {
     requestGeneration.current += 1;
   }, [previewCacheEpoch]);
+  useEffect(() => {
+    return () => {
+      if (staticImageRetryTimer.current != null)
+        window.clearTimeout(staticImageRetryTimer.current);
+    };
+  }, [thumbnailSource]);
   const preview =
     previewEntry &&
     previewEntry.key === previewKey &&
@@ -7132,7 +7143,10 @@ function MediaThumbnail({
             );
         }
       },
-      { rootMargin: '400px' },
+      // Roughly three grid rows on the supported thumbnail-size range. This
+      // keeps about the next twelve cached images warm without retaining
+      // decoded Image objects in application state.
+      { rootMargin: '1200px' },
     );
     const visibleObserver = new IntersectionObserver(
       (entries) => {
@@ -7268,6 +7282,12 @@ function MediaThumbnail({
       : thumbnailSource && thumbnailSource !== failedImageSource
         ? thumbnailSource
         : undefined;
+  const renderedImageSource =
+    imageSource &&
+    imageSource === thumbnailSource &&
+    staticImageRetry?.source === thumbnailSource
+      ? `${imageSource}${imageSource.includes('?') ? '&' : '?'}pimp_retry=${staticImageRetry.attempt}`
+      : imageSource;
   return (
     <div
       ref={thumbnailRef}
@@ -7302,15 +7322,43 @@ function MediaThumbnail({
           : undefined
       }
     >
-      {imageSource ? (
+      {renderedImageSource ? (
         <img
-          src={imageSource}
+          src={renderedImageSource}
           alt=""
           draggable={false}
           loading={nearViewport ? 'eager' : 'lazy'}
           decoding="async"
           onDragStart={(event) => event.preventDefault()}
-          onError={() => setFailedImageSource(imageSource)}
+          onError={() => {
+            if (imageSource !== thumbnailSource || !thumbnailSource) {
+              setFailedImageSource(imageSource);
+              return;
+            }
+            const attempt =
+              staticImageRetry?.source === thumbnailSource
+                ? staticImageRetry.attempt
+                : 0;
+            if (attempt >= 2) {
+              setFailedImageSource(thumbnailSource);
+              void desktopBridge.logUiError(
+                `Static thumbnail failed after bounded retries for media ${mediaId}`,
+              );
+              return;
+            }
+            if (staticImageRetryTimer.current != null)
+              window.clearTimeout(staticImageRetryTimer.current);
+            staticImageRetryTimer.current = window.setTimeout(
+              () => {
+                setStaticImageRetry({
+                  source: thumbnailSource,
+                  attempt: attempt + 1,
+                });
+                staticImageRetryTimer.current = undefined;
+              },
+              attempt === 0 ? 250 : 1_000,
+            );
+          }}
         />
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>
