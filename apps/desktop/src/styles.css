@@ -692,11 +692,12 @@ article.selected {
   border-color: var(--accent-strong);
   box-shadow: 0 0 0 1px var(--accent-strong);
 }
-.cards article[draggable='true'] {
+.cards article[data-native-drag='true'],
+.folder[data-native-drag='true'] {
   cursor: grab;
 }
-.cards article[draggable='true']:active,
-.folder[draggable='true']:active {
+.cards article[data-native-drag='true']:active,
+.folder[data-native-drag='true']:active {
   cursor: grabbing;
 }
 .thumb {
@@ -708,6 +709,11 @@ article.selected {
     var(--bg-panel)
   );
   overflow: hidden;
+}
+
+.media-thumbnail img {
+  -webkit-user-drag: none;
+  user-select: none;
 }
 .thumb img {
   width: 100%;

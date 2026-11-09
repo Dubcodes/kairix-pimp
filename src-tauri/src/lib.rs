@@ -39,14 +39,17 @@ use windows::{
             DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK,
         },
         System::{
-            Com::IDataObject,
+            Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL},
             Ole::{
                 DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
-                DROPEFFECT, DROPEFFECT_COPY,
+                CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
             },
             SystemServices::MK_LBUTTON,
         },
-        UI::Shell::{Common::ITEMIDLIST, ILFree, SHCreateDataObject, SHParseDisplayName},
+        UI::{
+            Shell::{Common::ITEMIDLIST, ILFree, SHCreateDataObject, SHParseDisplayName},
+            WindowsAndMessaging::{GetSystemMetrics, SM_CXDRAG, SM_CYDRAG},
+        },
     },
 };
 
@@ -54,6 +57,21 @@ use windows::{
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const MAX_NATIVE_DRAG_ITEMS: usize = 500;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDragThreshold {
+    horizontal: u32,
+    vertical: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum NativeDragOutcome {
+    Dropped,
+    Cancelled,
+    Rejected,
+}
 
 #[cfg(target_os = "windows")]
 #[implement(IDropSource)]
@@ -7877,30 +7895,39 @@ impl Drop for ShellItemIds {
 }
 
 #[cfg(target_os = "windows")]
-fn run_native_file_drag(paths: &[PathBuf]) -> Result<bool, String> {
+fn shell_drag_parsing_path(path: &Path) -> PathBuf {
+    let value = path.as_os_str().to_string_lossy();
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(ordinary) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(ordinary)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_native_drag_data_object(
+    paths: &[PathBuf],
+) -> Result<(IDataObject, ShellItemIds), String> {
     use std::os::windows::ffi::OsStrExt;
 
-    let _ole = OleInitialization::initialize()?;
     let mut item_ids = ShellItemIds(Vec::with_capacity(paths.len()));
-    for path in paths {
-        let wide = path
+    for (index, path) in paths.iter().enumerate() {
+        let shell_path = shell_drag_parsing_path(path);
+        let wide = shell_path
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         let mut item = std::ptr::null_mut();
         unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut item, 0, None) }.map_err(
-            |error| {
-                format!(
-                    "Windows Shell could not represent {} for dragging: {error}",
-                    path.display()
-                )
-            },
+            |error| format!("Windows Shell could not represent selected item {}: {error}", index + 1),
         )?;
         if item.is_null() {
             return Err(format!(
-                "Windows Shell returned no drag identity for {}",
-                path.display()
+                "Windows Shell returned no drag identity for selected item {}",
+                index + 1
             ));
         }
         item_ids.0.push(item);
@@ -7912,6 +7939,27 @@ fn run_native_file_drag(paths: &[PathBuf]) -> Result<bool, String> {
         .collect::<Vec<_>>();
     let data_object: IDataObject = unsafe { SHCreateDataObject(None, Some(&absolute_items), None) }
         .map_err(|error| format!("Windows could not create the file drag payload: {error}"))?;
+    let file_drop_format = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    unsafe { data_object.QueryGetData(&file_drop_format) }
+        .ok()
+        .map_err(|error| {
+            format!("Windows file drag payload does not expose CF_HDROP: {error}")
+        })?;
+    Ok((data_object, item_ids))
+}
+
+#[cfg(target_os = "windows")]
+fn run_native_file_drag(paths: &[PathBuf]) -> Result<NativeDragOutcome, String> {
+    // Tauri runs synchronous commands on its Windows UI thread. DoDragDrop must
+    // stay on that OLE-initialized STA so its modal loop can track the held button.
+    let _ole = OleInitialization::initialize()?;
+    let (data_object, _item_ids) = create_native_drag_data_object(paths)?;
     let drop_source: IDropSource = NativeDropSource.into();
     let mut completed_effect = DROPEFFECT(0);
     let result = unsafe {
@@ -7923,16 +7971,41 @@ fn run_native_file_drag(paths: &[PathBuf]) -> Result<bool, String> {
         )
     };
     if result == DRAGDROP_S_CANCEL {
-        return Ok(false);
+        return Ok(NativeDragOutcome::Cancelled);
     }
     if result != DRAGDROP_S_DROP {
         return Err(format!("Windows file drag failed: {result:?}"));
     }
-    Ok((completed_effect.0 & DROPEFFECT_COPY.0) != 0)
+    if (completed_effect.0 & DROPEFFECT_COPY.0) != 0 {
+        Ok(NativeDragOutcome::Dropped)
+    } else {
+        Ok(NativeDragOutcome::Rejected)
+    }
 }
 
 #[tauri::command]
-fn start_native_media_drag(app: AppHandle, media_ids: Vec<String>) -> Result<bool, String> {
+fn native_drag_threshold() -> NativeDragThreshold {
+    #[cfg(target_os = "windows")]
+    {
+        NativeDragThreshold {
+            horizontal: unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1) as u32,
+            vertical: unsafe { GetSystemMetrics(SM_CYDRAG) }.max(1) as u32,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        NativeDragThreshold {
+            horizontal: 4,
+            vertical: 4,
+        }
+    }
+}
+
+#[tauri::command]
+fn start_native_media_drag(
+    app: AppHandle,
+    media_ids: Vec<String>,
+) -> Result<NativeDragOutcome, String> {
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
     let paths = resolve_native_drag_media_paths(
@@ -7950,7 +8023,10 @@ fn start_native_media_drag(app: AppHandle, media_ids: Vec<String>) -> Result<boo
 }
 
 #[tauri::command]
-fn start_native_folder_drag(app: AppHandle, relative_path: String) -> Result<bool, String> {
+fn start_native_folder_drag(
+    app: AppHandle,
+    relative_path: String,
+) -> Result<NativeDragOutcome, String> {
     let settings = load_settings_file(&app)?;
     let path = resolve_native_drag_folder(Path::new(&settings.master_bin_path), &relative_path)?;
     #[cfg(target_os = "windows")]
@@ -10170,6 +10246,7 @@ pub fn run() {
             open_logs_folder,
             resolve_media_path,
             resolve_media_playback_source,
+            native_drag_threshold,
             start_native_media_drag,
             start_native_folder_drag,
             prepare_playback_proxy,
@@ -12290,6 +12367,48 @@ mod tests {
         assert!(resolve_native_drag_folder(&master, "not-a-folder.mp4")
             .unwrap_err()
             .contains("not available locally"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_drag_data_object_exposes_cf_hdrop_for_files_and_a_unicode_folder() {
+        let root = temporary("native-drag-cf-hdrop");
+        let folder = root.join("Card kōrero 音声");
+        let first = root.join("clip one.mp4");
+        let second = root.join("clip two.mp4");
+        let long_folder = root
+            .join("long supported path")
+            .join("a".repeat(90))
+            .join("b".repeat(90))
+            .join("c".repeat(90));
+        let long_file = long_folder.join("long clip.mp4");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(&long_folder).unwrap();
+        fs::write(&first, b"first synthetic clip").unwrap();
+        fs::write(&second, b"second synthetic clip").unwrap();
+        fs::write(&long_file, b"long synthetic clip").unwrap();
+        let _ole = OleInitialization::initialize().unwrap();
+
+        for paths in [
+            vec![first.canonicalize().unwrap(), second.canonicalize().unwrap()],
+            vec![folder.canonicalize().unwrap()],
+            vec![long_file.canonicalize().unwrap()],
+        ] {
+            let (data_object, _item_ids) = create_native_drag_data_object(&paths).unwrap();
+            let file_drop_format = FORMATETC {
+                cfFormat: CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            assert!(unsafe { data_object.QueryGetData(&file_drop_format) }.is_ok());
+        }
+
+        let threshold = native_drag_threshold();
+        assert!(threshold.horizontal > 0);
+        assert!(threshold.vertical > 0);
         fs::remove_dir_all(root).unwrap();
     }
 

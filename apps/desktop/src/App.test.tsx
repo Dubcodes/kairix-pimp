@@ -72,6 +72,7 @@ const mocks = vi.hoisted(() => ({
     ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
   catalogueListener: undefined as (() => void) | undefined,
   resolveMediaPath: vi.fn(),
+  nativeDragThreshold: vi.fn(),
   startNativeMediaDrag: vi.fn(),
   startNativeFolderDrag: vi.fn(),
   resolveMediaPlaybackSource: vi.fn(),
@@ -206,6 +207,7 @@ vi.mock('./bridge', () => ({
     verifyMediaIntegrity: mocks.verifyMediaIntegrity,
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
+    nativeDragThreshold: mocks.nativeDragThreshold,
     startNativeMediaDrag: mocks.startNativeMediaDrag,
     startNativeFolderDrag: mocks.startNativeFolderDrag,
     resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
@@ -389,10 +391,12 @@ describe('native application integration', () => {
     });
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
+    mocks.nativeDragThreshold.mockReset();
+    mocks.nativeDragThreshold.mockResolvedValue({ horizontal: 4, vertical: 4 });
     mocks.startNativeMediaDrag.mockReset();
-    mocks.startNativeMediaDrag.mockResolvedValue(false);
+    mocks.startNativeMediaDrag.mockResolvedValue('cancelled');
     mocks.startNativeFolderDrag.mockReset();
-    mocks.startNativeFolderDrag.mockResolvedValue(false);
+    mocks.startNativeFolderDrag.mockResolvedValue('cancelled');
     mocks.resolveMediaPlaybackSource.mockReset();
     mocks.preparePlaybackProxy.mockReset();
     mocks.preparePlaybackProxy.mockResolvedValue(
@@ -2678,12 +2682,45 @@ describe('native application integration', () => {
 
     await user.keyboard('{Control>}a{/Control}');
     expect(screen.getByText('3 selected')).toBeVisible();
-    const mediaDragTransfer = { effectAllowed: 'none' };
-    expect(
-      fireEvent.dragStart(screen.getByRole('option', { name: /two.mp4/ }), {
-        dataTransfer: mediaDragTransfer,
-      }),
-    ).toBe(false);
+    const mediaCard = screen.getByRole('option', { name: /two.mp4/ });
+    expect(mediaCard).toHaveAttribute('draggable', 'false');
+    const thumbnail = mediaCard.querySelector('img');
+    if (thumbnail) expect(thumbnail).toHaveAttribute('draggable', 'false');
+    expect(fireEvent.dragStart(mediaCard)).toBe(false);
+    fireEvent.pointerDown(mediaCard, {
+      pointerId: 7,
+      button: 0,
+      buttons: 1,
+      clientX: 10,
+      clientY: 10,
+    });
+    fireEvent.pointerMove(mediaCard, {
+      pointerId: 7,
+      buttons: 1,
+      clientX: 13,
+      clientY: 13,
+    });
+    fireEvent.pointerUp(mediaCard, {
+      pointerId: 7,
+      button: 0,
+      buttons: 0,
+      clientX: 13,
+      clientY: 13,
+    });
+    expect(mocks.startNativeMediaDrag).not.toHaveBeenCalled();
+    fireEvent.pointerDown(mediaCard, {
+      pointerId: 8,
+      button: 0,
+      buttons: 1,
+      clientX: 10,
+      clientY: 10,
+    });
+    fireEvent.pointerMove(mediaCard, {
+      pointerId: 8,
+      buttons: 1,
+      clientX: 15,
+      clientY: 10,
+    });
     await waitFor(() =>
       expect(mocks.startNativeMediaDrag).toHaveBeenCalledWith([
         'media-1',
@@ -2691,17 +2728,28 @@ describe('native application integration', () => {
         'media-3',
       ]),
     );
-    expect(mediaDragTransfer.effectAllowed).toBe('copy');
-    const folderDragTransfer = { effectAllowed: 'none' };
-    expect(
-      fireEvent.dragStart(screen.getByRole('button', { name: /20261024/ }), {
-        dataTransfer: folderDragTransfer,
-      }),
-    ).toBe(false);
+    expect(await screen.findByText(/Windows drag cancelled/)).toBeVisible();
+    fireEvent.click(mediaCard);
+    expect(screen.getByText('3 selected')).toBeVisible();
+    const folderButton = screen.getByRole('button', { name: /20261024/ });
+    expect(folderButton).toHaveAttribute('draggable', 'false');
+    expect(fireEvent.dragStart(folderButton)).toBe(false);
+    fireEvent.pointerDown(folderButton, {
+      pointerId: 9,
+      button: 0,
+      buttons: 1,
+      clientX: 20,
+      clientY: 20,
+    });
+    fireEvent.pointerMove(folderButton, {
+      pointerId: 9,
+      buttons: 1,
+      clientX: 20,
+      clientY: 25,
+    });
     await waitFor(() =>
       expect(mocks.startNativeFolderDrag).toHaveBeenCalledWith('20261024'),
     );
-    expect(folderDragTransfer.effectAllowed).toBe('copy');
     expect(
       screen.getByRole('toolbar', { name: 'Selected recordings' }),
     ).toBeVisible();
@@ -2931,6 +2979,9 @@ describe('native application integration', () => {
       expect(candidate).not.toBeNull();
       return candidate as HTMLImageElement;
     });
+    expect(image).toHaveAttribute('draggable', 'false');
+    expect(fireEvent.dragStart(image)).toBe(false);
+    expect(mocks.startNativeMediaDrag).not.toHaveBeenCalled();
     fireEvent.error(image);
     expect(await screen.findByText('MP4')).toBeVisible();
   });

@@ -5,7 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type DragEvent,
+  type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import {
@@ -44,6 +44,8 @@ import {
   emptyCatalogue,
   emptySettings,
   nativeAvailable,
+  type NativeDragOutcome,
+  type NativeDragThreshold,
   type Catalogue,
   type AppInfo,
   type BackupJob,
@@ -206,6 +208,27 @@ const keyboardInputOwner = (target: EventTarget | null) => {
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
+const defaultNativeDragThreshold: NativeDragThreshold = {
+  horizontal: 4,
+  vertical: 4,
+};
+
+const nativeDragMovementExceeded = (
+  origin: { x: number; y: number },
+  current: { x: number; y: number },
+  threshold: NativeDragThreshold,
+) =>
+  Math.abs(current.x - origin.x) >= Math.max(1, threshold.horizontal) ||
+  Math.abs(current.y - origin.y) >= Math.max(1, threshold.vertical);
+
+interface PendingNativeDrag {
+  pointerId: number;
+  origin: { x: number; y: number };
+  key: string;
+  run: () => Promise<NativeDragOutcome>;
+  droppedMessage: string;
+}
+
 export function App() {
   const native = nativeAvailable();
   const [settings, setSettings] = useState<DeviceSettings>(emptySettings);
@@ -218,6 +241,8 @@ export function App() {
   const [includeUnavailable, setIncludeUnavailable] = useState(false);
   const [folder, setFolder] = useState('All media');
   const [selected, setSelected] = useState<string[]>([]);
+  const [nativeDragThreshold, setNativeDragThreshold] =
+    useState<NativeDragThreshold>(defaultNativeDragThreshold);
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [projectInventory, setProjectInventory] = useState<ProjectInventory>();
   const [projectInventoryLoading, setProjectInventoryLoading] = useState(false);
@@ -408,6 +433,8 @@ export function App() {
   const dateReplanIntent = useRef(0);
   const dateReplanQueue = useRef<Promise<void>>(Promise.resolve());
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
+  const pendingNativeDrag = useRef<PendingNativeDrag | undefined>(undefined);
+  const suppressedNativeClick = useRef<{ key: string } | undefined>(undefined);
   const [libraryLocateId, setLibraryLocateId] = useState<string>();
   const settingsRef = useRef(settings);
   const [savingSettings] = useState(
@@ -432,6 +459,19 @@ export function App() {
   const automaticUpdateCheckStarted = useRef(false);
 
   const configured = Boolean(settings.initializedCataloguePath);
+  useEffect(() => {
+    if (!native) return;
+    let current = true;
+    void desktopBridge
+      .nativeDragThreshold()
+      .then((threshold) => {
+        if (current) setNativeDragThreshold(threshold);
+      })
+      .catch(() => undefined);
+    return () => {
+      current = false;
+    };
+  }, [native]);
   useEffect(() => {
     settingsRef.current = settings;
     savingSettings.setLatest(settings);
@@ -1920,45 +1960,93 @@ export function App() {
       setError(errorText(reason));
     }
   };
-  const startMediaDrag = (
-    event: DragEvent<HTMLElement>,
-    recording: Catalogue['media'][number],
+  const beginNativeDrag = (
+    event: ReactPointerEvent<HTMLElement>,
+    drag: Omit<PendingNativeDrag, 'pointerId' | 'origin'>,
   ) => {
+    if (!native || event.button !== 0 || (event.buttons & 1) === 0) return;
+    const target = event.target as HTMLElement;
+    const nestedControl = target.closest(
+      'input, textarea, select, a, button, [contenteditable="true"], [data-native-drag-ignore="true"]',
+    );
+    if (nestedControl && nestedControl !== event.currentTarget) return;
+    pendingNativeDrag.current = {
+      ...drag,
+      pointerId: event.pointerId,
+      origin: { x: event.clientX, y: event.clientY },
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+  const cancelPendingNativeDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (pendingNativeDrag.current?.pointerId === event.pointerId)
+      pendingNativeDrag.current = undefined;
+  };
+  const continueNativeDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const pending = pendingNativeDrag.current;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if ((event.buttons & 1) === 0) {
+      pendingNativeDrag.current = undefined;
+      return;
+    }
+    if (
+      !nativeDragMovementExceeded(
+        pending.origin,
+        { x: event.clientX, y: event.clientY },
+        nativeDragThreshold,
+      )
+    )
+      return;
+    pendingNativeDrag.current = undefined;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId);
     event.preventDefault();
-    if (!native || !recording.available) return;
+    event.stopPropagation();
+    const suppressedClick = { key: pending.key };
+    suppressedNativeClick.current = suppressedClick;
+    window.setTimeout(() => {
+      if (suppressedNativeClick.current === suppressedClick)
+        suppressedNativeClick.current = undefined;
+    }, 750);
+    setError('');
+    void pending
+      .run()
+      .then((outcome) => {
+        if (outcome === 'dropped') {
+          setMessage(pending.droppedMessage);
+        } else if (outcome === 'cancelled') {
+          setMessage(
+            'Windows drag cancelled. Original Library items are unchanged.',
+          );
+        } else {
+          setMessage(
+            'The destination did not accept the copy-only Windows drag. Original Library items are unchanged.',
+          );
+        }
+      })
+      .catch((reason) => setError(errorText(reason)));
+  };
+  const suppressClickAfterNativeDrag = (key: string) => {
+    const suppressed = suppressedNativeClick.current;
+    if (!suppressed || suppressed.key !== key) return false;
+    suppressedNativeClick.current = undefined;
+    return true;
+  };
+  const mediaDrag = (recording: Catalogue['media'][number]) => {
     const mediaIds = selected.includes(recording.id)
       ? selected
       : [recording.id];
-    event.dataTransfer.effectAllowed = 'copy';
-    setError('');
-    void desktopBridge
-      .startNativeMediaDrag(mediaIds)
-      .then((dropped) => {
-        if (dropped)
-          setMessage(
-            `${mediaIds.length} original recording${mediaIds.length === 1 ? '' : 's'} handed to the destination as a copy-only Windows drag.`,
-          );
-      })
-      .catch((reason) => setError(errorText(reason)));
+    return {
+      key: `media:${recording.id}`,
+      run: () => desktopBridge.startNativeMediaDrag(mediaIds),
+      droppedMessage: `${mediaIds.length} original recording${mediaIds.length === 1 ? '' : 's'} was accepted by the destination as a copy-only Windows drag. Confirm the destination completed its own copy or import.`,
+    };
   };
-  const startFolderDrag = (
-    event: DragEvent<HTMLElement>,
-    relativePath: string,
-  ) => {
-    event.preventDefault();
-    if (!native) return;
-    event.dataTransfer.effectAllowed = 'copy';
-    setError('');
-    void desktopBridge
-      .startNativeFolderDrag(relativePath)
-      .then((dropped) => {
-        if (dropped)
-          setMessage(
-            'Original Library folder handed to the destination as a copy-only Windows drag.',
-          );
-      })
-      .catch((reason) => setError(errorText(reason)));
-  };
+  const folderDrag = (relativePath: string) => ({
+    key: `folder:${relativePath}`,
+    run: () => desktopBridge.startNativeFolderDrag(relativePath),
+    droppedMessage:
+      'The original Library folder was accepted by the destination as a copy-only Windows drag. Confirm the destination completed its own copy or import.',
+  });
   const copySelectedPaths = async () => {
     const recordings = selectedPhysicalIds
       .map((id) => catalogue.media.find((item) => item.id === id))
@@ -4694,15 +4782,31 @@ export function App() {
                   <div className="folder-row" key={name}>
                     <button
                       className={`folder ${folder === name ? 'active' : ''}`}
-                      draggable={native}
+                      data-native-drag={native ? 'true' : undefined}
+                      draggable={false}
                       title="Drag this physical folder to another Windows application"
-                      onDragStart={(event) =>
-                        startFolderDrag(
+                      onDragStart={(event) => event.preventDefault()}
+                      onPointerDown={(event) =>
+                        beginNativeDrag(
                           event,
-                          name === 'Master Bin root' ? '' : name,
+                          folderDrag(name === 'Master Bin root' ? '' : name),
                         )
                       }
-                      onClick={() => setFolder(name)}
+                      onPointerMove={continueNativeDrag}
+                      onPointerUp={cancelPendingNativeDrag}
+                      onPointerCancel={cancelPendingNativeDrag}
+                      onLostPointerCapture={cancelPendingNativeDrag}
+                      onClick={(event) => {
+                        if (
+                          suppressClickAfterNativeDrag(
+                            `folder:${name === 'Master Bin root' ? '' : name}`,
+                          )
+                        ) {
+                          event.preventDefault();
+                          return;
+                        }
+                        setFolder(name);
+                      }}
                     >
                       <Folder size={16} />
                       <span>
@@ -4808,7 +4912,10 @@ export function App() {
                         }}
                         role="option"
                         data-media-id={item.id}
-                        draggable={native && item.available}
+                        data-native-drag={
+                          native && item.available ? 'true' : undefined
+                        }
+                        draggable={false}
                         title={
                           item.available
                             ? 'Drag the original file to another Windows application'
@@ -4816,7 +4923,15 @@ export function App() {
                         }
                         tabIndex={0}
                         aria-selected={selected.includes(item.id)}
-                        onDragStart={(event) => startMediaDrag(event, item)}
+                        onDragStart={(event) => event.preventDefault()}
+                        onPointerDown={(event) => {
+                          if (item.available)
+                            beginNativeDrag(event, mediaDrag(item));
+                        }}
+                        onPointerMove={continueNativeDrag}
+                        onPointerUp={cancelPendingNativeDrag}
+                        onPointerCancel={cancelPendingNativeDrag}
+                        onLostPointerCapture={cancelPendingNativeDrag}
                         onMouseDown={(event) => {
                           const target = event.target as HTMLElement;
                           if (
@@ -4828,6 +4943,12 @@ export function App() {
                             event.preventDefault();
                         }}
                         onClick={(event) => {
+                          if (
+                            suppressClickAfterNativeDrag(`media:${item.id}`)
+                          ) {
+                            event.preventDefault();
+                            return;
+                          }
                           setContextMenu(undefined);
                           selectRecording(item.id, {
                             toggle: event.ctrlKey || event.metaKey,
@@ -7185,8 +7306,10 @@ function MediaThumbnail({
         <img
           src={imageSource}
           alt=""
+          draggable={false}
           loading={nearViewport ? 'eager' : 'lazy'}
           decoding="async"
+          onDragStart={(event) => event.preventDefault()}
           onError={() => setFailedImageSource(imageSource)}
         />
       ) : (

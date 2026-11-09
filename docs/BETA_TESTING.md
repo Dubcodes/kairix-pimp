@@ -143,6 +143,16 @@ Premiere Pro 26.0.2 project and confirm Premiere recognizes the original media
 without modifying it. Record the Windows/Premiere versions and result. Rust and
 jsdom tests do not satisfy this installed cross-process acceptance gate.
 
+The 2026-11-09 correction pass launched a separately identified packaged test
+executable, configured repository-local disposable roots, and fully indexed two
+generated H.264 MP4 files (including spaces and Unicode) with 2 registered,
+0 pending and 0 errors. Their source SHA-256 values were recorded. Windows unit
+coverage also queried the real Shell `IDataObject` for `CF_HDROP` with two files,
+a Unicode folder and a greater-than-260-character path. Cross-window input is
+blocked by the computer-control safety boundary, so these checks do not satisfy
+the Explorer or Premiere drop gate; record the manual copy/import and post-drop
+source/destination hashes here before changing the feature status.
+
 ## Signed automatic-update acceptance
 
 Do not mark automatic updates operational from unit tests or a successful signing

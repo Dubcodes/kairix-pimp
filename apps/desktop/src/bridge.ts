@@ -84,6 +84,13 @@ export interface UpdaterConfiguration {
   target: 'development-channel' | 'stable-channel';
   reason?: string;
 }
+
+export interface NativeDragThreshold {
+  horizontal: number;
+  vertical: number;
+}
+
+export type NativeDragOutcome = 'dropped' | 'cancelled' | 'rejected';
 export interface MediaItem {
   id: string;
   relativePath: string;
@@ -716,10 +723,12 @@ export const desktopBridge = {
   mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
   resolveMediaPath: (mediaId: string) =>
     invoke<string>('resolve_media_path', { mediaId }),
+  nativeDragThreshold: () =>
+    invoke<NativeDragThreshold>('native_drag_threshold'),
   startNativeMediaDrag: (mediaIds: string[]) =>
-    invoke<boolean>('start_native_media_drag', { mediaIds }),
+    invoke<NativeDragOutcome>('start_native_media_drag', { mediaIds }),
   startNativeFolderDrag: (relativePath: string) =>
-    invoke<boolean>('start_native_folder_drag', { relativePath }),
+    invoke<NativeDragOutcome>('start_native_folder_drag', { relativePath }),
   resolveMediaPlaybackSource: async (mediaId: string) =>
     convertFileSrc(
       await invoke<string>('resolve_media_playback_source', { mediaId }),
