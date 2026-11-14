@@ -6,6 +6,7 @@ export default defineConfig({
       'packages/**/*.test.ts',
       'apps/**/*.test.ts',
       'apps/**/*.test.tsx',
+      'tools/**/*.test.js',
     ],
     environment: 'node',
     setupFiles: ['apps/desktop/src/test/setup.ts'],

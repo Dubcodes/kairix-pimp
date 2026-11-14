@@ -1,6 +1,6 @@
 {
   "name": "kairix-pimp",
-  "version": "0.1.1-6",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -15,6 +15,7 @@
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
+    "release:validate": "node tools/release-policy.mjs validate",
     "tauri": "tauri"
   },
   "devDependencies": {

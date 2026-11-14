@@ -74,4 +74,18 @@ describe('hover preview request cache', () => {
     cache.configure(1);
     expect(cache.usageBytes).toBe(0);
   });
+
+  it('reports bounded memory changes independently of generation queue state', async () => {
+    const cache = new HoverPreviewRequestCache(1024, 2);
+    const usage: Array<[number, number]> = [];
+    const unsubscribe = cache.subscribe((bytes, ready) =>
+      usage.push([bytes, ready]),
+    );
+    await cache.request('one', async () => preview('one'));
+    expect(usage.at(-1)?.[0]).toBeGreaterThan(0);
+    expect(usage.at(-1)?.[1]).toBe(1);
+    cache.invalidate();
+    expect(usage.at(-1)).toEqual([0, 0]);
+    unsubscribe();
+  });
 });

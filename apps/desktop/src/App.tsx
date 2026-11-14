@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
+import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import {
   Archive,
   ArrowLeft,
@@ -35,8 +44,12 @@ import {
   emptyCatalogue,
   emptySettings,
   nativeAvailable,
+  type NativeDragOutcome,
+  type NativeDragThreshold,
   type Catalogue,
   type AppInfo,
+  type BackupJob,
+  type BackgroundOperation,
   type DeviceSettings,
   type DiscoveryStatus,
   type IngestJob,
@@ -49,6 +62,8 @@ import {
   type ProjectRecord,
   type ProvisionalMetadataPatch,
   type SourceInventory,
+  type RemovableVolume,
+  type ResourceGovernorStatus,
   type UpdaterConfiguration,
 } from './bridge';
 import { datePatternPreview } from './date-pattern';
@@ -62,6 +77,7 @@ import { hoverPreviewRequestCache } from './hover-preview-cache';
 import { idlePreviewScheduler } from './idle-preview-scheduler';
 import {
   previewWorkQueue,
+  staticThumbnailWorkQueue,
   type PreviewPriority,
   type PreviewQueueStatus,
 } from './preview-work-queue';
@@ -70,6 +86,10 @@ import {
   readLastHoveredRatio,
   writeLastHoveredRatio,
 } from './thumbnail-hold';
+import {
+  StaticThumbnailBackoffError,
+  StaticThumbnailRequestRegistry,
+} from './static-thumbnail-requests';
 import {
   associatedMedia,
   expandLogicalMediaIds,
@@ -85,11 +105,20 @@ type SettingsSection =
   | 'General'
   | 'Library & Storage'
   | 'Ingest & Discovery'
+  | 'Resource Management'
   | 'Appearance'
   | 'Updates'
   | 'About & Support'
   | 'Diagnostics';
 type FolderSort = NonNullable<DeviceSettings['libraryFolderSort']>;
+type SelectionToolbarAction = 'tags' | 'projects' | 'favourite';
+type SelectionToolbarPosition =
+  'bottom-right' | 'bottom-center' | 'bottom-left';
+const defaultSelectionToolbarActions: SelectionToolbarAction[] = [
+  'tags',
+  'projects',
+  'favourite',
+];
 
 const icons = {
   Ingest: Inbox,
@@ -108,6 +137,29 @@ const projectCategoryLabels: Record<string, string> = {
   'notes-documentation': 'Notes and documentation',
   other: 'Other project assets',
 };
+const staticThumbnailRequests = new StaticThumbnailRequestRegistry();
+const staticThumbnailQueueKey = (key: string, cacheGeneration: number) =>
+  `static:${cacheGeneration}:${key}`;
+const requestStaticThumbnail = (
+  key: string,
+  mediaId: string,
+  priority: PreviewPriority,
+  cacheGeneration: number,
+) => {
+  const requestKey = `${cacheGeneration}:${key}`;
+  staticThumbnailWorkQueue.promote(
+    staticThumbnailQueueKey(key, cacheGeneration),
+    priority,
+  );
+  return staticThumbnailRequests.request(requestKey, () =>
+    staticThumbnailWorkQueue.schedule(
+      staticThumbnailQueueKey(key, cacheGeneration),
+      priority,
+      'Static thumbnail',
+      () => desktopBridge.prepareMediaThumbnail(mediaId),
+    ),
+  );
+};
 const size = (bytes: number) =>
   bytes < 1024 * 1024
     ? `${Math.round(bytes / 1024)} KB`
@@ -116,8 +168,66 @@ const duration = (seconds?: number) =>
   seconds == null
     ? '—'
     : `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`;
+const enrichmentVideoType = (fileType: string) =>
+  [
+    'mp4',
+    'mov',
+    'm4v',
+    'mxf',
+    'mts',
+    'm2ts',
+    'avi',
+    'h264',
+    'h265',
+    'hevc',
+    'r3d',
+    'braw',
+  ].includes(fileType.toLocaleLowerCase());
+
+const keyboardInputOwner = (target: EventTarget | null) => {
+  const selector = [
+    'input',
+    'textarea',
+    'select',
+    '[contenteditable]:not([contenteditable="false"])',
+    '[role="combobox"]',
+    '[role="textbox"]',
+    '[role="menu"]',
+    '[role="dialog"]',
+    '[aria-modal="true"]',
+  ].join(', ');
+  const element = target instanceof Element ? target : null;
+  const active = document.activeElement;
+  if (element?.closest(selector) || active?.closest(selector)) return true;
+  return Boolean(
+    document.querySelector(
+      '[aria-modal="true"], .combo-popover, [role="menu"]:not([hidden])',
+    ),
+  );
+};
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
+
+const defaultNativeDragThreshold: NativeDragThreshold = {
+  horizontal: 4,
+  vertical: 4,
+};
+
+const nativeDragMovementExceeded = (
+  origin: { x: number; y: number },
+  current: { x: number; y: number },
+  threshold: NativeDragThreshold,
+) =>
+  Math.abs(current.x - origin.x) >= Math.max(1, threshold.horizontal) ||
+  Math.abs(current.y - origin.y) >= Math.max(1, threshold.vertical);
+
+interface PendingNativeDrag {
+  pointerId: number;
+  origin: { x: number; y: number };
+  key: string;
+  run: () => Promise<NativeDragOutcome>;
+  droppedMessage: string;
+}
 
 export function App() {
   const native = nativeAvailable();
@@ -127,13 +237,25 @@ export function App() {
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>('General');
   const [query, setQuery] = useState('');
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
+  const [includeUnavailable, setIncludeUnavailable] = useState(false);
   const [folder, setFolder] = useState('All media');
   const [selected, setSelected] = useState<string[]>([]);
+  const [nativeDragThreshold, setNativeDragThreshold] =
+    useState<NativeDragThreshold>(defaultNativeDragThreshold);
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [projectInventory, setProjectInventory] = useState<ProjectInventory>();
   const [projectInventoryLoading, setProjectInventoryLoading] = useState(false);
   const [projectInventoryError, setProjectInventoryError] = useState('');
+  const [selectedPremiereSequenceId, setSelectedPremiereSequenceId] =
+    useState<string>();
   const [projectMediaQuery, setProjectMediaQuery] = useState('');
+  const [projectAvailableOpen, setProjectAvailableOpen] = useState(false);
+  const [projectAvailableQuery, setProjectAvailableQuery] = useState('');
+  const [projectAvailableTags, setProjectAvailableTags] = useState<string[]>(
+    [],
+  );
+  const [projectAvailablePage, setProjectAvailablePage] = useState(1);
   const [projectMediaSelection, setProjectMediaSelection] = useState<string[]>(
     [],
   );
@@ -143,17 +265,29 @@ export function App() {
   const [projectNotes, setProjectNotes] = useState('');
   const [projectTags, setProjectTags] = useState<string[]>([]);
   const [sources, setSources] = useState<string[]>([]);
-  const [dateOverride, setDateOverride] = useState('default');
+  const [dateOverride, setDateOverride] = useState('today');
   const [chosenDate, setChosenDate] = useState('');
   const [progress, setProgress] = useState<IngestProgress>();
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [jobsOpen, setJobsOpen] = useState(false);
+  const [backgroundOperations, setBackgroundOperations] = useState<
+    BackgroundOperation[]
+  >([]);
+  const [resourceStatus, setResourceStatus] =
+    useState<ResourceGovernorStatus>();
   const [completedJobsOpen, setCompletedJobsOpen] = useState(false);
   const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   const [startingIngest, setStartingIngest] = useState(false);
   const [inventory, setInventory] = useState<SourceInventory>();
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryError, setInventoryError] = useState('');
+  const [sdGrabberMode, setSdGrabberMode] = useState(false);
+  const [removableVolumes, setRemovableVolumes] = useState<RemovableVolume[]>(
+    [],
+  );
+  const [showSdGrabber, setShowSdGrabber] = useState(false);
+  const [allowDuplicateCopies, setAllowDuplicateCopies] = useState(false);
+  const [allowUnverifiedReimport, setAllowUnverifiedReimport] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -168,9 +302,15 @@ export function App() {
   const [thumbnailSourceRequestCount, setThumbnailSourceRequestCount] =
     useState(0);
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
+  const [previewStoredIds, setPreviewStoredIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [previewMemoryUsage, setPreviewMemoryUsage] = useState(0);
+  const [previewMemoryCount, setPreviewMemoryCount] = useState(0);
   const [previewQueueStatus, setPreviewQueueStatus] =
     useState<PreviewQueueStatus>(previewWorkQueue.status);
+  const [staticThumbnailQueueStatus, setStaticThumbnailQueueStatus] =
+    useState<PreviewQueueStatus>(staticThumbnailWorkQueue.status);
   const [previewCacheEpoch, setPreviewCacheEpoch] = useState(0);
   const [clearingPreviewCache, setClearingPreviewCache] = useState(false);
   const [applicationInfo, setApplicationInfo] = useState<AppInfo>();
@@ -199,9 +339,56 @@ export function App() {
   const [removeBatchTags, setRemoveBatchTags] = useState<string[]>([]);
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
   const [removeBatchProjects, setRemoveBatchProjects] = useState<string[]>([]);
-  const [batchDescription, setBatchDescription] = useState('');
+  const [descriptionDraft, setDescriptionDraft] = useState({
+    selectionKey: '',
+    value: '',
+  });
+  const [descriptionSaveStatus, setDescriptionSaveStatus] = useState<{
+    selectionKey: string;
+    state: 'idle' | 'saving' | 'saved' | 'failed';
+    detail?: string;
+  }>({ selectionKey: '', state: 'idle' });
   const [ingestBatchTags, setIngestBatchTags] = useState<string[]>([]);
   const [showScrollTop, setShowScrollTop] = useState(false);
+  const [viewerMediaId, setViewerMediaId] = useState<string>();
+  const [viewerSource, setViewerSource] = useState<string>();
+  const [viewerError, setViewerError] = useState('');
+  const [viewerProxyBusy, setViewerProxyBusy] = useState(false);
+  const [viewerPlaybackMetrics, setViewerPlaybackMetrics] = useState<{
+    sourceResolvedMs?: number;
+    metadataMs?: number;
+    firstFrameMs?: number;
+    playingMs?: number;
+    lastSeekMs?: number;
+    proxyGenerationMs?: number;
+  }>({});
+  const [thumbnailFrameStatus, setThumbnailFrameStatus] = useState('');
+  const [showSelectionDetails, setShowSelectionDetails] = useState(false);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const [diagnosticNow, setDiagnosticNow] = useState(() => Date.now());
+  const [selectionToolbarPosition, setSelectionToolbarPosition] =
+    useState<SelectionToolbarPosition>(() => {
+      const saved = localStorage.getItem('pimp-selection-toolbar-position');
+      return saved === 'bottom-left' || saved === 'bottom-center'
+        ? saved
+        : 'bottom-right';
+    });
+  const [selectionToolbarActions, setSelectionToolbarActions] = useState<
+    SelectionToolbarAction[]
+  >(() => {
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem('pimp-selection-toolbar-actions') ?? 'null',
+      );
+      return Array.isArray(saved)
+        ? defaultSelectionToolbarActions.filter((action) =>
+            saved.includes(action),
+          )
+        : defaultSelectionToolbarActions;
+    } catch {
+      return defaultSelectionToolbarActions;
+    }
+  });
   const [contextMenu, setContextMenu] = useState<{
     mediaId: string;
     x: number;
@@ -209,16 +396,45 @@ export function App() {
   }>();
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
+  const [backupProjectId, setBackupProjectId] = useState<string>();
+  const [backupDestination, setBackupDestination] = useState('');
+  const [backupJobs, setBackupJobs] = useState<BackupJob[]>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
   const catalogueSignature = useRef<string | undefined>(undefined);
   const metadataWrites = useRef(new Map<string, Promise<void>>());
   const pendingMetadataPatches = useRef(
     new Map<string, ProvisionalMetadataPatch>(),
   );
   const selectionAnchor = useRef<string | undefined>(undefined);
+  const selectionUndo = useRef<
+    Array<{ ids: string[]; anchor: string | undefined }>
+  >([]);
+  const selectionRedo = useRef<
+    Array<{ ids: string[]; anchor: string | undefined }>
+  >([]);
+  const lastEscapeAt = useRef(0);
+  const descriptionSaveGeneration = useRef(0);
+  const selectionKeyRef = useRef('');
   const contentRef = useRef<HTMLElement>(null);
+  const libraryPanelRef = useRef<HTMLDivElement>(null);
+  const librarySearchRef = useRef<HTMLInputElement>(null);
+  const viewerVideoRef = useRef<HTMLVideoElement>(null);
+  const viewerPlaybackStartedAt = useRef(0);
+  const viewerSeekStartedAt = useRef(0);
+  const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
+  const preparedThumbnailVersion = useRef(0);
+  const preparedThumbnailVersions = useRef(new Map<string, number>());
+  const inventoryDateOverride = useRef<string | undefined>(undefined);
+  const dateSelectionRef = useRef({ dateOverride, chosenDate });
+  const activeInventoryPlanId = useRef<string | undefined>(undefined);
+  const inventoryApprovalGeneration = useRef(0);
+  const dateReplanIntent = useRef(0);
+  const dateReplanQueue = useRef<Promise<void>>(Promise.resolve());
   const libraryCardRefs = useRef(new Map<string, HTMLElement>());
+  const pendingNativeDrag = useRef<PendingNativeDrag | undefined>(undefined);
+  const suppressedNativeClick = useRef<{ key: string } | undefined>(undefined);
   const [libraryLocateId, setLibraryLocateId] = useState<string>();
   const settingsRef = useRef(settings);
   const [savingSettings] = useState(
@@ -244,15 +460,37 @@ export function App() {
 
   const configured = Boolean(settings.initializedCataloguePath);
   useEffect(() => {
+    if (!native) return;
+    let current = true;
+    void desktopBridge
+      .nativeDragThreshold()
+      .then((threshold) => {
+        if (current) setNativeDragThreshold(threshold);
+      })
+      .catch(() => undefined);
+    return () => {
+      current = false;
+    };
+  }, [native]);
+  useEffect(() => {
     settingsRef.current = settings;
     savingSettings.setLatest(settings);
   }, [savingSettings, settings]);
+  useEffect(() => {
+    const unsubscribeQueue = previewWorkQueue.subscribe(setPreviewQueueStatus);
+    const unsubscribeMemory = hoverPreviewRequestCache.subscribe(
+      (usageBytes, readyEntries) => {
+        setPreviewMemoryUsage(usageBytes);
+        setPreviewMemoryCount(readyEntries);
+      },
+    );
+    return () => {
+      unsubscribeQueue();
+      unsubscribeMemory();
+    };
+  }, []);
   useEffect(
-    () =>
-      previewWorkQueue.subscribe((status) => {
-        setPreviewQueueStatus(status);
-        setPreviewMemoryUsage(hoverPreviewRequestCache.usageBytes);
-      }),
+    () => staticThumbnailWorkQueue.subscribe(setStaticThumbnailQueueStatus),
     [],
   );
   useEffect(() => {
@@ -262,13 +500,22 @@ export function App() {
     );
   }, [settings.previewRamCacheLimitBytes]);
   useEffect(() => {
-    if (!native || view !== 'Settings' || settingsSection !== 'Appearance')
+    if (
+      !native ||
+      view !== 'Settings' ||
+      !['Appearance', 'Diagnostics'].includes(settingsSection)
+    )
       return;
     void desktopBridge
       .hoverPreviewCacheUsage()
       .then(setPreviewCacheUsage)
       .catch(() => undefined);
   }, [native, settingsSection, view]);
+  useEffect(() => {
+    if (view !== 'Settings' || settingsSection !== 'Diagnostics') return;
+    const timer = window.setInterval(() => setDiagnosticNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [settingsSection, view]);
   useEffect(() => {
     const preservePendingSettings = (event: BeforeUnloadEvent) => {
       if (!savingSettings.hasUnsavedChanges()) return;
@@ -291,7 +538,7 @@ export function App() {
         if (result.registered > 0 || result.changed > 0) {
           await refresh();
           void desktopBridge
-            .enrichMedia()
+            .enrichMedia(announce)
             .then(refresh)
             .catch(() => undefined);
         }
@@ -388,6 +635,11 @@ export function App() {
           settingsRef.current = loaded;
           savingSettings.setLatest(loaded);
           setSettings(loaded);
+          setDateOverride(
+            loaded.ingestDateOrganization === 'original-file-dates'
+              ? 'original-file-dates'
+              : 'today',
+          );
           setMediaTools(tools);
           setApplicationInfo(loadedApplicationInfo);
           setUpdaterConfiguration(loadedUpdaterConfiguration);
@@ -399,6 +651,7 @@ export function App() {
           setDiscoveryStatus(loadedDiscoveryStatus);
           setView((loaded.startupPage as View | undefined) ?? 'Library');
           setJobs(await desktopBridge.initializeIngestJobs());
+          setBackupJobs(await desktopBridge.initializeBackupJobs());
           if (loaded.initializedCataloguePath) {
             const before = await desktopBridge.catalogueSignature();
             let nextCatalogue = await desktopBridge.loadCatalogue();
@@ -424,6 +677,14 @@ export function App() {
       stopCatalogue?.();
     };
   }, [native, refresh, savingSettings]);
+  useEffect(() => {
+    if (!native) return;
+    let stop: (() => void) | undefined;
+    void desktopBridge.onBackupJobsChanged(setBackupJobs).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, [native]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -444,32 +705,226 @@ export function App() {
   }, [settings.density, settings.theme]);
 
   useEffect(() => {
+    dateSelectionRef.current = { dateOverride, chosenDate };
+  }, [dateOverride, chosenDate]);
+
+  useEffect(() => {
     if (!native || sources.length === 0) return;
+    const approvalGeneration = ++inventoryApprovalGeneration.current;
+    ++dateReplanIntent.current;
+    activeInventoryPlanId.current = undefined;
     let current = true;
+    const operationId = crypto.randomUUID();
+    void Promise.resolve().then(() => {
+      if (!current) return;
+      setInventoryLoading(true);
+      setInventory(undefined);
+      setInventoryError('');
+    });
+    const selectedDate = dateSelectionRef.current;
     const previewDateOverride =
-      dateOverride === 'default'
-        ? undefined
-        : dateOverride === 'choose'
-          ? chosenDate || undefined
-          : dateOverride;
-    void desktopBridge
-      .inventorySources(sources, previewDateOverride)
+      selectedDate.dateOverride === 'choose'
+        ? selectedDate.chosenDate || undefined
+        : selectedDate.dateOverride;
+    inventoryDateOverride.current = previewDateOverride;
+    const request = sdGrabberMode
+      ? desktopBridge.inventorySdCard(operationId, sources, previewDateOverride)
+      : desktopBridge.inventorySources(
+          operationId,
+          sources,
+          previewDateOverride,
+        );
+    void request
       .then((result) => {
-        if (current) {
+        if (
+          current &&
+          approvalGeneration === inventoryApprovalGeneration.current
+        ) {
           setInventory(result);
+          activeInventoryPlanId.current = result.planId;
+          setConflicts(result.conflicts ?? []);
           setInventoryError('');
+          setAllowDuplicateCopies(false);
+          setAllowUnverifiedReimport(false);
         }
       })
       .catch((reason) => {
-        if (current) setInventoryError(errorText(reason));
+        if (current && !errorText(reason).toLowerCase().includes('cancelled'))
+          setInventoryError(errorText(reason));
       })
       .finally(() => {
         if (current) setInventoryLoading(false);
       });
     return () => {
       current = false;
+      void desktopBridge.cancelInventory(operationId).catch(() => undefined);
     };
-  }, [native, sources, dateOverride, chosenDate]);
+  }, [
+    native,
+    sources,
+    sdGrabberMode,
+    settings.sdGrabberExtensions,
+    settings.sdGrabberSearchSubfolders,
+  ]);
+
+  useEffect(() => {
+    if (!native || !inventory?.planId) return;
+    const nextDateOverride =
+      dateOverride === 'choose' ? chosenDate || undefined : dateOverride;
+    if (!nextDateOverride || inventoryDateOverride.current === nextDateOverride)
+      return;
+    const intent = ++dateReplanIntent.current;
+    const approvalGeneration = inventoryApprovalGeneration.current;
+    inventoryDateOverride.current = nextDateOverride;
+    setInventoryLoading(true);
+    setInventoryError('');
+    const run = dateReplanQueue.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (intent !== dateReplanIntent.current) return;
+        const planId = activeInventoryPlanId.current ?? inventory.planId;
+        try {
+          const result = await desktopBridge.replanIngestDestinations(
+            planId,
+            nextDateOverride,
+          );
+          if (approvalGeneration !== inventoryApprovalGeneration.current)
+            return;
+          activeInventoryPlanId.current = result.planId;
+          if (intent !== dateReplanIntent.current) return;
+          setInventory(result);
+          setConflicts(result.conflicts ?? []);
+        } catch (reason) {
+          if (intent !== dateReplanIntent.current) return;
+          inventoryDateOverride.current = undefined;
+          setInventoryError(errorText(reason));
+        } finally {
+          if (intent === dateReplanIntent.current) setInventoryLoading(false);
+        }
+      });
+    dateReplanQueue.current = run;
+  }, [native, inventory?.planId, dateOverride, chosenDate]);
+
+  useEffect(() => {
+    if (!native || !configured) return;
+    let current = true;
+    const refresh = () => {
+      void desktopBridge
+        .listBackgroundOperations()
+        .then((operations) => {
+          if (current) setBackgroundOperations(operations);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 500);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [configured, native]);
+
+  useEffect(() => {
+    if (!native || !configured) return;
+    let current = true;
+    const refresh = () => {
+      void desktopBridge
+        .getResourceGovernorStatus()
+        .then((status) => {
+          if (current) setResourceStatus(status);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 1_000);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [configured, native]);
+
+  useEffect(() => {
+    if (!native || !configured || !('__TAURI_INTERNALS__' in window)) return;
+    const activeOperations = backgroundOperations.filter((operation) =>
+      ['queued', 'running', 'cancelling'].includes(operation.state),
+    );
+    const activeIngest = jobs.find((job) =>
+      ['queued', 'copying', 'verifying'].includes(job.state),
+    );
+    const primary = activeOperations[0];
+    let title = 'Kairix PIMP';
+    let status = ProgressBarStatus.None;
+    let progress: number | undefined;
+    if (primary) {
+      const measured = primary.bytesTotal
+        ? (primary.bytesCompleted / primary.bytesTotal) * 100
+        : primary.totalItems
+          ? (primary.completedItems / primary.totalItems) * 100
+          : undefined;
+      title = `Kairix PIMP — ${primary.title}${measured == null ? '' : ` ${Math.round(measured)}%`}`;
+      status =
+        measured == null
+          ? ProgressBarStatus.Indeterminate
+          : ProgressBarStatus.Normal;
+      progress = measured == null ? undefined : Math.round(measured);
+    } else if (activeIngest) {
+      const measured = activeIngest.bytesTotal
+        ? (activeIngest.bytesTransferred / activeIngest.bytesTotal) * 100
+        : undefined;
+      title = `Kairix PIMP — Ingest${measured == null ? '' : ` ${Math.round(measured)}%`}`;
+      status =
+        measured == null
+          ? ProgressBarStatus.Indeterminate
+          : ProgressBarStatus.Normal;
+      progress = measured == null ? undefined : Math.round(measured);
+    } else if (
+      jobs.some((job) =>
+        ['failed', 'interrupted', 'needs-attention'].includes(job.state),
+      )
+    ) {
+      title = 'Kairix PIMP — Needs attention';
+      status = ProgressBarStatus.Error;
+    }
+    const appWindow = getCurrentWindow();
+    void appWindow.setTitle(title).catch(() => undefined);
+    void appWindow.setProgressBar({ status, progress }).catch(() => undefined);
+  }, [backgroundOperations, configured, jobs, native]);
+
+  useEffect(() => {
+    if (!native || !configured) return;
+    void desktopBridge
+      .enrichMedia(false)
+      .catch((reason) =>
+        desktopBridge.logUiError(
+          `Startup thumbnail repair failed: ${errorText(reason)}`,
+        ),
+      );
+  }, [configured, native]);
+
+  useEffect(() => {
+    if (
+      !native ||
+      view !== 'Ingest' ||
+      !settings.sdGrabberEnabled ||
+      !settings.sdGrabberAutoDetect
+    )
+      return;
+    let current = true;
+    const refreshVolumes = () => {
+      void desktopBridge
+        .listRemovableVolumes()
+        .then((volumes) => {
+          if (current) setRemovableVolumes(volumes);
+        })
+        .catch(() => undefined);
+    };
+    refreshVolumes();
+    const timer = window.setInterval(refreshVolumes, 5_000);
+    return () => {
+      current = false;
+      window.clearInterval(timer);
+    };
+  }, [native, settings.sdGrabberAutoDetect, settings.sdGrabberEnabled, view]);
   useEffect(() => {
     if (!native || !configured) return;
     let disposed = false;
@@ -521,7 +976,7 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [configured, native]);
   useEffect(() => {
-    if (!native || !configured) return;
+    if (!native || !configured || settings.backgroundProcessingPaused) return;
     let stabilityTimer: number | undefined;
     const startupTimer = window.setTimeout(() => {
       void runDiscovery().then((result) => {
@@ -540,7 +995,7 @@ export function App() {
       window.clearTimeout(startupTimer);
       if (stabilityTimer !== undefined) window.clearTimeout(stabilityTimer);
     };
-  }, [configured, native, runDiscovery]);
+  }, [configured, native, runDiscovery, settings.backgroundProcessingPaused]);
 
   useEffect(() => {
     const preventDefaultContextMenu = (event: MouseEvent) => {
@@ -564,6 +1019,7 @@ export function App() {
   useEffect(() => {
     if (!native) return;
     const generation = ++thumbnailSourceGeneration.current;
+    const preparedVersionAtStart = preparedThumbnailVersion.current;
     const mediaIds = catalogue.media
       .filter((item) => item.thumbnailPath)
       .map((item) => item.id);
@@ -571,8 +1027,23 @@ export function App() {
       .loadThumbnailSources(mediaIds)
       .then((sources) => {
         setThumbnailSourceRequestCount((count) => count + 1);
-        if (generation === thumbnailSourceGeneration.current)
-          setThumbnailSources(sources);
+        if (generation === thumbnailSourceGeneration.current) {
+          setThumbnailSources((current) => {
+            const next = { ...current };
+            for (const mediaId of mediaIds) {
+              if (
+                (preparedThumbnailVersions.current.get(mediaId) ?? 0) >
+                preparedVersionAtStart
+              )
+                continue;
+              if (sources[mediaId]) next[mediaId] = sources[mediaId];
+            }
+            const retainedIds = new Set(catalogue.media.map((item) => item.id));
+            for (const mediaId of Object.keys(next))
+              if (!retainedIds.has(mediaId)) delete next[mediaId];
+            return next;
+          });
+        }
       })
       .catch((reason) => {
         setThumbnailSourceRequestCount((count) => count + 1);
@@ -582,6 +1053,45 @@ export function App() {
           );
       });
   }, [catalogue.media, native]);
+  useEffect(() => {
+    if (!native) return;
+    const mediaIds = catalogue.media.map((item) => item.id);
+    let current = true;
+    void desktopBridge
+      .loadHoverPreviewStatuses(mediaIds)
+      .then((ready) => {
+        if (current) setPreviewStoredIds(new Set(ready));
+      })
+      .catch((reason) => {
+        if (current)
+          void desktopBridge.logUiError(
+            `Hover preview status loading failed: ${errorText(reason)}`,
+          );
+      });
+    return () => {
+      current = false;
+    };
+  }, [catalogue.media, native, previewCacheEpoch]);
+  const receivePreparedPreview = useCallback((mediaId: string) => {
+    setPreviewStoredIds((current) => {
+      if (current.has(mediaId)) return current;
+      const next = new Set(current);
+      next.add(mediaId);
+      return next;
+    });
+  }, []);
+  const receivePreparedThumbnail = useCallback(
+    (mediaId: string, source: string) => {
+      const version = ++preparedThumbnailVersion.current;
+      preparedThumbnailVersions.current.set(mediaId, version);
+      setThumbnailSources((current) =>
+        current[mediaId] === source
+          ? current
+          : { ...current, [mediaId]: source },
+      );
+    },
+    [],
+  );
   const selectedProject = catalogue.projects.find(
     (project) => project.id === selectedProjectId,
   );
@@ -615,6 +1125,81 @@ export function App() {
       ),
     [catalogue.media, projectMedia, selectedProjectId],
   );
+  const availableProjectMedia = useMemo(() => {
+    const query = projectAvailableQuery.trim().toLocaleLowerCase();
+    return unlinkedProjectMedia.filter((item) => {
+      const tags = logicalTags(item, catalogue.media);
+      return (
+        (!query || logicalMediaMatches(item, query, catalogue)) &&
+        projectAvailableTags.every((tag) => tags.includes(tag))
+      );
+    });
+  }, [
+    catalogue,
+    projectAvailableQuery,
+    projectAvailableTags,
+    unlinkedProjectMedia,
+  ]);
+  const availableProjectPageSize = 50;
+  const availableProjectPageCount = Math.max(
+    1,
+    Math.ceil(availableProjectMedia.length / availableProjectPageSize),
+  );
+  const pagedAvailableProjectMedia = availableProjectMedia.slice(
+    (projectAvailablePage - 1) * availableProjectPageSize,
+    projectAvailablePage * availableProjectPageSize,
+  );
+  const premiereSummary = useMemo(() => {
+    const index = projectInventory?.premiereIndex;
+    if (!index) return undefined;
+    const current = index.mediaReferences.filter(
+      (reference) =>
+        reference.evidence === 'imported-into-saved-project' ||
+        reference.evidence === 'used-in-saved-timeline',
+    );
+    const used = current.filter(
+      (reference) => reference.evidence === 'used-in-saved-timeline',
+    );
+    const timelineCoverageKnown = !index.issues.some((issue) =>
+      issue.includes(
+        'Timeline track-item media relationships were not established',
+      ),
+    );
+    const logicalCount = (references: typeof current) =>
+      new Set(
+        references.map(
+          (reference) => reference.mediaId ?? `path:${reference.path}`,
+        ),
+      ).size;
+    return {
+      imported: logicalCount(current),
+      used: timelineCoverageKnown ? logicalCount(used) : undefined,
+      unused: timelineCoverageKnown
+        ? logicalCount(
+            current.filter(
+              (reference) =>
+                reference.evidence === 'imported-into-saved-project',
+            ),
+          )
+        : undefined,
+      unresolved: logicalCount(
+        index.mediaReferences.filter((reference) => !reference.mediaId),
+      ),
+      historical: logicalCount(
+        index.mediaReferences.filter(
+          (reference) =>
+            reference.evidence === 'historical-reference-supported',
+        ),
+      ),
+      unclassified: logicalCount(
+        index.mediaReferences.filter(
+          (reference) =>
+            reference.evidence === 'unclassified-project-reference' ||
+            reference.evidence === 'previously-referenced-in-saved-project',
+        ),
+      ),
+    };
+  }, [projectInventory]);
   const folders = useMemo(() => {
     const summaries = new Map<
       string,
@@ -665,12 +1250,188 @@ export function App() {
           item.relativePath.split('/').slice(0, -1).join('/') ||
           'Master Bin root';
         return (
+          (includeUnavailable || item.available) &&
           (folder === 'All media' || folder === itemFolder) &&
+          tagFilters.every((filter) =>
+            logicalTags(item, catalogue.media).some(
+              (tag) => tag.toLocaleLowerCase() === filter.toLocaleLowerCase(),
+            ),
+          ) &&
           logicalMediaMatches(item, query, catalogue)
         );
       }),
-    [catalogue, displayedMedia, folder, query],
+    [catalogue, displayedMedia, folder, includeUnavailable, query, tagFilters],
   );
+  const replaceSelection = useCallback(
+    (ids: string[], anchor: string | undefined, recordHistory = true) => {
+      const known = new Set(catalogue.media.map((item) => item.id));
+      const next = [...new Set(ids.filter((id) => known.has(id)))];
+      if (
+        next.length === selected.length &&
+        next.every((id, index) => id === selected[index]) &&
+        anchor === selectionAnchor.current
+      )
+        return;
+      if (recordHistory) {
+        selectionUndo.current.push({
+          ids: [...selected],
+          anchor: selectionAnchor.current,
+        });
+        if (selectionUndo.current.length > 50) selectionUndo.current.shift();
+        selectionRedo.current = [];
+      }
+      selectionAnchor.current = anchor;
+      setSelected(next);
+    },
+    [catalogue.media, selected],
+  );
+  const undoSelection = useCallback(() => {
+    const previous = selectionUndo.current.pop();
+    if (!previous) return;
+    selectionRedo.current.push({
+      ids: [...selected],
+      anchor: selectionAnchor.current,
+    });
+    replaceSelection(previous.ids, previous.anchor, false);
+  }, [replaceSelection, selected]);
+  const redoSelection = useCallback(() => {
+    const next = selectionRedo.current.pop();
+    if (!next) return;
+    selectionUndo.current.push({
+      ids: [...selected],
+      anchor: selectionAnchor.current,
+    });
+    replaceSelection(next.ids, next.anchor, false);
+  }, [replaceSelection, selected]);
+  useEffect(() => {
+    const known = new Set(catalogue.media.map((item) => item.id));
+    selectionUndo.current = selectionUndo.current
+      .map((snapshot) => ({
+        ids: snapshot.ids.filter((id) => known.has(id)),
+        anchor:
+          snapshot.anchor && known.has(snapshot.anchor)
+            ? snapshot.anchor
+            : undefined,
+      }))
+      .slice(-50);
+    selectionRedo.current = selectionRedo.current
+      .map((snapshot) => ({
+        ids: snapshot.ids.filter((id) => known.has(id)),
+        anchor:
+          snapshot.anchor && known.has(snapshot.anchor)
+            ? snapshot.anchor
+            : undefined,
+      }))
+      .slice(-50);
+  }, [catalogue.media]);
+  const viewerRecording = viewerMediaId
+    ? catalogue.media.find((item) => item.id === viewerMediaId)
+    : undefined;
+  const viewerIndex = viewerRecording
+    ? filtered.findIndex((item) => item.id === viewerRecording.id)
+    : -1;
+  const viewerAssociatedMedia = viewerRecording
+    ? associatedMedia(viewerRecording, catalogue.media)
+    : [];
+  useEffect(() => {
+    if (!viewerMediaId || !viewerRecording?.available || !native) return;
+    viewerPlaybackStartedAt.current = performance.now();
+    let current = true;
+    void Promise.resolve().then(() => {
+      if (!current) return;
+      setViewerPlaybackMetrics({});
+      setViewerSource(undefined);
+      setViewerError('');
+      setViewerProxyBusy(false);
+    });
+    void desktopBridge
+      .resolveMediaPlaybackSource(viewerMediaId)
+      .then((source) => {
+        if (current) {
+          setViewerSource(source);
+          setViewerPlaybackMetrics((metrics) => ({
+            ...metrics,
+            sourceResolvedMs: Math.round(
+              performance.now() - viewerPlaybackStartedAt.current,
+            ),
+          }));
+        }
+      })
+      .catch((reason) => {
+        if (current) setViewerError(errorText(reason));
+      });
+    return () => {
+      current = false;
+    };
+  }, [native, viewerMediaId, viewerRecording?.available]);
+  useEffect(() => {
+    if (!native || !viewerMediaId) return;
+    const mediaId = viewerMediaId;
+    return () => {
+      void desktopBridge.releasePlaybackProxy(mediaId).catch(() => undefined);
+    };
+  }, [native, viewerMediaId]);
+  const openClipViewer = (mediaId: string) => {
+    libraryScrollPosition.current = libraryPanelRef.current?.scrollTop ?? 0;
+    replaceSelection([mediaId], mediaId);
+    setViewerMediaId(mediaId);
+  };
+  const closeClipViewer = () => {
+    setViewerMediaId(undefined);
+    const top = libraryScrollPosition.current;
+    window.requestAnimationFrame(() =>
+      libraryPanelRef.current?.scrollTo?.({ top }),
+    );
+  };
+  const navigateClipViewer = (offset: -1 | 1) => {
+    const next = filtered[viewerIndex + offset];
+    if (!next) return;
+    replaceSelection([next.id], next.id);
+    setViewerMediaId(next.id);
+  };
+  const saveCurrentViewerFrame = async () => {
+    if (!viewerRecording || !viewerVideoRef.current) return;
+    setThumbnailFrameStatus('Saving thumbnail…');
+    try {
+      const source = await desktopBridge.setMediaThumbnailFrame(
+        viewerRecording.id,
+        viewerVideoRef.current.currentTime,
+      );
+      setThumbnailSources((current) => ({
+        ...current,
+        [viewerRecording.id]: source,
+      }));
+      setPreviewCacheEpoch((current) => current + 1);
+      setThumbnailFrameStatus(
+        'Thumbnail saved to the shared catalogue. Other devices can reuse it after synchronization.',
+      );
+    } catch (reason) {
+      setThumbnailFrameStatus(`Thumbnail failed: ${errorText(reason)}`);
+    }
+  };
+  const createPlaybackProxy = async () => {
+    if (!viewerRecording) return;
+    setViewerProxyBusy(true);
+    const proxyStartedAt = performance.now();
+    try {
+      setViewerSource(
+        await desktopBridge.preparePlaybackProxy(viewerRecording.id),
+      );
+      viewerPlaybackStartedAt.current = performance.now();
+      setViewerPlaybackMetrics({
+        sourceResolvedMs: 0,
+        proxyGenerationMs: Math.round(performance.now() - proxyStartedAt),
+      });
+      setViewerError('');
+      setMessage(
+        'Compatible preview ready in the device-local cache. The original recording was unchanged.',
+      );
+    } catch (reason) {
+      setViewerError(`Compatible preview failed: ${errorText(reason)}`);
+    } finally {
+      setViewerProxyBusy(false);
+    }
+  };
   useEffect(() => {
     if (view !== 'Library' || !libraryLocateId) return;
     const card = libraryCardRefs.current.get(libraryLocateId);
@@ -699,17 +1460,91 @@ export function App() {
   );
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (view !== 'Library' || !(event.ctrlKey || event.metaKey)) return;
-      if (event.key.toLowerCase() !== 'a') return;
+      if (view !== 'Library') return;
       const target = event.target as HTMLElement | null;
-      if (target?.closest('input, textarea, [contenteditable="true"]')) return;
-      event.preventDefault();
-      setSelected(filtered.map((item) => item.id));
-      selectionAnchor.current = filtered.at(-1)?.id;
+      const editing = keyboardInputOwner(target);
+      const key = event.key.toLowerCase();
+      if (editing) {
+        if (event.key === 'Escape' && showShortcutHelp) {
+          event.preventDefault();
+          setShowShortcutHelp(false);
+        }
+        return;
+      }
+      if (viewerMediaId && (key === 'k' || event.key === ' ')) {
+        event.preventDefault();
+        const video = viewerVideoRef.current;
+        if (video?.paused) void video.play();
+        else video?.pause();
+        return;
+      }
+      if (event.altKey && event.key === 'ArrowLeft') {
+        event.preventDefault();
+        if (viewerMediaId) closeClipViewer();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'f') {
+        event.preventDefault();
+        librarySearchRef.current?.focus();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) redoSelection();
+        else undoSelection();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'y') {
+        event.preventDefault();
+        redoSelection();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'a') {
+        event.preventDefault();
+        replaceSelection(
+          filtered.map((item) => item.id),
+          filtered.at(-1)?.id,
+        );
+        return;
+      }
+      if (event.key === '?' && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        setShowShortcutHelp(true);
+        return;
+      }
+      if (event.key === 'Escape') {
+        if (showShortcutHelp) {
+          event.preventDefault();
+          setShowShortcutHelp(false);
+          return;
+        }
+        if (contextMenu) return;
+        if (viewerMediaId) {
+          event.preventDefault();
+          closeClipViewer();
+          return;
+        }
+        const now = Date.now();
+        if (now - lastEscapeAt.current < 600 && selected.length) {
+          event.preventDefault();
+          replaceSelection([], undefined);
+        }
+        lastEscapeAt.current = now;
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [filtered, view]);
+  }, [
+    contextMenu,
+    filtered,
+    redoSelection,
+    replaceSelection,
+    selected.length,
+    showShortcutHelp,
+    undoSelection,
+    view,
+    viewerMediaId,
+  ]);
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(undefined);
@@ -723,16 +1558,6 @@ export function App() {
       window.removeEventListener('keydown', closeOnEscape);
     };
   }, [contextMenu]);
-  useEffect(() => {
-    const content = contentRef.current;
-    if (!content) return;
-    const updateScrollControl = () =>
-      setShowScrollTop(content.scrollTop >= 480);
-    updateScrollControl();
-    content.addEventListener('scroll', updateScrollControl, { passive: true });
-    return () => content.removeEventListener('scroll', updateScrollControl);
-  }, []);
-
   const saveConfiguration = async () => {
     setError('');
     setBusy(true);
@@ -794,6 +1619,7 @@ export function App() {
   const addFiles = async () => {
     const chosen = await desktopBridge.chooseFiles();
     if (chosen.length) {
+      setSdGrabberMode(false);
       setInventory(undefined);
       setInventoryError('');
       setInventoryLoading(true);
@@ -803,14 +1629,50 @@ export function App() {
   const addFolder = async () => {
     const path = await desktopBridge.chooseFolder();
     if (path) {
+      setSdGrabberMode(false);
       setInventory(undefined);
       setInventoryError('');
       setInventoryLoading(true);
       setSources((current) => [...new Set([...current, path])]);
     }
   };
+  const scanSdSource = (path: string, identity?: string) => {
+    if (
+      identity &&
+      settings.sdGrabberRememberDevices &&
+      !settings.sdGrabberRecognizedDeviceIds.includes(identity)
+    ) {
+      persistPreference({
+        sdGrabberRecognizedDeviceIds: [
+          ...settings.sdGrabberRecognizedDeviceIds,
+          identity,
+        ],
+      });
+    }
+    setSdGrabberMode(true);
+    setShowSdGrabber(true);
+    setInventory(undefined);
+    setInventoryError('');
+    setInventoryLoading(true);
+    setSources([path]);
+  };
+  const chooseSdSource = async () => {
+    const path = await desktopBridge.chooseFolder();
+    if (path) scanSdSource(path);
+  };
+  const refreshRemovableVolumes = async () => {
+    try {
+      setRemovableVolumes(await desktopBridge.listRemovableVolumes());
+    } catch (reason) {
+      setInventoryError(errorText(reason));
+    }
+  };
   const ingest = async (renamedDestinations: Record<string, string> = {}) => {
     if (!sources.length) return;
+    if (!inventory?.planId) {
+      setError('Scan and review the selected source before starting ingest.');
+      return;
+    }
     setStartingIngest(true);
     setError('');
     setMessage('');
@@ -819,14 +1681,12 @@ export function App() {
       const job = await desktopBridge.startIngest({
         jobId,
         sources,
-        dateOverride:
-          dateOverride === 'default'
-            ? undefined
-            : dateOverride === 'choose'
-              ? chosenDate
-              : dateOverride,
+        dateOverride: dateOverride === 'choose' ? chosenDate : dateOverride,
         renamedDestinations,
         batchTags: ingestBatchTags,
+        approvedPlanId: inventory.planId,
+        allowDuplicateCopies,
+        allowUnverifiedReimport,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -836,9 +1696,36 @@ export function App() {
       setConflicts([]);
       setRenames({});
       setIngestBatchTags([]);
+      setAllowDuplicateCopies(false);
+      setAllowUnverifiedReimport(false);
+      setSdGrabberMode(false);
       setJobsOpen(true);
       setMessage(
         `Ingest queued with ${job.files.length} file${job.files.length === 1 ? '' : 's'}. You can keep browsing and edit metadata now.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setStartingIngest(false);
+    }
+  };
+  const reviewRenamedDestinations = async () => {
+    if (!inventory?.planId) return;
+    const reviewed = Object.fromEntries(
+      Object.entries(renames).filter(([, value]) => value.trim()),
+    );
+    setStartingIngest(true);
+    setError('');
+    try {
+      const next = await desktopBridge.reapproveIngestDestinations(
+        inventory.planId,
+        reviewed,
+      );
+      setInventory(next);
+      setConflicts([]);
+      setRenames({});
+      setMessage(
+        'Renamed destinations were validated and saved in a new approved ingest plan. Review the paths, then start ingest.',
       );
     } catch (reason) {
       setError(errorText(reason));
@@ -929,6 +1816,17 @@ export function App() {
       setError(errorText(reason));
     }
   };
+  const updateRecording = async (
+    mediaId: string,
+    next: { removeTags?: string[] },
+  ) => {
+    try {
+      const mediaIds = expandLogicalMediaIds([mediaId], catalogue.media);
+      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...next }));
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
   const selectRecording = (
     mediaId: string,
     options: { toggle: boolean; range: boolean },
@@ -941,28 +1839,102 @@ export function App() {
       if (start >= 0 && end >= 0) {
         const [from, to] = start < end ? [start, end] : [end, start];
         const range = filtered.slice(from, to + 1).map((item) => item.id);
-        setSelected((current) =>
-          options.toggle ? [...new Set([...current, ...range])] : range,
+        replaceSelection(
+          options.toggle ? [...new Set([...selected, ...range])] : range,
+          selectionAnchor.current,
         );
         return;
       }
     }
-    selectionAnchor.current = mediaId;
-    setSelected((current) => {
-      if (!options.toggle) return [mediaId];
-      return current.includes(mediaId)
-        ? current.filter((id) => id !== mediaId)
-        : [...current, mediaId];
-    });
+    replaceSelection(
+      !options.toggle
+        ? [mediaId]
+        : selected.includes(mediaId)
+          ? selected.filter((id) => id !== mediaId)
+          : [...selected, mediaId],
+      mediaId,
+    );
   };
   const selectedRecording =
     selected.length === 1
       ? catalogue.media.find((item) => item.id === selected[0])
       : undefined;
+  const selectionKey = selected.join('\u0000');
+  useEffect(() => {
+    selectionKeyRef.current = selectionKey;
+  }, [selectionKey]);
+  const descriptionValue =
+    descriptionDraft.selectionKey === selectionKey
+      ? descriptionDraft.value
+      : (selectedRecording?.notes ?? '');
+  const visibleDescriptionStatus =
+    descriptionSaveStatus.selectionKey === selectionKey
+      ? descriptionSaveStatus
+      : { selectionKey, state: 'idle' as const };
   const selectedAssociatedMedia = selectedRecording
     ? associatedMedia(selectedRecording, catalogue.media)
     : [];
   const selectedPhysicalIds = expandLogicalMediaIds(selected, catalogue.media);
+  const selectedTagState = (tag: string) => {
+    const selectedItems = selectedPhysicalIds
+      .map((id) => catalogue.media.find((item) => item.id === id))
+      .filter((item): item is NonNullable<typeof item> => Boolean(item));
+    const count = selectedItems.filter((item) =>
+      item.tags.some(
+        (candidate) =>
+          candidate.toLocaleLowerCase() === tag.toLocaleLowerCase(),
+      ),
+    ).length;
+    return count === 0
+      ? 'Present on none selected'
+      : count === selectedItems.length
+        ? 'Present on all selected'
+        : 'Present on some selected';
+  };
+  const saveSelectionDescription = async () => {
+    if (!selectedPhysicalIds.length) return;
+    const requestId = ++descriptionSaveGeneration.current;
+    const requestSelectionKey = selectionKey;
+    const mediaIds = [...selectedPhysicalIds];
+    const notes = descriptionValue;
+    const currentValues = mediaIds
+      .map((id) => catalogue.media.find((item) => item.id === id)?.notes)
+      .filter((value): value is string => value !== undefined);
+    setDescriptionSaveStatus({
+      selectionKey: requestSelectionKey,
+      state: 'saving',
+    });
+    if (
+      currentValues.length === mediaIds.length &&
+      currentValues.every((value) => value === notes)
+    ) {
+      setDescriptionSaveStatus({
+        selectionKey: requestSelectionKey,
+        state: 'saved',
+      });
+      return;
+    }
+    try {
+      const updated = await desktopBridge.updateMedia({ mediaIds, notes });
+      if (requestId !== descriptionSaveGeneration.current) return;
+      setCatalogue(updated);
+      if (selectionKeyRef.current === requestSelectionKey)
+        setDescriptionSaveStatus({
+          selectionKey: requestSelectionKey,
+          state: 'saved',
+        });
+    } catch (reason) {
+      if (
+        requestId === descriptionSaveGeneration.current &&
+        selectionKeyRef.current === requestSelectionKey
+      )
+        setDescriptionSaveStatus({
+          selectionKey: requestSelectionKey,
+          state: 'failed',
+          detail: errorText(reason),
+        });
+    }
+  };
   const contextRecording = contextMenu
     ? catalogue.media.find((item) => item.id === contextMenu.mediaId)
     : undefined;
@@ -988,6 +1960,93 @@ export function App() {
       setError(errorText(reason));
     }
   };
+  const beginNativeDrag = (
+    event: ReactPointerEvent<HTMLElement>,
+    drag: Omit<PendingNativeDrag, 'pointerId' | 'origin'>,
+  ) => {
+    if (!native || event.button !== 0 || (event.buttons & 1) === 0) return;
+    const target = event.target as HTMLElement;
+    const nestedControl = target.closest(
+      'input, textarea, select, a, button, [contenteditable="true"], [data-native-drag-ignore="true"]',
+    );
+    if (nestedControl && nestedControl !== event.currentTarget) return;
+    pendingNativeDrag.current = {
+      ...drag,
+      pointerId: event.pointerId,
+      origin: { x: event.clientX, y: event.clientY },
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+  const cancelPendingNativeDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (pendingNativeDrag.current?.pointerId === event.pointerId)
+      pendingNativeDrag.current = undefined;
+  };
+  const continueNativeDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const pending = pendingNativeDrag.current;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if ((event.buttons & 1) === 0) {
+      pendingNativeDrag.current = undefined;
+      return;
+    }
+    if (
+      !nativeDragMovementExceeded(
+        pending.origin,
+        { x: event.clientX, y: event.clientY },
+        nativeDragThreshold,
+      )
+    )
+      return;
+    pendingNativeDrag.current = undefined;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    event.preventDefault();
+    event.stopPropagation();
+    const suppressedClick = { key: pending.key };
+    suppressedNativeClick.current = suppressedClick;
+    window.setTimeout(() => {
+      if (suppressedNativeClick.current === suppressedClick)
+        suppressedNativeClick.current = undefined;
+    }, 750);
+    setError('');
+    void pending
+      .run()
+      .then((outcome) => {
+        if (outcome === 'dropped') {
+          setMessage(pending.droppedMessage);
+        } else if (outcome === 'cancelled') {
+          setMessage(
+            'Windows drag cancelled. Original Library items are unchanged.',
+          );
+        } else {
+          setMessage(
+            'The destination did not accept the copy-only Windows drag. Original Library items are unchanged.',
+          );
+        }
+      })
+      .catch((reason) => setError(errorText(reason)));
+  };
+  const suppressClickAfterNativeDrag = (key: string) => {
+    const suppressed = suppressedNativeClick.current;
+    if (!suppressed || suppressed.key !== key) return false;
+    suppressedNativeClick.current = undefined;
+    return true;
+  };
+  const mediaDrag = (recording: Catalogue['media'][number]) => {
+    const mediaIds = selected.includes(recording.id)
+      ? selected
+      : [recording.id];
+    return {
+      key: `media:${recording.id}`,
+      run: () => desktopBridge.startNativeMediaDrag(mediaIds),
+      droppedMessage: `${mediaIds.length} original recording${mediaIds.length === 1 ? '' : 's'} was accepted by the destination as a copy-only Windows drag. Confirm the destination completed its own copy or import.`,
+    };
+  };
+  const folderDrag = (relativePath: string) => ({
+    key: `folder:${relativePath}`,
+    run: () => desktopBridge.startNativeFolderDrag(relativePath),
+    droppedMessage:
+      'The original Library folder was accepted by the destination as a copy-only Windows drag. Confirm the destination completed its own copy or import.',
+  });
   const copySelectedPaths = async () => {
     const recordings = selectedPhysicalIds
       .map((id) => catalogue.media.find((item) => item.id === id))
@@ -1002,7 +2061,7 @@ export function App() {
       await navigator.clipboard.writeText(paths.join('\r\n'));
       const skipped = recordings.length - available.length;
       setMessage(
-        `${paths.length} media path${paths.length === 1 ? '' : 's'} copied for manual Premiere import${skipped ? `; ${skipped} unavailable item${skipped === 1 ? '' : 's'} skipped` : ''}.`,
+        `${paths.length} file path${paths.length === 1 ? '' : 's'} copied as text${skipped ? `; ${skipped} unavailable item${skipped === 1 ? '' : 's'} skipped` : ''}.`,
       );
     } catch (reason) {
       setError(errorText(reason));
@@ -1076,7 +2135,8 @@ export function App() {
       [
         `${applicationInfo?.edition ?? 'Kairix PIMP Light'} ${applicationInfo?.version ?? 'unknown'}`,
         `Build: ${applicationInfo?.buildCommit ?? 'unknown'}`,
-        `Channel: ${applicationInfo?.releaseChannel ?? 'Beta'}`,
+        `Classification: ${applicationInfo?.releaseClassification ?? 'Development'}`,
+        `Update channel: ${updaterConfiguration?.channel ?? 'Development'}`,
         `Device: ${settings.deviceId}`,
         `Catalogue items: ${catalogue.media.length}`,
         `Last scan: ${discoveryStatus.lastCompletedAt ?? 'never'}`,
@@ -1085,6 +2145,12 @@ export function App() {
         `FFmpeg: ${mediaTools?.ffmpegAvailable ? 'available' : 'unavailable'}`,
         `FFprobe: ${mediaTools?.ffprobeAvailable ? 'available' : 'unavailable'}`,
         `Thumbnail source batches: ${thumbnailSourceRequestCount}`,
+        `Static thumbnail queue: ${staticThumbnailQueueStatus.active ? 1 : 0} active, ${staticThumbnailQueueStatus.queued} queued`,
+        `Hover preview queue: ${previewQueueStatus.active ? 1 : 0} active, ${previewQueueStatus.queued} queued`,
+        `Resource profile: ${resourceStatus?.profile ?? settings.resourceProfile}`,
+        `Volume admission: ${resourceStatus?.volumes.reduce((total, volume) => total + volume.activeReaders, 0) ?? 0} readers, ${resourceStatus?.volumes.reduce((total, volume) => total + volume.activeWriters, 0) ?? 0} writers, ${resourceStatus?.queuedWorkers ?? 0} waiting`,
+        `Volume bytes: ${resourceStatus?.volumes.reduce((total, volume) => total + volume.bytesRead, 0) ?? 0} read, ${resourceStatus?.volumes.reduce((total, volume) => total + volume.bytesWritten, 0) ?? 0} written`,
+        `Playback timings (ms): ${JSON.stringify(viewerPlaybackMetrics)}`,
       ].join('\r\n'),
     );
     setMessage('Diagnostic summary copied without personal file paths.');
@@ -1094,7 +2160,9 @@ export function App() {
     setError('');
     previewWorkQueue.clearQueued();
     hoverPreviewRequestCache.invalidate();
+    setPreviewStoredIds(new Set());
     setPreviewMemoryUsage(0);
+    setPreviewMemoryCount(0);
     setPreviewCacheEpoch((value) => value + 1);
     try {
       setPreviewCacheUsage(await desktopBridge.clearHoverPreviewCache());
@@ -1104,6 +2172,7 @@ export function App() {
     } finally {
       hoverPreviewRequestCache.invalidate();
       setPreviewMemoryUsage(0);
+      setPreviewMemoryCount(0);
       setPreviewCacheEpoch((value) => value + 1);
       setClearingPreviewCache(false);
     }
@@ -1114,7 +2183,9 @@ export function App() {
       return;
     }
     setCheckingUpdate(true);
-    setUpdateStatus('Checking for a signed Beta update…');
+    setUpdateStatus(
+      `Checking the signed ${updaterConfiguration.channel} channel…`,
+    );
     setError('');
     try {
       const update = await checkApprovedBetaUpdate();
@@ -1123,8 +2194,8 @@ export function App() {
       setAvailableUpdate(update ?? undefined);
       setUpdateStatus(
         update
-          ? `Signed Beta ${update.version} is available.`
-          : `No newer signed Beta was available at ${checkedAt}.`,
+          ? `${update.classification} ${update.version} is available.`
+          : `No newer signed ${updaterConfiguration.channel} release was available at ${checkedAt}.`,
       );
     } catch (reason) {
       setUpdateStatus(`Update check failed: ${errorText(reason)}`);
@@ -1145,6 +2216,11 @@ export function App() {
     }
     automaticUpdateCheckStarted.current = true;
     void checkForUpdates();
+    const timer = window.setInterval(
+      () => void checkForUpdates(),
+      6 * 60 * 60 * 1_000,
+    );
+    return () => window.clearInterval(timer);
   }, [
     applicationInfo,
     checkForUpdates,
@@ -1156,6 +2232,18 @@ export function App() {
     if (updateBlockingJobs.length > 0) {
       setUpdateStatus(
         'Resolve every active or recoverable ingest job before installing an update.',
+      );
+      return;
+    }
+    if (backupBusy || updateBlockingBackupJobs.length > 0) {
+      setUpdateStatus(
+        'Wait for every active backup, verification, or restore test to finish before installing an update.',
+      );
+      return;
+    }
+    if (discoveryStatus.running) {
+      setUpdateStatus(
+        'Wait for the active Library scan or integrity verification to finish before installing an update.',
       );
       return;
     }
@@ -1180,9 +2268,10 @@ export function App() {
         }
       });
       setUpdateStatus(
-        'Update installed. Restart required if PIMP does not reopen.',
+        'The signed installer was launched. PIMP will close and Windows will restart it after installation; confirm the new version after it reopens.',
       );
     } catch (reason) {
+      setAvailableUpdate(undefined);
       setUpdateStatus(`Update installation failed: ${errorText(reason)}`);
     } finally {
       setCheckingUpdate(false);
@@ -1251,6 +2340,10 @@ export function App() {
     setProjectNotes(project.notes);
     setProjectTags(project.tags);
     setProjectMediaQuery('');
+    setProjectAvailableOpen(false);
+    setProjectAvailableQuery('');
+    setProjectAvailableTags([]);
+    setProjectAvailablePage(1);
     setProjectMediaSelection([]);
     setProjectAddTags([]);
     setProjectRemoveTags([]);
@@ -1368,9 +2461,83 @@ export function App() {
     setView('Library');
     setFolder('All media');
     setQuery('');
-    setSelected([target.id]);
-    selectionAnchor.current = target.id;
+    replaceSelection([target.id], target.id);
     setLibraryLocateId(target.id);
+  };
+  const startBackup = async () => {
+    if (!backupProjectId || !backupDestination) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      const completed = await desktopBridge.startProjectBackup(
+        backupProjectId,
+        backupDestination,
+      );
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage(
+        `Verified ${completed.manifest.sourceFileCount} files on the destination drive.`,
+      );
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const retryBackup = async (jobId: string) => {
+    const destinationRoot = await desktopBridge.chooseFolder();
+    if (!destinationRoot) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      await desktopBridge.retryProjectBackup(jobId, destinationRoot);
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage('Backup completed and independently re-verified.');
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const verifyBackup = async (jobId: string) => {
+    setBackupBusy(true);
+    setError('');
+    try {
+      await desktopBridge.verifyProjectBackup(jobId);
+      setBackupJobs(await desktopBridge.listBackupJobs());
+      setMessage('Every backup file still matches its SHA-256 manifest.');
+    } catch (reason) {
+      setBackupJobs(
+        await desktopBridge.listBackupJobs().catch(() => backupJobs),
+      );
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+  const testBackupRestore = async (jobId: string) => {
+    const restoreRoot = await desktopBridge.chooseFolder();
+    if (!restoreRoot) return;
+    setBackupBusy(true);
+    setError('');
+    try {
+      const result = await desktopBridge.testProjectBackupRestore(
+        jobId,
+        restoreRoot,
+      );
+      setMessage(
+        `Restore test passed: ${result.filesVerified} files and ${size(result.bytesVerified)} independently verified.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBackupBusy(false);
+    }
   };
   const activeJobs = jobs.filter((job) =>
     ['queued', 'copying', 'verifying'].includes(job.state),
@@ -1380,7 +2547,33 @@ export function App() {
     (job) => !activeJobs.includes(job) && !completedJobs.includes(job),
   );
   const workJobs = [...activeJobs, ...needsAttentionJobs];
+  const visibleBackgroundOperations = backgroundOperations.filter(
+    (operation) => operation.state !== 'completed' || inventoryLoading,
+  );
+  const activeBackgroundOperations = visibleBackgroundOperations.filter(
+    (operation) =>
+      !['completed', 'cancelled', 'failed'].includes(operation.state),
+  );
+  const primaryBackgroundOperation = activeBackgroundOperations[0];
+  const primaryOperationElapsedSeconds = primaryBackgroundOperation
+    ? Math.max(
+        0,
+        Math.round(
+          (diagnosticNow -
+            new Date(primaryBackgroundOperation.startedAt).getTime()) /
+            1000,
+        ),
+      )
+    : undefined;
+  const primaryOperationThroughput =
+    primaryBackgroundOperation?.bytesCompleted && primaryOperationElapsedSeconds
+      ? primaryBackgroundOperation.bytesCompleted /
+        primaryOperationElapsedSeconds
+      : undefined;
   const updateBlockingJobs = jobs.filter((job) => !jobIsClearableHistory(job));
+  const updateBlockingBackupJobs = backupJobs.filter((job) =>
+    ['prepared', 'copying', 'verifying'].includes(job.state),
+  );
   const totalJobBytes = activeJobs.reduce(
     (total, job) => total + job.bytesTotal,
     0,
@@ -1414,6 +2607,7 @@ export function App() {
     'General',
     'Library & Storage',
     'Ingest & Discovery',
+    'Resource Management',
     'Appearance',
     'Updates',
     'About & Support',
@@ -1499,7 +2693,10 @@ export function App() {
           </span>
         </div>
       </aside>
-      <main ref={contentRef}>
+      <main
+        ref={contentRef}
+        className={view === 'Library' ? 'library-main' : 'page-main'}
+      >
         <header>
           <div>
             <p>
@@ -1508,21 +2705,29 @@ export function App() {
             <h1>{view}</h1>
           </div>
           <div className="header-actions">
-            {native && configured && jobs.length > 0 && (
-              <button
-                className="job-indicator"
-                aria-expanded={jobsOpen}
-                onClick={() => setJobsOpen((open) => !open)}
-              >
-                {activeJobs.length > 0
-                  ? `${activeJobs.length} active · ${Math.round(
-                      (transferredJobBytes / Math.max(totalJobBytes, 1)) * 100,
-                    )}%`
-                  : needsAttentionJobs.length > 0
-                    ? `${needsAttentionJobs.length} need${needsAttentionJobs.length === 1 ? 's' : ''} attention`
-                    : 'All ingests complete'}
-              </button>
-            )}
+            {native &&
+              configured &&
+              (jobs.length > 0 || visibleBackgroundOperations.length > 0) && (
+                <button
+                  className="job-indicator"
+                  aria-expanded={jobsOpen}
+                  onClick={() => setJobsOpen((open) => !open)}
+                >
+                  {activeJobs.length + activeBackgroundOperations.length > 0
+                    ? `${activeJobs.length + activeBackgroundOperations.length} active${
+                        activeJobs.length > 0
+                          ? ` · ${Math.round(
+                              (transferredJobBytes /
+                                Math.max(totalJobBytes, 1)) *
+                                100,
+                            )}% ingest`
+                          : ''
+                      }`
+                    : needsAttentionJobs.length > 0
+                      ? `${needsAttentionJobs.length} need${needsAttentionJobs.length === 1 ? 's' : ''} attention`
+                      : 'All ingests complete'}
+                </button>
+              )}
             <div className="sync">
               {native ? 'Native desktop' : 'Web preview'}{' '}
               <span>{configured ? 'persisted' : 'not configured'}</span>
@@ -1530,19 +2735,117 @@ export function App() {
           </div>
         </header>
         {jobsOpen && (
-          <section className="job-panel" aria-label="Ingest jobs">
+          <section className="job-panel" aria-label="Background Operations">
             <div className="job-panel-heading">
               <div>
-                <strong>Background ingest</strong>
-                <small>Pause takes effect safely between files.</small>
+                <strong>Background Operations</strong>
+                <small>
+                  Inventory cancellation stops at a safe read boundary. Ingest
+                  pause takes effect between files.
+                </small>
               </div>
               <button onClick={() => setJobsOpen(false)}>Close</button>
             </div>
             <div className="job-counts" role="status">
+              <span>Other work {visibleBackgroundOperations.length}</span>
               <span>Active {activeJobs.length}</span>
               <span>Completed {completedJobs.length}</span>
               <span>Needs attention {needsAttentionJobs.length}</span>
             </div>
+            <p className="job-complete-status" role="status">
+              Resource profile:{' '}
+              {resourceStatus?.profile ?? settings.resourceProfile}
+              {resourceStatus?.backgroundPaused ? ' · background paused' : ''}
+              {resourceStatus?.waiting[0]
+                ? ` · ${resourceStatus.waiting[0].operation}: ${resourceStatus.waiting[0].reason}`
+                : ' · no resource waits'}
+            </p>
+            {visibleBackgroundOperations.map((operation) => (
+              <article className="job-card" key={operation.id}>
+                <header>
+                  <div>
+                    <strong>{operation.title}</strong>
+                    <small>
+                      {operation.stage}
+                      {operation.currentItem
+                        ? ` · ${operation.currentItem}`
+                        : ''}
+                    </small>
+                  </div>
+                  <div className="job-actions">
+                    {operation.cancellable && (
+                      <button
+                        onClick={() =>
+                          void desktopBridge.cancelBackgroundOperation(
+                            operation.id,
+                          )
+                        }
+                      >
+                        {operation.kind === 'playback-proxy'
+                          ? 'Cancel conversion'
+                          : 'Cancel scan'}
+                      </button>
+                    )}
+                  </div>
+                </header>
+                {operation.bytesTotal ? (
+                  <progress
+                    value={operation.bytesCompleted}
+                    max={operation.bytesTotal}
+                  />
+                ) : operation.totalItems ? (
+                  <progress
+                    value={operation.completedItems}
+                    max={operation.totalItems}
+                  />
+                ) : (
+                  <progress />
+                )}
+                <small>
+                  {operation.kind === 'playback-proxy' ? (
+                    <>
+                      {duration(operation.completedItems)}
+                      {operation.totalItems === undefined
+                        ? ' processed'
+                        : ` / ${duration(operation.totalItems)} processed`}
+                    </>
+                  ) : (
+                    <>
+                      {operation.completedItems}
+                      {operation.totalItems === undefined
+                        ? ' discovered'
+                        : ` / ${operation.totalItems} files`}
+                    </>
+                  )}
+                  {operation.bytesTotal
+                    ? ` · ${size(operation.bytesCompleted)} / ${size(operation.bytesTotal)} read`
+                    : ''}
+                  {operation.kind ===
+                  'playback-proxy' ? null : operation.kind ===
+                    'media-enrichment' ? (
+                    <>
+                      {' · '}
+                      {operation.counts.newFiles} thumbnails generated ·{' '}
+                      {operation.counts.existingFiles} existing ·{' '}
+                      {operation.counts.attemptedFiles} attempted ·{' '}
+                      {operation.counts.failedFiles} unavailable or failed ·{' '}
+                      {operation.counts.pendingFiles} pending
+                    </>
+                  ) : (
+                    <>
+                      {' · '}
+                      {operation.counts.newFiles} new ·{' '}
+                      {operation.counts.duplicateFiles} duplicate ·{' '}
+                      {operation.counts.attentionFiles} attention ·{' '}
+                      {operation.counts.failedFiles} failed
+                    </>
+                  )}
+                </small>
+                {operation.error && (
+                  <small className="job-error">{operation.error}</small>
+                )}
+              </article>
+            ))}
             {activeJobs.length === 0 && needsAttentionJobs.length === 0 && (
               <p className="job-complete-status">All ingests complete</p>
             )}
@@ -1848,13 +3151,34 @@ export function App() {
                     </select>
                   </label>
                   <ToggleField
-                    label="Check for beta updates"
-                    description="Check the approved signed Beta channel; never install PR artifacts."
+                    label="Check for updates automatically"
+                    description="Check after startup and every six hours without delaying normal use."
                     checked={settings.checkForUpdates ?? true}
                     onChange={(checkForUpdates) =>
                       void persistPreference({ checkForUpdates })
                     }
                   />
+                  <label>
+                    Update channel
+                    <select
+                      value={settings.updateChannel ?? 'development'}
+                      onChange={(event) =>
+                        void persistPreference({
+                          updateChannel: event.target
+                            .value as DeviceSettings['updateChannel'],
+                        })
+                      }
+                    >
+                      <option value="development">Development</option>
+                      <option value="stable">Stable</option>
+                    </select>
+                    <small>
+                      Development receives approved ongoing releases and newer
+                      stable milestones. Stable receives only formally approved
+                      stable releases and stable hotfixes. Changing channel
+                      never downgrades PIMP.
+                    </small>
+                  </label>
                 </>
               )}
 
@@ -1915,7 +3239,7 @@ export function App() {
                     />
                   )}
                   <PathField
-                    label="Thumbnail cache (device-local)"
+                    label="Local derivative cache (hover previews and proxies)"
                     value={settings.thumbnailCachePath}
                     placeholder="Automatic local cache"
                     onChange={(thumbnailCachePath) =>
@@ -1923,23 +3247,6 @@ export function App() {
                     }
                     onBrowse={() => chooseSettingFolder('thumbnailCachePath')}
                   />
-                  <label>
-                    Thumbnail cache limit (GB)
-                    <input
-                      type="number"
-                      min="1"
-                      value={Math.round(
-                        settings.thumbnailCacheLimitBytes / 1024 / 1024 / 1024,
-                      )}
-                      onChange={(event) =>
-                        setSettings({
-                          ...settings,
-                          thumbnailCacheLimitBytes:
-                            Number(event.target.value) * 1024 * 1024 * 1024,
-                        })
-                      }
-                    />
-                  </label>
                   {configured && (
                     <div className="scan-status" role="status">
                       <h3>Library discovery</h3>
@@ -1962,7 +3269,9 @@ export function App() {
                           <dt>Progress</dt>
                           <dd>
                             {discoveryStatus.running
-                              ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                              ? discoveryStatus.totalFiles > 0
+                                ? `${discoveryStatus.filesProcessed} / ${discoveryStatus.totalFiles}`
+                                : `${discoveryStatus.filesProcessed} processed · discovering total…`
                               : 'Idle'}
                           </dd>
                         </div>
@@ -1984,7 +3293,7 @@ export function App() {
                           disabled={busy || discoveryStatus.running}
                           onClick={doRescan}
                         >
-                          Scan for new files
+                          Quick inventory (no content reads)
                         </button>
                         <button
                           disabled={busy || discoveryStatus.running}
@@ -2020,12 +3329,13 @@ export function App() {
                       <input
                         type="radio"
                         checked={settings.ingestDateOrganization === 'today'}
-                        onChange={() =>
+                        onChange={() => {
                           setSettings({
                             ...settings,
                             ingestDateOrganization: 'today',
-                          })
-                        }
+                          });
+                          if (!sources.length) setDateOverride('today');
+                        }}
                       />{' '}
                       Use today's date
                     </label>
@@ -2036,12 +3346,14 @@ export function App() {
                           settings.ingestDateOrganization ===
                           'original-file-dates'
                         }
-                        onChange={() =>
+                        onChange={() => {
                           setSettings({
                             ...settings,
                             ingestDateOrganization: 'original-file-dates',
-                          })
-                        }
+                          });
+                          if (!sources.length)
+                            setDateOverride('original-file-dates');
+                        }}
                       />{' '}
                       Use original file dates
                     </label>
@@ -2063,6 +3375,91 @@ export function App() {
                       month; mm is minute.
                     </small>
                   </label>
+                  <fieldset>
+                    <legend>SD Card Grabber</legend>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberEnabled: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Enable SD Card Grabber
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberAutoDetect}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberAutoDetect: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Detect removable cards automatically
+                    </label>
+                    <label>
+                      Included file extensions
+                      <input
+                        value={settings.sdGrabberExtensions.join(', ')}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberExtensions: event.target.value
+                              .split(',')
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          })
+                        }
+                      />
+                      <small>
+                        Defaults to MP4 and WAV; matching ignores case.
+                      </small>
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberSearchSubfolders}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberSearchSubfolders: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Search subfolders
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.sdGrabberRememberDevices}
+                        disabled={!settings.sdGrabberEnabled}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            sdGrabberRememberDevices: event.target.checked,
+                          })
+                        }
+                      />{' '}
+                      Remember recognised device identities
+                    </label>
+                    <label title="Source cleanup is not implemented">
+                      <input type="checkbox" checked={false} disabled /> Offer
+                      source cleanup after independent verification
+                    </label>
+                    <small>
+                      Cleanup remains disabled. The Grabber copies, verifies and
+                      registers media without modifying the card.
+                    </small>
+                  </fieldset>
                   <div className="settings-explainer">
                     New external files require repeated stable observations and
                     SHA-256 verification. PIMP never replaces a destination on
@@ -2075,6 +3472,178 @@ export function App() {
                   >
                     {busy ? 'Saving…' : 'Save ingest preferences'}
                   </button>
+                </>
+              )}
+
+              {activeSettingsSection === 'Resource Management' && (
+                <>
+                  <fieldset className="settings-subsection">
+                    <legend>Processing profile</legend>
+                    {(
+                      [
+                        [
+                          'quiet',
+                          'Quiet',
+                          'Spaces background admissions apart and permits one background worker across volumes.',
+                        ],
+                        [
+                          'balanced',
+                          'Balanced — recommended',
+                          'Keeps foreground work responsive with one background worker during normal activity.',
+                        ],
+                        [
+                          'performance',
+                          'Performance',
+                          'Allows two background workers when they use independent volumes; each volume remains serialized.',
+                        ],
+                      ] as const
+                    ).map(([value, label, description]) => (
+                      <label key={value}>
+                        <input
+                          type="radio"
+                          name="resource-profile"
+                          checked={settings.resourceProfile === value}
+                          onChange={() =>
+                            void persistPreference({ resourceProfile: value })
+                          }
+                        />{' '}
+                        <strong>{label}</strong>
+                        <small>{description}</small>
+                      </label>
+                    ))}
+                  </fieldset>
+                  <ToggleField
+                    label="Gentle scanning for older drives"
+                    description="Adds a safe delay between automatic background admissions. Full-file access remains limited to one worker per volume."
+                    checked={settings.gentleScanning}
+                    onChange={(gentleScanning) =>
+                      void persistPreference({ gentleScanning })
+                    }
+                  />
+                  <ToggleField
+                    label="Pause automatic background processing"
+                    description="Pauses automatic discovery, enrichment, and preview preparation at safe file boundaries. Ingest, explicit verification, playback, and visible thumbnails remain available."
+                    checked={settings.backgroundProcessingPaused}
+                    onChange={(backgroundProcessingPaused) =>
+                      void persistPreference({ backgroundProcessingPaused })
+                    }
+                  />
+                  <ToggleField
+                    label="Increase processing while safely idle"
+                    description="Allows controlled extra work only after the idle delay and when supported Windows CPU and memory evidence also indicate capacity. Input inactivity alone is insufficient."
+                    checked={settings.increaseProcessingWhileIdle}
+                    onChange={(increaseProcessingWhileIdle) =>
+                      void persistPreference({ increaseProcessingWhileIdle })
+                    }
+                  />
+                  <label>
+                    Idle delay (minutes)
+                    <input
+                      type="number"
+                      min="1"
+                      max="120"
+                      value={settings.resourceIdleDelayMinutes}
+                      onChange={(event) =>
+                        void persistPreference({
+                          resourceIdleDelayMinutes: Number(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                  <div className="settings-explainer" role="status">
+                    <strong>Current scheduler</strong>
+                    <p>
+                      {resourceStatus
+                        ? `${resourceStatus.activeBackgroundWorkers} active background worker(s), ${resourceStatus.queuedWorkers} waiting · ${resourceStatus.volumes.length} observed volume(s)`
+                        : 'Loading device-local resource status…'}
+                    </p>
+                    <p>
+                      PIMP uses stable volume identity where Windows supplies
+                      it. Physical-drive grouping behind separate logical
+                      volumes is not inferred when Windows cannot prove the
+                      relationship.
+                    </p>
+                    <p>
+                      Idle boost:{' '}
+                      {resourceStatus?.systemActivity.idleBoostEligible
+                        ? 'active'
+                        : 'inactive'}{' '}
+                      ·{' '}
+                      {resourceStatus?.systemActivity.reason ??
+                        'Waiting for native activity evidence'}
+                    </p>
+                  </div>
+                  <fieldset className="settings-subsection">
+                    <legend>Manual processing</legend>
+                    <p>
+                      Manual work moves ahead of automatic preparation but never
+                      bypasses volume serialization, source validation, or
+                      no-overwrite rules.
+                    </p>
+                    <div className="scan-actions">
+                      <button
+                        disabled={busy}
+                        onClick={() =>
+                          void desktopBridge
+                            .enrichMedia()
+                            .then((count) =>
+                              setMessage(
+                                `Technical metadata and missing static thumbnails processed for ${count} recording(s).`,
+                              ),
+                            )
+                            .catch((reason) => setError(errorText(reason)))
+                        }
+                      >
+                        Generate missing thumbnails
+                      </button>
+                      <button
+                        disabled={selected.length === 0}
+                        onClick={() =>
+                          void Promise.all(
+                            selected.map((mediaId) =>
+                              desktopBridge.loadHoverPreview(mediaId),
+                            ),
+                          )
+                            .then(() =>
+                              setMessage(
+                                `Prepared scrubbable previews for ${selected.length} selected recording(s).`,
+                              ),
+                            )
+                            .catch((reason) => setError(errorText(reason)))
+                        }
+                      >
+                        Prepare selected previews
+                      </button>
+                      <button
+                        disabled={selected.length === 0}
+                        onClick={() =>
+                          void Promise.all(
+                            selected.map((mediaId) =>
+                              desktopBridge.verifyMediaIntegrity(mediaId),
+                            ),
+                          )
+                            .then(() =>
+                              setMessage(
+                                `Integrity verification completed for ${selected.length} selected recording(s).`,
+                              ),
+                            )
+                            .catch((reason) => setError(errorText(reason)))
+                        }
+                      >
+                        Verify selected media
+                      </button>
+                      <button
+                        disabled={discoveryStatus.running}
+                        onClick={doRescan}
+                      >
+                        Quick Library inventory
+                      </button>
+                    </div>
+                  </fieldset>
+                  <small>
+                    GPU, battery, and explicit throughput caps are omitted until
+                    the native host can enforce and measure them reliably.
+                  </small>
                 </>
               )}
 
@@ -2139,14 +3708,78 @@ export function App() {
                       <option value="compact">Compact</option>
                     </select>
                   </label>
-                  <ToggleField
-                    label="Enable hover preview"
-                    description="Generate low-resolution video frames locally when a Library thumbnail is hovered. No audio is played."
-                    checked={settings.hoverPreviewsEnabled ?? true}
-                    onChange={(hoverPreviewsEnabled) =>
-                      void persistPreference({ hoverPreviewsEnabled })
-                    }
-                  />
+                  <fieldset className="settings-subsection toolbar-settings">
+                    <legend>Library selection toolbar</legend>
+                    <label>
+                      Position
+                      <select
+                        value={selectionToolbarPosition}
+                        onChange={(event) => {
+                          const position = event.target
+                            .value as SelectionToolbarPosition;
+                          setSelectionToolbarPosition(position);
+                          localStorage.setItem(
+                            'pimp-selection-toolbar-position',
+                            position,
+                          );
+                        }}
+                      >
+                        <option value="bottom-right">Bottom right</option>
+                        <option value="bottom-center">Bottom center</option>
+                        <option value="bottom-left">Bottom left</option>
+                      </select>
+                    </label>
+                    <div role="group" aria-label="Primary selection actions">
+                      {(
+                        [
+                          ['tags', 'Add tags'],
+                          ['projects', 'Assign projects'],
+                          ['favourite', 'Favourite'],
+                        ] as Array<[SelectionToolbarAction, string]>
+                      ).map(([action, label]) => (
+                        <label className="inline-check" key={action}>
+                          <input
+                            type="checkbox"
+                            checked={selectionToolbarActions.includes(action)}
+                            onChange={(event) => {
+                              const next = event.target.checked
+                                ? [...selectionToolbarActions, action]
+                                : selectionToolbarActions.filter(
+                                    (candidate) => candidate !== action,
+                                  );
+                              setSelectionToolbarActions(next);
+                              localStorage.setItem(
+                                'pimp-selection-toolbar-actions',
+                                JSON.stringify(next),
+                              );
+                            }}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectionToolbarPosition('bottom-right');
+                        setSelectionToolbarActions(
+                          defaultSelectionToolbarActions,
+                        );
+                        localStorage.removeItem(
+                          'pimp-selection-toolbar-position',
+                        );
+                        localStorage.removeItem(
+                          'pimp-selection-toolbar-actions',
+                        );
+                      }}
+                    >
+                      Reset toolbar to defaults
+                    </button>
+                    <small>
+                      Toolbar layout stays on this device and never changes
+                      catalogue metadata.
+                    </small>
+                  </fieldset>
                   <fieldset className="settings-subsection">
                     <legend>Thumbnail &amp; Preview</legend>
                     <label>
@@ -2179,15 +3812,23 @@ export function App() {
                   <label>
                     Preview preloading
                     <select
-                      value={settings.previewPreloading ?? 'visible-nearby'}
-                      onChange={(event) =>
-                        void persistPreference({
-                          previewPreloading: event.target
-                            .value as DeviceSettings['previewPreloading'],
-                        })
+                      value={
+                        settings.hoverPreviewsEnabled === false
+                          ? 'off'
+                          : (settings.previewPreloading ?? 'visible-nearby')
                       }
+                      onChange={(event) => {
+                        const previewPreloading = event.target
+                          .value as DeviceSettings['previewPreloading'];
+                        void persistPreference({
+                          previewPreloading,
+                          hoverPreviewsEnabled: previewPreloading !== 'off',
+                        });
+                      }}
                     >
-                      <option value="hovered">Only when hovered</option>
+                      <option value="off">Off (static thumbnails only)</option>
+                      <option value="hovered">On hover</option>
+                      <option value="visible">Visible recordings</option>
                       <option value="visible-nearby">
                         Visible and nearby recordings (recommended)
                       </option>
@@ -2245,10 +3886,49 @@ export function App() {
                       }
                     />
                   </label>
+                  <label>
+                    Playback proxy cache limit (GB)
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="100"
+                      step="0.5"
+                      value={(
+                        (settings.playbackProxyCacheLimitBytes ??
+                          2 * 1024 * 1024 * 1024) /
+                        1024 /
+                        1024 /
+                        1024
+                      ).toFixed(1)}
+                      onChange={(event) =>
+                        void persistPreference({
+                          playbackProxyCacheLimitBytes: Math.max(
+                            512 * 1024 * 1024,
+                            Math.round(
+                              Number(event.target.value) * 1024 * 1024 * 1024,
+                            ),
+                          ),
+                        })
+                      }
+                    />
+                  </label>
                   <div className="info-card">
                     <strong>Hover preview cache</strong>
-                    <span>{size(previewMemoryUsage)} in memory</span>
-                    <span>{size(previewCacheUsage)} on disk</span>
+                    <span>
+                      {previewMemoryCount} loaded · {size(previewMemoryUsage)}
+                      {' in memory'}
+                    </span>
+                    <span>
+                      {previewStoredIds.size} stored · {size(previewCacheUsage)}
+                      {' on disk'}
+                    </span>
+                    <span role="status">
+                      {staticThumbnailQueueStatus.active
+                        ? `Generating static thumbnail · ${staticThumbnailQueueStatus.queued} queued`
+                        : staticThumbnailQueueStatus.queued
+                          ? `${staticThumbnailQueueStatus.queued} static thumbnails queued`
+                          : 'Static thumbnail queue idle'}
+                    </span>
                     <span role="status">
                       {previewQueueStatus.active
                         ? `Preparing ${previewQueueStatus.activeLabel ?? 'preview'} · ${previewQueueStatus.queued} queued`
@@ -2288,11 +3968,16 @@ export function App() {
                 <>
                   <div className="info-card">
                     <strong>
-                      {applicationInfo?.edition ?? 'Kairix PIMP Light'}
+                      {applicationInfo?.edition ?? 'Kairix PIMP Light'}{' '}
+                      {applicationInfo?.displayVersion ?? 'unknown'} —{' '}
+                      {applicationInfo?.releaseClassification ?? 'Development'}
                     </strong>
-                    <span>Version {applicationInfo?.version ?? 'unknown'}</span>
                     <span>
-                      Channel {applicationInfo?.releaseChannel ?? 'Beta'}
+                      Update channel{' '}
+                      {updaterConfiguration?.channel ?? 'Development'}
+                    </span>
+                    <span>
+                      Release date {applicationInfo?.releaseDate ?? 'unknown'}
                     </span>
                     <span>
                       Build {applicationInfo?.buildCommit ?? 'development'}
@@ -2310,6 +3995,8 @@ export function App() {
                       <>
                         <span>
                           {availableUpdate.version}
+                          {' — '}
+                          {availableUpdate.classification}
                           {availableUpdate.sizeBytes
                             ? ` · ${size(availableUpdate.sizeBytes)}`
                             : ''}
@@ -2329,7 +4016,7 @@ export function App() {
                     )}
                   </div>
                   <div className="info-card">
-                    <strong>Latest manually downloadable beta</strong>
+                    <strong>Latest approved public release</strong>
                     <span>
                       Check the permanent public GitHub Releases page.
                     </span>
@@ -2362,12 +4049,19 @@ export function App() {
                       disabled={
                         checkingUpdate ||
                         !availableUpdate ||
-                        updateBlockingJobs.length > 0
+                        updateBlockingJobs.length > 0 ||
+                        backupBusy ||
+                        updateBlockingBackupJobs.length > 0 ||
+                        discoveryStatus.running
                       }
                       title={
                         updateBlockingJobs.length
                           ? 'Active or recoverable ingest jobs must be resolved before updating'
-                          : undefined
+                          : backupBusy || updateBlockingBackupJobs.length
+                            ? 'Active backup, verification, or restore work must finish before updating'
+                            : discoveryStatus.running
+                              ? 'The active Library scan must finish before updating'
+                              : undefined
                       }
                       onClick={installUpdate}
                     >
@@ -2382,8 +4076,8 @@ export function App() {
                   </div>
                   {updaterConfiguration?.configured ? (
                     <small>
-                      Only the approved Beta manifest and artifacts with a valid
-                      Tauri signature can install.
+                      Only the selected approved channel manifest and artifacts
+                      with a valid Tauri signature can install.
                     </small>
                   ) : (
                     <small>
@@ -2402,7 +4096,12 @@ export function App() {
                     <strong>Kairix PIMP Light</strong>
                     <span>Production Ingest &amp; Media Processor</span>
                     <span>
-                      Version {applicationInfo?.version ?? 'unknown'} · Beta
+                      Version {applicationInfo?.displayVersion ?? 'unknown'} ·{' '}
+                      {applicationInfo?.releaseClassification ?? 'Development'}
+                    </span>
+                    <span>
+                      Build {applicationInfo?.buildCommit ?? 'unknown'} ·{' '}
+                      {applicationInfo?.releaseDate ?? 'unpublished'}
                     </span>
                     <p>
                       Complete non-AI media ingest and catalogue edition. The
@@ -2468,6 +4167,172 @@ export function App() {
                       <dt>Thumbnail source batches</dt>
                       <dd>{thumbnailSourceRequestCount}</dd>
                     </div>
+                    <div>
+                      <dt>Static thumbnails in current scope</dt>
+                      <dd>
+                        {
+                          filtered.filter(
+                            (item) => thumbnailSources[item.id] != null,
+                          ).length
+                        }{' '}
+                        ready ·{' '}
+                        {
+                          filtered.filter(
+                            (item) =>
+                              item.available &&
+                              thumbnailSources[item.id] == null &&
+                              enrichmentVideoType(item.fileType),
+                          ).length
+                        }{' '}
+                        missing
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Active native workers</dt>
+                      <dd>{activeBackgroundOperations.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Resource profile</dt>
+                      <dd>
+                        {resourceStatus?.profile ?? settings.resourceProfile}
+                        {resourceStatus?.backgroundPaused
+                          ? ' · background paused'
+                          : ''}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Volume admission</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `${resourceStatus.volumes.reduce((total, volume) => total + volume.activeReaders, 0)} reader(s) · ${resourceStatus.volumes.reduce((total, volume) => total + volume.activeWriters, 0)} writer(s) · ${resourceStatus.queuedWorkers} waiting`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Volume bytes</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `${size(resourceStatus.volumes.reduce((total, volume) => total + volume.bytesRead, 0))} read · ${size(resourceStatus.volumes.reduce((total, volume) => total + volume.bytesWritten, 0))} written`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Admission wait</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `${resourceStatus.averageWaitMillis} ms average · ${resourceStatus.waiting[0]?.reason ?? 'No queued work'}`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Volume I/O errors</dt>
+                      <dd>
+                        {resourceStatus
+                          ? resourceStatus.volumes.reduce(
+                              (total, volume) => total + volume.ioErrors,
+                              0,
+                            ) || 'None reported'
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>System activity evidence</dt>
+                      <dd>
+                        {resourceStatus
+                          ? `CPU ${resourceStatus.systemActivity.cpuLoadPercent?.toFixed(1) ?? '—'}% · input idle ${resourceStatus.systemActivity.inputIdleSeconds ?? '—'}s · ${size(resourceStatus.systemActivity.availableMemoryBytes ?? 0)} memory available`
+                          : 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Idle processing</dt>
+                      <dd>
+                        {resourceStatus?.systemActivity.reason ?? 'Loading…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Static-thumbnail lane</dt>
+                      <dd>
+                        {staticThumbnailQueueStatus.active
+                          ? '1 active'
+                          : 'Idle'}{' '}
+                        · {staticThumbnailQueueStatus.queued} queued
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Hover-preview lane</dt>
+                      <dd>
+                        {previewQueueStatus.active ? '1 active' : 'Idle'} ·{' '}
+                        {previewQueueStatus.queued} queued
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Active FFmpeg work</dt>
+                      <dd>
+                        {
+                          activeBackgroundOperations.filter((operation) =>
+                            [
+                              'static-thumbnail',
+                              'hover-preview',
+                              'playback-proxy',
+                              'media-enrichment',
+                            ].includes(operation.kind),
+                          ).length
+                        }{' '}
+                        reported workers
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Current operation</dt>
+                      <dd>
+                        {primaryBackgroundOperation
+                          ? `${primaryBackgroundOperation.title} · ${primaryBackgroundOperation.stage} · ${primaryOperationElapsedSeconds}s elapsed`
+                          : 'Idle'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Measured throughput</dt>
+                      <dd>
+                        {primaryOperationThroughput
+                          ? `${size(primaryOperationThroughput)}/s`
+                          : 'Unavailable for the current operation'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Preview caches</dt>
+                      <dd>
+                        {previewMemoryCount} loaded · {size(previewMemoryUsage)}
+                        {' RAM / '}
+                        {size(
+                          settings.previewRamCacheLimitBytes ||
+                            128 * 1024 * 1024,
+                        )}{' '}
+                        budget · {previewStoredIds.size} stored ·{' '}
+                        {size(previewCacheUsage)} disk /{' '}
+                        {size(settings.previewCacheLimitBytes)} budget
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Last playback timings</dt>
+                      <dd>
+                        Resolve {viewerPlaybackMetrics.sourceResolvedMs ?? '—'}{' '}
+                        ms · metadata {viewerPlaybackMetrics.metadataMs ?? '—'}{' '}
+                        ms · first frame{' '}
+                        {viewerPlaybackMetrics.firstFrameMs ?? '—'} ms · playing{' '}
+                        {viewerPlaybackMetrics.playingMs ?? '—'} ms · seek{' '}
+                        {viewerPlaybackMetrics.lastSeekMs ?? '—'} ms
+                        {viewerPlaybackMetrics.proxyGenerationMs != null
+                          ? ` · proxy ${viewerPlaybackMetrics.proxyGenerationMs} ms`
+                          : ''}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Recent processing errors</dt>
+                      <dd>
+                        {backgroundOperations.filter(
+                          (operation) => operation.error,
+                        ).length || 'None reported'}
+                      </dd>
+                    </div>
                   </dl>
                   <div className="scan-actions">
                     <button
@@ -2502,10 +4367,35 @@ export function App() {
               <label className="search">
                 <Search size={17} />
                 <input
+                  ref={librarySearchRef}
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
                   placeholder="Search filenames, folders, tags, notes, projects, dates, codec…"
                 />
+              </label>
+              <div className="library-filter-combo">
+                <SearchableComboBox
+                  label="Filter by tags"
+                  mode="multiple"
+                  options={knownTags.map((tag) => ({ id: tag, label: tag }))}
+                  selectedIds={tagFilters}
+                  onSelectionChange={setTagFilters}
+                  placeholder="Filter tags…"
+                />
+              </div>
+              <label
+                className="availability-toggle"
+                title="Unavailable means not present on this device; it does not mean safely archived"
+              >
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={includeUnavailable}
+                  onChange={(event) =>
+                    setIncludeUnavailable(event.target.checked)
+                  }
+                />
+                Include unavailable
               </label>
               <button
                 disabled={busy || discoveryStatus.running}
@@ -2513,11 +4403,348 @@ export function App() {
               >
                 <RefreshCw size={15} />
                 {discoveryStatus.running
-                  ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
-                  : 'Scan for new files'}
+                  ? discoveryStatus.totalFiles > 0
+                    ? `Scanning ${discoveryStatus.filesProcessed}/${discoveryStatus.totalFiles}`
+                    : `Scanning · ${discoveryStatus.filesProcessed} processed`
+                  : 'Quick inventory (no content reads)'}
               </button>
             </section>
-            <section className="content-grid">
+            {viewerRecording && (
+              <section
+                className={`clip-viewer ${
+                  viewerRecording.technical.height &&
+                  viewerRecording.technical.width &&
+                  viewerRecording.technical.height >
+                    viewerRecording.technical.width
+                    ? 'portrait'
+                    : 'landscape'
+                }`}
+                aria-label={`Clip viewer for ${viewerRecording.originalFilename}`}
+              >
+                <header className="clip-viewer-header">
+                  <button type="button" onClick={closeClipViewer}>
+                    <ArrowLeft aria-hidden="true" size={15} /> Back to Library
+                  </button>
+                  <div>
+                    <strong>{viewerRecording.originalFilename}</strong>
+                    <span>{viewerRecording.relativePath}</span>
+                  </div>
+                  <nav aria-label="Clip viewer navigation">
+                    <button
+                      type="button"
+                      disabled={viewerIndex <= 0}
+                      onClick={() => navigateClipViewer(-1)}
+                    >
+                      Previous
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        viewerIndex < 0 || viewerIndex >= filtered.length - 1
+                      }
+                      onClick={() => navigateClipViewer(1)}
+                    >
+                      Next
+                    </button>
+                  </nav>
+                </header>
+                <div className="clip-viewer-upper">
+                  <div className="clip-player">
+                    {!viewerRecording.available ? (
+                      <div className="clip-player-state" role="status">
+                        <strong>Media unavailable locally</strong>
+                        <span>
+                          Unavailable means the file is not present on this
+                          device; it does not mean archived or deleted.
+                        </span>
+                      </div>
+                    ) : viewerError ? (
+                      <div className="clip-player-state" role="alert">
+                        <strong>Preview unavailable</strong>
+                        <span>{viewerError}</span>
+                        <button
+                          type="button"
+                          disabled={
+                            viewerProxyBusy || !mediaTools?.ffmpegAvailable
+                          }
+                          onClick={() => void createPlaybackProxy()}
+                        >
+                          {!mediaTools?.ffmpegAvailable
+                            ? 'FFmpeg is required for a compatible preview'
+                            : viewerProxyBusy
+                              ? 'Creating compatible preview…'
+                              : 'Create compatible preview'}
+                        </button>
+                      </div>
+                    ) : viewerSource ? (
+                      <video
+                        ref={viewerVideoRef}
+                        src={viewerSource}
+                        controls
+                        preload="metadata"
+                        playsInline
+                        aria-label={`Playback ${viewerRecording.originalFilename}`}
+                        onLoadedMetadata={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            metadataMs:
+                              metrics.metadataMs ??
+                              Math.round(
+                                performance.now() -
+                                  viewerPlaybackStartedAt.current,
+                              ),
+                          }))
+                        }
+                        onLoadedData={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            firstFrameMs:
+                              metrics.firstFrameMs ??
+                              Math.round(
+                                performance.now() -
+                                  viewerPlaybackStartedAt.current,
+                              ),
+                          }))
+                        }
+                        onPlaying={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            playingMs:
+                              metrics.playingMs ??
+                              Math.round(
+                                performance.now() -
+                                  viewerPlaybackStartedAt.current,
+                              ),
+                          }))
+                        }
+                        onSeeking={() => {
+                          viewerSeekStartedAt.current = performance.now();
+                        }}
+                        onSeeked={() =>
+                          setViewerPlaybackMetrics((metrics) => ({
+                            ...metrics,
+                            lastSeekMs: Math.round(
+                              performance.now() - viewerSeekStartedAt.current,
+                            ),
+                          }))
+                        }
+                        onError={() =>
+                          setViewerError(
+                            'WebView2 could not play this file or codec. The original media was not changed.',
+                          )
+                        }
+                      />
+                    ) : (
+                      <div className="clip-player-state" role="status">
+                        Loading local preview…
+                      </div>
+                    )}
+                  </div>
+                  <aside className="clip-metadata" aria-label="Clip metadata">
+                    <h3>Recording details</h3>
+                    <dl>
+                      <div>
+                        <dt>Resolution</dt>
+                        <dd>
+                          {viewerRecording.technical.width &&
+                          viewerRecording.technical.height
+                            ? `${viewerRecording.technical.width} × ${viewerRecording.technical.height}`
+                            : 'Unknown'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Frame rate</dt>
+                        <dd>
+                          {viewerRecording.technical.frameRate
+                            ? `${viewerRecording.technical.frameRate} fps`
+                            : 'Unknown'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Codec</dt>
+                        <dd>{viewerRecording.technical.codec ?? 'Unknown'}</dd>
+                      </div>
+                      <div>
+                        <dt>Duration</dt>
+                        <dd>
+                          {duration(viewerRecording.technical.durationSeconds)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Size</dt>
+                        <dd>{size(viewerRecording.technical.sizeBytes)}</dd>
+                      </div>
+                      <div>
+                        <dt>Integrity</dt>
+                        <dd>
+                          {viewerRecording.needsReview
+                            ? 'Needs review'
+                            : viewerRecording.available
+                              ? 'Verified locally'
+                              : 'Unavailable locally'}
+                        </dd>
+                      </div>
+                    </dl>
+                    <div className="clip-associated">
+                      <strong>
+                        {viewerAssociatedMedia.length} associated physical file
+                        {viewerAssociatedMedia.length === 1 ? '' : 's'}
+                      </strong>
+                      {viewerAssociatedMedia.map((recording) => (
+                        <div key={recording.id}>
+                          <span>{recording.originalFilename}</span>
+                          <button
+                            type="button"
+                            disabled={!recording.available}
+                            onClick={() =>
+                              void runSelectedFileAction('reveal', recording)
+                            }
+                          >
+                            Reveal
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </aside>
+                </div>
+                <div className="clip-editor">
+                  <label className="clip-description">
+                    Description
+                    <textarea
+                      value={descriptionValue}
+                      onChange={(event) =>
+                        setDescriptionDraft({
+                          selectionKey,
+                          value: event.target.value,
+                        })
+                      }
+                      placeholder="Describe this recording"
+                    />
+                    <button
+                      type="button"
+                      disabled={
+                        busy || visibleDescriptionStatus.state === 'saving'
+                      }
+                      onClick={() => void saveSelectionDescription()}
+                    >
+                      {visibleDescriptionStatus.state === 'saving'
+                        ? 'Saving…'
+                        : 'Save description'}
+                    </button>
+                    <span role="status">
+                      {visibleDescriptionStatus.state === 'saved'
+                        ? 'Saved'
+                        : visibleDescriptionStatus.state === 'failed'
+                          ? `Failed: ${visibleDescriptionStatus.detail}`
+                          : ''}
+                    </span>
+                  </label>
+                  <div className="clip-editor-field">
+                    <SearchableComboBox
+                      label="Add tags"
+                      mode="multiple"
+                      options={knownTags.map((tag) => ({
+                        id: tag,
+                        label: tag,
+                        description: selectedTagState(tag),
+                      }))}
+                      selectedIds={[]}
+                      onSelectionChange={(ids) =>
+                        void updateSelection({ addTags: ids })
+                      }
+                      placeholder="Search or create tags…"
+                      onCreate={(label) => ({ id: label, label })}
+                    />
+                    <div className="clip-chips">
+                      {logicalTags(viewerRecording, catalogue.media).map(
+                        (tag) => (
+                          <button
+                            type="button"
+                            key={tag}
+                            aria-label={`Remove tag ${tag}`}
+                            onClick={() =>
+                              void updateSelection({ removeTags: [tag] })
+                            }
+                          >
+                            {tag} ×
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </div>
+                  <div className="clip-editor-field">
+                    <SearchableComboBox
+                      label="Assign projects"
+                      mode="multiple"
+                      options={catalogue.projects.map((project) => ({
+                        id: project.id,
+                        label: project.name,
+                      }))}
+                      selectedIds={logicalProjectIds(
+                        viewerRecording,
+                        catalogue.media,
+                      )}
+                      onSelectionChange={(ids) => {
+                        const current = logicalProjectIds(
+                          viewerRecording,
+                          catalogue.media,
+                        );
+                        void updateSelection({
+                          addProjectIds: ids.filter(
+                            (id) => !current.includes(id),
+                          ),
+                          removeProjectIds: current.filter(
+                            (id) => !ids.includes(id),
+                          ),
+                        });
+                      }}
+                      placeholder="Search projects…"
+                    />
+                    <button
+                      type="button"
+                      className="clip-favourite"
+                      onClick={() =>
+                        void updateSelection({
+                          favourite: !viewerRecording.favourite,
+                        })
+                      }
+                    >
+                      <Star
+                        aria-hidden="true"
+                        size={14}
+                        fill={
+                          viewerRecording.favourite ? 'currentColor' : 'none'
+                        }
+                      />{' '}
+                      {viewerRecording.favourite
+                        ? 'Remove favourite'
+                        : 'Favourite'}
+                    </button>
+                  </div>
+                  <section className="analysis-placeholder">
+                    <strong>Analysis</strong>
+                    <span>
+                      Transcript, summary and observations are unavailable in
+                      the Light edition. No analysis result is fabricated.
+                    </span>
+                  </section>
+                  <section className="thumbnail-frame-control">
+                    <strong>Thumbnail</strong>
+                    <button
+                      type="button"
+                      disabled={!viewerSource || Boolean(viewerError)}
+                      onClick={() => void saveCurrentViewerFrame()}
+                    >
+                      Use current video frame
+                    </button>
+                    <span role="status">{thumbnailFrameStatus}</span>
+                  </section>
+                </div>
+              </section>
+            )}
+            <section
+              className={`content-grid ${viewerRecording ? 'library-hidden' : ''}`}
+            >
               <div className="folder-panel">
                 <div className="folder-panel-heading">
                   <h3>Folders</h3>
@@ -2555,7 +4782,31 @@ export function App() {
                   <div className="folder-row" key={name}>
                     <button
                       className={`folder ${folder === name ? 'active' : ''}`}
-                      onClick={() => setFolder(name)}
+                      data-native-drag={native ? 'true' : undefined}
+                      draggable={false}
+                      title="Drag this physical folder to another Windows application"
+                      onDragStart={(event) => event.preventDefault()}
+                      onPointerDown={(event) =>
+                        beginNativeDrag(
+                          event,
+                          folderDrag(name === 'Master Bin root' ? '' : name),
+                        )
+                      }
+                      onPointerMove={continueNativeDrag}
+                      onPointerUp={cancelPendingNativeDrag}
+                      onPointerCancel={cancelPendingNativeDrag}
+                      onLostPointerCapture={cancelPendingNativeDrag}
+                      onClick={(event) => {
+                        if (
+                          suppressClickAfterNativeDrag(
+                            `folder:${name === 'Master Bin root' ? '' : name}`,
+                          )
+                        ) {
+                          event.preventDefault();
+                          return;
+                        }
+                        setFolder(name);
+                      }}
                     >
                       <Folder size={16} />
                       <span>
@@ -2590,12 +4841,34 @@ export function App() {
                   </div>
                 ))}
               </div>
-              <div className="library-panel">
+              <div
+                className="library-panel"
+                ref={libraryPanelRef}
+                onScroll={(event) =>
+                  setShowScrollTop(event.currentTarget.scrollTop >= 480)
+                }
+              >
                 <div className="section-head">
                   <div>
                     <h2>Media library</h2>
                     <span>{filtered.length} persisted items</span>
                   </div>
+                  <label className="thumbnail-size-control">
+                    <span>Thumbnail size</span>
+                    <input
+                      type="range"
+                      min="160"
+                      max="360"
+                      step="20"
+                      value={settings.libraryThumbnailWidth}
+                      onChange={(event) =>
+                        void persistPreference({
+                          libraryThumbnailWidth: Number(event.target.value),
+                        })
+                      }
+                    />
+                    <output>{settings.libraryThumbnailWidth}px</output>
+                  </label>
                 </div>
                 {!filtered.length ? (
                   <div className="empty">
@@ -2619,6 +4892,11 @@ export function App() {
                 ) : (
                   <div
                     className="cards"
+                    style={
+                      {
+                        '--library-thumbnail-width': `${settings.libraryThumbnailWidth}px`,
+                      } as CSSProperties
+                    }
                     role="listbox"
                     aria-label="Media library"
                     aria-multiselectable="true"
@@ -2633,8 +4911,27 @@ export function App() {
                           else libraryCardRefs.current.delete(item.id);
                         }}
                         role="option"
+                        data-media-id={item.id}
+                        data-native-drag={
+                          native && item.available ? 'true' : undefined
+                        }
+                        draggable={false}
+                        title={
+                          item.available
+                            ? 'Drag the original file to another Windows application'
+                            : undefined
+                        }
                         tabIndex={0}
                         aria-selected={selected.includes(item.id)}
+                        onDragStart={(event) => event.preventDefault()}
+                        onPointerDown={(event) => {
+                          if (item.available)
+                            beginNativeDrag(event, mediaDrag(item));
+                        }}
+                        onPointerMove={continueNativeDrag}
+                        onPointerUp={cancelPendingNativeDrag}
+                        onPointerCancel={cancelPendingNativeDrag}
+                        onLostPointerCapture={cancelPendingNativeDrag}
                         onMouseDown={(event) => {
                           const target = event.target as HTMLElement;
                           if (
@@ -2646,20 +4943,67 @@ export function App() {
                             event.preventDefault();
                         }}
                         onClick={(event) => {
+                          if (
+                            suppressClickAfterNativeDrag(`media:${item.id}`)
+                          ) {
+                            event.preventDefault();
+                            return;
+                          }
                           setContextMenu(undefined);
                           selectRecording(item.id, {
                             toggle: event.ctrlKey || event.metaKey,
                             range: event.shiftKey,
                           });
                         }}
+                        onDoubleClick={() => openClipViewer(item.id)}
                         onKeyDown={(event) => {
-                          if (event.key !== 'Enter' && event.key !== ' ')
+                          if (
+                            [
+                              'ArrowLeft',
+                              'ArrowUp',
+                              'ArrowRight',
+                              'ArrowDown',
+                            ].includes(event.key)
+                          ) {
+                            event.preventDefault();
+                            const offset =
+                              event.key === 'ArrowLeft' ||
+                              event.key === 'ArrowUp'
+                                ? -1
+                                : 1;
+                            const index = filtered.findIndex(
+                              (candidate) => candidate.id === item.id,
+                            );
+                            const target = filtered[index + offset];
+                            if (!target) return;
+                            libraryCardRefs.current.get(target.id)?.focus();
+                            if (event.shiftKey)
+                              selectRecording(target.id, {
+                                toggle: true,
+                                range: true,
+                              });
                             return;
-                          event.preventDefault();
-                          selectRecording(item.id, {
-                            toggle: event.ctrlKey || event.metaKey,
-                            range: event.shiftKey,
-                          });
+                          }
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            openClipViewer(item.id);
+                            return;
+                          }
+                          if (event.key.toLowerCase() === 'k') {
+                            event.preventDefault();
+                            openClipViewer(item.id);
+                            window.requestAnimationFrame(
+                              () => void viewerVideoRef.current?.play(),
+                            );
+                            return;
+                          }
+                          if (event.key === ' ') {
+                            event.preventDefault();
+                            selectRecording(item.id, {
+                              toggle: true,
+                              range: event.shiftKey,
+                            });
+                          }
                         }}
                         onContextMenu={(event) => {
                           event.preventDefault();
@@ -2684,10 +5028,14 @@ export function App() {
                             fileType={item.fileType}
                             thumbnailSource={thumbnailSources[item.id]}
                             sourceAvailable={item.available}
+                            previewStored={previewStoredIds.has(item.id)}
+                            onPreviewPrepared={receivePreparedPreview}
+                            onThumbnailPrepared={receivePreparedThumbnail}
                             previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
                             previewCacheEpoch={previewCacheEpoch}
                             enableHoverPreview={
                               (settings.hoverPreviewsEnabled ?? true) &&
+                              settings.previewPreloading !== 'off' &&
                               !clearingPreviewCache
                             }
                             holdFrame={settings.thumbnailHoldFrame ?? 'first'}
@@ -2696,12 +5044,27 @@ export function App() {
                             }
                             allowBackgroundPreparation={activeJobs.length === 0}
                           />
+                          <input
+                            className="media-select"
+                            type="checkbox"
+                            draggable={false}
+                            checked={selected.includes(item.id)}
+                            aria-label={`Select ${item.originalFilename}`}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
+                            onChange={() => {
+                              setContextMenu(undefined);
+                              selectRecording(item.id, {
+                                toggle: true,
+                                range: false,
+                              });
+                            }}
+                          />
                           <span>
                             {duration(item.technical.durationSeconds)}
                           </span>
-                          {selected.includes(item.id) && (
-                            <b className="check">✓</b>
-                          )}
                         </div>
                         <div className="card-body">
                           <strong>{item.originalFilename}</strong>
@@ -2713,7 +5076,36 @@ export function App() {
                           <small>{item.relativePath}</small>
                           <div className="pills">
                             {logicalTags(item, catalogue.media).map((tag) => (
-                              <em key={tag}>{tag}</em>
+                              <span className="tag-chip" key={tag}>
+                                <button
+                                  type="button"
+                                  title={`Filter Library by ${tag}`}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onContextMenu={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    setTagFilters((current) =>
+                                      current.includes(tag)
+                                        ? current
+                                        : [...current, tag],
+                                    );
+                                  }}
+                                >
+                                  {tag}
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label={`Remove tag ${tag} from ${item.originalFilename}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void updateRecording(item.id, {
+                                      removeTags: [tag],
+                                    });
+                                  }}
+                                >
+                                  ×
+                                </button>
+                              </span>
                             ))}
                           </div>
                           <div className="projects">
@@ -2770,7 +5162,9 @@ export function App() {
                 )}
               </div>
             </section>
-            <div className="library-overlays">
+            <div
+              className={`library-overlays ${viewerRecording ? 'library-hidden' : ''}`}
+            >
               {showScrollTop && (
                 <button
                   type="button"
@@ -2778,7 +5172,7 @@ export function App() {
                   aria-label="Scroll Library to top"
                   title="Scroll to top"
                   onClick={() =>
-                    contentRef.current?.scrollTo({
+                    libraryPanelRef.current?.scrollTo({
                       top: 0,
                       behavior: window.matchMedia?.(
                         '(prefers-reduced-motion: reduce)',
@@ -2792,205 +5186,285 @@ export function App() {
                 </button>
               )}
               {selected.length > 0 && (
-                <div className="batch">
+                <div
+                  className={`batch selection-toolbar ${selectionToolbarPosition}`}
+                  role="toolbar"
+                  aria-label="Selected recordings"
+                >
                   <div className="batch-heading">
                     <strong>{selected.length} selected</strong>
                     <span>Changes persist immediately</span>
                   </div>
-                  <div className="batch-combo">
-                    <Tag size={15} />
-                    <SearchableComboBox
-                      label="Add tags"
-                      mode="multiple"
-                      options={knownTags.map((tag) => ({
-                        id: tag,
-                        label: tag,
-                      }))}
-                      selectedIds={batchTags}
-                      onSelectionChange={(ids) => {
-                        setBatchTags(ids);
-                        void updateSelection({ addTags: ids });
-                      }}
-                      placeholder="Search or create tags…"
-                      onCreate={(label) => ({ id: label, label })}
-                    />
-                  </div>
-                  <div className="batch-combo">
-                    <Tag size={15} />
-                    <SearchableComboBox
-                      label="Remove tags"
-                      mode="multiple"
-                      options={knownTags.map((tag) => ({
-                        id: tag,
-                        label: tag,
-                      }))}
-                      selectedIds={removeBatchTags}
-                      onSelectionChange={(ids) => {
-                        setRemoveBatchTags(ids);
-                        void updateSelection({ removeTags: ids });
-                      }}
-                      placeholder="Remove tags…"
-                    />
-                  </div>
-                  <div className="batch-combo">
-                    <UsersRound size={15} />
-                    <SearchableComboBox
-                      label="Add projects"
-                      mode="multiple"
-                      options={catalogue.projects.map((project) => ({
-                        id: project.id,
-                        label: project.name,
-                      }))}
-                      selectedIds={batchProjects}
-                      onSelectionChange={(ids) => {
-                        setBatchProjects(ids);
-                        void updateSelection({ addProjectIds: ids });
-                      }}
-                      placeholder="Search projects…"
-                    />
-                  </div>
-                  <div className="batch-combo">
-                    <UsersRound size={15} />
-                    <SearchableComboBox
-                      label="Remove projects"
-                      mode="multiple"
-                      options={catalogue.projects.map((project) => ({
-                        id: project.id,
-                        label: project.name,
-                      }))}
-                      selectedIds={removeBatchProjects}
-                      onSelectionChange={(ids) => {
-                        setRemoveBatchProjects(ids);
-                        void updateSelection({ removeProjectIds: ids });
-                      }}
-                      placeholder="Remove projects…"
-                    />
-                  </div>
-                  <label className="batch-description">
-                    Description for selection
-                    <input
-                      value={batchDescription}
-                      onChange={(event) =>
-                        setBatchDescription(event.target.value)
-                      }
-                      placeholder="Replace description on selected media"
-                    />
+                  {selectionToolbarActions.includes('tags') && (
+                    <div className="batch-combo compact-batch-control">
+                      <Tag size={15} />
+                      <SearchableComboBox
+                        label="Add tags"
+                        mode="multiple"
+                        options={knownTags.map((tag) => ({
+                          id: tag,
+                          label: tag,
+                          description: selectedTagState(tag),
+                        }))}
+                        selectedIds={batchTags}
+                        onSelectionChange={(ids) => {
+                          setBatchTags(ids);
+                          void updateSelection({ addTags: ids });
+                        }}
+                        placeholder="Add tags…"
+                        onCreate={(label) => ({ id: label, label })}
+                      />
+                    </div>
+                  )}
+                  {selectionToolbarActions.includes('projects') && (
+                    <div className="batch-combo compact-batch-control">
+                      <UsersRound size={15} />
+                      <SearchableComboBox
+                        label="Assign projects"
+                        mode="multiple"
+                        options={catalogue.projects.map((project) => ({
+                          id: project.id,
+                          label: project.name,
+                        }))}
+                        selectedIds={batchProjects}
+                        onSelectionChange={(ids) => {
+                          setBatchProjects(ids);
+                          void updateSelection({ addProjectIds: ids });
+                        }}
+                        placeholder="Assign project…"
+                      />
+                    </div>
+                  )}
+                  {selectionToolbarActions.includes('favourite') && (
                     <button
-                      className="batch-primary"
-                      disabled={busy}
-                      onClick={() =>
-                        void updateSelection({ notes: batchDescription })
-                      }
-                    >
-                      Apply description
-                    </button>
-                  </label>
-                  <div className="file-actions" aria-label="Selection actions">
-                    <button
+                      type="button"
                       className="batch-primary"
                       onClick={() => void updateSelection({ favourite: true })}
                     >
                       <Star size={13} /> Favourite
                     </button>
-                    <button
-                      onClick={() => void updateSelection({ favourite: false })}
-                    >
-                      Remove favourite
-                    </button>
-                    <button
-                      disabled={selectedPhysicalIds.every(
-                        (id) =>
-                          !catalogue.media.find((item) => item.id === id)
-                            ?.available,
-                      )}
-                      onClick={() => void copySelectedPaths()}
-                    >
-                      <Copy size={13} /> Copy paths for Premiere
-                    </button>
-                    <button
-                      disabled={selectedPhysicalIds.length === 0}
-                      onClick={() => void exportPremiereManifest()}
-                    >
-                      Export Premiere manifest
-                    </button>
-                  </div>
-                  {selectedRecording && (
-                    <>
-                      <div
-                        className="associated-files"
-                        role="group"
-                        aria-label="Associated physical files"
-                      >
-                        <strong>
-                          {selectedAssociatedMedia.length} associated file
-                          {selectedAssociatedMedia.length === 1 ? '' : 's'}
-                        </strong>
-                        {selectedAssociatedMedia.map((recording) => (
-                          <div className="associated-file" key={recording.id}>
-                            <div>
-                              <b>{recording.originalFilename}</b>
-                              <span>
-                                {recording.fileType.toUpperCase()} ·{' '}
-                                {size(recording.technical.sizeBytes)} ·{' '}
-                                {recording.needsReview
-                                  ? 'Integrity needs review'
-                                  : recording.available
-                                    ? 'Integrity verified'
-                                    : 'Unavailable locally'}
-                              </span>
-                              <code>{recording.relativePath}</code>
-                            </div>
-                            <button
-                              disabled={!recording.available}
-                              aria-label={`Reveal ${recording.originalFilename} in Explorer`}
-                              onClick={() =>
-                                void runSelectedFileAction('reveal', recording)
-                              }
-                            >
-                              <LocateFixed size={13} /> Reveal
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                      <div
-                        className="file-actions"
-                        aria-label="Recording actions"
-                      >
-                        <button
-                          disabled={!selectedRecording.available}
-                          onClick={() => void runSelectedFileAction('reveal')}
-                        >
-                          <LocateFixed size={13} /> Reveal in Explorer
-                        </button>
-                        <button
-                          disabled={!selectedRecording.available}
-                          onClick={() => void runSelectedFileAction('folder')}
-                        >
-                          <FolderOpen size={13} /> Open date folder
-                        </button>
-                        <button
-                          disabled={!selectedRecording.available}
-                          onClick={() => void runSelectedFileAction('copy')}
-                        >
-                          <Copy size={13} /> Copy path
-                        </button>
-                      </div>
-                    </>
                   )}
                   <button
+                    type="button"
                     className="batch-clear"
                     onClick={() => {
-                      setSelected([]);
+                      replaceSelection([], undefined);
                       setBatchTags([]);
                       setRemoveBatchTags([]);
                       setBatchProjects([]);
                       setRemoveBatchProjects([]);
-                      setBatchDescription('');
-                      selectionAnchor.current = undefined;
+                      setDescriptionDraft({ selectionKey: '', value: '' });
                     }}
                   >
                     Clear selection
                   </button>
+                  <button
+                    type="button"
+                    className="batch-clear"
+                    aria-expanded={showSelectionDetails}
+                    onClick={() =>
+                      setShowSelectionDetails((current) => !current)
+                    }
+                  >
+                    {showSelectionDetails ? 'Fewer actions' : 'More actions'}
+                  </button>
+                  {showSelectionDetails && (
+                    <>
+                      <button
+                        type="button"
+                        disabled={selectedPhysicalIds.length === 0}
+                        onClick={() => void exportPremiereManifest()}
+                      >
+                        Export Premiere manifest
+                      </button>
+                      <div className="batch-combo">
+                        <Tag size={15} />
+                        <SearchableComboBox
+                          label="Remove tags"
+                          mode="multiple"
+                          options={knownTags.map((tag) => ({
+                            id: tag,
+                            label: tag,
+                          }))}
+                          selectedIds={removeBatchTags}
+                          onSelectionChange={(ids) => {
+                            setRemoveBatchTags(ids);
+                            void updateSelection({ removeTags: ids });
+                          }}
+                          placeholder="Remove tags…"
+                        />
+                      </div>
+                      <div className="batch-combo">
+                        <UsersRound size={15} />
+                        <SearchableComboBox
+                          label="Remove projects"
+                          mode="multiple"
+                          options={catalogue.projects.map((project) => ({
+                            id: project.id,
+                            label: project.name,
+                          }))}
+                          selectedIds={removeBatchProjects}
+                          onSelectionChange={(ids) => {
+                            setRemoveBatchProjects(ids);
+                            void updateSelection({ removeProjectIds: ids });
+                          }}
+                          placeholder="Remove projects…"
+                        />
+                      </div>
+                      <label className="batch-description">
+                        {selected.length === 1
+                          ? `Description for ${selectedRecording?.originalFilename ?? 'recording'}`
+                          : 'Replace description on all selected recordings'}
+                        <input
+                          value={descriptionValue}
+                          onChange={(event) =>
+                            setDescriptionDraft({
+                              selectionKey,
+                              value: event.target.value,
+                            })
+                          }
+                          placeholder={
+                            selected.length === 1
+                              ? 'Describe this recording'
+                              : 'Bulk replacement description'
+                          }
+                        />
+                        {selected.length > 1 && (
+                          <small>
+                            Bulk replacement overwrites the description on every
+                            selected physical recording.
+                          </small>
+                        )}
+                        <button
+                          className="batch-primary"
+                          disabled={
+                            busy || visibleDescriptionStatus.state === 'saving'
+                          }
+                          onClick={() => void saveSelectionDescription()}
+                        >
+                          {visibleDescriptionStatus.state === 'saving'
+                            ? 'Saving…'
+                            : selected.length === 1
+                              ? 'Save description'
+                              : 'Replace descriptions'}
+                        </button>
+                        <span
+                          role="status"
+                          className={
+                            visibleDescriptionStatus.state === 'failed'
+                              ? 'field-error'
+                              : undefined
+                          }
+                        >
+                          {visibleDescriptionStatus.state === 'saved'
+                            ? 'Saved'
+                            : visibleDescriptionStatus.state === 'failed'
+                              ? `Failed: ${visibleDescriptionStatus.detail}`
+                              : ''}
+                        </span>
+                      </label>
+                      <div
+                        className="file-actions"
+                        aria-label="Selection actions"
+                      >
+                        <button
+                          onClick={() =>
+                            void updateSelection({ favourite: false })
+                          }
+                        >
+                          Remove favourite
+                        </button>
+                        <button
+                          disabled={selectedPhysicalIds.every(
+                            (id) =>
+                              !catalogue.media.find((item) => item.id === id)
+                                ?.available,
+                          )}
+                          onClick={() => void copySelectedPaths()}
+                          title="Copies newline-separated text; it does not import media"
+                        >
+                          <Copy size={13} /> Copy file paths
+                        </button>
+                        <small className="action-note">
+                          File paths are copied as text only; this does not
+                          import media into Premiere.
+                        </small>
+                      </div>
+                      {selectedRecording && (
+                        <>
+                          <div
+                            className="associated-files"
+                            role="group"
+                            aria-label="Associated physical files"
+                          >
+                            <strong>
+                              {selectedAssociatedMedia.length} associated file
+                              {selectedAssociatedMedia.length === 1 ? '' : 's'}
+                            </strong>
+                            {selectedAssociatedMedia.map((recording) => (
+                              <div
+                                className="associated-file"
+                                key={recording.id}
+                              >
+                                <div>
+                                  <b>{recording.originalFilename}</b>
+                                  <span>
+                                    {recording.fileType.toUpperCase()} ·{' '}
+                                    {size(recording.technical.sizeBytes)} ·{' '}
+                                    {recording.needsReview
+                                      ? 'Integrity needs review'
+                                      : recording.available
+                                        ? 'Integrity verified'
+                                        : 'Unavailable locally'}
+                                  </span>
+                                  <code>{recording.relativePath}</code>
+                                </div>
+                                <button
+                                  disabled={!recording.available}
+                                  aria-label={`Reveal ${recording.originalFilename} in Explorer`}
+                                  onClick={() =>
+                                    void runSelectedFileAction(
+                                      'reveal',
+                                      recording,
+                                    )
+                                  }
+                                >
+                                  <LocateFixed size={13} /> Reveal
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                          <div
+                            className="file-actions"
+                            aria-label="Recording actions"
+                          >
+                            <button
+                              disabled={!selectedRecording.available}
+                              onClick={() =>
+                                void runSelectedFileAction('reveal')
+                              }
+                            >
+                              <LocateFixed size={13} /> Reveal in Explorer
+                            </button>
+                            <button
+                              disabled={!selectedRecording.available}
+                              onClick={() =>
+                                void runSelectedFileAction('folder')
+                              }
+                            >
+                              <FolderOpen size={13} /> Open date folder
+                            </button>
+                            <button
+                              disabled={!selectedRecording.available}
+                              onClick={() => void runSelectedFileAction('copy')}
+                            >
+                              <Copy size={13} /> Copy path
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -3029,7 +5503,7 @@ export function App() {
                     void copySelectedPaths();
                   }}
                 >
-                  Copy path for Premiere
+                  Copy file paths
                 </button>
                 <button
                   role="menuitem"
@@ -3046,10 +5520,133 @@ export function App() {
                 </button>
               </div>
             )}
+            {showShortcutHelp && (
+              <div className="modal-backdrop" role="presentation">
+                <section
+                  className="shortcut-dialog"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="shortcut-title"
+                >
+                  <div className="section-head">
+                    <h2 id="shortcut-title">Library shortcuts</h2>
+                    <button
+                      type="button"
+                      autoFocus
+                      onClick={() => setShowShortcutHelp(false)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <dl>
+                    <div>
+                      <dt>Arrow keys</dt>
+                      <dd>Move card focus</dd>
+                    </div>
+                    <div>
+                      <dt>Shift + arrow</dt>
+                      <dd>Extend selection</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + Space</dt>
+                      <dd>Toggle focused recording</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + A</dt>
+                      <dd>Select filtered recordings</dd>
+                    </div>
+                    <div>
+                      <dt>Enter</dt>
+                      <dd>Open focused recording</dd>
+                    </div>
+                    <div>
+                      <dt>K / Space</dt>
+                      <dd>Open or toggle viewer playback</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + F</dt>
+                      <dd>Focus Library search</dd>
+                    </div>
+                    <div>
+                      <dt>Ctrl + Z / Ctrl + Y</dt>
+                      <dd>Undo or redo selection only</dd>
+                    </div>
+                    <div>
+                      <dt>Escape twice</dt>
+                      <dd>Clear selection</dd>
+                    </div>
+                    <div>
+                      <dt>?</dt>
+                      <dd>Show this reference</dd>
+                    </div>
+                  </dl>
+                  <p>
+                    Text fields keep their normal typing and undo shortcuts.
+                    Selection undo never changes metadata or files.
+                  </p>
+                </section>
+              </div>
+            )}
           </>
         ) : view === 'Ingest' ? (
           <section className="ingest">
             <div className="drop">
+              <button
+                type="button"
+                className="primary"
+                disabled={!settings.sdGrabberEnabled}
+                onClick={() => {
+                  setShowSdGrabber((current) => !current);
+                  void refreshRemovableVolumes();
+                }}
+              >
+                <HardDrive size={18} /> Grab files from SD card
+              </button>
+              {showSdGrabber && (
+                <div className="source-list" aria-label="SD Card Grabber">
+                  <strong>SD Card Grabber</strong>
+                  <small>
+                    Scans only {settings.sdGrabberExtensions.join(', ')} files
+                    and copies verified new recordings. Nothing is deleted from
+                    the card.
+                  </small>
+                  {removableVolumes.map((volume) => (
+                    <div className="button-row" key={volume.identity}>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          scanSdSource(volume.rootPath, volume.identity)
+                        }
+                      >
+                        Scan {volume.label} ({volume.rootPath})
+                      </button>
+                      <small>
+                        {size(volume.availableBytes)} free of{' '}
+                        {size(volume.capacityBytes)}
+                        {settings.sdGrabberRecognizedDeviceIds.includes(
+                          volume.identity,
+                        )
+                          ? ' · Recognised card'
+                          : ''}
+                      </small>
+                    </div>
+                  ))}
+                  {removableVolumes.length === 0 && (
+                    <small className="pending">
+                      No Windows removable volume detected. Some card readers
+                      appear as fixed drives; choose the card folder manually.
+                    </small>
+                  )}
+                  <div className="button-row">
+                    <button type="button" onClick={chooseSdSource}>
+                      Choose card folder manually
+                    </button>
+                    <button type="button" onClick={refreshRemovableVolumes}>
+                      Refresh devices
+                    </button>
+                  </div>
+                </div>
+              )}
               <UploadCloud size={42} />
               <h2>Drop camera media here</h2>
               <p>
@@ -3082,6 +5679,8 @@ export function App() {
                       setInventoryError('');
                       setConflicts([]);
                       setRenames({});
+                      setSdGrabberMode(false);
+                      setAllowDuplicateCopies(false);
                     }}
                   >
                     Clear
@@ -3101,9 +5700,37 @@ export function App() {
               {inventory && (
                 <div className="source-list" aria-label="Source inventory">
                   <strong>
-                    {inventory.copyFileCount} of {inventory.totalFileCount}{' '}
-                    files will be copied ({size(inventory.copyBytes)})
+                    {sdGrabberMode
+                      ? `${inventory.copyFileCount} new recording${inventory.copyFileCount === 1 ? '' : 's'} — ${size(inventory.copyBytes)}`
+                      : `${inventory.copyFileCount} of ${inventory.totalFileCount} files will be copied (${size(inventory.copyBytes)})`}
                   </strong>
+                  {sdGrabberMode && (
+                    <>
+                      <small>
+                        {inventory.alreadyImportedFileCount} already imported —{' '}
+                        {size(inventory.alreadyImportedBytes)}
+                      </small>
+                      <small
+                        className={
+                          inventory.attentionFileCount ? 'error' : undefined
+                        }
+                      >
+                        {inventory.attentionFileCount} require attention —{' '}
+                        {size(inventory.attentionBytes)}
+                      </small>
+                    </>
+                  )}
+                  {!sdGrabberMode &&
+                    (inventory.alreadyImportedFileCount ?? 0) > 0 && (
+                      <small>
+                        {inventory.alreadyImportedFileCount} verified global
+                        duplicate
+                        {inventory.alreadyImportedFileCount === 1
+                          ? ''
+                          : 's'}{' '}
+                        will be skipped ({size(inventory.alreadyImportedBytes)})
+                      </small>
+                    )}
                   <small>
                     {
                       inventory.files.filter((file) => file.preserveHierarchy)
@@ -3145,8 +5772,11 @@ export function App() {
                           <span role="cell">
                             <b>Destination</b>
                             <code title={file.plannedRelativePath}>
-                              {file.plannedRelativePath}
+                              {file.disposition === 'already-imported'
+                                ? `Already imported: ${file.existingRelativePath}`
+                                : file.plannedRelativePath}
                             </code>
+                            {file.detail && <small>{file.detail}</small>}
                           </span>
                         </div>
                       ))}
@@ -3185,33 +5815,36 @@ export function App() {
                 </b>
                 .
               </p>
-              {[
-                ['default', 'Use remembered mode'],
-                ['today', 'Today'],
-                ['yesterday', 'Yesterday'],
-                ['choose', 'Choose date'],
-              ].map(([value, label]) => (
-                <label
-                  className={dateOverride === value ? 'chosen' : ''}
-                  key={value}
-                >
-                  <input
-                    type="radio"
-                    checked={dateOverride === value}
-                    onChange={() => setDateOverride(value)}
-                  />
-                  <span>
-                    <b>{label}</b>
-                  </span>
-                </label>
-              ))}
-              {dateOverride === 'choose' && (
-                <input
-                  type="date"
-                  value={chosenDate}
-                  onChange={(event) => setChosenDate(event.target.value)}
-                />
-              )}
+              <fieldset className="ingest-date-choices">
+                <legend>Choose once for this batch</legend>
+                {[
+                  ['today', 'Today'],
+                  ['yesterday', 'Yesterday'],
+                  ['choose', 'Choose date'],
+                  ['original-file-dates', 'Use clip date'],
+                ].map(([value, label]) => (
+                  <label key={value}>
+                    <input
+                      type="radio"
+                      name="ingest-date-choice"
+                      value={value}
+                      checked={dateOverride === value}
+                      onChange={() => setDateOverride(value)}
+                    />
+                    {label}
+                  </label>
+                ))}
+                {dateOverride === 'choose' && (
+                  <label>
+                    Date for this batch
+                    <input
+                      type="date"
+                      value={chosenDate}
+                      onChange={(event) => setChosenDate(event.target.value)}
+                    />
+                  </label>
+                )}
+              </fieldset>
               <SearchableComboBox
                 label="Tags for all files in this ingest"
                 mode="multiple"
@@ -3250,29 +5883,61 @@ export function App() {
                   ))}
                 </div>
               )}
+              {(inventory?.alreadyImportedFileCount ?? 0) > 0 && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowDuplicateCopies}
+                    onChange={(event) =>
+                      setAllowDuplicateCopies(event.target.checked)
+                    }
+                  />{' '}
+                  Intentionally create additional physical copies of verified
+                  duplicates
+                </label>
+              )}
+              {(inventory?.attentionFileCount ?? 0) > 0 && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowUnverifiedReimport}
+                    onChange={(event) =>
+                      setAllowUnverifiedReimport(event.target.checked)
+                    }
+                  />{' '}
+                  Copy safe incoming sources whose previous catalogue copy is
+                  missing or failed verification
+                </label>
+              )}
               <button
                 className="primary"
                 disabled={
                   startingIngest ||
                   inventoryLoading ||
                   !inventory ||
-                  inventory.copyFileCount === 0 ||
+                  (inventory.copyFileCount === 0 &&
+                    !allowDuplicateCopies &&
+                    !allowUnverifiedReimport) ||
                   !sources.length ||
                   (dateOverride === 'choose' && !chosenDate)
                 }
                 onClick={() =>
-                  void ingest(
-                    Object.fromEntries(
-                      Object.entries(renames).filter(([, value]) =>
-                        value.trim(),
-                      ),
-                    ),
-                  )
+                  conflicts.length > 0
+                    ? void reviewRenamedDestinations()
+                    : void ingest()
                 }
               >
                 {startingIngest
-                  ? 'Creating ingest job…'
-                  : 'Start verified ingest'}
+                  ? conflicts.length > 0
+                    ? 'Approving renamed destinations…'
+                    : 'Creating ingest job…'
+                  : conflicts.length > 0
+                    ? 'Review renamed destinations'
+                    : sdGrabberMode
+                      ? allowDuplicateCopies || allowUnverifiedReimport
+                        ? `Grab ${(inventory?.copyFileCount ?? 0) + (allowDuplicateCopies ? (inventory?.alreadyImportedFileCount ?? 0) : 0) + (allowUnverifiedReimport ? (inventory?.attentionFileCount ?? 0) : 0)} reviewed files`
+                        : `Grab ${inventory?.copyFileCount ?? 0} new file${inventory?.copyFileCount === 1 ? '' : 's'}`
+                      : 'Start verified ingest'}
               </button>
             </div>
           </section>
@@ -3428,8 +6093,8 @@ export function App() {
                   <div>
                     <h3>Project-local files</h3>
                     <span>
-                      Read-only inventory; Premiere files are never parsed or
-                      changed
+                      Read-only inventory; supported saved projects are parsed
+                      from stable snapshots and never changed
                     </span>
                   </div>
                 </div>
@@ -3482,6 +6147,207 @@ export function App() {
                 )}
               </section>
 
+              {projectInventory?.premiereIndex && (
+                <section className="premiere-index">
+                  <div className="section-head">
+                    <div>
+                      <h3>Saved-project observation</h3>
+                      <span>
+                        {projectInventory.premiereIndex.status} · parser{' '}
+                        {projectInventory.premiereIndex.parserVersion} ·{' '}
+                        {new Date(
+                          projectInventory.premiereIndex.indexedAt,
+                        ).toLocaleString()}
+                      </span>
+                    </div>
+                  </div>
+                  <p>
+                    This local, rebuildable index observes a completed saved
+                    project. It may differ from unsaved Premiere state, is not
+                    live Companion evidence, and never marks unknown media as
+                    not imported.
+                  </p>
+                  {premiereSummary && (
+                    <div className="project-stats premiere-summary">
+                      <div>
+                        <span>Imported</span>
+                        <strong>{premiereSummary.imported}</strong>
+                      </div>
+                      <div>
+                        <span>Used in timelines</span>
+                        <strong>{premiereSummary.used ?? 'Unknown'}</strong>
+                      </div>
+                      <div>
+                        <span>Unused imports</span>
+                        <strong>{premiereSummary.unused ?? 'Unknown'}</strong>
+                      </div>
+                      <div>
+                        <span>Unresolved</span>
+                        <strong>{premiereSummary.unresolved}</strong>
+                      </div>
+                      <div>
+                        <span>Historical evidence</span>
+                        <strong>{premiereSummary.historical}</strong>
+                      </div>
+                      <div>
+                        <span>Unclassified references</span>
+                        <strong>{premiereSummary.unclassified}</strong>
+                      </div>
+                    </div>
+                  )}
+                  {projectInventory.premiereIndex.issues.map((issue) => (
+                    <div
+                      className="project-index-issue"
+                      role="status"
+                      key={issue}
+                    >
+                      {issue}
+                    </div>
+                  ))}
+                  {projectInventory.premiereIndex.status !== 'unsupported' && (
+                    <div className="premiere-index-grid">
+                      <div>
+                        <h4>Top-level sequences</h4>
+                        {projectInventory.premiereIndex.sequences
+                          .filter((sequence) => !sequence.nested)
+                          .map((sequence) => (
+                            <button
+                              type="button"
+                              className="project-index-row project-index-sequence"
+                              aria-pressed={
+                                selectedPremiereSequenceId === sequence.id
+                              }
+                              key={sequence.id}
+                              onClick={() =>
+                                setSelectedPremiereSequenceId(
+                                  selectedPremiereSequenceId === sequence.id
+                                    ? undefined
+                                    : sequence.id,
+                                )
+                              }
+                            >
+                              <strong>{sequence.name}</strong>
+                              <span>
+                                {sequence.timelinePlacements} placement
+                                {sequence.timelinePlacements === 1 ? '' : 's'}
+                              </span>
+                            </button>
+                          ))}
+                        {!projectInventory.premiereIndex.sequences.some(
+                          (sequence) => !sequence.nested,
+                        ) && <span className="muted">Unknown</span>}
+                        <details>
+                          <summary>
+                            Nested sequences (
+                            {
+                              projectInventory.premiereIndex.sequences.filter(
+                                (sequence) => sequence.nested,
+                              ).length
+                            }
+                            )
+                          </summary>
+                          {projectInventory.premiereIndex.sequences
+                            .filter((sequence) => sequence.nested)
+                            .map((sequence) => (
+                              <button
+                                type="button"
+                                className="project-index-row project-index-sequence"
+                                aria-pressed={
+                                  selectedPremiereSequenceId === sequence.id
+                                }
+                                key={sequence.id}
+                                onClick={() =>
+                                  setSelectedPremiereSequenceId(
+                                    selectedPremiereSequenceId === sequence.id
+                                      ? undefined
+                                      : sequence.id,
+                                  )
+                                }
+                              >
+                                <strong>{sequence.name}</strong>
+                                <span>
+                                  {sequence.timelinePlacements} placement
+                                  {sequence.timelinePlacements === 1 ? '' : 's'}
+                                </span>
+                              </button>
+                            ))}
+                        </details>
+                        {selectedPremiereSequenceId &&
+                          (() => {
+                            const sequence =
+                              projectInventory.premiereIndex?.sequences.find(
+                                (candidate) =>
+                                  candidate.id === selectedPremiereSequenceId,
+                              );
+                            if (!sequence) return null;
+                            return (
+                              <div className="sequence-recordings">
+                                <h5>{sequence.name} recordings</h5>
+                                {sequence.mediaPaths.length ? (
+                                  sequence.mediaPaths.map((path) => {
+                                    const reference =
+                                      projectInventory.premiereIndex?.mediaReferences.find(
+                                        (candidate) => candidate.path === path,
+                                      );
+                                    return (
+                                      <div
+                                        className="project-index-row"
+                                        key={path}
+                                      >
+                                        <code>{path}</code>
+                                        <span>
+                                          {reference?.mediaId
+                                            ? 'Matched'
+                                            : 'Unresolved'}
+                                        </span>
+                                      </div>
+                                    );
+                                  })
+                                ) : (
+                                  <span className="muted">
+                                    Usage unknown or no established timeline
+                                    media.
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
+                      </div>
+                      <div>
+                        <h4>Imported-media evidence</h4>
+                        {projectInventory.premiereIndex.mediaReferences.map(
+                          (reference) => (
+                            <div
+                              className="project-index-row"
+                              key={reference.path}
+                            >
+                              <code>{reference.path}</code>
+                              <span>
+                                {reference.evidence === 'used-in-saved-timeline'
+                                  ? `Used · ${reference.timelinePlacements} placement${reference.timelinePlacements === 1 ? '' : 's'}`
+                                  : reference.evidence ===
+                                      'imported-into-saved-project'
+                                    ? 'Imported · unused'
+                                    : reference.evidence ===
+                                        'historical-reference-supported'
+                                      ? 'Historical · supported by prior observation'
+                                      : 'Unclassified project reference'}
+                                {' · '}
+                                {reference.mediaId
+                                  ? 'Matched to Master Bin ID'
+                                  : 'Unresolved'}
+                              </span>
+                            </div>
+                          ),
+                        )}
+                        {!projectInventory.premiereIndex.mediaReferences
+                          .length && <span className="muted">Unknown</span>}
+                      </div>
+                    </div>
+                  )}
+                </section>
+              )}
+
               <section className="project-linked-media">
                 <div className="section-head">
                   <div>
@@ -3496,9 +6362,10 @@ export function App() {
                   <Search aria-hidden="true" size={17} />
                   <input
                     value={projectMediaQuery}
-                    onChange={(event) =>
-                      setProjectMediaQuery(event.target.value)
-                    }
+                    onChange={(event) => {
+                      setProjectMediaQuery(event.target.value);
+                      setProjectAvailablePage(1);
+                    }}
                     placeholder="Search Master Bin footage to link…"
                   />
                 </label>
@@ -3624,79 +6491,190 @@ export function App() {
                   </div>
                 )}
                 {[
-                  ['Assigned recordings', linkedProjectMedia],
-                  ['Available to add', unlinkedProjectMedia],
-                ].map(([heading, recordings]) => (
-                  <div
-                    className="project-media-section"
-                    key={heading as string}
-                  >
-                    <h4>{heading as string}</h4>
-                    <div className="project-media-list">
-                      {(recordings as typeof projectMedia).map((item) => (
-                        <div className="project-media-row" key={item.id}>
-                          <input
-                            type="checkbox"
-                            aria-label={`Select ${item.originalFilename}`}
-                            checked={projectMediaSelection.includes(item.id)}
-                            onChange={(event) => {
-                              setProjectMediaSelection((current) =>
-                                event.target.checked
-                                  ? [...new Set([...current, item.id])]
-                                  : current.filter((id) => id !== item.id),
-                              );
-                              if (event.target.checked) {
-                                setProjectMediaDescription(item.notes);
-                                setProjectAddTags([]);
-                                setProjectRemoveTags([]);
-                              }
-                            }}
-                          />
-                          <div className="project-media-thumb">
-                            <MediaThumbnail
-                              mediaId={item.id}
-                              fileType={item.fileType}
-                              thumbnailSource={thumbnailSources[item.id]}
-                            />
-                          </div>
-                          <span>
-                            <strong>{item.originalFilename}</strong>
-                            <small>{item.relativePath}</small>
-                            <span className="pills">
-                              {logicalTags(item, catalogue.media).map((tag) => (
-                                <em key={tag}>{tag}</em>
-                              ))}
-                            </span>
-                          </span>
-                          {item.favourite && (
-                            <Star aria-label="Favourite" size={14} />
-                          )}
+                  {
+                    heading: 'Assigned recordings',
+                    recordings: linkedProjectMedia,
+                  },
+                  {
+                    heading: 'Available to add',
+                    recordings: unlinkedProjectMedia,
+                  },
+                ].map(({ heading, recordings }) => {
+                  const available = heading === 'Available to add';
+                  if (available && !projectAvailableOpen) {
+                    return (
+                      <div className="project-media-section" key={heading}>
+                        <button
+                          type="button"
+                          className="project-media-section-toggle"
+                          aria-expanded="false"
+                          onClick={() => setProjectAvailableOpen(true)}
+                        >
+                          Available to add ({unlinkedProjectMedia.length})
+                        </button>
+                      </div>
+                    );
+                  }
+                  const displayedRecordings = available
+                    ? pagedAvailableProjectMedia
+                    : recordings;
+                  return (
+                    <div className="project-media-section" key={heading}>
+                      {available ? (
+                        <div className="project-available-heading">
                           <button
                             type="button"
-                            disabled={!item.available}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void desktopBridge
-                                .revealMediaInExplorer(item.id)
-                                .catch((reason) => setError(errorText(reason)));
-                            }}
+                            className="project-media-section-toggle"
+                            aria-expanded="true"
+                            onClick={() => setProjectAvailableOpen(false)}
                           >
-                            Reveal
+                            Available to add ({unlinkedProjectMedia.length})
                           </button>
+                          <label>
+                            Search available recordings
+                            <input
+                              value={projectAvailableQuery}
+                              onChange={(event) => {
+                                setProjectAvailableQuery(event.target.value);
+                                setProjectAvailablePage(1);
+                              }}
+                            />
+                          </label>
+                          <SearchableComboBox
+                            label="Filter available recordings by tags"
+                            mode="multiple"
+                            options={knownTags.map((tag) => ({
+                              id: tag,
+                              label: tag,
+                            }))}
+                            selectedIds={projectAvailableTags}
+                            onSelectionChange={(tags) => {
+                              setProjectAvailableTags(tags);
+                              setProjectAvailablePage(1);
+                            }}
+                            placeholder="Filter tags…"
+                          />
+                          <small>
+                            Showing {displayedRecordings.length} of{' '}
+                            {availableProjectMedia.length} matching recordings
+                          </small>
+                        </div>
+                      ) : (
+                        <h4>
+                          Assigned recordings ({linkedProjectMedia.length})
+                        </h4>
+                      )}
+                      <div className="project-media-list">
+                        {(displayedRecordings as typeof projectMedia).map(
+                          (item) => (
+                            <div className="project-media-row" key={item.id}>
+                              <input
+                                type="checkbox"
+                                aria-label={`Select ${item.originalFilename}`}
+                                checked={projectMediaSelection.includes(
+                                  item.id,
+                                )}
+                                onChange={(event) => {
+                                  setProjectMediaSelection((current) =>
+                                    event.target.checked
+                                      ? [...new Set([...current, item.id])]
+                                      : current.filter((id) => id !== item.id),
+                                  );
+                                  if (event.target.checked) {
+                                    setProjectMediaDescription(item.notes);
+                                    setProjectAddTags([]);
+                                    setProjectRemoveTags([]);
+                                  }
+                                }}
+                              />
+                              <div className="project-media-thumb">
+                                <MediaThumbnail
+                                  mediaId={item.id}
+                                  fileType={item.fileType}
+                                  thumbnailSource={thumbnailSources[item.id]}
+                                  sourceAvailable={item.available}
+                                  previewStored={previewStoredIds.has(item.id)}
+                                  onPreviewPrepared={receivePreparedPreview}
+                                  previewKey={`${item.id}:${item.sha256}:${item.observedSize ?? ''}:${item.observedModifiedMillis ?? ''}`}
+                                  previewCacheEpoch={previewCacheEpoch}
+                                  onThumbnailPrepared={receivePreparedThumbnail}
+                                />
+                              </div>
+                              <span>
+                                <strong>{item.originalFilename}</strong>
+                                <small>{item.relativePath}</small>
+                                <span className="pills">
+                                  {logicalTags(item, catalogue.media).map(
+                                    (tag) => (
+                                      <em key={tag}>{tag}</em>
+                                    ),
+                                  )}
+                                </span>
+                              </span>
+                              {item.favourite && (
+                                <Star aria-label="Favourite" size={14} />
+                              )}
+                              <button
+                                type="button"
+                                disabled={!item.available}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void desktopBridge
+                                    .revealMediaInExplorer(item.id)
+                                    .catch((reason) =>
+                                      setError(errorText(reason)),
+                                    );
+                                }}
+                              >
+                                Reveal
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  navigateProjectMediaToLibrary(item.id);
+                                }}
+                              >
+                                View in Library
+                              </button>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                      {available && availableProjectPageCount > 1 && (
+                        <div
+                          className="project-available-pages"
+                          aria-label="Available recording pages"
+                        >
                           <button
                             type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              navigateProjectMediaToLibrary(item.id);
-                            }}
+                            disabled={projectAvailablePage === 1}
+                            onClick={() =>
+                              setProjectAvailablePage((page) => page - 1)
+                            }
                           >
-                            View in Library
+                            Previous
+                          </button>
+                          <span>
+                            Page {projectAvailablePage} of{' '}
+                            {availableProjectPageCount}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={
+                              projectAvailablePage === availableProjectPageCount
+                            }
+                            onClick={() =>
+                              setProjectAvailablePage((page) => page + 1)
+                            }
+                          >
+                            Next
                           </button>
                         </div>
-                      ))}
+                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </section>
             </section>
           ) : (
@@ -3774,12 +6752,132 @@ export function App() {
             </section>
           )
         ) : (
-          <section className="empty">
-            <h2>No destructive archive actions</h2>
+          <section className="settings-form backup-workspace">
+            <h2>Verified backup</h2>
             <p>
-              Automatic deletion and cleanup are intentionally deferred. Your
-              source recordings remain untouched.
+              Copy a complete project folder to a separate drive. PIMP stages
+              each file on that drive, preserves its hierarchy, refuses
+              overwrites, and verifies every SHA-256 hash before marking the
+              backup verified.
             </p>
+            <SearchableComboBox
+              label="Project to back up"
+              mode="single"
+              options={catalogue.projects.map((project) => ({
+                id: project.id,
+                label: project.name,
+                description: project.workingDirectory,
+              }))}
+              selectedIds={backupProjectId ? [backupProjectId] : []}
+              onSelectionChange={(ids) => setBackupProjectId(ids[0])}
+              placeholder="Search projects…"
+            />
+            <PathField
+              label="External-drive destination"
+              value={backupDestination}
+              onChange={setBackupDestination}
+              onBrowse={async () => {
+                const path = await desktopBridge.chooseFolder();
+                if (path) setBackupDestination(path);
+              }}
+            />
+            <button
+              type="button"
+              className="primary"
+              disabled={backupBusy || !backupProjectId || !backupDestination}
+              onClick={() => void startBackup()}
+            >
+              {backupBusy
+                ? 'Backup operation running…'
+                : 'Start verified backup'}
+            </button>
+
+            <div className="backup-safety" role="note">
+              <strong>Cleanup is unavailable</strong>
+              <p>
+                This milestone never deletes source media. A verified backup is
+                evidence only; it does not prove Premiere dependency collection
+                or authorize cleanup.
+              </p>
+            </div>
+
+            <section className="backup-provider">
+              <h3>Degoo handoff</h3>
+              <p>
+                Degoo has no supported public integration API suitable for an
+                unattended PIMP backup. Use Degoo's official browser to upload a
+                verified generation. Cloud status remains verification pending
+                until PIMP can independently download and hash every object.
+              </p>
+              <button
+                type="button"
+                onClick={() => void desktopBridge.openSupportLink('degoo')}
+              >
+                Open official Degoo web app
+              </button>
+            </section>
+
+            <section className="backup-history">
+              <h3>Backup jobs</h3>
+              {backupJobs.length === 0 ? (
+                <p>No backup jobs have been created on this device.</p>
+              ) : (
+                backupJobs
+                  .slice()
+                  .reverse()
+                  .map((job) => (
+                    <article key={job.id} className="backup-job">
+                      <div>
+                        <strong>{job.projectName}</strong>
+                        <span className={`status ${job.state}`}>
+                          {job.state}
+                        </span>
+                      </div>
+                      <small title={job.generationPath}>
+                        {job.generationPath}
+                      </small>
+                      <progress
+                        max={Math.max(job.manifest.sourceBytes, 1)}
+                        value={job.bytesCompleted}
+                      />
+                      <small>
+                        {job.filesCompleted} / {job.manifest.sourceFileCount}{' '}
+                        files · {size(job.bytesCompleted)} /{' '}
+                        {size(job.manifest.sourceBytes)}
+                      </small>
+                      {job.error && <p role="alert">{job.error}</p>}
+                      <div className="project-actions">
+                        {job.state === 'verified' ? (
+                          <>
+                            <button
+                              type="button"
+                              disabled={backupBusy}
+                              onClick={() => void verifyBackup(job.id)}
+                            >
+                              Re-verify hashes
+                            </button>
+                            <button
+                              type="button"
+                              disabled={backupBusy}
+                              onClick={() => void testBackupRestore(job.id)}
+                            >
+                              Test restore to empty folder
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={backupBusy}
+                            onClick={() => void retryBackup(job.id)}
+                          >
+                            Choose drive and retry
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ))
+              )}
+            </section>
           </section>
         )}
       </main>
@@ -3879,6 +6977,9 @@ function MediaThumbnail({
   holdFrame = 'first',
   preloading = 'visible-nearby',
   allowBackgroundPreparation = true,
+  onThumbnailPrepared,
+  previewStored = false,
+  onPreviewPrepared,
 }: {
   mediaId: string;
   fileType: string;
@@ -3890,9 +6991,12 @@ function MediaThumbnail({
   holdFrame?: DeviceSettings['thumbnailHoldFrame'];
   preloading?: DeviceSettings['previewPreloading'];
   allowBackgroundPreparation?: boolean;
+  onThumbnailPrepared?: (mediaId: string, source: string) => void;
+  previewStored?: boolean;
+  onPreviewPrepared?: (mediaId: string) => void;
 }) {
   const thumbnailRef = useRef<HTMLDivElement>(null);
-  const [showThumbnail, setShowThumbnail] = useState(
+  const [nearViewport, setNearViewport] = useState(
     () => typeof IntersectionObserver === 'undefined',
   );
   const [previewEntry, setPreviewEntry] = useState<{
@@ -3906,7 +7010,14 @@ function MediaThumbnail({
   );
   const latestHoveredRatio = useRef(lastHoveredRatio);
   const [isHovering, setIsHovering] = useState(false);
+  const [failedImageSource, setFailedImageSource] = useState<string>();
+  const [staticImageRetry, setStaticImageRetry] = useState<{
+    source: string;
+    attempt: number;
+  }>();
+  const staticImageRetryTimer = useRef<number | undefined>(undefined);
   const requestGeneration = useRef(0);
+  const staticRequestGeneration = useRef(0);
   const releasePreview = useCallback(() => {
     requestGeneration.current += 1;
     setPreviewIndex(undefined);
@@ -3921,6 +7032,12 @@ function MediaThumbnail({
   useEffect(() => {
     requestGeneration.current += 1;
   }, [previewCacheEpoch]);
+  useEffect(() => {
+    return () => {
+      if (staticImageRetryTimer.current != null)
+        window.clearTimeout(staticImageRetryTimer.current);
+    };
+  }, [thumbnailSource]);
   const preview =
     previewEntry &&
     previewEntry.key === previewKey &&
@@ -3934,56 +7051,134 @@ function MediaThumbnail({
     previewableVideoTypes.has(fileType.toLowerCase()) &&
     !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
   const requestPreview = useCallback(
-    (priority: PreviewPriority = 0) => {
+    (priority: PreviewPriority = 2) => {
       if (preview || !previewKey || !previewEligible) return;
       previewWorkQueue.promote(`load:${previewKey}`, priority);
       const generation = ++requestGeneration.current;
       const request = hoverPreviewRequestCache.request(previewKey, () =>
-        previewWorkQueue.schedule(
-          `load:${previewKey}`,
-          priority,
-          fileType.toUpperCase(),
-          () => desktopBridge.loadHoverPreview(mediaId),
-        ),
+        desktopBridge.loadHoverPreview(mediaId),
       );
       void request
         .then((result) => {
           if (
             generation === requestGeneration.current &&
             result.mediaId === mediaId
-          )
+          ) {
             setPreviewEntry({
               key: previewKey,
               epoch: previewCacheEpoch,
               preview: result,
             });
+            onPreviewPrepared?.(mediaId);
+          }
         })
         .catch(() => undefined);
     },
     [
-      fileType,
       mediaId,
       preview,
       previewCacheEpoch,
       previewEligible,
       previewKey,
+      onPreviewPrepared,
     ],
   );
   useEffect(() => {
     const element = thumbnailRef.current;
     if (!element || typeof IntersectionObserver === 'undefined') return;
-    const observer = new IntersectionObserver(
+    const generation = ++staticRequestGeneration.current;
+    let nearby = false;
+    let attempts = 0;
+    let retryTimer: number | undefined;
+    const request = (priority: PreviewPriority) => {
+      if (
+        !nearby ||
+        thumbnailSource ||
+        !sourceAvailable ||
+        !previewKey ||
+        !previewableVideoTypes.has(fileType.toLowerCase())
+      )
+        return;
+      void requestStaticThumbnail(
+        previewKey,
+        mediaId,
+        priority,
+        previewCacheEpoch,
+      )
+        .then((source) => {
+          if (generation === staticRequestGeneration.current)
+            onThumbnailPrepared?.(mediaId, source);
+        })
+        .catch((reason) => {
+          if (
+            generation !== staticRequestGeneration.current ||
+            !nearby ||
+            attempts >= 4
+          )
+            return;
+          attempts += 1;
+          const delay =
+            reason instanceof StaticThumbnailBackoffError
+              ? Math.max(50, reason.retryAt - Date.now())
+              : Math.min(30_000, 500 * 2 ** (attempts - 1));
+          retryTimer = window.setTimeout(() => request(priority), delay);
+        });
+    };
+    const nearObserver = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
-          setShowThumbnail(true);
-          observer.disconnect();
+          nearby = true;
+          setNearViewport(true);
+          setFailedImageSource((failed) =>
+            failed === thumbnailSource ? undefined : failed,
+          );
+          request(1);
+        } else {
+          nearby = false;
+          setNearViewport(false);
+          if (retryTimer != null) window.clearTimeout(retryTimer);
+          if (previewKey)
+            staticThumbnailWorkQueue.cancel(
+              staticThumbnailQueueKey(previewKey, previewCacheEpoch),
+            );
         }
       },
-      { rootMargin: '400px' },
+      // Roughly three grid rows on the supported thumbnail-size range. This
+      // keeps about the next twelve cached images warm without retaining
+      // decoded Image objects in application state.
+      { rootMargin: '1200px' },
     );
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
+    const visibleObserver = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          nearby = true;
+          request(0);
+        }
+      },
+      { rootMargin: '0px' },
+    );
+    nearObserver.observe(element);
+    visibleObserver.observe(element);
+    return () => {
+      staticRequestGeneration.current += 1;
+      nearby = false;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      nearObserver.disconnect();
+      visibleObserver.disconnect();
+      if (previewKey)
+        staticThumbnailWorkQueue.cancel(
+          staticThumbnailQueueKey(previewKey, previewCacheEpoch),
+        );
+    };
+  }, [
+    fileType,
+    mediaId,
+    onThumbnailPrepared,
+    previewKey,
+    previewCacheEpoch,
+    sourceAvailable,
+    thumbnailSource,
+  ]);
   useEffect(() => {
     const element = thumbnailRef.current;
     if (!element || typeof IntersectionObserver === 'undefined') return;
@@ -4001,8 +7196,10 @@ function MediaThumbnail({
     if (
       !element ||
       preview ||
+      !thumbnailSource ||
       !previewEligible ||
       preloading === 'hovered' ||
+      preloading === 'off' ||
       typeof IntersectionObserver === 'undefined'
     )
       return;
@@ -4011,9 +7208,10 @@ function MediaThumbnail({
         const isNearby = entries.some((entry) => entry.isIntersecting);
         if (isNearby && allowBackgroundPreparation && previewKey)
           void previewWorkQueue
-            .schedule(`prepare:${previewKey}`, 2, fileType.toUpperCase(), () =>
+            .schedule(`prepare:${previewKey}`, 4, fileType.toUpperCase(), () =>
               desktopBridge.prepareHoverPreview(mediaId),
             )
+            .then(() => onPreviewPrepared?.(mediaId))
             .catch(() => undefined);
         else if (
           !isNearby &&
@@ -4023,16 +7221,18 @@ function MediaThumbnail({
         )
           void idlePreviewScheduler
             .schedule(`prepare:${previewKey}`, () =>
-              previewWorkQueue.schedule(
-                `prepare:${previewKey}`,
-                3,
-                fileType.toUpperCase(),
-                () => desktopBridge.prepareHoverPreview(mediaId),
-              ),
+              previewWorkQueue
+                .schedule(
+                  `prepare:${previewKey}`,
+                  5,
+                  fileType.toUpperCase(),
+                  () => desktopBridge.prepareHoverPreview(mediaId),
+                )
+                .then(() => onPreviewPrepared?.(mediaId)),
             )
             .catch(() => undefined);
       },
-      { rootMargin: '400px' },
+      { rootMargin: preloading === 'visible' ? '0px' : '400px' },
     );
     const visible = new IntersectionObserver(
       (entries) => {
@@ -4040,7 +7240,7 @@ function MediaThumbnail({
           allowBackgroundPreparation &&
           entries.some((entry) => entry.isIntersecting)
         )
-          requestPreview(1);
+          requestPreview(3);
       },
       { rootMargin: '0px' },
     );
@@ -4059,7 +7259,9 @@ function MediaThumbnail({
     preview,
     previewEligible,
     previewKey,
+    onPreviewPrepared,
     requestPreview,
+    thumbnailSource,
   ]);
   const displayedFrame =
     preview &&
@@ -4074,6 +7276,18 @@ function MediaThumbnail({
     (preview
       ? holdFrameIndex(preview, holdFrame, lastHoveredRatio)
       : undefined);
+  const imageSource =
+    displayedFrame && displayedFrame !== failedImageSource
+      ? displayedFrame
+      : thumbnailSource && thumbnailSource !== failedImageSource
+        ? thumbnailSource
+        : undefined;
+  const renderedImageSource =
+    imageSource &&
+    imageSource === thumbnailSource &&
+    staticImageRetry?.source === thumbnailSource
+      ? `${imageSource}${imageSource.includes('?') ? '&' : '?'}pimp_retry=${staticImageRetry.attempt}`
+      : imageSource;
   return (
     <div
       ref={thumbnailRef}
@@ -4108,15 +7322,58 @@ function MediaThumbnail({
           : undefined
       }
     >
-      {displayedFrame || (showThumbnail && thumbnailSource) ? (
+      {renderedImageSource ? (
         <img
-          src={displayedFrame ?? thumbnailSource}
+          src={renderedImageSource}
           alt=""
-          loading="lazy"
+          draggable={false}
+          loading={nearViewport ? 'eager' : 'lazy'}
           decoding="async"
+          onDragStart={(event) => event.preventDefault()}
+          onError={() => {
+            if (imageSource !== thumbnailSource || !thumbnailSource) {
+              setFailedImageSource(imageSource);
+              return;
+            }
+            const attempt =
+              staticImageRetry?.source === thumbnailSource
+                ? staticImageRetry.attempt
+                : 0;
+            if (attempt >= 2) {
+              setFailedImageSource(thumbnailSource);
+              void desktopBridge.logUiError(
+                `Static thumbnail failed after bounded retries for media ${mediaId}`,
+              );
+              return;
+            }
+            if (staticImageRetryTimer.current != null)
+              window.clearTimeout(staticImageRetryTimer.current);
+            staticImageRetryTimer.current = window.setTimeout(
+              () => {
+                setStaticImageRetry({
+                  source: thumbnailSource,
+                  attempt: attempt + 1,
+                });
+                staticImageRetryTimer.current = undefined;
+              },
+              attempt === 0 ? 250 : 1_000,
+            );
+          }}
         />
       ) : (
         <span className="file-kind">{fileType.toUpperCase()}</span>
+      )}
+      {preview && (
+        <span
+          className="preview-ready-indicator"
+          title="Scrubbable preview ready"
+          aria-label="Scrubbable preview ready"
+        />
+      )}
+      {!preview && previewStored && (
+        <span className="sr-only">
+          Scrubbable preview stored on this device
+        </span>
       )}
       {isHovering &&
         displayedIndex != null &&

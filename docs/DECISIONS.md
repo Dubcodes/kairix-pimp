@@ -218,7 +218,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 ## ADR-028 — Fail-closed signed Beta update channel
 
 - **Date:** 2026-10-26
-- **Status:** Accepted
+- **Status:** Superseded by ADR-070 for channel naming and version policy; signature and fail-closed requirements retained
 - **Decision:** In-app updates use only the official Tauri 2 updater, an embedded minisign public key and the fixed HTTPS `beta-channel/latest.json` release asset. Only reviewed beta tags with protected signing secrets may publish that manifest and signed NSIS updater payload. Beta builds use a numeric SemVer prerelease component (for example `0.1.1-1`) so the same version remains valid for Windows MSI packaging; the release channel remains explicitly Beta. The application blocks installation during active ingest. Missing key configuration is an actionable unavailable state, never “up to date.”
 - **Release-candidate clarification:** The host now owns an update-installation gate. It atomically checks durable job state before installation and prevents start, resume or retry until the updater returns or restarts the process. Public-key syntax is validated in the native configuration response. Version `0.1.1-4` is a completed-ingest and preview-cache correction candidate; it is not evidence of a completed signed upgrade.
 - **Consequences:** The source and CI foundation are complete, but in-app installation remains provisionally disabled until the release owner provisions the protected private key/password and matching public repository variable. Manual per-user NSIS installation remains supported.
@@ -304,8 +304,8 @@ Known early decisions predate this log; their original dates were not recorded. 
 
 - **Date:** 2026-10-28
 - **Status:** Accepted
-- **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card.
-- **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Cards outside the viewport retain placeholders until near view. The grid itself is still not virtualized; the 3,000-card component measurement remains a baseline for the planned large-library virtualization milestone.
+- **Decision:** Resolve all requested catalogue thumbnail references in one native command per catalogue revision, validating the expected media-ID filename and canonical cache containment once before returning local asset URLs. Library cards use an IntersectionObserver margin plus browser-native lazy/async image decoding instead of invoking a catalogue replay and Base64 transfer per card. If a near-visible available video has no valid static image, request one fingerprint-keyed canonical cache generation and share its source with every workspace.
+- **Consequences:** A 700-record Library performs one lightweight thumbnail-source lookup rather than hundreds of native catalogue loads and large IPC payloads. Existing cached cards outside the viewport retain placeholders until near view; genuinely missing near-visible images no longer wait behind catalogue-order enrichment, and hover preparation waits for the static result. The request cache is bounded and retains failures for that source fingerprint to prevent remount retry loops. The grid itself is still not virtualized; installed performance measurement remains required.
 
 ## ADR-041 — Seed durable ingest metadata without replacing file edits
 
@@ -369,3 +369,193 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Package the Premiere Companion separately and begin with a user-selected schema-1 JSON manifest rather than a persistent local network service. The native exporter resolves only explicit known media IDs beneath canonical Master Bin, includes selected attached audio, refuses overwrite, and exposes no arbitrary filesystem command. The UXP panel requests access only to that file, uses supported Premiere 25.6 APIs, reconciles existing media paths and never reads `.prproj` internals.
 - **Consequences:** Desktop PIMP remains independent of the plugin and no authentication/listening service is needed. Manifest selection is an explicit user step. Automated validation proves the interchange boundary, but `.ccx` packaging and real Premiere imports remain unverified until UXP Developer Tool and installed-project acceptance are completed.
+
+## ADR-050 — Verify provider-neutral backups before cloud handoff
+
+- **Date:** 2026-10-29
+- **Status:** Accepted
+- **Reviewed:** 2026-10-30 after focused review of the available reverse-engineered Degoo client and the inconclusive disposable-account browser transfer.
+- **Decision:** Back up complete registered Working Project folders through a persistent device-local job, same-destination-volume staging, source-consistency checks, atomic no-overwrite promotion and a portable SHA-256 manifest. Record destination volume identity separately from its drive letter. Treat upload acknowledgement, listings and provider metadata as verification-pending until every remote object can be independently read through a supported interface and matched to the manifest. Use only documented provider interfaces or explicit written provider authorization. Degoo remains a manual official-browser handoff while no suitable public API exists; private web endpoints, browser-fingerprint impersonation, retained browser sessions and browser automation are not production integration mechanisms.
+- **Consequences:** External-drive copies can be retried and independently restored without modifying sources. The manifest remains provider-neutral and excludes credentials/device paths. The reviewed community Degoo client is evidence of a historic private protocol only and its code is not copied; any future native adapter needs provider authorization, OS credential storage, resumable/idempotent transfer semantics, independent restored-byte SHA-256 verification, Windows acceptance and a separate license/security review. Backup evidence does not imply Premiere collection completeness or cleanup eligibility, and no deletion operation exists.
+
+## ADR-051 — Coordinate update installation and suppress unchanged scan evidence
+
+- **Date:** 2026-10-30
+- **Status:** Accepted
+- **Decision:** Use one short-lived native coordinator for update authorization and critical filesystem-operation permits. Installation checks durable ingest and active backup state plus permits for scan, integrity verification, backup/restore work, enrichment, preview generation/preparation and cache clearing; new conflicting work fails closed after authorization. Keep long work outside the coordinator mutex. Run discovery traversal/hashing on a blocking worker and stream entries. A full scan still hashes every eligible known file but appends `media.evidence-observed` only when this device's size, timestamp, SHA-256 or review state changes, with a second equality check against the latest projection before append. Updater checks/installations are single-flight, and failed checks/downloads clear their resource so retry starts from a fresh signed manifest.
+- **Consequences:** Update installation cannot race into named recoverable filesystem work, stale updater objects cannot be installed after a failed check, and repeated unchanged full scans no longer grow synchronized event streams. Total scan work remains proportional to files/hashes requested, event replay remains authoritative, and automatic updates remain unverified until protected keys are provisioned and a real installed Windows version-to-version acceptance pass succeeds.
+
+## ADR-052 — Freeze ingest approval and verify global duplicates locally
+
+- **Date:** 2026-10-30
+- **Status:** Accepted
+- **Decision:** Persist a device-local approved plan at inventory time and require its opaque UUID when creating a job. Record exact sources, snapshots, SHA-256 and planned destinations; reject changed plans/sources and never rebuild the selection at start. Use catalogue hash/size only to locate global duplicate candidates, then freshly resolve, snapshot and SHA-256 a local Master Bin copy before skipping. Reserve content hashes across active jobs. Keep an explicit second-copy override. Build the SD Card Grabber as a filtered MP4/WAV entry point into this same ingest pipeline, with Windows removable-volume identity separate from drive letter and manual folder fallback.
+- **Consequences:** A card can be rescanned under another date/name without copying verified existing content, while remote catalogue knowledge cannot cause footage loss. Scanning performs one bounded source hash per included file and candidate verification reads, trading deliberate card I/O for dependable duplicate decisions. Approved plans and device identities remain local; authoritative event schemas do not change. Cleanup remains disabled.
+
+## ADR-053 — Serialize cancellable removable-media inventory off the event thread
+
+- **Date:** 2026-11-04
+- **Status:** Accepted
+- **Decision:** Run traversal, chunked SHA-256 and duplicate inspection in one serialized Tauri blocking worker identified by a UI-generated operation ID. A newer request cancels the prior operation; cancellation is checked between entries and every hash chunk. Publish stage, item and byte progress through a typed Background Operations contract. Do not repeat full source hashing when converting the approved plan into a job. Instead, bind the plan to the optional Windows volume identity and require the bytes copied by the worker to match the approved SHA-256 before staging promotion, followed by the existing independent staging and source-consistency checks.
+- **Consequences:** Large cards no longer monopolize the desktop event thread or create overlapping full-card reads. Cancellation is cooperative rather than forceful, so an in-progress OS read completes before the next check. Existing approved-plan and job stores remain readable through serde defaults. Physical-card disconnect, installed shutdown and resource measurements remain release-blocking acceptance work; source deletion remains unavailable.
+
+## ADR-054 — Keep Premiere manifest fallback while direct transports await host proof
+
+- **Date:** 2026-11-04
+- **Status:** Accepted
+- **Decision:** Continue the first-party UXP companion on documented 25.6 APIs, recursively reconcile existing media paths, reuse exact child-bin names and default to `PIMP Media / <actual Master Bin folder>`. Rename clipboard UI to **Copy file paths** and describe it as text. Convert only short legacy-safe extended drive paths at the human/API boundary. Do not enable direct loopback handoff until authenticated pairing and Premiere 26.0.2 network-permission behavior are accepted. Do not enable outbound drag until a Windows OLE `IDataObject`/`CF_HDROP` copy-only source is accepted against Explorer and Premiere 26.0.2.
+- **Consequences:** Manual manifest selection remains an extra step but is explicit, offline and narrow. Automated tests establish selection, path conversion and reconciliation logic, not real Premiere behavior. HTML/text drag, direct `.prproj` modification, third-party helpers and Premiere 27-only drag features remain excluded.
+
+## ADR-055 — Validate rebuildable thumbnails and isolate Windows Shell paths
+
+- **Date:** 2026-11-04
+- **Status:** Accepted
+- **Decision:** Treat a catalogue thumbnail reference as a hint and require the expected cache-owned file to be a bounded non-empty JPEG before display or reuse. Regenerate only missing/invalid candidates through a cache-local temporary file and atomic rename, expose attempted/generated/existing/failed/pending counts, and retry on later startup passes. At the Explorer boundary only, convert short legacy-safe extended drive/UNC paths and invoke `SHOpenFolderAndSelectItems` with the containing-folder PIDL plus child PIDL.
+- **Consequences:** Eviction and damaged cache files self-heal without rebuilding every thumbnail or touching originals. Long or legacy-unsafe Shell paths fail with a precise limitation instead of mutating canonical filesystem paths. Automated API-boundary tests do not replace installed Explorer/WebView2 acceptance.
+
+## ADR-056 — Keep clip playback in-window and custom frames cache-owned
+
+- **Date:** 2026-11-04
+- **Status:** Accepted
+- **Decision:** Resolve Clip Viewer playback from a known catalogue ID through the native root boundary and use WebView2's media element before considering bounded on-demand proxies. Keep selection/filter state in the Library view. Generate a manually chosen thumbnail with FFmpeg only on explicit request and validate source stability plus JPEG output. ADR-071 supersedes the original device-local placement: the selected frame now creates a distinct shared static derivative while the playback proxy remains local.
+- **Consequences:** Common codecs gain practical offline playback without another window or source mutation, while unsupported codecs fail visibly. A custom frame can follow the catalogue to another synchronized device without becoming authoritative media evidence. Installed WebView2 codec, keyboard, fullscreen, scaling and portrait acceptance remains required.
+
+## ADR-057 — Index only bounded stable saved-project snapshots
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Add a conservative read-only fallback alongside ADR-037's preferred Companion path. Parse only the deterministic main `.prproj` after a stable size/modification read, accept bounded gzip-XML/XML, reject document types and excessive decompression/events/depth/values, and resolve only unambiguous canonical object definitions/references, project containers, bins and track items. Persist the fingerprinted projection device-locally. Associate catalogue media only by exact existing canonical path.
+- **Consequences:** Projects can expose useful offline saved-state evidence without a plugin or project mutation. Sanitized Premiere-26-shaped evidence supports named definition deduplication, root/nested placement, imported/used/unclassified path states and placement counts. Time ranges and ambiguous relationships remain unknown rather than inferred. ADR-064 further restricts historical labels to prior positive observations. Projections never authorize cleanup, and live Companion evidence retains separate provenance.
+
+## ADR-058 — Keep selection workflow history local and non-authoritative
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Keep the compact Library selection toolbar fixed above the scrolling grid and store only its device-local position/action visibility in WebView local storage. Retain at most 50 in-memory selection snapshots containing stable media IDs and the range anchor. Keyboard undo/redo applies only to selection and yields to editable controls.
+- **Consequences:** Accidental selection loss is recoverable without undoing metadata or filesystem operations, toolbar preferences never enter synchronized events, and removed media IDs are pruned from history. Installed WebView2 focus, zoom and assistive-technology acceptance remains required.
+
+## ADR-059 — Reapprove date mapping without rehashing and proxy only on demand
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Restore exactly Today, Yesterday, Choose date and Use clip date as request-scoped ingest choices. When an approved inventory exists, re-enumerate its source selection, reject any size/modification change, reuse its stored SHA-256 evidence and issue a replacement approved plan after recomputing package-safe destinations, duplicates and collisions. For Clip Viewer failures, generate only an explicitly requested H.264/AAC proxy in the device cache, fingerprinted by media/source/transform identity, validated with FFprobe and committed only after a source-stability recheck.
+- **Consequences:** Destination-only date changes do not impose another full-card read and cannot silently alter the saved two-mode preference. Unsupported codecs gain a bounded retryable cache fallback without changing originals or prebuilding the Library. Installed HEVC playback plus conversion cancellation and meaningful progress remain required before calling the fallback fully accepted.
+
+## ADR-060 — Bound available project media without a second cache
+
+- **Date:** 2026-11-05
+- **Status:** Accepted
+- **Decision:** Keep assigned project recordings visible. Keep available-to-add media collapsed and unmounted until requested, then filter it by text/tags and render 50 logical recordings per page. Reuse canonical media IDs, logical audio grouping, thumbnail-source state and the ordinary missing-thumbnail recovery path from Library.
+- **Consequences:** Opening a project no longer mounts hundreds of hidden cards or starts page-specific media work. Assignment remains an authoritative metadata operation. Native outbound drag remains disabled under ADR-054 until a copy-only OLE payload is accepted in Explorer and Premiere 26.0.2.
+
+## ADR-061 — Retain only in-flight static-thumbnail requests
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Deduplicate static-thumbnail requests only while their promise is in flight. Store bounded failure/backoff state separately, retry cancellations immediately, and key requests by source identity plus cache generation. Prioritize visible and nearby static images ahead of explicit and automatic hover work. Coordinate native writes with bounded per-media locks while keeping FFmpeg outside the catalogue write mutex and protecting the returned file during cache eviction.
+- **Consequences:** An empty or failed request no longer permanently suppresses a visible thumbnail, navigation shares genuine concurrent work, and enrichment of another recording cannot block the foreground image behind the whole pass. Repeated failures remain rate-limited, cache/source replacements get fresh request identities, and no synchronized event is emitted when catalogue enrichment would be a no-op.
+
+## ADR-062 — Revise approved ingest plans without rescanning source roots
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Treat a destination-date change as a serialized revision of the persisted approved plan. Recheck only the exact approved source paths, their size/modification snapshot and optional volume identity; retain their approved SHA-256 without reopening source content or discovering new files. Persist the camera-package representative timestamp needed for deterministic package-safe original-date mapping. Keep earlier revisions until the replacement is durably written, identify all revisions by one lineage, reject superseded revisions at ingest start and consume the lineage only after its job is durable. Run native replanning on a blocking worker and serialize frontend intents so the latest selection is rebased on the latest durable revision.
+- **Consequences:** Date changes perform zero source-content bytes of I/O and work in proportion to the approved file list rather than the size or contents of selected roots. Fresh local verification of existing Master Bin duplicate candidates may still read those destination candidates. Older schemas remain readable through defaults; a legacy camera-package plan without package-date evidence must be rescanned before selecting original file dates. Interrupted writes retain the prior valid revision, while stale responses cannot authorize an unintended ingest.
+
+## ADR-063 — Manage playback proxies as cancellable fingerprinted work
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Generate an on-demand playback proxy in a blocking worker with one per-fingerprint generation lock, FFmpeg's machine-readable progress stream and cooperative cancellation that kills and waits for the child before reporting cancellation. Expose actual processed/total time through Background Operations and terminate registered FFmpeg children during application exit paths. Accept a cache entry only after FFprobe proves a finalized MP4 container, nonzero duration, H.264 yuv420 video and AAC for any audio stream, followed by the existing source-snapshot recheck and no-overwrite promotion. Give playback proxies a separate persisted cache allowance, protect files currently returned to Clip Viewer and active partials, reject symlink entries during eviction and remove only abandoned PIMP-named partials.
+- **Consequences:** Concurrent requests do not launch duplicate encoders, cancellation and failure leave retryable state instead of a plausible partial MP4, and a configured budget is no longer silently raised to 512 MB. Cache identity includes source and transform evidence, so parameter changes cannot reuse incompatible output. Automated lifecycle/validation tests do not establish installed WebView2 codec behavior, real HEVC throughput or shutdown behavior under every Windows failure mode.
+
+## ADR-064 — Give editable controls keyboard ownership and keep Premiere absence unknown
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Global Library/viewer shortcuts yield whenever focus is in an input, textarea, select, contenteditable field, searchable combo, menu or modal interaction. Selection undo/redo remains device-local and never intercepts native text editing. Saved-project indexing classifies an arbitrary path as unclassified unless the same canonical path has prior positive imported/used evidence in the previous device-local projection; only that carry-forward may be labelled historical. If bounded parsing cannot establish timeline relationships, imported-versus-unused counts remain unknown rather than zero.
+- **Consequences:** Typing, native undo and combo-box navigation cannot accidentally play media or change the Library selection. Saved-project summaries avoid turning parser absence into negative editorial evidence, while previously observed positive evidence remains visible with explicit historical provenance. Legacy projection values remain readable, but neither historical nor unclassified evidence authorizes cleanup; broad Premiere and installed keyboard acceptance remain external work.
+
+## ADR-065 — Separate static and hover-preview processing lanes
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Give ordinary static thumbnails and hover-preview generation independent bounded frontend work lanes. Static visible/near-visible work keeps its own priority queue and retry backoff; clearing hover data never cancels it. Bound static extraction to 60 seconds and remove its cache-local temporary on timeout. Load a validated disk-cached hover preview outside the generation queue and before FFmpeg/volume admission. Treat batched fingerprint-and-manifest results as stored evidence, while the preview-ready indicator requires frames loaded in frontend memory.
+- **Consequences:** A long hover encode or a saturated generation queue cannot starve missing Library images or a cache-hit read. The blue indicator means scrubbing works immediately and disappears when the component releases its frame collection; disk evidence can reload without regeneration. Installed slow-drive and WebView2 latency measurements remain required.
+
+## ADR-066 — Project authoritative worker state into native Windows progress
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Register static-thumbnail and hover-preview worker lifetimes in the native Background Operations projection. Select one active native operation for the window title and Tauri-supported Windows taskbar progress; show a determinate percentage only from that operation's measured byte/item total, otherwise use the indeterminate state. Clear the native state when work ends and show an error state for durable ingest attention when no worker is active.
+- **Consequences:** Clip conversion, scans, project indexing, backups, thumbnails and hover preparation share one observable device-local model without synchronized progress churn. Unrelated jobs are never averaged into a fabricated percentage. Installed Windows title/taskbar behavior still requires acceptance with the packaged app.
+
+## ADR-067 — Persist responsive Library tile width separately from density
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Store a device-local Library thumbnail width from 160–360 logical pixels. Use CSS auto-fill columns and stable 16:9 media boxes, while density continues to control surrounding spacing rather than derivative generation. Give the folder tree and media panel independent overflow within the available workspace height, and place Scroll to top at the lower-right of the media area.
+- **Consequences:** Wide windows can show more than three columns without stretching every card, resizing/sidebar changes reflow automatically, and zooming tiles never regenerates cache files. Folder and media scrolling no longer depend on a fixed sticky-panel maximum. High-DPI and installed small/ultrawide window acceptance remain manual.
+
+## ADR-068 — Serialize derivative FFmpeg and optimize proxy seek points
+
+- **Date:** 2026-11-06
+- **Status:** Accepted
+- **Decision:** Keep static and hover request lanes independent, but admit only one derivative FFmpeg process globally. Order waiters as playback/custom-frame work, visible static thumbnails, interactive hover work and finally background hover/enrichment; never interrupt the active child merely to reorder the queue. Encode playback proxies with `fastdecode`, a forced keyframe every two seconds, H.264 yuv420p/AAC and `+faststart`, and version the transform fingerprint so old proxies are never mistaken for the new profile. Record source-resolution, metadata, first-frame, playing, seek and proxy-generation timings device-locally.
+- **Consequences:** Slow disks do not receive simultaneous thumbnail/hover/proxy decoders, while visible work runs before queued background work after the current safe boundary. A 12-second synthetic 1080p benchmark reduced seven-second proxy seek from about 171–172 ms to 136 ms, kept encode time within 15 ms, and increased output size by about 18%; installed production footage may behave differently. Incremental playback of an incomplete proxy remains rejected because only finalized, probed output is trusted.
+
+## ADR-069 — Coordinate full-content work by stable volume identity
+
+- **Date:** 2026-11-07
+- **Status:** Accepted
+- **Decision:** Add one device-local governor beneath existing durable jobs and the global derivative gate. Prefer Windows volume GUID identity, atomically acquire sorted source/destination needs, allow one full-content accessor per identified volume, apply explicit priority only between safe units, and retain bounded aging, cancellation, shutdown, byte/wait metrics and I/O-error backoff. Quiet/Balanced/Performance and gentle/pause settings change actual admission. Idle expansion requires input inactivity plus supported CPU and available-memory evidence; input inactivity alone is insufficient. Quick Library inventory becomes metadata-only.
+- **Consequences:** Ingest, verification, backup/restore and derivatives no longer compete invisibly on the same identified volume, while independent volumes can proceed within the selected profile. Existing job journals and promotion boundaries remain authoritative. Windows cannot always prove that separate logical volumes share physical hardware, FFmpeg byte-rate caps are not enforceable through this boundary, and installed slow-drive/disconnect testing remains required.
+
+## ADR-070 — Classify protected SemVer releases explicitly
+
+- **Date:** 2026-11-07
+- **Status:** Accepted
+- **Decision:** Store valid three-component SemVer everywhere, display a zero patch without the technical suffix, and compare integer components rather than decimals or strings. Reserve whole-major versions for protected Stable promotion, but require explicit classification rather than inferring trust from the number. Publish approved Development and Stable builds as immutable GitHub Releases and expose independently signed channel manifests only after read-back verification.
+- **Consequences:** `1.22` correctly follows `1.3`, legacy `0.1.1-5` remains comparable, and current source can advance to `0.2` without falsely claiming `1.0`. Stable and Development users have distinct fail-closed channels. Owner key/environment provisioning and a real installed A-to-B signed upgrade remain release gates.
+
+## ADR-071 — Share deterministic static thumbnails, keep heavy derivatives local
+
+- **Date:** 2026-11-07
+- **Status:** Accepted
+- **Decision:** Store static JPEG derivatives beneath the selected shared catalogue at `thumbnails/v1`, named by source SHA-256 plus seek/format/transform version. Validate and flush unique temporary files, atomically promote without replacement, reuse a concurrent valid winner, and migrate validated legacy local JPEGs incrementally. Retain frontend asset references across ordinary refreshes. Keep hover previews, playback proxies and decoded presentation memory device-local and bounded.
+- **Consequences:** Syncthing-connected devices can display the same static thumbnail without repeated FFmpeg decoding, including before media arrives. Shared derivatives are not authoritative, are not silently evicted, and require a future explicit cleanup design. Custom frames now synchronize as distinct immutable derivatives. Real two-device conflict, arrival-order, free-space and installed 1,000-record scrolling acceptance remain outstanding.
+
+## ADR-072 — Serialize immutable release and updater-channel publication
+
+- **Date:** 2026-11-07
+- **Status:** Accepted
+- **Decision:** Serialize all public-release attempts and all signed-channel publication attempts with separate non-cancelling concurrency groups. Treat versioned installer and updater assets as immutable, permit a retry to reuse only a complete independently verified signed set, and stop on partial or different bytes. Compare the candidate against the current channel with integer SemVer before replacing `latest.json`; publish the manifest only after payload read-back and signature verification. A Stable payload carries both Stable and Development target entries before advancing both channels.
+- **Consequences:** A release event plus an explicit dispatch cannot race, an older job cannot roll a channel backward, and a failed build leaves the previous manifest intact. Same-version different bytes and ambiguous partial publications require owner review instead of automatic repair. Protected environments, signing credentials and an installed A-to-B acceptance pass remain mandatory external gates.
+
+## ADR-073 — Expose canonical originals through a pointer-driven COPY-only Windows OLE drag
+
+- **Date:** 2026-11-08
+- **Status:** Accepted, corrected 2026-11-14, pending installed host acceptance
+- **Decision:** Initiate native dragging only from real card or physical-folder pointer gestures after movement exceeds the Windows drag metrics. Disable HTML/card/image dragging, preserve selection while the gesture begins and invoke a maintained native drag library for ordinary short local paths. Resolve explicit media IDs and relative folders beneath the canonical Master Bin, expand each selected logical video's unambiguous attached-audio ID, deduplicate physical paths and reject missing, changed, escaped or excessive physical selections. Use `drag` 2.1.1 under its MIT/Apache-2.0 terms with COPY mode. Because that release has a confirmed unresolved Windows panic for UNC/mapped-share canonical forms and long paths, route those path classes through PIMP's guarded Shell/OLE implementation, which converts extended paths only for Shell parsing, retains absolute PIDLs, requires `CF_HDROP` and offers only `DROPEFFECT_COPY`.
+- **Consequences:** WebView2 cannot substitute a thumbnail JPEG or claim the HTML drag session before native drag starts. Explorer and applications such as Premiere receive ordinary physical file paths without clipboard text, browser MIME data or a helper application. A real folder preserves hierarchy, but no folder-preservation option is exposed for arbitrary multi-file selection because neither `CF_HDROP` nor the crate's Windows backend represents a virtual hierarchy. Automated tests establish expansion, adapter routing, pointer routing and payload format but do not establish cross-process behavior; Explorer cancellation/copy and Premiere 26.0.2 acceptance remain release gates. The manifest Companion remains the structured hierarchy/import workflow.
+
+## ADR-074 — Generate hover frames with bounded sparse seeks
+
+- **Date:** 2026-11-08
+- **Status:** Accepted
+- **Decision:** Replace the full-stream `fps` hover filter with at most eight sequential targeted input seeks at 320-pixel width. Preserve the first actual `showinfo` timestamp emitted for each retained JPEG, clamp the final request inside the media duration, use one 60-second deadline for the complete entry and invalidate old cache identities through schema/fingerprint version 3. Keep one FFmpeg child and one source-volume reader active at a time.
+- **Consequences:** A disposable 600-second, 1280×720 H.264 fixture on the development machine completed eight sparse samples in 1,286 ms versus 2,838 ms for the previous full-stream filter (about 55% less elapsed time). The same 120-second synthetic clip favored the old single process (711 ms versus 1,323 ms), so sparse generation is a long-media optimization, not a universal performance claim. The conservative eight-frame cap reduces optional work and RAM; installed 4K/production-codec and slow-drive acceptance remains required. Failed entries regenerate once under the existing queue/backoff policy.
+
+## ADR-075 — Prefer an existing finalized playback proxy during source resolution
+
+- **Date:** 2026-11-08
+- **Status:** Accepted
+- **Decision:** Give Clip Viewer a purpose-built native source resolver. Canonicalize the original and derive the existing source/transform fingerprint; if that exact proxy exists and FFprobe again proves the finalized H.264/yuv420/AAC MP4 contract, protect and return it. Otherwise return the original path without generating work. Keep explicit proxy generation as the fallback after WebView2 reports an unsupported source.
+- **Consequences:** Reopening an already proxied HEVC or otherwise unsupported clip no longer repeats the original playback failure or asks for another generation click. Resolution can incur one local FFprobe, but never a source transcode. Partial, stale and invalid cache files remain unavailable. Automated tests prove identity and UI reuse, not installed WebView2 first-frame latency; representative H.264/HEVC acceptance remains required.
+
+## ADR-076 — Scope WebView thumbnail assets to validated files at runtime
+
+- **Date:** 2026-11-10
+- **Status:** Accepted, pending installed large-library acceptance
+- **Decision:** Enable Tauri's asset protocol with an empty configured filesystem scope and include both `asset:` and the Windows `http://asset.localhost` origin in the image CSP. Native thumbnail commands may grant exact-file access only after resolving the configured shared store, rejecting path escape and validating bounded JPEG bytes. Retain stable converted URLs, retry a transient static load twice with cache-busting request identities and prewarm roughly the next three grid rows without retaining decoded `Image` objects.
+- **Consequences:** A user-selected shared catalogue works in the packaged WebView without exposing Master Bin or a whole drive to frontend asset requests. Transient WebView/cache failures do not permanently suppress a valid derivative, and hover-frame memory can be released independently. Runtime file grants last for the process lifetime; broad static globs remain forbidden. Installed WebView2 cold/warm and repeated approximately-1,000-record scrolling measurements remain required before the latency target is claimed.

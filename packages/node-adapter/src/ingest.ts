@@ -1,5 +1,5 @@
-import { createReadStream, createWriteStream } from 'node:fs';
-import { access, mkdir, rename, rm, stat } from 'node:fs/promises';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
+import { access, copyFile, link, mkdir, rm, stat } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -21,6 +21,8 @@ export interface IngestOptions {
   captureTimezone?: string;
   signal?: AbortSignal;
   onProgress?: (copiedBytes: number, totalBytes: number) => void;
+  /** Testable promotion boundary; production callers normally omit this. */
+  beforePromote?: () => void | Promise<void>;
 }
 
 export interface IngestResult {
@@ -104,7 +106,17 @@ export async function ingestFile(
       signal: options.signal,
     });
     await verifyMatchingChecksums(options.sourcePath, temporary);
-    await rename(temporary, destination);
+    await options.beforePromote?.();
+    // Node's Windows rename replaces an existing file, so the reference
+    // adapter uses COPYFILE_EXCL where hard links are unavailable. Both paths
+    // have create-new semantics and cannot overwrite a concurrent destination.
+    if (process.platform === 'win32') {
+      await copyFile(temporary, destination, constants.COPYFILE_EXCL);
+      await rm(temporary);
+    } else {
+      await link(temporary, destination);
+      await rm(temporary);
+    }
     return {
       status: 'imported',
       destination,

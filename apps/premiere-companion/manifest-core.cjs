@@ -57,14 +57,27 @@
       mediaIds.add(item.mediaId);
       paths.add(pathKey);
       return Object.assign({}, item, {
-        absolutePath: item.absolutePath.trim(),
+        absolutePath: compatibleHostPath(item.absolutePath.trim()),
       });
     });
     return Object.assign({}, value, { items: items });
   }
 
   function normalizePath(path) {
-    return String(path).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return compatibleHostPath(String(path))
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, '')
+      .toLowerCase();
+  }
+
+  function compatibleHostPath(path) {
+    var value = String(path);
+    if (!/^\\\\\?\\[a-z]:[\\/]/i.test(value)) return value;
+    var ordinary = value.slice(4);
+    var unsafeLegacySegment = ordinary.split(/[\\/]/).some(function (segment) {
+      return /[ .]$/.test(segment);
+    });
+    return !unsafeLegacySegment && ordinary.length < 260 ? ordinary : value;
   }
 
   function safeRelative(path, allowEmpty) {
@@ -94,6 +107,7 @@
     KIND: KIND,
     validate: validate,
     normalizePath: normalizePath,
+    compatibleHostPath: compatibleHostPath,
     groupByBin: groupByBin,
   };
 });

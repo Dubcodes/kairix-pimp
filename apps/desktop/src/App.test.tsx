@@ -9,6 +9,7 @@ import {
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Catalogue, DeviceSettings, IngestJob } from './bridge';
+import { previewWorkQueue } from './preview-work-queue';
 import { resetLastHoveredRatioMemoryCache } from './thumbnail-hold';
 
 const mocks = vi.hoisted(() => ({
@@ -23,6 +24,7 @@ const mocks = vi.hoisted(() => ({
     thumbnailCacheLimitBytes: 2147483648,
     hoverPreviewsEnabled: true,
     previewCacheLimitBytes: 536870912,
+    playbackProxyCacheLimitBytes: 2147483648,
     thumbnailHoldFrame: 'first',
     previewPreloading: 'visible-nearby',
     previewRamCacheLimitBytes: 0,
@@ -34,12 +36,25 @@ const mocks = vi.hoisted(() => ({
     closeToTray: true,
     startupPage: 'Library' as const,
     checkForUpdates: true,
+    updateChannel: 'development' as const,
     theme: 'graphite' as const,
     density: 'comfortable' as const,
+    libraryThumbnailWidth: 240,
     showAttachedAudioSeparately: false,
     sidebarCollapsed: false,
     libraryFolderSort: 'newest' as const,
     libraryFolderOrder: [],
+    sdGrabberEnabled: true,
+    sdGrabberAutoDetect: false,
+    sdGrabberExtensions: ['mp4', 'wav'],
+    sdGrabberSearchSubfolders: true,
+    sdGrabberRememberDevices: true,
+    sdGrabberRecognizedDeviceIds: [],
+    resourceProfile: 'balanced' as const,
+    gentleScanning: true,
+    increaseProcessingWhileIdle: true,
+    resourceIdleDelayMinutes: 10,
+    backgroundProcessingPaused: false,
   } as DeviceSettings,
   catalogue: { media: [], projects: [], updatedAt: '' } as Catalogue,
   saveSettings: vi.fn(),
@@ -55,12 +70,30 @@ const mocks = vi.hoisted(() => ({
   rescan: vi.fn(),
   discoveryListener: undefined as
     ((status: import('./bridge').DiscoveryStatus) => void) | undefined,
+  catalogueListener: undefined as (() => void) | undefined,
   resolveMediaPath: vi.fn(),
+  nativeDragThreshold: vi.fn(),
+  startNativeMediaDrag: vi.fn(),
+  startNativeFolderDrag: vi.fn(),
+  resolveMediaPlaybackSource: vi.fn(),
+  preparePlaybackProxy: vi.fn(),
+  releasePlaybackProxy: vi.fn(),
+  setMediaThumbnailFrame: vi.fn(),
   revealMediaInExplorer: vi.fn(),
   openMediaFolder: vi.fn(),
   mediaToolsStatus: vi.fn(),
   chooseFiles: vi.fn(),
   inventorySources: vi.fn(),
+  inventorySdCard: vi.fn(),
+  cancelInventory: vi.fn(),
+  cancelBackgroundOperation: vi.fn(),
+  listBackgroundOperations: vi.fn(),
+  getResourceGovernorStatus: vi.fn(),
+  logUiError: vi.fn(),
+  verifyMediaIntegrity: vi.fn(),
+  reapproveIngestDestinations: vi.fn(),
+  replanIngestDestinations: vi.fn(),
+  listRemovableVolumes: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
   updaterConfiguration: vi.fn(),
@@ -72,13 +105,22 @@ const mocks = vi.hoisted(() => ({
   openProjectFolder: vi.fn(),
   revealProjectAsset: vi.fn(),
   loadHoverPreview: vi.fn(),
+  loadHoverPreviewStatuses: vi.fn(),
   prepareHoverPreview: vi.fn(),
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
+  prepareMediaThumbnail: vi.fn(),
   choosePremiereManifestDestination: vi.fn(),
   exportPremiereManifest: vi.fn(),
   startIngest: vi.fn(),
+  backupJobs: [] as import('./bridge').BackupJob[],
+  initializeBackupJobs: vi.fn(),
+  listBackupJobs: vi.fn(),
+  startProjectBackup: vi.fn(),
+  retryProjectBackup: vi.fn(),
+  verifyProjectBackup: vi.fn(),
+  testProjectBackupRestore: vi.fn(),
 }));
 
 vi.mock('./bridge', () => ({
@@ -103,11 +145,15 @@ vi.mock('./bridge', () => ({
       mocks.jobListener = handler;
       return () => undefined;
     }),
+    onBackupJobsChanged: vi.fn(async () => () => undefined),
     onDiscoveryProgress: vi.fn(async (handler) => {
       mocks.discoveryListener = handler;
       return () => undefined;
     }),
-    onCatalogueChanged: vi.fn(async () => () => undefined),
+    onCatalogueChanged: vi.fn(async (handler) => {
+      mocks.catalogueListener = handler;
+      return () => undefined;
+    }),
     getDiscoveryStatus: vi.fn(async () => ({
       running: false,
       full: false,
@@ -118,12 +164,14 @@ vi.mock('./bridge', () => ({
       pending: 0,
       errors: 0,
     })),
-    logUiError: vi.fn(),
+    logUiError: mocks.logUiError,
     appInfo: vi.fn(async () => ({
       version: '0.1.1-1',
+      displayVersion: '0.1.1-1',
       buildCommit: 'test-commit',
       edition: 'Kairix PIMP Light',
-      releaseChannel: 'Beta',
+      releaseClassification: 'Development',
+      releaseDate: '2026-11-07',
     })),
     openSupportLink: mocks.openSupportLink,
     openLogsFolder: vi.fn(),
@@ -132,6 +180,14 @@ vi.mock('./bridge', () => ({
     chooseFolder: vi.fn(),
     chooseFiles: mocks.chooseFiles,
     inventorySources: mocks.inventorySources,
+    inventorySdCard: mocks.inventorySdCard,
+    cancelInventory: mocks.cancelInventory,
+    cancelBackgroundOperation: mocks.cancelBackgroundOperation,
+    listBackgroundOperations: mocks.listBackgroundOperations,
+    getResourceGovernorStatus: mocks.getResourceGovernorStatus,
+    reapproveIngestDestinations: mocks.reapproveIngestDestinations,
+    replanIngestDestinations: mocks.replanIngestDestinations,
+    listRemovableVolumes: mocks.listRemovableVolumes,
     startIngest: mocks.startIngest,
     cancelIngest: vi.fn(),
     updateMedia: mocks.updateMedia,
@@ -139,19 +195,35 @@ vi.mock('./bridge', () => ({
     createProject: vi.fn(),
     retryProjectSynchronization: mocks.retryProjectSynchronization,
     inventoryProject: mocks.inventoryProject,
+    initializeBackupJobs: mocks.initializeBackupJobs,
+    listBackupJobs: mocks.listBackupJobs,
+    startProjectBackup: mocks.startProjectBackup,
+    retryProjectBackup: mocks.retryProjectBackup,
+    verifyProjectBackup: mocks.verifyProjectBackup,
+    testProjectBackupRestore: mocks.testProjectBackupRestore,
     openProjectFolder: mocks.openProjectFolder,
     revealProjectAsset: mocks.revealProjectAsset,
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
+    verifyMediaIntegrity: mocks.verifyMediaIntegrity,
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
+    nativeDragThreshold: mocks.nativeDragThreshold,
+    startNativeMediaDrag: mocks.startNativeMediaDrag,
+    startNativeFolderDrag: mocks.startNativeFolderDrag,
+    resolveMediaPlaybackSource: mocks.resolveMediaPlaybackSource,
+    preparePlaybackProxy: mocks.preparePlaybackProxy,
+    releasePlaybackProxy: mocks.releasePlaybackProxy,
+    setMediaThumbnailFrame: mocks.setMediaThumbnailFrame,
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
     loadThumbnailSources: mocks.loadThumbnailSources,
+    prepareMediaThumbnail: mocks.prepareMediaThumbnail,
     choosePremiereManifestDestination: mocks.choosePremiereManifestDestination,
     exportPremiereManifest: mocks.exportPremiereManifest,
     loadHoverPreview: mocks.loadHoverPreview,
+    loadHoverPreviewStatuses: mocks.loadHoverPreviewStatuses,
     prepareHoverPreview: mocks.prepareHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
@@ -206,6 +278,21 @@ const testJob = (id: string, state: IngestJob['state']): IngestJob => ({
 });
 
 describe('native application integration', () => {
+  it('keeps cleanup unavailable in the verified backup workspace', async () => {
+    render(<App />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Archive' }));
+    expect(
+      screen.getByRole('heading', { name: 'Verified backup' }),
+    ).toBeTruthy();
+    expect(screen.getByText('Cleanup is unavailable')).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'Start verified backup' }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Open official Degoo web app' }),
+    ).toBeTruthy();
+  });
   it('previews date, 24-hour and 12-hour folder tokens', () => {
     const now = new Date(2026, 9, 23, 17, 42, 9);
     expect(datePatternPreview('yyyymmdd', now)).toBe('20261023');
@@ -230,6 +317,7 @@ describe('native application integration', () => {
       thumbnailCacheLimitBytes: 2147483648,
       hoverPreviewsEnabled: true,
       previewCacheLimitBytes: 536870912,
+      playbackProxyCacheLimitBytes: 2147483648,
       thumbnailHoldFrame: 'first',
       previewPreloading: 'visible-nearby',
       previewRamCacheLimitBytes: 0,
@@ -241,12 +329,25 @@ describe('native application integration', () => {
       closeToTray: true,
       startupPage: 'Library',
       checkForUpdates: true,
+      updateChannel: 'development',
       theme: 'graphite',
       density: 'comfortable',
+      libraryThumbnailWidth: 240,
       showAttachedAudioSeparately: false,
       sidebarCollapsed: false,
       libraryFolderSort: 'newest',
       libraryFolderOrder: [],
+      sdGrabberEnabled: true,
+      sdGrabberAutoDetect: false,
+      sdGrabberExtensions: ['mp4', 'wav'],
+      sdGrabberSearchSubfolders: true,
+      sdGrabberRememberDevices: true,
+      sdGrabberRecognizedDeviceIds: [],
+      resourceProfile: 'balanced',
+      gentleScanning: true,
+      increaseProcessingWhileIdle: true,
+      resourceIdleDelayMinutes: 10,
+      backgroundProcessingPaused: false,
     };
     mocks.saveSettings.mockReset();
     mocks.loadCatalogue.mockReset();
@@ -256,6 +357,15 @@ describe('native application integration', () => {
     mocks.jobs = [];
     mocks.initializeIngestJobs.mockReset();
     mocks.initializeIngestJobs.mockImplementation(async () => mocks.jobs);
+    mocks.backupJobs = [];
+    mocks.initializeBackupJobs.mockReset();
+    mocks.initializeBackupJobs.mockImplementation(async () => mocks.backupJobs);
+    mocks.listBackupJobs.mockReset();
+    mocks.listBackupJobs.mockImplementation(async () => mocks.backupJobs);
+    mocks.startProjectBackup.mockReset();
+    mocks.retryProjectBackup.mockReset();
+    mocks.verifyProjectBackup.mockReset();
+    mocks.testProjectBackupRestore.mockReset();
     mocks.clearCompletedIngestJobs.mockReset();
     mocks.clearCompletedIngestJobs.mockImplementation(
       async (jobId?: string) => {
@@ -267,6 +377,7 @@ describe('native application integration', () => {
     );
     mocks.updateIngestFileMetadata.mockReset();
     mocks.jobListener = undefined;
+    mocks.catalogueListener = undefined;
     mocks.refreshMediaAvailability.mockReset();
     mocks.refreshMediaAvailability.mockResolvedValue(false);
     mocks.rescan.mockReset();
@@ -281,6 +392,26 @@ describe('native application integration', () => {
     });
     mocks.resolveMediaPath.mockReset();
     mocks.resolveMediaPath.mockResolvedValue('C:\\Master\\20261024\\clip.mp4');
+    mocks.nativeDragThreshold.mockReset();
+    mocks.nativeDragThreshold.mockResolvedValue({ horizontal: 4, vertical: 4 });
+    mocks.startNativeMediaDrag.mockReset();
+    mocks.startNativeMediaDrag.mockResolvedValue('cancelled');
+    mocks.startNativeFolderDrag.mockReset();
+    mocks.startNativeFolderDrag.mockResolvedValue('cancelled');
+    mocks.resolveMediaPlaybackSource.mockReset();
+    mocks.preparePlaybackProxy.mockReset();
+    mocks.preparePlaybackProxy.mockResolvedValue(
+      'asset://localhost/playback-proxy.mp4',
+    );
+    mocks.releasePlaybackProxy.mockReset();
+    mocks.releasePlaybackProxy.mockResolvedValue(undefined);
+    mocks.resolveMediaPlaybackSource.mockResolvedValue(
+      'asset://localhost/clip.mp4',
+    );
+    mocks.setMediaThumbnailFrame.mockReset();
+    mocks.setMediaThumbnailFrame.mockResolvedValue(
+      'data:image/jpeg;base64,selected',
+    );
     mocks.revealMediaInExplorer.mockReset();
     mocks.revealMediaInExplorer.mockResolvedValue(undefined);
     mocks.openMediaFolder.mockReset();
@@ -288,9 +419,10 @@ describe('native application integration', () => {
     mocks.updaterConfiguration.mockReset();
     mocks.updaterConfiguration.mockResolvedValue({
       configured: false,
-      channel: 'Beta',
+      channel: 'Development',
       endpoint:
-        'https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json',
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/{{target}}/latest.json',
+      target: 'development-channel',
       reason:
         'Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.',
     });
@@ -305,6 +437,7 @@ describe('native application integration', () => {
     mocks.chooseFiles.mockResolvedValue([]);
     mocks.inventorySources.mockReset();
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000001',
       files: [],
       excluded: [],
       issues: [],
@@ -312,7 +445,45 @@ describe('native application integration', () => {
       totalBytes: 0,
       copyFileCount: 0,
       copyBytes: 0,
+      alreadyImportedFileCount: 0,
+      alreadyImportedBytes: 0,
+      attentionFileCount: 0,
+      attentionBytes: 0,
     });
+    mocks.inventorySdCard.mockReset();
+    mocks.cancelInventory.mockReset();
+    mocks.cancelInventory.mockResolvedValue(undefined);
+    mocks.cancelBackgroundOperation.mockReset();
+    mocks.cancelBackgroundOperation.mockResolvedValue(undefined);
+    mocks.listBackgroundOperations.mockReset();
+    mocks.getResourceGovernorStatus.mockReset();
+    mocks.getResourceGovernorStatus.mockResolvedValue({
+      profile: 'balanced',
+      idleBoostActive: false,
+      backgroundPaused: false,
+      shutdown: false,
+      activeBackgroundWorkers: 0,
+      queuedWorkers: 0,
+      averageWaitMillis: 0,
+      volumes: [],
+      waiting: [],
+      recentErrors: [],
+      systemActivity: {
+        inputIdleSeconds: 0,
+        cpuLoadPercent: 10,
+        availableMemoryBytes: 8 * 1024 * 1024 * 1024,
+        idleBoostEligible: false,
+        reason: 'Waiting for the configured input-idle period',
+      },
+    });
+    mocks.verifyMediaIntegrity.mockReset();
+    mocks.verifyMediaIntegrity.mockResolvedValue(true);
+    mocks.listBackgroundOperations.mockResolvedValue([]);
+    mocks.reapproveIngestDestinations.mockReset();
+    mocks.replanIngestDestinations.mockReset();
+    mocks.inventorySdCard.mockImplementation(mocks.inventorySources);
+    mocks.listRemovableVolumes.mockReset();
+    mocks.listRemovableVolumes.mockResolvedValue([]);
     mocks.updateMedia.mockReset();
     mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
     mocks.openSupportLink.mockReset();
@@ -326,6 +497,8 @@ describe('native application integration', () => {
     mocks.revealProjectAsset.mockReset();
     mocks.revealProjectAsset.mockResolvedValue(undefined);
     mocks.loadHoverPreview.mockReset();
+    mocks.loadHoverPreviewStatuses.mockReset();
+    mocks.loadHoverPreviewStatuses.mockResolvedValue([]);
     mocks.prepareHoverPreview.mockReset();
     mocks.prepareHoverPreview.mockResolvedValue(undefined);
     mocks.hoverPreviewCacheUsage.mockReset();
@@ -334,6 +507,8 @@ describe('native application integration', () => {
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.loadThumbnailSources.mockReset();
     mocks.loadThumbnailSources.mockResolvedValue({});
+    mocks.prepareMediaThumbnail.mockReset();
+    mocks.prepareMediaThumbnail.mockResolvedValue(undefined);
     mocks.choosePremiereManifestDestination.mockReset();
     mocks.choosePremiereManifestDestination.mockResolvedValue(undefined);
     mocks.exportPremiereManifest.mockReset();
@@ -353,6 +528,151 @@ describe('native application integration', () => {
       filesCompleted: 0,
     });
     mocks.catalogue = { media: [], projects: [], updatedAt: '' };
+  });
+
+  it('opens, navigates and closes the in-window Clip Viewer without losing Library state', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'portrait-clip',
+          relativePath: '20261104/portrait.mp4',
+          originalFilename: 'portrait.mp4',
+          sha256: 'portrait',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-04',
+          fileType: 'mp4',
+          tags: ['interview'],
+          projectIds: [],
+          notes: 'Opening shot',
+          technical: {
+            sizeBytes: 2_000,
+            durationSeconds: 65,
+            width: 1080,
+            height: 1920,
+            codec: 'h264',
+            frameRate: 25,
+          },
+          available: true,
+          needsReview: false,
+        },
+        {
+          id: 'next-clip',
+          relativePath: '20261104/next.mp4',
+          originalFilename: 'next.mp4',
+          sha256: 'next',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-04',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 1_000, durationSeconds: 5 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-04T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    render(<App />);
+
+    const portraitName = await screen.findByText('portrait.mp4');
+    fireEvent.doubleClick(portraitName.closest('article')!);
+
+    expect(
+      await screen.findByRole('region', {
+        name: 'Clip viewer for portrait.mp4',
+      }),
+    ).toHaveClass('portrait');
+    const player = await screen.findByLabelText('Playback portrait.mp4');
+    expect(player).toHaveAttribute('src', 'asset://localhost/clip.mp4');
+    expect(player).toHaveAttribute('playsinline');
+    expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith(
+      'portrait-clip',
+    );
+    const play = vi.fn().mockResolvedValue(undefined);
+    const pause = vi.fn();
+    Object.defineProperties(player, {
+      paused: { configurable: true, value: true },
+      play: { configurable: true, value: play },
+      pause: { configurable: true, value: pause },
+    });
+    const description = screen.getByRole('textbox', { name: /Description/ });
+    await user.clear(description);
+    await user.type(description, 'K space');
+    fireEvent.keyDown(description, { key: ' ', code: 'Space' });
+    fireEvent.keyDown(description, { key: 'z', ctrlKey: true });
+    expect(description).toHaveValue('K space');
+    expect(play).not.toHaveBeenCalled();
+    expect(pause).not.toHaveBeenCalled();
+    const tagCombo = screen.getByPlaceholderText('Add tags…');
+    tagCombo.focus();
+    fireEvent.keyDown(tagCombo, { key: 'k' });
+    expect(play).not.toHaveBeenCalled();
+    tagCombo.blur();
+    fireEvent.keyDown(window, { key: 'k' });
+    expect(play).toHaveBeenCalledTimes(1);
+    Object.defineProperty(player, 'currentTime', {
+      configurable: true,
+      value: 12.5,
+    });
+    await user.click(
+      screen.getByRole('button', { name: 'Use current video frame' }),
+    );
+    expect(mocks.setMediaThumbnailFrame).toHaveBeenCalledWith(
+      'portrait-clip',
+      12.5,
+    );
+    expect(
+      await screen.findByText(/saved to the shared catalogue/i),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(
+      await screen.findByRole('region', { name: 'Clip viewer for next.mp4' }),
+    ).toBeVisible();
+    expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith('next-clip');
+
+    fireEvent.error(await screen.findByLabelText('Playback next.mp4'));
+    expect(await screen.findByText('Preview unavailable')).toBeVisible();
+    expect(screen.getByText(/original media was not changed/i)).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Create compatible preview' }),
+    );
+    expect(mocks.preparePlaybackProxy).toHaveBeenCalledWith('next-clip');
+    const proxyPlayer = await screen.findByLabelText('Playback next.mp4');
+    expect(proxyPlayer).toHaveAttribute(
+      'src',
+      'asset://localhost/playback-proxy.mp4',
+    );
+    fireEvent.loadedMetadata(proxyPlayer);
+    fireEvent.loadedData(proxyPlayer);
+    fireEvent.playing(proxyPlayer);
+    fireEvent.seeking(proxyPlayer);
+    fireEvent.seeked(proxyPlayer);
+
+    await user.click(screen.getByRole('button', { name: 'Back to Library' }));
+    expect(
+      screen.getByRole('heading', { name: 'Media library' }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('checkbox', { name: 'Select next.mp4' }),
+    ).toBeChecked();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Diagnostics' }));
+    expect(screen.getByText(/first frame \d+ ms/)).toBeVisible();
+    expect(screen.getByText(/proxy \d+ ms/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    mocks.resolveMediaPlaybackSource.mockResolvedValueOnce(
+      'asset://localhost/playback-proxy.mp4',
+    );
+    fireEvent.doubleClick(screen.getByText('next.mp4').closest('article')!);
+    expect(await screen.findByLabelText('Playback next.mp4')).toHaveAttribute(
+      'src',
+      'asset://localhost/playback-proxy.mp4',
+    );
+    expect(mocks.preparePlaybackProxy).toHaveBeenCalledTimes(1);
   });
 
   it('separates active, completed and attention jobs and clears one completed entry', async () => {
@@ -518,6 +838,56 @@ describe('native application integration', () => {
       sizeBytes: 300,
       mainPremiereProject: 'Simple Vlog 057.prproj',
       scannedAt: '2026-10-28T01:00:00Z',
+      premiereIndex: {
+        parserVersion: 'pimp-prproj-1',
+        sourceRelativePath: 'Simple Vlog 057.prproj',
+        sourceFingerprint: 'fixture-hash',
+        sourceModifiedMillis: 1,
+        indexedAt: '2026-10-28T01:00:00Z',
+        status: 'partial',
+        formatVersion: '42',
+        mediaReferences: [
+          {
+            path: 'C:\\Master\\20261028\\DJI_0001.MP4',
+            evidence: 'imported-into-saved-project',
+            mediaId: 'video',
+            sequenceIds: [],
+            timelinePlacements: 0,
+          },
+          {
+            path: 'D:\\Historical\\offline.mp4',
+            evidence: 'historical-reference-supported',
+            sequenceIds: [],
+            timelinePlacements: 0,
+          },
+          {
+            path: 'D:\\Unclassified\\arbitrary.mp4',
+            evidence: 'unclassified-project-reference',
+            sequenceIds: [],
+            timelinePlacements: 0,
+          },
+        ],
+        sequences: [
+          {
+            id: 'sequence-main',
+            name: 'Main Edit',
+            nested: false,
+            mediaPaths: [],
+            timelinePlacements: 0,
+          },
+          {
+            id: 'sequence-nested',
+            name: 'Opening',
+            nested: true,
+            mediaPaths: [],
+            timelinePlacements: 0,
+          },
+        ],
+        bins: ['Media'],
+        issues: [
+          'Timeline track-item media relationships were not established; usage remains unknown',
+        ],
+      },
       items: [
         {
           relativePath: 'Simple Vlog 057.prproj',
@@ -546,6 +916,18 @@ describe('native application integration', () => {
     await user.click(
       screen.getByRole('button', { name: /Simple Vlog 057.*1 assigned/ }),
     );
+    expect(await screen.findByText('Saved-project observation')).toBeVisible();
+    expect(screen.getByText('Main Edit')).toBeVisible();
+    expect(screen.getByText(/Matched to Master Bin ID/)).toBeVisible();
+    expect(screen.getAllByText(/Unresolved/)[0]).toBeVisible();
+    expect(screen.getByText('Imported')).toBeVisible();
+    expect(screen.getAllByText('Unknown').length).toBeGreaterThanOrEqual(2);
+    expect(
+      screen.getByText(/Historical · supported by prior observation/),
+    ).toBeVisible();
+    expect(screen.getByText(/Unclassified project reference/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /Main Edit/ }));
+    expect(screen.getByText('Main Edit recordings')).toBeVisible();
 
     expect(
       (await screen.findAllByText('Simple Vlog 057.prproj'))[0],
@@ -589,6 +971,12 @@ describe('native application integration', () => {
       removeProjectIds: ['project-a'],
     });
 
+    expect(
+      screen.queryByRole('checkbox', { name: /title.png/ }),
+    ).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole('button', { name: 'Available to add (1)' }),
+    );
     await user.click(screen.getByRole('checkbox', { name: /title.png/ }));
     await user.click(screen.getByRole('button', { name: 'Add to project' }));
     expect(mocks.updateMedia).toHaveBeenCalledWith({
@@ -624,6 +1012,96 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('heading', { name: 'Simple Vlog 057' }),
     ).toBeVisible();
+  });
+
+  it('keeps available project recordings collapsed and paginates mounted rows', async () => {
+    mocks.catalogue = {
+      media: Array.from({ length: 120 }, (_, index) => ({
+        id: `available-${index}`,
+        relativePath: `20261105/clip-${String(index).padStart(4, '0')}.mp4`,
+        originalFilename: `clip-${String(index).padStart(4, '0')}.mp4`,
+        sha256: `sha-${index}`,
+        captureDateProvenance: 'filesystem',
+        ingestDate: '2026-11-05',
+        fileType: 'mp4',
+        tags: index === 119 ? ['interview'] : [],
+        projectIds: [],
+        notes: '',
+        technical: { sizeBytes: 100 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Large project',
+          workingDirectory: 'C:\\Projects\\Large',
+          mediaIds: [],
+          notes: '',
+          tags: [],
+          createdAt: '2026-11-05T00:00:00Z',
+        },
+      ],
+      updatedAt: '2026-11-05T00:00:00Z',
+    };
+    mocks.inventoryProject.mockResolvedValue({
+      projectId: 'project-a',
+      rootPath: 'C:\\Projects\\Large',
+      itemCount: 0,
+      sizeBytes: 0,
+      scannedAt: '2026-11-05T00:00:00Z',
+      items: [],
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Projects' }));
+    await user.click(
+      screen.getByRole('button', { name: /Large project.*0 assigned/ }),
+    );
+
+    const toggle = await screen.findByRole('button', {
+      name: 'Available to add (120)',
+    });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(
+      screen.queryByRole('checkbox', { name: 'Select clip-0000.mp4' }),
+    ).not.toBeInTheDocument();
+    await user.click(toggle);
+    expect(
+      screen.getAllByRole('checkbox', { name: /Select clip-/ }),
+    ).toHaveLength(50);
+    expect(screen.getByText('Page 1 of 3')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(
+      screen.getByRole('checkbox', { name: 'Select clip-0050.mp4' }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('checkbox', { name: 'Select clip-0000.mp4' }),
+    ).not.toBeInTheDocument();
+
+    const availableSearch = screen.getByRole('textbox', {
+      name: 'Search available recordings',
+    });
+    await user.type(availableSearch, 'clip-0119');
+    expect(
+      screen.getByRole('checkbox', { name: 'Select clip-0119.mp4' }),
+    ).toBeVisible();
+    expect(
+      screen.getAllByRole('checkbox', { name: /Select clip-/ }),
+    ).toHaveLength(1);
+    await user.clear(availableSearch);
+    await user.click(
+      screen.getByRole('combobox', {
+        name: 'Filter available recordings by tags',
+      }),
+    );
+    await user.click(screen.getByRole('option', { name: 'interview' }));
+    expect(
+      screen.getByRole('checkbox', { name: 'Select clip-0119.mp4' }),
+    ).toBeVisible();
+    expect(
+      screen.getAllByRole('checkbox', { name: /Select clip-/ }),
+    ).toHaveLength(1);
   });
 
   it('ignores superseded project inventory results and failures', async () => {
@@ -730,12 +1208,17 @@ describe('native application integration', () => {
         'data:image/jpeg;base64,last',
       ],
     });
+    mocks.loadHoverPreviewStatuses.mockResolvedValue(['hover-video']);
     const user = userEvent.setup();
     const { container } = render(<App />);
     await screen.findByRole('option', { name: /hover.mp4/ });
     const thumbnail = container.querySelector(
       '.media-thumbnail',
     ) as HTMLElement;
+    await screen.findByText('Scrubbable preview stored on this device');
+    expect(
+      screen.queryByLabelText('Scrubbable preview ready'),
+    ).not.toBeInTheDocument();
     vi.spyOn(thumbnail, 'getBoundingClientRect').mockReturnValue({
       left: 0,
       width: 100,
@@ -752,6 +1235,9 @@ describe('native application integration', () => {
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1),
     );
     await screen.findByLabelText('Move horizontally to preview video frames');
+    expect(
+      screen.getByLabelText('Scrubbable preview ready'),
+    ).toBeInTheDocument();
     const setItem = vi.spyOn(Storage.prototype, 'setItem');
     fireEvent.pointerMove(thumbnail, { clientX: 10 });
     fireEvent.pointerMove(thumbnail, { clientX: 55 });
@@ -789,6 +1275,9 @@ describe('native application integration', () => {
       expect(mocks.clearHoverPreviewCache).toHaveBeenCalledTimes(1),
     );
     await user.click(screen.getByRole('button', { name: 'Library' }));
+    expect(
+      screen.queryByLabelText('Scrubbable preview ready'),
+    ).not.toBeInTheDocument();
     const refreshedThumbnail = container.querySelector(
       '.media-thumbnail',
     ) as HTMLElement;
@@ -796,6 +1285,61 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it('loads a stored hover preview without waiting behind the generation queue', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'cached-hover',
+          relativePath: '20261108/cached.mp4',
+          originalFilename: 'cached.mp4',
+          sha256: 'cached-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-08',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100, durationSeconds: 10 },
+          thumbnailPath: 'cached.jpg',
+          available: true,
+          needsReview: false,
+          observedSize: 100,
+          observedModifiedMillis: 123,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-08T00:00:00Z',
+    };
+    mocks.loadHoverPreviewStatuses.mockResolvedValue(['cached-hover']);
+    mocks.loadHoverPreview.mockResolvedValue({
+      mediaId: 'cached-hover',
+      durationSeconds: 10,
+      frameTimes: [0],
+      frames: ['data:image/jpeg;base64,cached'],
+    });
+    let releaseGeneration!: () => void;
+    const blockedGeneration = previewWorkQueue.schedule(
+      'test:blocked-generation',
+      4,
+      'blocked generation',
+      () =>
+        new Promise<void>((resolve) => {
+          releaseGeneration = resolve;
+        }),
+    );
+    const { container } = render(<App />);
+    await screen.findByText('Scrubbable preview stored on this device');
+    fireEvent.pointerEnter(
+      container.querySelector('.media-thumbnail') as HTMLElement,
+    );
+    await waitFor(() => expect(mocks.loadHoverPreview).toHaveBeenCalledOnce());
+    expect(
+      screen.getByLabelText('Scrubbable preview ready'),
+    ).toBeInTheDocument();
+    releaseGeneration();
+    await blockedGeneration;
   });
 
   it('persists device-local preview preparation and RAM allowance controls', async () => {
@@ -821,9 +1365,55 @@ describe('native application integration', () => {
       ),
     );
     expect(screen.getByText('Generation queue idle')).toBeVisible();
+    await user.selectOptions(screen.getByLabelText('Position'), 'bottom-left');
+    await user.click(screen.getByRole('checkbox', { name: 'Add tags' }));
+    expect(localStorage.getItem('pimp-selection-toolbar-position')).toBe(
+      'bottom-left',
+    );
+    expect(
+      localStorage.getItem('pimp-selection-toolbar-actions'),
+    ).not.toContain('tags');
+    await user.click(
+      screen.getByRole('button', { name: 'Reset toolbar to defaults' }),
+    );
+    expect(localStorage.getItem('pimp-selection-toolbar-position')).toBeNull();
   });
 
-  it.each([100, 700, 3000])(
+  it('persists enforceable resource profiles and gentle-drive controls', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Resource Management' }),
+    );
+    await user.click(screen.getByRole('radio', { name: /Performance/ }));
+    await user.click(
+      screen.getByRole('switch', {
+        name: /Gentle scanning for older drives/,
+      }),
+    );
+    await user.click(
+      screen.getByRole('switch', {
+        name: /Pause automatic background processing/,
+      }),
+    );
+    await waitFor(() =>
+      expect(mocks.saveSettings.mock.calls.at(-1)?.[0]).toEqual(
+        expect.objectContaining({
+          resourceProfile: 'performance',
+          gentleScanning: false,
+          backgroundProcessingPaused: true,
+        }),
+      ),
+    );
+    expect(screen.getByText(/stable volume identity/i)).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Generate missing thumbnails' }),
+    ).toBeEnabled();
+  });
+
+  it.each([100, 700, 1000, 3000])(
     'batches thumbnail source lookup once for %i recordings',
     async (count) => {
       mocks.catalogue = {
@@ -861,9 +1451,142 @@ describe('native application integration', () => {
           ([mediaIds]) => mediaIds.length === count,
         ),
       ).toHaveLength(1);
+      expect(document.querySelector('[value="NaN"]')).toBeNull();
     },
     15_000,
   );
+
+  it('retains a valid static thumbnail when a catalogue refresh has no replacement source', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'persistent-thumbnail',
+          relativePath: '20261107/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'persistent-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-07',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100 },
+          thumbnailPath: 'persistent.jpg',
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-07T00:00:00Z',
+    };
+    let suppliedSource = false;
+    mocks.loadThumbnailSources.mockImplementation(async (mediaIds) => {
+      if (!suppliedSource && mediaIds.includes('persistent-thumbnail')) {
+        suppliedSource = true;
+        return {
+          'persistent-thumbnail': 'asset://localhost/persistent.jpg',
+        };
+      }
+      return {};
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        document.querySelector('img[src="asset://localhost/persistent.jpg"]'),
+      ).not.toBeNull(),
+    );
+    mocks.catalogue = {
+      ...mocks.catalogue,
+      media: [...mocks.catalogue.media],
+      updatedAt: '2026-11-07T00:01:00Z',
+    };
+    mocks.catalogueSignature.mockResolvedValue('refreshed-signature');
+    await act(async () => mocks.catalogueListener?.());
+    await waitFor(() =>
+      expect(
+        mocks.loadThumbnailSources.mock.calls.filter(([ids]) =>
+          ids.includes('persistent-thumbnail'),
+        ),
+      ).toHaveLength(2),
+    );
+    expect(
+      document.querySelector('img[src="asset://localhost/persistent.jpg"]'),
+    ).not.toBeNull();
+  });
+
+  it('renders an existing static source before viewport observation and after folder remount', async () => {
+    const originalObserver = globalThis.IntersectionObserver;
+    class InertIntersectionObserver {
+      constructor() {}
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = '0px';
+      thresholds = [0];
+    }
+    globalThis.IntersectionObserver =
+      InertIntersectionObserver as unknown as typeof IntersectionObserver;
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'mounted-thumbnail',
+          relativePath: '20261108/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'mounted-sha',
+          captureDateProvenance: 'filesystem',
+          ingestDate: '2026-11-08',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 100 },
+          thumbnailPath: 'mounted.jpg',
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-11-08T00:00:00Z',
+    };
+    mocks.loadThumbnailSources.mockResolvedValue({
+      'mounted-thumbnail': 'asset://localhost/mounted.jpg',
+    });
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+      await waitFor(() =>
+        expect(
+          document.querySelector('img[src="asset://localhost/mounted.jpg"]'),
+        ).not.toBeNull(),
+      );
+      await user.click(screen.getByRole('button', { name: /20261108/ }));
+      expect(
+        document.querySelector('img[src="asset://localhost/mounted.jpg"]'),
+      ).not.toBeNull();
+      await user.click(screen.getByRole('button', { name: /All media/ }));
+      expect(
+        document.querySelector('img[src="asset://localhost/mounted.jpg"]'),
+      ).not.toBeNull();
+    } finally {
+      globalThis.IntersectionObserver = originalObserver;
+    }
+  });
+
+  it('gives Library and ordinary pages distinct scroll ownership', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    expect(
+      (await screen.findByRole('heading', { name: 'Library' })).closest('main'),
+    ).toHaveClass('library-main');
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(
+      screen.getByRole('heading', { name: 'Settings' }).closest('main'),
+    ).toHaveClass('page-main');
+  });
 
   it('persists sidebar collapse and accessible logical folder ordering', async () => {
     mocks.catalogue = {
@@ -975,7 +1698,9 @@ describe('native application integration', () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      await screen.findByRole('button', { name: /Scan for new files/ }),
+      await screen.findByRole('button', {
+        name: /Quick inventory \(no content reads\)/,
+      }),
     );
     expect(mocks.rescan).toHaveBeenCalledWith(false);
     expect(
@@ -993,6 +1718,7 @@ describe('native application integration', () => {
   it('shows a complete source inventory before enabling ingest', async () => {
     mocks.chooseFiles.mockResolvedValue(['E:\\XDROOT\\Clip\\A001.MXF']);
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000002',
       files: [
         {
           sourcePath: 'E:\\XDROOT\\Clip\\A001.MXF',
@@ -1035,6 +1761,346 @@ describe('native application integration', () => {
     ).toBeEnabled();
   });
 
+  it.each([
+    ['today', 'Today'],
+    ['original-file-dates', 'Use clip date'],
+  ] as const)(
+    'keeps all one-off date choices consistent when the saved mode is %s',
+    async (savedMode, initialLabel) => {
+      mocks.settings.ingestDateOrganization = savedMode;
+      const sourceInventory = {
+        planId: '00000000-0000-4000-8000-000000000020',
+        files: [
+          {
+            sourcePath: 'E:\\DCIM\\clip.mp4',
+            sourceRelativePath: 'DCIM/clip.mp4',
+            plannedRelativePath: '20261105/DCIM/clip.mp4',
+            sizeBytes: 100,
+            kind: 'video',
+            analysisSupported: true,
+            preserveHierarchy: true,
+          },
+        ],
+        excluded: [],
+        issues: [],
+        totalFileCount: 1,
+        totalBytes: 100,
+        copyFileCount: 1,
+        copyBytes: 100,
+      };
+      mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
+      mocks.inventorySources.mockResolvedValue(sourceInventory);
+      let revision = 20;
+      mocks.replanIngestDestinations.mockImplementation(
+        async (_planId: string, date: string) => ({
+          ...sourceInventory,
+          planId: `00000000-0000-4000-8000-${String(++revision).padStart(12, '0')}`,
+          files: sourceInventory.files.map((file) => ({
+            ...file,
+            plannedRelativePath: `${date}/DCIM/clip.mp4`,
+          })),
+        }),
+      );
+      const user = userEvent.setup();
+      render(<App />);
+      await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+      await user.click(screen.getByRole('button', { name: 'Choose files' }));
+      await screen.findByText('1 of 1 files will be copied (0 KB)');
+
+      expect(screen.getByRole('radio', { name: initialLabel })).toBeChecked();
+      await user.click(screen.getByRole('radio', { name: 'Yesterday' }));
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          'yesterday',
+        ),
+      );
+      await user.click(screen.getByRole('radio', { name: 'Choose date' }));
+      await user.type(
+        screen.getByLabelText('Date for this batch'),
+        '2026-10-31',
+      );
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          '2026-10-31',
+        ),
+      );
+      await user.click(screen.getByRole('radio', { name: 'Use clip date' }));
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          'original-file-dates',
+        ),
+      );
+      await user.click(screen.getByRole('radio', { name: 'Today' }));
+      await waitFor(() =>
+        expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+          expect.any(String),
+          'today',
+        ),
+      );
+      expect(mocks.inventorySources).toHaveBeenCalledTimes(1);
+      expect(mocks.saveSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it('serializes rapid date changes and rebases the latest intent on the durable revision', async () => {
+    mocks.settings.ingestDateOrganization = 'original-file-dates';
+    const sourceInventory = {
+      planId: '00000000-0000-4000-8000-000000000030',
+      files: [
+        {
+          sourcePath: 'E:\\DCIM\\clip.mp4',
+          sourceRelativePath: 'DCIM/clip.mp4',
+          plannedRelativePath: '20261105/DCIM/clip.mp4',
+          sizeBytes: 100,
+          kind: 'video',
+          analysisSupported: true,
+          preserveHierarchy: true,
+        },
+      ],
+      excluded: [],
+      issues: [],
+      totalFileCount: 1,
+      totalBytes: 100,
+      copyFileCount: 1,
+      copyBytes: 100,
+    };
+    const firstRevision = {
+      ...sourceInventory,
+      planId: '00000000-0000-4000-8000-000000000031',
+    };
+    let resolveFirst!: (inventory: typeof sourceInventory) => void;
+    mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
+    mocks.inventorySources.mockResolvedValue(sourceInventory);
+    mocks.replanIngestDestinations
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockImplementationOnce(async () => ({
+        ...sourceInventory,
+        planId: '00000000-0000-4000-8000-000000000032',
+      }));
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(screen.getByRole('button', { name: 'Choose files' }));
+    await screen.findByText('1 of 1 files will be copied (0 KB)');
+    await user.click(screen.getByRole('radio', { name: 'Yesterday' }));
+    await waitFor(() =>
+      expect(mocks.replanIngestDestinations).toHaveBeenCalledWith(
+        sourceInventory.planId,
+        'yesterday',
+      ),
+    );
+    await user.click(screen.getByRole('radio', { name: 'Today' }));
+    expect(mocks.replanIngestDestinations).toHaveBeenCalledTimes(1);
+
+    resolveFirst(firstRevision);
+    await waitFor(() =>
+      expect(mocks.replanIngestDestinations).toHaveBeenLastCalledWith(
+        firstRevision.planId,
+        'today',
+      ),
+    );
+    expect(mocks.inventorySources).toHaveBeenCalledTimes(1);
+  });
+
+  it('scans a detected card and clearly separates new and imported files', async () => {
+    mocks.saveSettings.mockImplementation(async (settings) => settings);
+    mocks.listRemovableVolumes.mockResolvedValue([
+      {
+        rootPath: 'E:\\',
+        label: 'CAMERA CARD',
+        identity: 'volume:1234:FAT32:64000000000',
+        capacityBytes: 64_000_000_000,
+        availableBytes: 32_000_000_000,
+      },
+    ]);
+    mocks.inventorySdCard.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000010',
+      files: [
+        {
+          sourcePath: 'E:\\DCIM\\new.mp4',
+          sourceRelativePath: 'DCIM/new.mp4',
+          plannedRelativePath: '20261030/DCIM/new.mp4',
+          sizeBytes: 1_000,
+          kind: 'video',
+          analysisSupported: true,
+          preserveHierarchy: true,
+          disposition: 'new',
+        },
+        {
+          sourcePath: 'E:\\DCIM\\old.wav',
+          sourceRelativePath: 'DCIM/old.wav',
+          plannedRelativePath: '20261030/DCIM/old.wav',
+          sizeBytes: 2_000,
+          kind: 'audio',
+          analysisSupported: true,
+          preserveHierarchy: true,
+          disposition: 'already-imported',
+          existingRelativePath: '20261020/old.wav',
+        },
+      ],
+      excluded: [],
+      issues: [],
+      totalFileCount: 2,
+      totalBytes: 3_000,
+      copyFileCount: 1,
+      copyBytes: 1_000,
+      alreadyImportedFileCount: 1,
+      alreadyImportedBytes: 2_000,
+      attentionFileCount: 0,
+      attentionBytes: 0,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(
+      screen.getByRole('button', { name: /Grab files from SD card/ }),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: /Scan CAMERA CARD/ }),
+    );
+    await waitFor(() =>
+      expect(mocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sdGrabberRecognizedDeviceIds: ['volume:1234:FAT32:64000000000'],
+        }),
+      ),
+    );
+    expect(await screen.findByText(/1 new recording/)).toBeVisible();
+    expect(screen.getByText(/1 already imported/)).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Grab 1 new file' }),
+    ).toBeEnabled();
+  });
+
+  it('shows cancellable checksum progress in Background Operations', async () => {
+    mocks.listBackgroundOperations.mockResolvedValue([
+      {
+        id: '00000000-0000-4000-8000-000000000099',
+        kind: 'source-inventory',
+        title: 'SD-card inventory and duplicate verification',
+        state: 'running',
+        stage: 'Calculating checksums',
+        currentItem: 'A001.MP4',
+        completedItems: 3,
+        totalItems: 10,
+        bytesCompleted: 256,
+        bytesTotal: 1024,
+        counts: {
+          newFiles: 2,
+          duplicateFiles: 1,
+          attentionFiles: 0,
+          failedFiles: 0,
+          attemptedFiles: 0,
+          existingFiles: 0,
+          pendingFiles: 8,
+        },
+        cancellable: true,
+        pausable: false,
+        retryable: false,
+        startedAt: '2026-10-31T00:00:00Z',
+        updatedAt: '2026-10-31T00:00:01Z',
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    expect(
+      screen.getByRole('region', { name: 'Background Operations' }),
+    ).toBeVisible();
+    expect(screen.getByText(/Calculating checksums · A001.MP4/)).toBeVisible();
+    expect(screen.getByText(/0 KB \/ 1 KB read/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Cancel scan' }));
+    expect(mocks.cancelBackgroundOperation).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000099',
+    );
+  });
+
+  it('shows real playback-proxy time progress and routes safe cancellation', async () => {
+    mocks.listBackgroundOperations.mockResolvedValue([
+      {
+        id: 'playback-proxy:fixture',
+        kind: 'playback-proxy',
+        title: 'Playback proxy: interview.mxf',
+        state: 'running',
+        stage: 'Transcoding H.264/AAC preview',
+        currentItem: 'interview.mxf',
+        completedItems: 134,
+        totalItems: 516,
+        bytesCompleted: 0,
+        counts: {
+          newFiles: 0,
+          duplicateFiles: 0,
+          attentionFiles: 0,
+          failedFiles: 0,
+          attemptedFiles: 0,
+          existingFiles: 0,
+          pendingFiles: 0,
+        },
+        cancellable: true,
+        pausable: false,
+        retryable: false,
+        startedAt: '2026-11-06T00:00:00Z',
+        updatedAt: '2026-11-06T00:02:14Z',
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    expect(screen.getByText(/2:14 \/ 8:36 processed/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Cancel conversion' }));
+    expect(mocks.cancelBackgroundOperation).toHaveBeenCalledWith(
+      'playback-proxy:fixture',
+    );
+  });
+
+  it('shows the real Premiere indexing stage without a fabricated percentage', async () => {
+    mocks.listBackgroundOperations.mockResolvedValue([
+      {
+        id: 'project-index:project-1',
+        kind: 'premiere-index',
+        title: 'Premiere project index: Documentary',
+        state: 'running',
+        stage: 'Resolving saved media references',
+        currentItem: 'Documentary.prproj',
+        completedItems: 0,
+        bytesCompleted: 0,
+        counts: {
+          newFiles: 0,
+          duplicateFiles: 0,
+          attentionFiles: 0,
+          failedFiles: 0,
+          attemptedFiles: 0,
+          existingFiles: 0,
+          pendingFiles: 0,
+        },
+        cancellable: false,
+        pausable: false,
+        retryable: false,
+        startedAt: '2026-11-06T00:00:00Z',
+        updatedAt: '2026-11-06T00:00:01Z',
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: /1 active/ }));
+    const panel = screen.getByRole('region', { name: 'Background Operations' });
+    expect(
+      screen.getByText(
+        /Resolving saved media references · Documentary\.prproj/,
+      ),
+    ).toBeVisible();
+    expect(panel.querySelector('progress')).not.toHaveAttribute('value');
+  });
+
   it('renders 63 long planned paths as bounded semantic rows', async () => {
     const files = Array.from({ length: 63 }, (_, index) => {
       const name = `DJI_20261028_${String(index).padStart(4, '0')}_VERY_LONG_CAMERA_RECORDING_NAME.MP4`;
@@ -1051,6 +2117,7 @@ describe('native application integration', () => {
     });
     mocks.chooseFiles.mockResolvedValue(files.map((file) => file.sourcePath));
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000003',
       files,
       excluded: [
         {
@@ -1090,6 +2157,7 @@ describe('native application integration', () => {
   it('persists newly created batch tags in the ingest request', async () => {
     mocks.chooseFiles.mockResolvedValue(['E:\\DCIM\\clip.mp4']);
     mocks.inventorySources.mockResolvedValue({
+      planId: '00000000-0000-4000-8000-000000000004',
       files: [
         {
           sourcePath: 'E:\\DCIM\\clip.mp4',
@@ -1225,7 +2293,7 @@ describe('native application integration', () => {
       'Ingest',
     );
     await user.click(
-      screen.getByRole('switch', { name: /Check for beta updates/ }),
+      screen.getByRole('switch', { name: /Check for updates automatically/ }),
     );
     await user.click(screen.getByRole('button', { name: 'Appearance' }));
     await user.click(screen.getByRole('radio', { name: /Midnight/ }));
@@ -1264,6 +2332,27 @@ describe('native application integration', () => {
     expect(screen.getByLabelText('Default startup page')).toHaveValue('Ingest');
     await user.click(screen.getByRole('button', { name: 'Appearance' }));
     expect(screen.getByLabelText('Layout density')).toHaveValue('compact');
+  });
+
+  it('persists Library thumbnail size without regenerating media', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Media library' });
+
+    fireEvent.change(screen.getByLabelText('Thumbnail size'), {
+      target: { value: '320' },
+    });
+
+    await waitFor(() =>
+      expect(mocks.saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ libraryThumbnailWidth: 320 }),
+      ),
+    );
+    expect(mocks.prepareMediaThumbnail).not.toHaveBeenCalled();
+    expect(mocks.prepareHoverPreview).not.toHaveBeenCalled();
+    expect(screen.getByText('320px')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
   });
 
   it('keeps a failed preference visible and retryable', async () => {
@@ -1313,7 +2402,7 @@ describe('native application integration', () => {
   it('reports checking, available and up-to-date states for a configured signer', async () => {
     mocks.updaterConfiguration.mockResolvedValue({
       configured: true,
-      channel: 'Beta',
+      channel: 'Development',
       endpoint: 'https://example.invalid/latest.json',
     });
     mocks.settings = { ...mocks.settings, checkForUpdates: false };
@@ -1325,20 +2414,23 @@ describe('native application integration', () => {
     mocks.checkApprovedBetaUpdate.mockReturnValueOnce(pending.promise);
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      screen.getByText('Checking for a signed Beta update…'),
+      screen.getByText('Checking the signed Development channel…'),
     ).toBeVisible();
     await act(async () => pending.resolve(null));
     expect(
-      await screen.findByText(/No newer signed Beta was available/),
+      await screen.findByText(
+        /No newer signed Development release was available/,
+      ),
     ).toBeVisible();
 
     mocks.checkApprovedBetaUpdate.mockResolvedValueOnce({
       currentVersion: '0.1.1-2',
       version: '0.1.1-4',
+      classification: 'Development',
     });
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      await screen.findByText('Signed Beta 0.1.1-4 is available.'),
+      await screen.findByText('Development 0.1.1-4 is available.'),
     ).toBeVisible();
 
     mocks.checkApprovedBetaUpdate.mockRejectedValueOnce(
@@ -1380,6 +2472,7 @@ describe('native application integration', () => {
     });
     render(<App />);
     await user.click(await screen.findByText('clip.mp4'));
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
 
     await user.click(
       screen.getByRole('button', { name: /Reveal in Explorer/ }),
@@ -1465,6 +2558,7 @@ describe('native application integration', () => {
       'dji_0001.wav',
     );
     await user.click(screen.getByRole('option', { name: /DJI_0001.MP4/ }));
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
 
     const associatedFiles = screen.getByRole('group', {
       name: 'Associated physical files',
@@ -1478,9 +2572,7 @@ describe('native application integration', () => {
       mediaIds: ['video', 'audio'],
       favourite: true,
     });
-    await user.click(
-      screen.getByRole('button', { name: /Copy paths for Premiere/ }),
-    );
+    await user.click(screen.getByRole('button', { name: /Copy file paths/ }));
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
         'C:\\Master\\video\r\nC:\\Master\\audio',
@@ -1591,15 +2683,95 @@ describe('native application integration', () => {
 
     await user.keyboard('{Control>}a{/Control}');
     expect(screen.getByText('3 selected')).toBeVisible();
+    const mediaCard = screen.getByRole('option', { name: /two.mp4/ });
+    expect(mediaCard).toHaveAttribute('draggable', 'false');
+    const thumbnail = mediaCard.querySelector('img');
+    if (thumbnail) expect(thumbnail).toHaveAttribute('draggable', 'false');
+    expect(fireEvent.dragStart(mediaCard)).toBe(false);
+    fireEvent.pointerDown(mediaCard, {
+      pointerId: 7,
+      button: 0,
+      buttons: 1,
+      clientX: 10,
+      clientY: 10,
+    });
+    fireEvent.pointerMove(mediaCard, {
+      pointerId: 7,
+      buttons: 1,
+      clientX: 13,
+      clientY: 13,
+    });
+    fireEvent.pointerUp(mediaCard, {
+      pointerId: 7,
+      button: 0,
+      buttons: 0,
+      clientX: 13,
+      clientY: 13,
+    });
+    expect(mocks.startNativeMediaDrag).not.toHaveBeenCalled();
+    fireEvent.pointerDown(mediaCard, {
+      pointerId: 8,
+      button: 0,
+      buttons: 1,
+      clientX: 10,
+      clientY: 10,
+    });
+    fireEvent.pointerMove(mediaCard, {
+      pointerId: 8,
+      buttons: 1,
+      clientX: 15,
+      clientY: 10,
+    });
+    await waitFor(() =>
+      expect(mocks.startNativeMediaDrag).toHaveBeenCalledWith([
+        'media-1',
+        'media-2',
+        'media-3',
+      ]),
+    );
+    expect(await screen.findByText(/Windows drag cancelled/)).toBeVisible();
+    fireEvent.click(mediaCard);
+    expect(screen.getByText('3 selected')).toBeVisible();
+    const folderButton = screen.getByRole('button', { name: /20261024/ });
+    expect(folderButton).toHaveAttribute('draggable', 'false');
+    expect(fireEvent.dragStart(folderButton)).toBe(false);
+    fireEvent.pointerDown(folderButton, {
+      pointerId: 9,
+      button: 0,
+      buttons: 1,
+      clientX: 20,
+      clientY: 20,
+    });
+    fireEvent.pointerMove(folderButton, {
+      pointerId: 9,
+      buttons: 1,
+      clientX: 20,
+      clientY: 25,
+    });
+    await waitFor(() =>
+      expect(mocks.startNativeFolderDrag).toHaveBeenCalledWith('20261024'),
+    );
+    expect(
+      screen.getByRole('toolbar', { name: 'Selected recordings' }),
+    ).toBeVisible();
+    await user.keyboard('{Control>}z{/Control}');
+    expect(screen.getByText('2 selected')).toBeVisible();
+    await user.keyboard('{Control>}y{/Control}');
+    expect(screen.getByText('3 selected')).toBeVisible();
+    const search = screen.getByPlaceholderText(/Search filenames, folders/);
+    await user.click(search);
+    await user.type(search, 'x');
+    await user.keyboard('{Control>}z{/Control}');
+    expect(screen.getByText('3 selected')).toBeVisible();
+    await user.clear(search);
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
     await user.click(screen.getByRole('button', { name: 'Favourite' }));
     expect(mocks.updateMedia).toHaveBeenCalledWith({
       mediaIds: ['media-1', 'media-2', 'media-3'],
       favourite: true,
     });
 
-    await user.click(
-      screen.getByRole('button', { name: /Copy paths for Premiere/ }),
-    );
+    await user.click(screen.getByRole('button', { name: /Copy file paths/ }));
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
         'C:\\Master\\media-1.mp4\r\nC:\\Master\\media-2.mp4\r\nC:\\Master\\media-3.mp4',
@@ -1614,7 +2786,7 @@ describe('native application integration', () => {
       screen.getByRole('menu', { name: 'Recording context menu' }),
     ).toBeVisible();
 
-    const content = document.querySelector('main') as HTMLElement;
+    const content = document.querySelector('.library-panel') as HTMLElement;
     const scrollTo = vi.fn();
     Object.defineProperty(content, 'scrollTop', {
       configurable: true,
@@ -1635,6 +2807,294 @@ describe('native application integration', () => {
     );
     expect(scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'auto' });
     vi.unstubAllGlobals();
+  });
+
+  it('toggles independent Library checkboxes without collapsing multiselection', async () => {
+    mocks.catalogue = {
+      media: ['one', 'two', 'three'].map((name, index) => ({
+        id: `media-${index + 1}`,
+        relativePath: `20261024/${name}.mp4`,
+        originalFilename: `${name}.mp4`,
+        sha256: name,
+        captureDateProvenance: 'unknown' as const,
+        ingestDate: '2026-10-24',
+        fileType: 'mp4',
+        tags: [],
+        projectIds: [],
+        notes: '',
+        technical: { sizeBytes: 10 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    render(<App />);
+
+    const first = await screen.findByRole('checkbox', {
+      name: 'Select one.mp4',
+    });
+    const third = screen.getByRole('checkbox', { name: 'Select three.mp4' });
+    await user.click(first);
+    await user.click(third);
+    expect(first).toBeChecked();
+    expect(third).toBeChecked();
+    expect(screen.getByText('2 selected')).toBeVisible();
+
+    first.focus();
+    await user.keyboard(' ');
+    expect(first).not.toBeChecked();
+    expect(third).toBeChecked();
+    expect(screen.getByText('1 selected')).toBeVisible();
+  });
+
+  it('loads the selected description and ignores a late save for another selection', async () => {
+    mocks.catalogue = {
+      media: ['one', 'two'].map((name, index) => ({
+        id: `media-${index + 1}`,
+        relativePath: `20261024/${name}.mp4`,
+        originalFilename: `${name}.mp4`,
+        sha256: name,
+        captureDateProvenance: 'unknown' as const,
+        ingestDate: '2026-10-24',
+        fileType: 'mp4',
+        tags: [],
+        projectIds: [],
+        notes: `${name} saved note`,
+        technical: { sizeBytes: 10 },
+        available: true,
+        needsReview: false,
+      })),
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    const pending = deferred<typeof mocks.catalogue>();
+    mocks.updateMedia.mockReturnValueOnce(pending.promise);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole('checkbox', { name: 'Select one.mp4' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+    const description = screen.getByRole('textbox', {
+      name: /Description for one.mp4/,
+    });
+    expect(description).toHaveValue('one saved note');
+    await user.clear(description);
+    await user.type(description, 'updated one');
+    await user.click(screen.getByRole('button', { name: 'Save description' }));
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+    expect(mocks.updateMedia).toHaveBeenCalledWith({
+      mediaIds: ['media-1'],
+      notes: 'updated one',
+    });
+
+    await user.click(screen.getByText('two.mp4'));
+    expect(
+      screen.getByRole('textbox', { name: /Description for two.mp4/ }),
+    ).toHaveValue('two saved note');
+    pending.resolve({
+      ...mocks.catalogue,
+      media: mocks.catalogue.media.map((item) =>
+        item.id === 'media-1' ? { ...item, notes: 'updated one' } : item,
+      ),
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('textbox', { name: /Description for two.mp4/ }),
+      ).toHaveValue('two saved note'),
+    );
+  });
+
+  it('preserves a failed description draft and reports the failure', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'media-1',
+          relativePath: '20261024/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'clip',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.updateMedia.mockRejectedValueOnce(new Error('disk unavailable'));
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(
+      await screen.findByRole('checkbox', { name: 'Select clip.mp4' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+    const description = screen.getByRole('textbox', {
+      name: /Description for clip.mp4/,
+    });
+    await user.type(description, 'Keep this draft');
+    await user.click(screen.getByRole('button', { name: 'Save description' }));
+    expect(await screen.findByText('Failed: disk unavailable')).toBeVisible();
+    expect(description).toHaveValue('Keep this draft');
+  });
+
+  it('retries a broken static thumbnail twice before falling back with diagnostics', async () => {
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'media-1',
+          relativePath: '20261024/clip.mp4',
+          originalFilename: 'clip.mp4',
+          sha256: 'clip',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          thumbnailPath: 'media-1.jpg',
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.loadThumbnailSources.mockResolvedValue({
+      'media-1': 'asset://localhost/media-1.jpg',
+    });
+    render(<App />);
+    const image = await waitFor(() => {
+      const candidate = document.querySelector(
+        'img[src="asset://localhost/media-1.jpg"]',
+      );
+      expect(candidate).not.toBeNull();
+      return candidate as HTMLImageElement;
+    });
+    expect(image).toHaveAttribute('draggable', 'false');
+    expect(fireEvent.dragStart(image)).toBe(false);
+    expect(mocks.startNativeMediaDrag).not.toHaveBeenCalled();
+    fireEvent.error(image);
+    const retryOne = await waitFor(() => {
+      const candidate = document.querySelector(
+        'img[src="asset://localhost/media-1.jpg?pimp_retry=1"]',
+      );
+      expect(candidate).not.toBeNull();
+      return candidate as HTMLImageElement;
+    });
+    fireEvent.error(retryOne);
+    const retryTwo = await waitFor(
+      () => {
+        const candidate = document.querySelector(
+          'img[src="asset://localhost/media-1.jpg?pimp_retry=2"]',
+        );
+        expect(candidate).not.toBeNull();
+        return candidate as HTMLImageElement;
+      },
+      { timeout: 2_000 },
+    );
+    fireEvent.error(retryTwo);
+    expect(await screen.findByText('MP4')).toBeVisible();
+    expect(mocks.logUiError).toHaveBeenCalledWith(
+      'Static thumbnail failed after bounded retries for media media-1',
+    );
+  });
+
+  it('prepares one missing visible thumbnail and reuses it in Projects', async () => {
+    mocks.settings.previewPreloading = 'hovered';
+    const originalObserver = globalThis.IntersectionObserver;
+    class ImmediateIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {}
+      observe(target: Element) {
+        this.callback(
+          [{ isIntersecting: true, target } as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver,
+        );
+      }
+      unobserve() {}
+      disconnect() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = '0px';
+      thresholds = [0];
+    }
+    globalThis.IntersectionObserver =
+      ImmediateIntersectionObserver as unknown as typeof IntersectionObserver;
+    mocks.catalogue = {
+      media: [
+        {
+          id: 'shared-thumbnail',
+          relativePath: '20261024/shared.mp4',
+          originalFilename: 'shared.mp4',
+          sha256: 'shared-sha',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-10-24',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: ['project-a'],
+          notes: '',
+          technical: { sizeBytes: 10 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+      projects: [
+        {
+          id: 'project-a',
+          name: 'Shared thumbnail project',
+          workingDirectory: 'C:\\Projects\\Shared',
+          mediaIds: ['shared-thumbnail'],
+          notes: '',
+          tags: [],
+          createdAt: '2026-10-24T00:00:00Z',
+        },
+      ],
+      updatedAt: '2026-10-24T00:00:00Z',
+    };
+    mocks.prepareMediaThumbnail.mockResolvedValue(
+      'asset://localhost/shared-thumbnail.jpg',
+    );
+    mocks.inventoryProject.mockResolvedValue({
+      projectId: 'project-a',
+      rootPath: 'C:\\Projects\\Shared',
+      itemCount: 0,
+      sizeBytes: 0,
+      scannedAt: '2026-10-24T00:00:00Z',
+      items: [],
+    });
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+      await user.click(await screen.findByRole('button', { name: 'Library' }));
+      await waitFor(() =>
+        expect(mocks.prepareMediaThumbnail).toHaveBeenCalledTimes(1),
+      );
+      await user.click(screen.getByRole('button', { name: 'Projects' }));
+      await user.click(
+        screen.getByRole('button', { name: /Shared thumbnail project/ }),
+      );
+      await waitFor(() =>
+        expect(
+          document.querySelector(
+            'img[src="asset://localhost/shared-thumbnail.jpg"]',
+          ),
+        ).not.toBeNull(),
+      );
+      expect(mocks.prepareMediaThumbnail).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.IntersectionObserver = originalObserver;
+    }
   });
 
   it('explains optional feature loss when FFmpeg tools are missing', async () => {

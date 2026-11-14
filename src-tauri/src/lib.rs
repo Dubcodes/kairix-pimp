@@ -1,7 +1,11 @@
+mod backup;
 mod catalogue;
 mod discovery;
 mod fs_safe;
+mod premiere_index;
+mod resource_governor;
 
+use backup::BackupJob;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use catalogue::{
     Catalogue, CatalogueEvent, CatalogueIssue, MediaItem, ProjectRecord, TechnicalMetadata,
@@ -9,15 +13,17 @@ use catalogue::{
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
+use premiere_index::PremiereProjectIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration as StdDuration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
@@ -26,7 +32,71 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 #[cfg(target_os = "windows")]
+use windows::{
+    core::{implement, PCWSTR},
+    Win32::{
+        Foundation::{
+            DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK,
+        },
+        System::{
+            Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL},
+            Ole::{
+                DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
+                CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
+            },
+            SystemServices::MK_LBUTTON,
+        },
+        UI::{
+            Shell::{Common::ITEMIDLIST, ILFree, SHCreateDataObject, SHParseDisplayName},
+            WindowsAndMessaging::{GetSystemMetrics, SM_CXDRAG, SM_CYDRAG},
+        },
+    },
+};
+
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+const MAX_NATIVE_DRAG_ITEMS: usize = 500;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDragThreshold {
+    horizontal: u32,
+    vertical: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum NativeDragOutcome {
+    Dropped,
+    Cancelled,
+    Rejected,
+}
+
+#[cfg(target_os = "windows")]
+#[implement(IDropSource)]
+struct NativeDropSource;
+
+#[cfg(target_os = "windows")]
+impl IDropSource_Impl for NativeDropSource_Impl {
+    fn QueryContinueDrag(
+        &self,
+        escape_pressed: windows::core::BOOL,
+        key_state: windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS,
+    ) -> windows::core::HRESULT {
+        if escape_pressed.as_bool() {
+            DRAGDROP_S_CANCEL
+        } else if (key_state.0 & MK_LBUTTON.0) == 0 {
+            DRAGDROP_S_DROP
+        } else {
+            S_OK
+        }
+    }
+
+    fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
 
 fn should_suppress_child_console(is_windows: bool, debug_build: bool) -> bool {
     is_windows && !debug_build
@@ -51,12 +121,133 @@ struct NativeState {
     discovery_write: Mutex<()>,
     discovery_status: Mutex<DiscoveryStatus>,
     enrichment_write: Mutex<()>,
+    enrichment_worker_active: Mutex<bool>,
+    enrichment_requested: Mutex<bool>,
+    enrichment_status: Mutex<Option<BackgroundOperation>>,
     job_store: Mutex<()>,
     worker_active: Mutex<bool>,
     availability: Mutex<HashMap<String, (String, bool)>>,
     tray_available: Mutex<bool>,
-    update_installing: Mutex<bool>,
+    operations: Mutex<OperationCoordinator>,
     preview_generation: Mutex<()>,
+    static_thumbnail_generation: Mutex<()>,
+    static_thumbnail_status: Mutex<HashMap<String, BackgroundOperation>>,
+    hover_preview_status: Mutex<HashMap<String, BackgroundOperation>>,
+    derivative_admission: DerivativeAdmission,
+    thumbnail_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    playback_proxy_generations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    playback_proxy_status: Mutex<HashMap<String, BackgroundOperation>>,
+    playback_proxy_cancelled: Mutex<HashSet<String>>,
+    active_playback_proxies: Mutex<HashMap<String, PathBuf>>,
+    playback_proxy_temporaries: Mutex<HashSet<PathBuf>>,
+    playback_proxy_processes: Mutex<HashMap<String, u32>>,
+    backup_job_store: Mutex<()>,
+    approved_plan_store: Mutex<()>,
+    inventory_worker: Mutex<()>,
+    inventory_cancelled: Mutex<HashSet<String>>,
+    inventory_status: Mutex<Option<BackgroundOperation>>,
+    project_inventory_status: Mutex<HashMap<String, BackgroundOperation>>,
+    volume_governor: resource_governor::VolumeGovernor,
+    system_load_sample: Mutex<Option<SystemLoadSample>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SystemLoadSample {
+    idle_ticks: u64,
+    total_ticks: u64,
+    cpu_load_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemActivityEvidence {
+    input_idle_seconds: Option<u64>,
+    cpu_load_percent: Option<f64>,
+    available_memory_bytes: Option<u64>,
+    idle_boost_eligible: bool,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceGovernorStatus {
+    #[serde(flatten)]
+    governor: resource_governor::GovernorSnapshot,
+    system_activity: SystemActivityEvidence,
+}
+
+#[derive(Default)]
+struct OperationCoordinator {
+    update_installing: bool,
+    active: BTreeMap<&'static str, usize>,
+}
+
+struct OperationPermit<'a> {
+    coordinator: &'a Mutex<OperationCoordinator>,
+    name: &'static str,
+}
+
+#[derive(Default)]
+struct DerivativeAdmission {
+    state: Mutex<DerivativeAdmissionState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct DerivativeAdmissionState {
+    active: bool,
+    waiting: [usize; 4],
+}
+
+struct DerivativePermit<'a> {
+    admission: &'a DerivativeAdmission,
+}
+
+impl DerivativeAdmission {
+    fn acquire(&self, priority: usize) -> DerivativePermit<'_> {
+        let priority = priority.min(3);
+        let mut state = self.state.lock().unwrap();
+        state.waiting[priority] += 1;
+        while state.active || state.waiting[..priority].iter().any(|count| *count > 0) {
+            state = self.ready.wait(state).unwrap();
+        }
+        state.waiting[priority] -= 1;
+        state.active = true;
+        DerivativePermit { admission: self }
+    }
+}
+
+impl Drop for DerivativePermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock().unwrap();
+        state.active = false;
+        self.admission.ready.notify_all();
+    }
+}
+
+impl Drop for OperationPermit<'_> {
+    fn drop(&mut self) {
+        let mut coordinator = self.coordinator.lock().unwrap();
+        if let Some(count) = coordinator.active.get_mut(self.name) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                coordinator.active.remove(self.name);
+            }
+        }
+    }
+}
+
+fn begin_critical_operation<'a>(
+    coordinator: &'a Mutex<OperationCoordinator>,
+    name: &'static str,
+) -> Result<OperationPermit<'a>, String> {
+    let mut state = coordinator.lock().unwrap();
+    if state.update_installing {
+        return Err(UPDATE_OPERATION_BLOCKED.into());
+    }
+    *state.active.entry(name).or_default() += 1;
+    drop(state);
+    Ok(OperationPermit { coordinator, name })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +264,8 @@ struct DeviceSettings {
     hover_previews_enabled: bool,
     #[serde(default = "default_preview_cache_limit_bytes")]
     preview_cache_limit_bytes: u64,
+    #[serde(default = "default_playback_proxy_cache_limit_bytes")]
+    playback_proxy_cache_limit_bytes: u64,
     #[serde(default = "default_thumbnail_hold_frame")]
     thumbnail_hold_frame: String,
     #[serde(default = "default_preview_preloading")]
@@ -95,10 +288,14 @@ struct DeviceSettings {
     startup_page: String,
     #[serde(default = "default_true")]
     check_for_updates: bool,
+    #[serde(default = "default_update_channel")]
+    update_channel: String,
     #[serde(default = "default_theme")]
     theme: String,
     #[serde(default = "default_density")]
     density: String,
+    #[serde(default = "default_library_thumbnail_width")]
+    library_thumbnail_width: u16,
     #[serde(default)]
     show_attached_audio_separately: bool,
     #[serde(default)]
@@ -107,6 +304,28 @@ struct DeviceSettings {
     library_folder_sort: String,
     #[serde(default)]
     library_folder_order: Vec<String>,
+    #[serde(default = "default_true")]
+    sd_grabber_enabled: bool,
+    #[serde(default = "default_true")]
+    sd_grabber_auto_detect: bool,
+    #[serde(default = "default_sd_grabber_extensions")]
+    sd_grabber_extensions: Vec<String>,
+    #[serde(default = "default_true")]
+    sd_grabber_search_subfolders: bool,
+    #[serde(default = "default_true")]
+    sd_grabber_remember_devices: bool,
+    #[serde(default)]
+    sd_grabber_recognized_device_ids: Vec<String>,
+    #[serde(default = "default_resource_profile")]
+    resource_profile: String,
+    #[serde(default = "default_true")]
+    gentle_scanning: bool,
+    #[serde(default = "default_true")]
+    increase_processing_while_idle: bool,
+    #[serde(default = "default_resource_idle_delay_minutes")]
+    resource_idle_delay_minutes: u16,
+    #[serde(default)]
+    background_processing_paused: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -147,6 +366,8 @@ struct ProjectInventory {
     main_premiere_project: Option<String>,
     scanned_at: String,
     items: Vec<ProjectAsset>,
+    #[serde(default)]
+    premiere_index: Option<PremiereProjectIndex>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -213,17 +434,36 @@ fn default_theme() -> String {
 fn default_density() -> String {
     "comfortable".into()
 }
+fn default_library_thumbnail_width() -> u16 {
+    240
+}
 fn default_library_folder_sort() -> String {
     "newest".into()
 }
 fn default_preview_cache_limit_bytes() -> u64 {
     512 * 1024 * 1024
 }
+
+fn default_playback_proxy_cache_limit_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
 fn default_thumbnail_hold_frame() -> String {
     "first".into()
 }
 fn default_preview_preloading() -> String {
     "visible-nearby".into()
+}
+fn default_sd_grabber_extensions() -> Vec<String> {
+    vec!["mp4".into(), "wav".into()]
+}
+fn default_resource_profile() -> String {
+    "balanced".into()
+}
+fn default_update_channel() -> String {
+    "development".into()
+}
+fn default_resource_idle_delay_minutes() -> u16 {
+    10
 }
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
@@ -243,6 +483,7 @@ impl Default for DeviceSettings {
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             hover_previews_enabled: true,
             preview_cache_limit_bytes: default_preview_cache_limit_bytes(),
+            playback_proxy_cache_limit_bytes: default_playback_proxy_cache_limit_bytes(),
             thumbnail_hold_frame: default_thumbnail_hold_frame(),
             preview_preloading: default_preview_preloading(),
             preview_ram_cache_limit_bytes: 0,
@@ -254,12 +495,25 @@ impl Default for DeviceSettings {
             close_to_tray: true,
             startup_page: default_startup_page(),
             check_for_updates: true,
+            update_channel: default_update_channel(),
             theme: default_theme(),
             density: default_density(),
+            library_thumbnail_width: default_library_thumbnail_width(),
             show_attached_audio_separately: false,
             sidebar_collapsed: false,
             library_folder_sort: default_library_folder_sort(),
             library_folder_order: vec![],
+            sd_grabber_enabled: true,
+            sd_grabber_auto_detect: true,
+            sd_grabber_extensions: default_sd_grabber_extensions(),
+            sd_grabber_search_subfolders: true,
+            sd_grabber_remember_devices: true,
+            sd_grabber_recognized_device_ids: vec![],
+            resource_profile: default_resource_profile(),
+            gentle_scanning: true,
+            increase_processing_while_idle: true,
+            resource_idle_delay_minutes: default_resource_idle_delay_minutes(),
+            background_processing_paused: false,
         }
     }
 }
@@ -274,6 +528,12 @@ struct IngestRequest {
     renamed_destinations: HashMap<String, String>,
     #[serde(default)]
     batch_tags: Vec<String>,
+    #[serde(default)]
+    approved_plan_id: Option<String>,
+    #[serde(default)]
+    allow_duplicate_copies: bool,
+    #[serde(default)]
+    allow_unverified_reimport: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -287,6 +547,12 @@ struct InventoryFile {
     kind: String,
     analysis_supported: bool,
     preserve_hierarchy: bool,
+    #[serde(default)]
+    disposition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    existing_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(skip)]
     source_root_path: String,
     #[serde(skip)]
@@ -309,14 +575,76 @@ struct InventoryExclusion {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct InventoryConflict {
+    source_path: String,
+    destination_path: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct SourceInventory {
+    plan_id: String,
     files: Vec<InventoryFile>,
     excluded: Vec<InventoryExclusion>,
     issues: Vec<String>,
+    #[serde(default)]
+    conflicts: Vec<InventoryConflict>,
     total_file_count: usize,
     total_bytes: u64,
     copy_file_count: usize,
     copy_bytes: u64,
+    #[serde(default)]
+    already_imported_file_count: usize,
+    #[serde(default)]
+    already_imported_bytes: u64,
+    #[serde(default)]
+    attention_file_count: usize,
+    #[serde(default)]
+    attention_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RemovableVolume {
+    root_path: String,
+    label: String,
+    identity: String,
+    capacity_bytes: u64,
+    available_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ApprovedIngestFile {
+    inventory: InventoryFile,
+    source_size: u64,
+    source_modified_millis: Option<u128>,
+    #[serde(default)]
+    planning_modified_millis: Option<u128>,
+    source_sha256: Option<String>,
+    #[serde(default)]
+    source_volume_identity: Option<String>,
+    existing_media_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ApprovedIngestPlan {
+    schema_version: u32,
+    id: String,
+    #[serde(default)]
+    lineage_id: String,
+    #[serde(default)]
+    revision: u64,
+    created_at: String,
+    batch_timestamp: String,
+    master_bin_path: String,
+    sources: Vec<String>,
+    date_override: Option<String>,
+    files: Vec<ApprovedIngestFile>,
+    inventory: SourceInventory,
+    sd_grabber: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -363,6 +691,16 @@ struct IngestJobFile {
     pending_metadata: Option<ProvisionalMetadata>,
     #[serde(default)]
     metadata_error: Option<String>,
+    #[serde(default)]
+    source_modified_millis: Option<u128>,
+    #[serde(default)]
+    approved_sha256: Option<String>,
+    #[serde(default)]
+    source_volume_identity: Option<String>,
+    #[serde(default)]
+    duplicate_existing_relative_path: Option<String>,
+    #[serde(default)]
+    intentional_duplicate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -370,6 +708,10 @@ struct IngestJobFile {
 struct IngestJob {
     schema_version: u32,
     id: String,
+    #[serde(default)]
+    approved_plan_id: Option<String>,
+    #[serde(default)]
+    approved_plan_lineage_id: Option<String>,
     state: String,
     created_at: String,
     updated_at: String,
@@ -404,6 +746,98 @@ struct IngestProgress {
     files_total: usize,
     bytes_complete: u64,
     bytes_total: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct OperationCounts {
+    new_files: usize,
+    duplicate_files: usize,
+    attention_files: usize,
+    failed_files: usize,
+    #[serde(default)]
+    attempted_files: usize,
+    #[serde(default)]
+    existing_files: usize,
+    #[serde(default)]
+    pending_files: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundOperation {
+    id: String,
+    kind: String,
+    title: String,
+    state: String,
+    stage: String,
+    current_item: Option<String>,
+    completed_items: usize,
+    total_items: Option<usize>,
+    bytes_completed: u64,
+    bytes_total: Option<u64>,
+    counts: OperationCounts,
+    cancellable: bool,
+    pausable: bool,
+    retryable: bool,
+    error: Option<String>,
+    started_at: String,
+    updated_at: String,
+}
+
+struct TransientOperationGuard<'a> {
+    statuses: &'a Mutex<HashMap<String, BackgroundOperation>>,
+    id: String,
+}
+
+impl TransientOperationGuard<'_> {
+    fn set_stage(&self, stage: &str) {
+        if let Some(operation) = self.statuses.lock().unwrap().get_mut(&self.id) {
+            operation.state = "running".into();
+            operation.stage = stage.into();
+            operation.updated_at = Utc::now().to_rfc3339();
+        }
+    }
+}
+
+impl Drop for TransientOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.statuses.lock().unwrap().remove(&self.id);
+    }
+}
+
+fn begin_transient_operation<'a>(
+    statuses: &'a Mutex<HashMap<String, BackgroundOperation>>,
+    id: String,
+    kind: &str,
+    title: &str,
+    stage: &str,
+    current_item: Option<String>,
+) -> TransientOperationGuard<'a> {
+    let now = Utc::now().to_rfc3339();
+    statuses.lock().unwrap().insert(
+        id.clone(),
+        BackgroundOperation {
+            id: id.clone(),
+            kind: kind.into(),
+            title: title.into(),
+            state: "queued".into(),
+            stage: stage.into(),
+            current_item,
+            completed_items: 0,
+            total_items: None,
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: now.clone(),
+            updated_at: now,
+        },
+    );
+    TransientOperationGuard { statuses, id }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -446,9 +880,11 @@ struct MediaToolsStatus {
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     version: String,
+    display_version: String,
     build_commit: String,
     edition: String,
-    release_channel: String,
+    release_classification: String,
+    release_date: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,6 +893,7 @@ struct UpdaterConfiguration {
     configured: bool,
     channel: String,
     endpoint: String,
+    target: String,
     reason: Option<String>,
 }
 
@@ -484,6 +921,710 @@ fn jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or("Invalid application configuration path")?
         .join("ingest-jobs.json"))
+}
+
+fn approved_plan_path(app: &AppHandle, plan_id: &str) -> Result<PathBuf, String> {
+    let id = Uuid::parse_str(plan_id).map_err(|_| "Approved ingest plan ID is invalid")?;
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("approved-ingest-plans")
+        .join(format!("{id}.json")))
+}
+
+fn save_approved_plan(app: &AppHandle, plan: &ApprovedIngestPlan) -> Result<(), String> {
+    write_json(&approved_plan_path(app, &plan.id)?, plan)
+}
+
+fn load_approved_plan(app: &AppHandle, plan_id: &str) -> Result<ApprovedIngestPlan, String> {
+    let path = approved_plan_path(app, plan_id)?;
+    if !path.is_file() {
+        return Err("Approved ingest plan is missing; scan the source again".into());
+    }
+    read_json(&path)
+}
+
+fn approved_plan_lineage(plan: &ApprovedIngestPlan) -> &str {
+    if plan.lineage_id.is_empty() {
+        &plan.id
+    } else {
+        &plan.lineage_id
+    }
+}
+
+fn current_approved_plan(
+    app: &AppHandle,
+    requested_id: &str,
+) -> Result<ApprovedIngestPlan, String> {
+    let requested = load_approved_plan(app, requested_id)?;
+    let lineage = approved_plan_lineage(&requested).to_owned();
+    let directory = approved_plan_path(app, requested_id)?
+        .parent()
+        .ok_or("Invalid approved plan directory")?
+        .to_path_buf();
+    let mut current = requested;
+    if !directory.is_dir() {
+        return Ok(current);
+    }
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(candidate) = read_json::<ApprovedIngestPlan>(&path) else {
+            continue;
+        };
+        if approved_plan_lineage(&candidate) == lineage && candidate.revision > current.revision {
+            current = candidate;
+        }
+    }
+    Ok(current)
+}
+
+fn begin_approved_plan_revision(mut plan: ApprovedIngestPlan) -> ApprovedIngestPlan {
+    let lineage = approved_plan_lineage(&plan).to_owned();
+    plan.id = Uuid::new_v4().to_string();
+    plan.lineage_id = lineage;
+    plan.revision = plan.revision.saturating_add(1);
+    plan.created_at = Utc::now().to_rfc3339();
+    plan.inventory.plan_id = plan.id.clone();
+    plan
+}
+
+fn remove_approved_plan_lineage(app: &AppHandle, lineage: &str) -> Result<(), String> {
+    let directory = approved_plan_path(app, lineage)?
+        .parent()
+        .ok_or("Invalid approved plan directory")?
+        .to_path_buf();
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(plan) = read_json::<ApprovedIngestPlan>(&path) else {
+            continue;
+        };
+        if approved_plan_lineage(&plan) == lineage {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn reapprove_ingest_destinations(
+    app: AppHandle,
+    plan_id: String,
+    renamed_destinations: HashMap<String, String>,
+) -> Result<SourceInventory, String> {
+    if renamed_destinations.is_empty() {
+        return Err("Enter at least one explicit replacement filename".into());
+    }
+    let state = app.state::<NativeState>();
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut plan = current_approved_plan(&app, &plan_id)?;
+    if plan.schema_version != 1 || plan.master_bin_path != settings.master_bin_path {
+        return Err("The approved plan is stale; scan the source again".into());
+    }
+    let known_sources = plan
+        .files
+        .iter()
+        .map(|file| file.inventory.source_path.clone())
+        .collect::<HashSet<_>>();
+    if renamed_destinations
+        .keys()
+        .any(|source| !known_sources.contains(source))
+    {
+        return Err("A destination rename does not belong to the approved plan".into());
+    }
+    let mut planned = HashSet::new();
+    for approved in &mut plan.files {
+        if let Some(filename) = renamed_destinations.get(&approved.inventory.source_path) {
+            let filename = fs_safe::validate_relative(filename.trim())?;
+            if filename.components().count() != 1 {
+                return Err("Conflict resolution accepts a filename, not a folder path".into());
+            }
+            let current = Path::new(&approved.inventory.planned_relative_path);
+            let parent = current.parent().unwrap_or_else(|| Path::new(""));
+            approved.inventory.planned_relative_path = portable_relative(&parent.join(filename));
+            approved.inventory.disposition = "new".into();
+            approved.inventory.detail = None;
+            approved.inventory.existing_relative_path = None;
+            approved.existing_media_id = None;
+        }
+        let destination =
+            fs_safe::resolve_for_create(&master, &approved.inventory.planned_relative_path)?;
+        if destination.exists() {
+            return Err(format!(
+                "The reviewed destination already exists: {}",
+                approved.inventory.planned_relative_path
+            ));
+        }
+        if !planned.insert(
+            approved
+                .inventory
+                .planned_relative_path
+                .to_ascii_lowercase(),
+        ) {
+            return Err("Two reviewed files still use the same destination".into());
+        }
+    }
+    plan = begin_approved_plan_revision(plan);
+    plan.inventory.files = plan
+        .files
+        .iter()
+        .map(|file| file.inventory.clone())
+        .collect();
+    plan.inventory.conflicts.clear();
+    plan.inventory.copy_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .count();
+    plan.inventory.copy_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .map(|file| file.size_bytes)
+        .sum();
+    plan.inventory.attention_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .count();
+    plan.inventory.attention_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .map(|file| file.size_bytes)
+        .sum();
+    save_approved_plan(&app, &plan)?;
+    Ok(plan.inventory)
+}
+
+#[tauri::command]
+async fn replan_ingest_destinations(
+    app: AppHandle,
+    plan_id: String,
+    date_override: String,
+) -> Result<SourceInventory, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        replan_ingest_destinations_blocking(app, plan_id, date_override)
+    })
+    .await
+    .map_err(|error| format!("Date reapproval worker failed: {error}"))?
+}
+
+fn local_datetime_from_millis(millis: Option<u128>) -> Option<DateTime<Local>> {
+    let millis = u64::try_from(millis?).ok()?;
+    let time =
+        std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(millis))?;
+    Some(DateTime::<Local>::from(time))
+}
+
+fn replan_approved_relative_path(
+    settings: &DeviceSettings,
+    master: &Path,
+    approved: &ApprovedIngestFile,
+    date_override: &str,
+    batch_timestamp: &DateTime<Local>,
+) -> Result<String, String> {
+    let current = fs_safe::validate_relative(&approved.inventory.planned_relative_path)?;
+    let suffix = current.components().skip(1).collect::<PathBuf>();
+    if suffix.as_os_str().is_empty() {
+        return Err("Approved destination is missing its filename; scan the source again".into());
+    }
+    let original_dates = date_override == "original-file-dates";
+    if original_dates
+        && approved.planning_modified_millis.is_none()
+        && package_component(Path::new(&approved.inventory.source_relative_path))
+    {
+        return Err(
+            "This camera-package plan predates safe date reapproval; scan the source again".into(),
+        );
+    }
+    let planning_millis = approved
+        .planning_modified_millis
+        .or(approved.source_modified_millis);
+    let (date, _, _) = destination_date_from_modified(
+        settings,
+        local_datetime_from_millis(planning_millis),
+        &Some(date_override.to_owned()),
+        batch_timestamp,
+    )?;
+    let compact_date = date.replace('-', "");
+    let date_folder = if !settings.master_bin_path.trim().is_empty() && master.join(&date).is_dir()
+    {
+        date
+    } else if !settings.master_bin_path.trim().is_empty() && master.join(&compact_date).is_dir() {
+        compact_date
+    } else {
+        date
+    };
+    let relative = PathBuf::from(date_folder).join(suffix);
+    fs_safe::validate_relative(&relative.to_string_lossy())?;
+    Ok(portable_relative(&relative))
+}
+
+fn replan_ingest_destinations_blocking(
+    app: AppHandle,
+    plan_id: String,
+    date_override: String,
+) -> Result<SourceInventory, String> {
+    let state = app.state::<NativeState>();
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
+    let settings = load_settings_file(&app)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut plan = current_approved_plan(&app, &plan_id)?;
+    if plan.schema_version != 1 || plan.master_bin_path != settings.master_bin_path {
+        return Err("The approved plan is stale; scan the source again".into());
+    }
+    let batch_timestamp = DateTime::parse_from_rfc3339(&plan.batch_timestamp)
+        .map_err(|_| "The approved plan has an invalid batch timestamp; scan again")?
+        .with_timezone(&Local);
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
+    for item in &catalogue.media {
+        hash_index
+            .entry(item.sha256.clone())
+            .or_default()
+            .push(item);
+    }
+    let mut selection_hashes = HashMap::<String, String>::new();
+    let mut planned_destinations = HashSet::new();
+    let mut conflicts = Vec::new();
+    for approved in &mut plan.files {
+        let mut inventory = approved.inventory.clone();
+        let source = PathBuf::from(&inventory.source_path);
+        if !approved_source_snapshot_matches(&source, approved) {
+            return Err(format!(
+                "Source changed since approval: {}; scan the source again",
+                source.display()
+            ));
+        }
+        let hash = approved
+            .source_sha256
+            .as_ref()
+            .ok_or("The approved plan predates safe date reapproval; scan the source again")?;
+        inventory.planned_relative_path = replan_approved_relative_path(
+            &settings,
+            &master,
+            approved,
+            &date_override,
+            &batch_timestamp,
+        )?;
+        approved.existing_media_id = None;
+        if let Some(relative_path) = selection_hashes.get(hash) {
+            inventory.disposition = "already-imported".into();
+            inventory.existing_relative_path = Some(relative_path.clone());
+            inventory.detail = Some("Duplicate recording within this approved selection".into());
+        } else {
+            let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
+            let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
+                &settings,
+                candidates,
+                approved.source_size,
+                hash,
+                Some(&state),
+                None,
+            );
+            inventory.disposition = disposition;
+            inventory.existing_relative_path = relative_path;
+            inventory.detail = detail;
+            approved.existing_media_id = media_id;
+            if inventory.disposition == "new" {
+                selection_hashes.insert(hash.clone(), inventory.planned_relative_path.clone());
+            }
+        }
+        if inventory.disposition != "already-imported" {
+            let destination =
+                fs_safe::resolve_for_create(&master, &inventory.planned_relative_path)?;
+            let unique =
+                planned_destinations.insert(inventory.planned_relative_path.to_ascii_lowercase());
+            if destination.exists() || !unique {
+                let reason = if destination.exists() {
+                    "A different file already occupies the planned destination"
+                } else {
+                    "Two selected files resolve to the same planned destination"
+                };
+                conflicts.push(InventoryConflict {
+                    source_path: inventory.source_path.clone(),
+                    destination_path: inventory.planned_relative_path.clone(),
+                    reason: reason.into(),
+                });
+                inventory.disposition = "attention".into();
+                inventory.detail = Some(format!(
+                    "{reason}. Enter a new filename and approve the revised plan."
+                ));
+            }
+        }
+        approved.inventory = inventory;
+    }
+    plan = begin_approved_plan_revision(plan);
+    plan.date_override = Some(date_override);
+    plan.inventory.files = plan
+        .files
+        .iter()
+        .map(|file| file.inventory.clone())
+        .collect();
+    plan.inventory.conflicts = conflicts;
+    plan.inventory.copy_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .count();
+    plan.inventory.copy_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .map(|file| file.size_bytes)
+        .sum();
+    plan.inventory.already_imported_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .count();
+    plan.inventory.already_imported_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .map(|file| file.size_bytes)
+        .sum();
+    plan.inventory.attention_file_count = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .count();
+    plan.inventory.attention_bytes = plan
+        .inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .map(|file| file.size_bytes)
+        .sum();
+    save_approved_plan(&app, &plan)?;
+    Ok(plan.inventory)
+}
+
+fn backup_jobs_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .join("backup-jobs.json"))
+}
+
+fn load_backup_jobs_unlocked(app: &AppHandle) -> Result<Vec<BackupJob>, String> {
+    read_json(&backup_jobs_path(app)?)
+}
+
+fn save_backup_job(app: &AppHandle, job: &BackupJob) -> Result<(), String> {
+    let state = app.state::<NativeState>();
+    let _guard = state.backup_job_store.lock().unwrap();
+    let mut jobs = load_backup_jobs_unlocked(app)?;
+    if let Some(existing) = jobs.iter_mut().find(|existing| existing.id == job.id) {
+        *existing = job.clone();
+    } else {
+        jobs.push(job.clone());
+    }
+    write_json(&backup_jobs_path(app)?, &jobs)?;
+    let _ = app.emit("backup-jobs-changed", &jobs);
+    Ok(())
+}
+
+fn mark_interrupted_backup_jobs(jobs: &mut [BackupJob]) -> bool {
+    let mut changed = false;
+    for job in jobs {
+        if matches!(job.state.as_str(), "prepared" | "copying" | "verifying") {
+            job.state = "interrupted".into();
+            job.error = Some(
+                "The application stopped before this backup completed. Review and retry it.".into(),
+            );
+            job.updated_at = Utc::now().to_rfc3339();
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[tauri::command]
+fn initialize_backup_jobs(app: AppHandle) -> Result<Vec<BackupJob>, String> {
+    let state = app.state::<NativeState>();
+    let _guard = state.backup_job_store.lock().unwrap();
+    let mut jobs = load_backup_jobs_unlocked(&app)?;
+    let changed = mark_interrupted_backup_jobs(&mut jobs);
+    if changed {
+        write_json(&backup_jobs_path(&app)?, &jobs)?;
+    }
+    Ok(jobs)
+}
+
+#[tauri::command]
+fn list_backup_jobs(app: AppHandle) -> Result<Vec<BackupJob>, String> {
+    let state = app.state::<NativeState>();
+    let _guard = state.backup_job_store.lock().unwrap();
+    load_backup_jobs_unlocked(&app)
+}
+
+#[tauri::command]
+async fn start_project_backup(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    project_id: String,
+    destination_root: String,
+) -> Result<BackupJob, String> {
+    let _operation = begin_critical_operation(&state.operations, "project backup")?;
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let project = catalogue
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or("Unknown project")?;
+    let source = resolve_known_project_directory(&settings, &project_id)?;
+    let destination = PathBuf::from(destination_root);
+    let project_name = project.name.clone();
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let worker_state = worker_app.state::<NativeState>();
+        configure_volume_governor(&worker_state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let destination_volume = volume_resource_id(&destination)?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Project backup: {project_name}"),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(destination_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
+        let mut job = backup::plan_backup(&project_id, &project_name, &source, &destination)?;
+        save_backup_job(&worker_app, &job)?;
+        if let Err(error) =
+            backup::execute_backup(&mut job, |snapshot| save_backup_job(&worker_app, snapshot))
+        {
+            if !matches!(job.state.as_str(), "needs-attention" | "failed") {
+                job.state = "failed".into();
+                job.error = Some(error.clone());
+                job.updated_at = Utc::now().to_rfc3339();
+                save_backup_job(&worker_app, &job)?;
+            }
+            if likely_io_error(&error) {
+                volume_permit.record_error(error.clone());
+            }
+            return Err(error);
+        }
+        volume_permit.add_bytes_for(&source_volume, job.manifest.source_bytes, 0);
+        volume_permit.add_bytes_for(
+            &destination_volume,
+            job.manifest.source_bytes,
+            job.manifest.source_bytes,
+        );
+        Ok(job)
+    })
+    .await
+    .map_err(|error| format!("Backup worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn retry_project_backup(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+    destination_root: Option<String>,
+) -> Result<BackupJob, String> {
+    let _operation = begin_critical_operation(&state.operations, "project backup")?;
+    let mut job = {
+        let state = app.state::<NativeState>();
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Backup job no longer exists")?
+    };
+    if job.state == "verified" {
+        return Err("This backup is already verified".into());
+    }
+    if let Some(destination_root) = destination_root {
+        job.destination_root = destination_root;
+    }
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut job = job;
+        let worker_state = worker_app.state::<NativeState>();
+        let settings = load_settings_file(&worker_app)?;
+        configure_volume_governor(&worker_state, &settings);
+        let source_volume = volume_resource_id(Path::new(&job.source_root))?;
+        let destination_volume = volume_resource_id(Path::new(&job.destination_root))?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Retry project backup: {}", job.project_name),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(destination_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
+        job.error = None;
+        if let Err(error) =
+            backup::execute_backup(&mut job, |snapshot| save_backup_job(&worker_app, snapshot))
+        {
+            if !matches!(job.state.as_str(), "needs-attention" | "failed") {
+                job.state = "failed".into();
+                job.error = Some(error.clone());
+                job.updated_at = Utc::now().to_rfc3339();
+                save_backup_job(&worker_app, &job)?;
+            }
+            if likely_io_error(&error) {
+                volume_permit.record_error(error.clone());
+            }
+            return Err(error);
+        }
+        volume_permit.add_bytes_for(&source_volume, job.manifest.source_bytes, 0);
+        volume_permit.add_bytes_for(
+            &destination_volume,
+            job.manifest.source_bytes,
+            job.manifest.source_bytes,
+        );
+        Ok(job)
+    })
+    .await
+    .map_err(|error| format!("Backup worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn verify_project_backup(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+) -> Result<BackupJob, String> {
+    let _operation = begin_critical_operation(&state.operations, "backup verification")?;
+    let mut job = {
+        let state = app.state::<NativeState>();
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Backup job no longer exists")?
+    };
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let worker_state = worker_app.state::<NativeState>();
+        let settings = load_settings_file(&worker_app)?;
+        configure_volume_governor(&worker_state, &settings);
+        let destination_volume = volume_resource_id(Path::new(&job.destination_root))?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Verify project backup: {}", job.project_name),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![resource_governor::VolumeNeed::read(
+                    destination_volume.clone(),
+                )],
+            ),
+            || false,
+        )?;
+        match backup::verify_backup(&job) {
+            Ok(()) => {
+                job.state = "verified".into();
+                job.error = None;
+            }
+            Err(error) => {
+                if likely_io_error(&error) {
+                    volume_permit.record_error(error.clone());
+                }
+                job.state = "needs-attention".into();
+                job.error = Some(error.clone());
+                job.updated_at = Utc::now().to_rfc3339();
+                save_backup_job(&worker_app, &job)?;
+                return Err(error);
+            }
+        }
+        volume_permit.add_bytes_for(&destination_volume, job.manifest.source_bytes, 0);
+        job.updated_at = Utc::now().to_rfc3339();
+        save_backup_job(&worker_app, &job)?;
+        Ok(job)
+    })
+    .await
+    .map_err(|error| format!("Backup verification worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn test_project_backup_restore(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+    restore_root: String,
+) -> Result<backup::RestoreTestResult, String> {
+    let _operation = begin_critical_operation(&state.operations, "backup restore test")?;
+    let job = {
+        let state = app.state::<NativeState>();
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or("Backup job no longer exists")?
+    };
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let worker_state = worker_app.state::<NativeState>();
+        let settings = load_settings_file(&worker_app)?;
+        configure_volume_governor(&worker_state, &settings);
+        let source_volume = volume_resource_id(Path::new(&job.destination_root))?;
+        let destination_volume = volume_resource_id(Path::new(&restore_root))?;
+        let mut volume_permit = worker_state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Restore test: {}", job.project_name),
+                resource_governor::PRIORITY_RECOVERY,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(destination_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
+        let result = backup::restore_backup_test(&job, Path::new(&restore_root));
+        match result {
+            Ok(result) => {
+                volume_permit.add_bytes_for(&source_volume, result.bytes_verified, 0);
+                volume_permit.add_bytes_for(
+                    &destination_volume,
+                    result.bytes_verified,
+                    result.bytes_verified,
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                if likely_io_error(&error) {
+                    volume_permit.record_error(error.clone());
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("Restore-test worker failed: {error}"))?
 }
 
 fn discovery_status_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -580,9 +1721,7 @@ fn clear_finalized_jobs(
     let before = jobs.len();
     jobs.retain(|job| {
         let selected = job_id.map_or(true, |job_id| job.id == job_id);
-        !(selected
-            && job_is_fully_finalized(job)
-            && !recovery_job_ids.contains(job.id.as_str()))
+        !(selected && job_is_fully_finalized(job) && !recovery_job_ids.contains(job.id.as_str()))
     });
     Ok(before - jobs.len())
 }
@@ -591,10 +1730,7 @@ fn recovery_job_ids(settings: &DeviceSettings) -> Result<HashSet<String>, String
     if settings.master_bin_path.trim().is_empty() {
         return Ok(HashSet::new());
     }
-    let root = fs_safe::staging_root(
-        Path::new(&settings.master_bin_path),
-        &settings.device_id,
-    )?;
+    let root = fs_safe::staging_root(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let directory = root.join("jobs");
     if !directory.exists() {
         return Ok(HashSet::new());
@@ -609,7 +1745,10 @@ fn recovery_job_ids(settings: &DeviceSettings) -> Result<HashSet<String>, String
             .file_type()
             .map_err(|error| format!("Cannot inspect recovery record type: {error}"))?
             .is_file()
-            || !matches!(path.extension().and_then(|value| value.to_str()), Some("json") | Some("backup"))
+            || !matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("json") | Some("backup")
+            )
         {
             continue;
         }
@@ -647,29 +1786,50 @@ fn has_active_ingest(jobs: &[IngestJob]) -> bool {
         .any(|job| matches!(job.state.as_str(), "queued" | "copying" | "verifying"))
 }
 
-const UPDATE_OPERATION_BLOCKED: &str =
-    "A verified update is being installed. Wait for the application to restart before starting or resuming ingest.";
+const UPDATE_OPERATION_BLOCKED: &str = "A verified update is being installed. Wait for the application to restart before starting another filesystem operation.";
 
 fn job_blocks_update(job: &IngestJob) -> bool {
     !job_is_fully_finalized(job)
 }
 
-fn begin_update_gate(installing: &mut bool, jobs: &[IngestJob]) -> Result<(), String> {
-    if *installing {
+fn begin_update_gate(
+    coordinator: &mut OperationCoordinator,
+    ingest_jobs: &[IngestJob],
+    backup_jobs: &[BackupJob],
+) -> Result<(), String> {
+    if coordinator.update_installing {
         return Err("A verified update installation is already in progress.".into());
     }
-    if jobs.iter().any(job_blocks_update) {
+    if !coordinator.active.is_empty() {
+        let operations = coordinator
+            .active
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "Wait for active filesystem work to finish before installing the update: {operations}."
+        ));
+    }
+    if ingest_jobs.iter().any(job_blocks_update) {
         return Err(
-            "Resolve every active or recoverable ingest job before installing an update."
-                .into(),
+            "Resolve every active or recoverable ingest job before installing an update.".into(),
         );
     }
-    *installing = true;
+    if backup_jobs
+        .iter()
+        .any(|job| matches!(job.state.as_str(), "prepared" | "copying" | "verifying"))
+    {
+        return Err(
+            "Wait for every active project backup to finish before installing an update.".into(),
+        );
+    }
+    coordinator.update_installing = true;
     Ok(())
 }
 
-fn end_update_gate(update_installing: &Mutex<bool>) {
-    *update_installing.lock().unwrap() = false;
+fn end_update_gate(operations: &Mutex<OperationCoordinator>) {
+    operations.lock().unwrap().update_installing = false;
 }
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
@@ -750,8 +1910,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 fn write_json_if_changed<T: Serialize>(path: &Path, value: &T) -> Result<bool, String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     if path.is_file()
-        && fs::read(path)
-            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?
+        && fs::read(path).map_err(|error| format!("Cannot read {}: {error}", path.display()))?
             == bytes
     {
         return Ok(false);
@@ -800,8 +1959,10 @@ fn append_events(settings: &DeviceSettings, events: Vec<CatalogueEvent>) -> Resu
 }
 
 #[tauri::command]
-fn load_settings(app: AppHandle) -> Result<DeviceSettings, String> {
-    load_settings_file(&app)
+fn load_settings(app: AppHandle, state: State<'_, NativeState>) -> Result<DeviceSettings, String> {
+    let settings = load_settings_file(&app)?;
+    configure_volume_governor(&state, &settings);
+    Ok(settings)
 }
 
 fn preserve_device_identity(current: &str, requested: &str) -> Result<String, String> {
@@ -848,21 +2009,30 @@ fn save_settings(
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
     }
+    if !matches!(settings.update_channel.as_str(), "development" | "stable") {
+        return Err("Choose the Development or Stable update channel".into());
+    }
+    if !matches!(
+        settings.resource_profile.as_str(),
+        "quiet" | "balanced" | "performance"
+    ) {
+        return Err("Choose a supported resource profile".into());
+    }
+    if !(1..=120).contains(&settings.resource_idle_delay_minutes) {
+        return Err("Idle processing delay must be between 1 and 120 minutes".into());
+    }
+    if !(160..=360).contains(&settings.library_thumbnail_width) {
+        return Err("Library thumbnail width must be between 160 and 360 pixels".into());
+    }
     if !matches!(
         settings.thumbnail_hold_frame.as_str(),
-        "first"
-            | "10-percent"
-            | "20-percent"
-            | "middle"
-            | "80-percent"
-            | "last"
-            | "last-hovered"
+        "first" | "10-percent" | "20-percent" | "middle" | "80-percent" | "last" | "last-hovered"
     ) {
         return Err("Choose a supported thumbnail hold frame".into());
     }
     if !matches!(
         settings.preview_preloading.as_str(),
-        "hovered" | "visible-nearby" | "idle"
+        "off" | "hovered" | "visible" | "visible-nearby" | "idle"
     ) {
         return Err("Choose a supported preview preloading mode".into());
     }
@@ -885,6 +2055,41 @@ fn save_settings(
             | "custom"
     ) {
         return Err("Choose a supported Library folder ordering".into());
+    }
+    settings.sd_grabber_extensions = settings
+        .sd_grabber_extensions
+        .iter()
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if settings.sd_grabber_extensions.is_empty()
+        || settings.sd_grabber_extensions.len() > 16
+        || settings.sd_grabber_extensions.iter().any(|value| {
+            value.len() > 12
+                || !value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+    {
+        return Err("SD Card Grabber extensions must be simple file extensions".into());
+    }
+    settings.sd_grabber_recognized_device_ids = settings
+        .sd_grabber_recognized_device_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if settings.sd_grabber_recognized_device_ids.len() > 64
+        || settings
+            .sd_grabber_recognized_device_ids
+            .iter()
+            .any(|value| value.len() > 160 || value.chars().any(char::is_control))
+    {
+        return Err("Recognised SD device identities are invalid".into());
     }
     fs::create_dir_all(settings.master_bin_path.trim())
         .map_err(|e| format!("Cannot create Master Bin: {e}"))?;
@@ -914,6 +2119,7 @@ fn save_settings(
         .map_err(|e| format!("Cannot create thumbnail cache: {e}"))?;
     settings.initialized_catalogue_path = next_catalogue;
     write_json(&settings_path(&app)?, &settings)?;
+    configure_volume_governor(&state, &settings);
     let autostart_result = if settings.start_with_windows {
         app.autolaunch().enable()
     } else {
@@ -937,19 +2143,10 @@ fn load_catalogue(app: AppHandle, state: State<'_, NativeState>) -> Result<Catal
     let mut settings = load_settings_file(&app)?;
     let mut catalogue = load_catalogue_file(&settings)?;
     let sync_path = project_manifest_sync_path(&app)?;
-    recover_pending_project_paths(
-        &sync_path,
-        &settings_path(&app)?,
-        &mut settings,
-        &catalogue,
-    )?;
+    recover_pending_project_paths(&sync_path, &settings_path(&app)?, &mut settings, &catalogue)?;
     let drifted_manifests = project_manifest_drift_requests(&settings, &catalogue);
-    let manifest_issues = reconcile_project_manifests(
-        &app,
-        &settings,
-        &catalogue,
-        drifted_manifests,
-    )?;
+    let manifest_issues =
+        reconcile_project_manifests(&app, &settings, &catalogue, drifted_manifests)?;
     drop(_manifest_guard);
     let master = PathBuf::from(&settings.master_bin_path);
     for item in &mut catalogue.media {
@@ -1150,10 +2347,25 @@ fn inventory_candidate(
     relative: &Path,
     source_root: &Path,
     root_is_package: bool,
+    allowed_extensions: Option<&HashSet<String>>,
 ) {
     let size = candidate.metadata().ok().map(|metadata| metadata.len());
     inventory.total_file_count += 1;
     inventory.total_bytes += size.unwrap_or(0);
+    if allowed_extensions.is_some_and(|allowed| {
+        candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| !allowed.contains(&value.to_ascii_lowercase()))
+            .unwrap_or(true)
+    }) {
+        inventory.excluded.push(InventoryExclusion {
+            path: candidate.to_string_lossy().into(),
+            reason: "Not included by the SD Card Grabber profile".into(),
+            size_bytes: size,
+        });
+        return;
+    }
     if let Some(reason) = exclusion_reason(candidate) {
         inventory.excluded.push(InventoryExclusion {
             path: candidate.to_string_lossy().into(),
@@ -1189,6 +2401,9 @@ fn inventory_candidate(
         kind: media_kind(candidate).into(),
         analysis_supported: analysis_supported(candidate),
         preserve_hierarchy: root_is_package || package_component(relative),
+        disposition: "new".into(),
+        existing_relative_path: None,
+        detail: None,
         source_root_path,
         source_root_label,
         include_source_root: root_is_package,
@@ -1197,17 +2412,53 @@ fn inventory_candidate(
     });
 }
 
+#[cfg(test)]
 fn build_source_inventory(sources: &[String]) -> SourceInventory {
+    build_source_inventory_filtered(sources, None, true)
+}
+
+#[cfg(test)]
+fn build_source_inventory_filtered(
+    sources: &[String],
+    allowed_extensions: Option<&HashSet<String>>,
+    recursive: bool,
+) -> SourceInventory {
+    build_source_inventory_filtered_with_progress(sources, allowed_extensions, recursive, |_, _| {
+        Ok(())
+    })
+    .expect("no-op inventory progress cannot fail")
+}
+
+fn build_source_inventory_filtered_with_progress(
+    sources: &[String],
+    allowed_extensions: Option<&HashSet<String>>,
+    recursive: bool,
+    mut progress: impl FnMut(&SourceInventory, &Path) -> Result<(), String>,
+) -> Result<SourceInventory, String> {
     let mut inventory = SourceInventory::default();
     for source in sources {
         let path = PathBuf::from(source);
+        progress(&inventory, &path)?;
         if path.is_file() {
             let relative = PathBuf::from(path.file_name().unwrap_or_default());
             let root = path.parent().unwrap_or_else(|| Path::new("."));
-            inventory_candidate(&mut inventory, &path, &relative, root, false);
+            inventory_candidate(
+                &mut inventory,
+                &path,
+                &relative,
+                root,
+                false,
+                allowed_extensions,
+            );
+            progress(&inventory, &path)?;
         } else if path.is_dir() {
             let root_is_package = package_component(&path);
-            for result in WalkDir::new(&path).follow_links(false) {
+            let walker = if recursive {
+                WalkDir::new(&path)
+            } else {
+                WalkDir::new(&path).max_depth(1)
+            };
+            for result in walker.follow_links(false) {
                 match result {
                     Ok(entry) if entry.file_type().is_file() => {
                         let relative = entry.path().strip_prefix(&path).unwrap_or(entry.path());
@@ -1217,9 +2468,11 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
                             relative,
                             &path,
                             root_is_package,
+                            allowed_extensions,
                         );
+                        progress(&inventory, entry.path())?;
                     }
-                    Ok(_) => {}
+                    Ok(entry) => progress(&inventory, entry.path())?,
                     Err(error) => inventory.issues.push(format!(
                         "Cannot inventory {}: {error}",
                         error.path().unwrap_or(&path).display()
@@ -1337,20 +2590,221 @@ fn build_source_inventory(sources: &[String]) -> SourceInventory {
     }
     inventory.copy_file_count = inventory.files.len();
     inventory.copy_bytes = inventory.files.iter().map(|file| file.size_bytes).sum();
-    inventory
+    Ok(inventory)
 }
 
-#[tauri::command]
-fn inventory_sources(
-    app: AppHandle,
+fn classify_global_duplicate(
+    settings: &DeviceSettings,
+    candidates: &[&MediaItem],
+    expected_size: u64,
+    source_hash: &str,
+    governor: Option<&NativeState>,
+    cancellable_operation_id: Option<&str>,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    // Stored size observations are useful lookup hints, but they are not
+    // authoritative and older compatible records may not contain one. The
+    // fresh local snapshot and SHA-256 check below decide whether a copy is
+    // safe to trust.
+    let candidates = candidates
+        .iter()
+        .copied()
+        .filter(|item| item.sha256 == source_hash)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return ("new".into(), None, None, None);
+    }
+    let master = PathBuf::from(&settings.master_bin_path);
+    let mut failures = Vec::new();
+    for item in candidates {
+        let candidate = match fs_safe::resolve_existing(&master, &item.relative_path) {
+            Ok(path) if path.is_file() => path,
+            Ok(_) => {
+                failures.push(format!("{} is not a local file", item.relative_path));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{} is unavailable: {error}", item.relative_path));
+                continue;
+            }
+        };
+        let before = match fs_safe::snapshot(&candidate) {
+            Ok(value) if value.length == expected_size => value,
+            Ok(_) => {
+                failures.push(format!("{} has a different size", item.relative_path));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{} cannot be read: {error}", item.relative_path));
+                continue;
+            }
+        };
+        let mut volume_permit = if let Some(state) = governor {
+            configure_volume_governor(state, settings);
+            let volume_id = match volume_resource_id(&candidate) {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(format!("{} volume is unavailable: {error}", item.relative_path));
+                    continue;
+                }
+            };
+            match state.volume_governor.acquire(
+                    resource_governor::Request::new(
+                        format!("Duplicate verification: {}", item.original_filename),
+                        resource_governor::PRIORITY_RECOVERY,
+                        false,
+                        vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+                    ),
+                    || {
+                        cancellable_operation_id
+                            .is_some_and(|id| inventory_was_cancelled(state, id))
+                    },
+                ) {
+                Ok(permit) => Some((permit, volume_id)),
+                Err(error) => {
+                    failures.push(format!("{} verification was not admitted: {error}", item.relative_path));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let hash = sha256(&candidate);
+        if let Some((permit, volume_id)) = volume_permit.as_mut() {
+            if hash.is_ok() {
+                permit.add_bytes_for(volume_id, expected_size, 0);
+            } else if let Err(error) = &hash {
+                permit.record_error(error.clone());
+            }
+        }
+        let after = fs_safe::snapshot(&candidate);
+        if hash.as_deref() == Ok(source_hash) && after.as_ref() == Ok(&before) {
+            return (
+                "already-imported".into(),
+                Some(item.id.clone()),
+                Some(item.relative_path.clone()),
+                Some("A local Master Bin copy was independently SHA-256 verified".into()),
+            );
+        }
+        failures.push(format!(
+            "{} failed fresh integrity verification",
+            item.relative_path
+        ));
+    }
+    (
+        "attention".into(),
+        None,
+        None,
+        Some(format!(
+            "Catalogue content match is not a trustworthy local copy: {}. The incoming source was not skipped.",
+            failures.join("; ")
+        )),
+    )
+}
+
+fn approved_source_snapshot_matches(path: &Path, approved: &ApprovedIngestFile) -> bool {
+    let Ok(snapshot) = fs_safe::snapshot(path) else {
+        return false;
+    };
+    if snapshot.length != approved.source_size
+        || snapshot.modified_millis != approved.source_modified_millis
+    {
+        return false;
+    }
+    if let Some(expected_volume) = approved.source_volume_identity.as_deref() {
+        if volume_identity_for_path(path).ok().flatten().as_deref() != Some(expected_volume) {
+            return false;
+        }
+    }
+    fs_safe::snapshot(path).as_ref() == Ok(&snapshot)
+}
+
+fn create_approved_inventory(
+    app: &AppHandle,
+    state: &NativeState,
+    operation_id: &str,
     sources: Vec<String>,
     date_override: Option<String>,
+    sd_grabber: bool,
 ) -> Result<SourceInventory, String> {
+    check_inventory_cancelled(state, operation_id)?;
     let settings = load_settings_file(&app)?;
+    configure_volume_governor(state, &settings);
+    if sd_grabber && !settings.sd_grabber_enabled {
+        return Err("Enable SD Card Grabber in Settings before scanning a card".into());
+    }
     let master = PathBuf::from(&settings.master_bin_path);
+    let master_canonical = master
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve Master Bin: {error}"))?;
+    let config_root = settings_path(app)?
+        .parent()
+        .ok_or("Invalid application configuration path")?
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve application working directory: {error}"))?;
+    let staging = fs_safe::staging_root(&master, &settings.device_id)?;
+    for source in &sources {
+        let canonical = Path::new(source)
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve selected source {source}: {error}"))?;
+        if paths_overlap(&master_canonical, &canonical)
+            || paths_overlap(&staging, &canonical)
+            || paths_overlap(&config_root, &canonical)
+        {
+            return Err(format!(
+                "Selected source {} overlaps the Master Bin or a protected PIMP working directory",
+                canonical.display()
+            ));
+        }
+    }
     let batch_timestamp = Local::now();
-    let mut inventory = build_source_inventory(&sources);
-    for file in &mut inventory.files {
+    let allowed = settings
+        .sd_grabber_extensions
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.state = "running".into();
+        operation.stage = "Enumerating".into();
+        operation.current_item = None;
+        operation.completed_items = 0;
+        operation.total_items = None;
+        operation.bytes_completed = 0;
+        operation.bytes_total = None;
+    });
+    let mut inventory = build_source_inventory_filtered_with_progress(
+        &sources,
+        sd_grabber.then_some(&allowed),
+        !sd_grabber || settings.sd_grabber_search_subfolders,
+        |progress, path| {
+            check_inventory_cancelled(state, operation_id)?;
+            update_inventory_operation(state, operation_id, |operation| {
+                operation.completed_items = progress.total_file_count;
+                operation.current_item = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+            });
+            Ok(())
+        },
+    )?;
+    check_inventory_cancelled(state, operation_id)?;
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.stage = "Inspecting files".into();
+        operation.completed_items = 0;
+        operation.total_items = Some(inventory.files.len());
+        operation.bytes_total = Some(inventory.files.iter().map(|file| file.size_bytes).sum());
+    });
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
+    for item in &catalogue.media {
+        hash_index
+            .entry(item.sha256.clone())
+            .or_default()
+            .push(item);
+    }
+    let mut snapshots = Vec::with_capacity(inventory.files.len());
+    let mut volume_identities = HashMap::<String, Option<String>>::new();
+    for (index, file) in inventory.files.iter_mut().enumerate() {
+        check_inventory_cancelled(state, operation_id)?;
         let filename = Path::new(&file.source_path)
             .file_name()
             .unwrap_or_default()
@@ -1364,9 +2818,708 @@ fn inventory_sources(
             &batch_timestamp,
             &filename,
         )?;
+        let source = PathBuf::from(&file.source_path);
+        let snapshot = fs_safe::snapshot(&source)?;
+        let volume_identity = volume_identities
+            .entry(file.source_root_path.clone())
+            .or_insert_with(|| volume_identity_for_path(&source).ok().flatten())
+            .clone();
+        snapshots.push((snapshot, volume_identity));
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.completed_items = index + 1;
+            operation.current_item = Some(filename);
+        });
     }
+
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.stage = "Calculating checksums".into();
+        operation.completed_items = 0;
+        operation.bytes_completed = 0;
+    });
+    let mut source_hashes = Vec::with_capacity(inventory.files.len());
+    let mut bytes_read = 0_u64;
+    for (index, file) in inventory.files.iter().enumerate() {
+        check_inventory_cancelled(state, operation_id)?;
+        let source = PathBuf::from(&file.source_path);
+        let volume_id = volume_resource_id(&source)?;
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.stage = "Waiting for source-volume access".into();
+            operation.current_item = source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+        });
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Approved source inventory: {}", source.display()),
+                resource_governor::PRIORITY_FOREGROUND,
+                false,
+                vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+            ),
+            || inventory_was_cancelled(state, operation_id),
+        )?;
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.stage = "Calculating checksums".into();
+        });
+        let hash = sha256_inventory(&source, state, operation_id, &mut bytes_read)?;
+        volume_permit.add_bytes_for(&volume_id, file.size_bytes, 0);
+        source_hashes.push(hash);
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.completed_items = index + 1;
+            operation.current_item = source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+        });
+    }
+
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.stage = "Checking duplicates".into();
+        operation.completed_items = 0;
+    });
+    let mut approved_files = Vec::new();
+    let mut selection_hashes = HashMap::<String, String>::new();
+    for (index, file) in inventory.files.iter_mut().enumerate() {
+        check_inventory_cancelled(state, operation_id)?;
+        let (snapshot, source_volume_identity) = &snapshots[index];
+        let hash = &source_hashes[index];
+        let source = PathBuf::from(&file.source_path);
+        let mut existing_media_id = None;
+        if fs_safe::snapshot(&source)? != *snapshot {
+            file.disposition = "attention".into();
+            file.detail =
+                Some("Source changed while the approved inventory was being built".into());
+        } else if let Some(relative_path) = selection_hashes.get(hash) {
+            file.disposition = "already-imported".into();
+            file.existing_relative_path = Some(relative_path.clone());
+            file.detail = Some("Duplicate recording within this approved selection".into());
+        } else {
+            let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
+            let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
+                &settings,
+                candidates,
+                snapshot.length,
+                hash,
+                Some(state),
+                Some(operation_id),
+            );
+            file.disposition = disposition;
+            file.existing_relative_path = relative_path;
+            file.detail = detail;
+            existing_media_id = media_id;
+            if file.disposition == "new" {
+                selection_hashes.insert(hash.clone(), file.planned_relative_path.clone());
+            }
+        }
+        if file.disposition != "already-imported" {
+            let destination = fs_safe::resolve_for_create(&master, &file.planned_relative_path)?;
+            if destination.exists() {
+                let reason = "A different file already occupies the planned destination";
+                inventory.conflicts.push(InventoryConflict {
+                    source_path: file.source_path.clone(),
+                    destination_path: file.planned_relative_path.clone(),
+                    reason: reason.into(),
+                });
+                file.disposition = "attention".into();
+                file.detail = Some(format!(
+                    "{reason}. Enter a new filename and approve the revised plan."
+                ));
+            }
+        }
+        let disposition = file.disposition.clone();
+        approved_files.push(ApprovedIngestFile {
+            inventory: file.clone(),
+            source_size: snapshot.length,
+            source_modified_millis: snapshot.modified_millis,
+            planning_modified_millis: file
+                .package_date_source_path
+                .as_deref()
+                .and_then(|path| fs_safe::snapshot(Path::new(path)).ok())
+                .and_then(|snapshot| snapshot.modified_millis)
+                .or(snapshot.modified_millis),
+            source_sha256: Some(hash.clone()),
+            source_volume_identity: source_volume_identity.clone(),
+            existing_media_id,
+        });
+        update_inventory_operation(state, operation_id, |operation| {
+            operation.completed_items = index + 1;
+            operation.current_item = source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+            match disposition.as_str() {
+                "new" => operation.counts.new_files += 1,
+                "already-imported" => operation.counts.duplicate_files += 1,
+                "attention" => operation.counts.attention_files += 1,
+                _ => operation.counts.failed_files += 1,
+            }
+        });
+    }
+    inventory.copy_file_count = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .count();
+    inventory.copy_bytes = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "new")
+        .map(|file| file.size_bytes)
+        .sum();
+    inventory.already_imported_file_count = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .count();
+    inventory.already_imported_bytes = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "already-imported")
+        .map(|file| file.size_bytes)
+        .sum();
+    inventory.attention_file_count = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .count();
+    inventory.attention_bytes = inventory
+        .files
+        .iter()
+        .filter(|file| file.disposition == "attention")
+        .map(|file| file.size_bytes)
+        .sum();
+    inventory.plan_id = Uuid::new_v4().to_string();
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
+    save_approved_plan(
+        app,
+        &ApprovedIngestPlan {
+            schema_version: 1,
+            id: inventory.plan_id.clone(),
+            lineage_id: inventory.plan_id.clone(),
+            revision: 0,
+            created_at: Utc::now().to_rfc3339(),
+            batch_timestamp: batch_timestamp.to_rfc3339(),
+            master_bin_path: settings.master_bin_path,
+            sources,
+            date_override,
+            files: approved_files,
+            inventory: inventory.clone(),
+            sd_grabber,
+        },
+    )?;
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.state = "completed".into();
+        operation.stage = "Ready for review".into();
+        operation.current_item = None;
+        operation.cancellable = false;
+        operation.completed_items = inventory.files.len();
+        operation.total_items = Some(inventory.files.len());
+        operation.bytes_completed = operation.bytes_total.unwrap_or(0);
+    });
     Ok(inventory)
 }
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    fs_safe::within(left, right) || fs_safe::within(right, left)
+}
+
+fn begin_inventory_operation(
+    state: &NativeState,
+    operation_id: &str,
+    title: &str,
+) -> Result<(), String> {
+    Uuid::parse_str(operation_id).map_err(|_| "Inventory operation ID must be a UUID")?;
+    let now = Utc::now().to_rfc3339();
+    let previous = state
+        .inventory_status
+        .lock()
+        .unwrap()
+        .replace(BackgroundOperation {
+            id: operation_id.into(),
+            kind: "source-inventory".into(),
+            title: title.into(),
+            state: "queued".into(),
+            stage: "Waiting for the inventory worker".into(),
+            current_item: None,
+            completed_items: 0,
+            total_items: None,
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: true,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: now.clone(),
+            updated_at: now,
+        });
+    if let Some(previous) = previous.filter(|operation| {
+        matches!(
+            operation.state.as_str(),
+            "queued" | "running" | "cancelling"
+        )
+    }) {
+        state
+            .inventory_cancelled
+            .lock()
+            .unwrap()
+            .insert(previous.id);
+    }
+    state
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .remove(operation_id);
+    Ok(())
+}
+
+async fn run_inventory_command(
+    app: AppHandle,
+    operation_id: String,
+    sources: Vec<String>,
+    date_override: Option<String>,
+    sd_grabber: bool,
+) -> Result<SourceInventory, String> {
+    let started = Instant::now();
+    {
+        let state = app.state::<NativeState>();
+        begin_inventory_operation(
+            &state,
+            &operation_id,
+            if sd_grabber {
+                "SD-card inventory and duplicate verification"
+            } else {
+                "Source inventory and duplicate verification"
+            },
+        )?;
+    }
+    let worker_app = app.clone();
+    let worker_operation_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = worker_app.state::<NativeState>();
+        let _serial = state.inventory_worker.lock().unwrap();
+        check_inventory_cancelled(&state, &worker_operation_id)?;
+        diagnostic_log(
+            &worker_app,
+            "INFO",
+            "inventory",
+            &format!("{} started", worker_operation_id),
+        );
+        create_approved_inventory(
+            &worker_app,
+            &state,
+            &worker_operation_id,
+            sources,
+            date_override,
+            sd_grabber,
+        )
+    })
+    .await
+    .map_err(|error| format!("Inventory worker failed: {error}"))?;
+    if let Err(error) = &result {
+        let state = app.state::<NativeState>();
+        let cancelled = inventory_was_cancelled(&state, &operation_id);
+        update_inventory_operation(&state, &operation_id, |operation| {
+            operation.state = if cancelled { "cancelled" } else { "failed" }.into();
+            operation.stage = if cancelled {
+                "Cancelled safely"
+            } else {
+                "Inventory failed"
+            }
+            .into();
+            operation.error = (!cancelled).then(|| error.clone());
+            operation.cancellable = false;
+            operation.retryable = !cancelled;
+        });
+        diagnostic_log(&app, "ERROR", "inventory", error);
+    } else if let Ok(inventory) = &result {
+        let seconds = started.elapsed().as_secs_f64().max(0.001);
+        diagnostic_log(
+            &app,
+            "INFO",
+            "inventory",
+            &format!(
+                "{} completed: {} files, {} source bytes read in {:.3}s ({:.1} MiB/s)",
+                operation_id,
+                inventory.total_file_count,
+                inventory.total_bytes,
+                seconds,
+                inventory.total_bytes as f64 / 1024.0 / 1024.0 / seconds
+            ),
+        );
+    }
+    app.state::<NativeState>()
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .remove(&operation_id);
+    result
+}
+
+#[tauri::command]
+async fn inventory_sources(
+    app: AppHandle,
+    operation_id: String,
+    sources: Vec<String>,
+    date_override: Option<String>,
+) -> Result<SourceInventory, String> {
+    run_inventory_command(app, operation_id, sources, date_override, false).await
+}
+
+#[tauri::command]
+async fn inventory_sd_card(
+    app: AppHandle,
+    operation_id: String,
+    sources: Vec<String>,
+    date_override: Option<String>,
+) -> Result<SourceInventory, String> {
+    run_inventory_command(app, operation_id, sources, date_override, true).await
+}
+
+#[cfg(target_os = "windows")]
+fn removable_volumes() -> Vec<RemovableVolume> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+        GetVolumeNameForVolumeMountPointW,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
+    let mut volumes = Vec::new();
+    let drives = unsafe { GetLogicalDrives() };
+    for index in 0..26_u32 {
+        if drives & (1 << index) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + index as u8) as char);
+        let wide = std::ffi::OsStr::new(&root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_REMOVABLE {
+            continue;
+        }
+        let mut label = vec![0_u16; 261];
+        let mut filesystem = vec![0_u16; 64];
+        let mut serial = 0_u32;
+        let information_ok = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                label.as_mut_ptr(),
+                label.len() as u32,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            )
+        } != 0;
+        if !information_ok {
+            continue;
+        }
+        let mut available = 0_u64;
+        let mut capacity = 0_u64;
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                &mut capacity,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            continue;
+        }
+        let label_end = label
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(label.len());
+        let filesystem_end = filesystem
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(filesystem.len());
+        let filesystem = String::from_utf16_lossy(&filesystem[..filesystem_end]);
+        let mut volume_name = vec![0_u16; 261];
+        let stable_identity = (unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                volume_name.as_mut_ptr(),
+                volume_name.len() as u32,
+            )
+        } != 0)
+            .then(|| {
+                let end = volume_name
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(volume_name.len());
+                format!(
+                    "volume-guid:{}",
+                    String::from_utf16_lossy(&volume_name[..end]).to_ascii_lowercase()
+                )
+            })
+            .unwrap_or_else(|| format!("volume:{serial:08x}:{filesystem}:{capacity}"));
+        volumes.push(RemovableVolume {
+            root_path: root.clone(),
+            label: {
+                let value = String::from_utf16_lossy(&label[..label_end]);
+                if value.trim().is_empty() {
+                    "Removable media".into()
+                } else {
+                    value
+                }
+            },
+            identity: stable_identity,
+            capacity_bytes: capacity,
+            available_bytes: available,
+        });
+    }
+    volumes
+}
+
+#[cfg(not(target_os = "windows"))]
+fn removable_volumes() -> Vec<RemovableVolume> {
+    Vec::new()
+}
+
+#[tauri::command]
+fn list_removable_volumes() -> Vec<RemovableVolume> {
+    removable_volumes()
+}
+
+#[cfg(target_os = "windows")]
+fn volume_identity_for_path(path: &Path) -> Result<Option<String>, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+        GetVolumePathNameW,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut root = vec![0_u16; 261];
+    if unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return Err(format!(
+            "Cannot identify source volume for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut serial = 0_u32;
+    let mut filesystem = vec![0_u16; 64];
+    if unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Cannot read source-volume identity for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut volume_name = vec![0_u16; 261];
+    if unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            root.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        )
+    } != 0
+    {
+        let end = volume_name
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(volume_name.len());
+        return Ok(Some(format!(
+            "volume-guid:{}",
+            String::from_utf16_lossy(&volume_name[..end]).to_ascii_lowercase()
+        )));
+    }
+    let mut capacity = 0_u64;
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            &mut capacity,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Cannot read source-volume capacity for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let end = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filesystem.len());
+    Ok(Some(format!(
+        "volume:{serial:08X}:{}:{capacity}",
+        String::from_utf16_lossy(&filesystem[..end])
+    )))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn volume_identity_for_path(_path: &Path) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+fn volume_resource_id(path: &Path) -> Result<String, String> {
+    if let Some(identity) = volume_identity_for_path(path)? {
+        return Ok(identity);
+    }
+    let existing = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .ok_or("Cannot identify volume for a rootless path")?
+    };
+    let canonical = fs::canonicalize(existing)
+        .map_err(|error| format!("Cannot resolve volume for {}: {error}", path.display()))?;
+    let root = canonical
+        .components()
+        .next()
+        .ok_or("Cannot identify filesystem root")?;
+    Ok(format!("filesystem:{}", root.as_os_str().to_string_lossy()))
+}
+
+fn likely_io_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "cannot read",
+        "cannot write",
+        "source read",
+        "staging write",
+        "flush",
+        "i/o error",
+        "os error",
+        "disconnected",
+        "unavailable",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+#[cfg(target_os = "windows")]
+fn system_activity_evidence(
+    state: &NativeState,
+    settings: &DeviceSettings,
+) -> SystemActivityEvidence {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::{
+            SystemInformation::{GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX},
+            Threading::GetSystemTimes,
+        },
+        UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+    };
+
+    let mut last_input = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    let input_idle_seconds = (unsafe { GetLastInputInfo(&mut last_input) } != 0).then(|| {
+        let now = unsafe { GetTickCount64() } as u32;
+        u64::from(now.wrapping_sub(last_input.dwTime)) / 1_000
+    });
+
+    let mut idle = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let times_available = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } != 0;
+    let ticks =
+        |value: FILETIME| (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    let cpu_load_percent = if times_available {
+        let idle_ticks = ticks(idle);
+        let total_ticks = ticks(kernel).saturating_add(ticks(user));
+        let mut previous = state.system_load_sample.lock().unwrap();
+        let calculated = previous.as_ref().and_then(|prior| {
+            let total_delta = total_ticks.saturating_sub(prior.total_ticks);
+            let idle_delta = idle_ticks.saturating_sub(prior.idle_ticks);
+            (total_delta > 0).then(|| {
+                (100.0 * (total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64)
+                    .clamp(0.0, 100.0)
+            })
+        });
+        let retained =
+            calculated.or_else(|| previous.as_ref().and_then(|sample| sample.cpu_load_percent));
+        *previous = Some(SystemLoadSample {
+            idle_ticks,
+            total_ticks,
+            cpu_load_percent: retained,
+        });
+        retained
+    } else {
+        None
+    };
+
+    let mut memory = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let available_memory_bytes =
+        (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullAvailPhys);
+    let required_idle = u64::from(settings.resource_idle_delay_minutes) * 60;
+    let eligible = settings.increase_processing_while_idle
+        && input_idle_seconds.is_some_and(|seconds| seconds >= required_idle)
+        && cpu_load_percent.is_some_and(|percent| percent <= 50.0)
+        && available_memory_bytes.is_some_and(|bytes| bytes >= 2 * 1024 * 1024 * 1024);
+    let reason = if !settings.increase_processing_while_idle {
+        "Idle processing boost is disabled".into()
+    } else if input_idle_seconds.is_none_or(|seconds| seconds < required_idle) {
+        "Waiting for the configured input-idle period".into()
+    } else if cpu_load_percent.is_none() {
+        "Waiting for a supported CPU-load sample".into()
+    } else if cpu_load_percent.is_some_and(|percent| percent > 50.0) {
+        "System CPU load is above the idle-processing threshold".into()
+    } else if available_memory_bytes.is_none_or(|bytes| bytes < 2 * 1024 * 1024 * 1024) {
+        "Available memory is below the idle-processing threshold".into()
+    } else {
+        "Input, CPU, and memory evidence allow controlled idle processing".into()
+    };
+    SystemActivityEvidence {
+        input_idle_seconds,
+        cpu_load_percent,
+        available_memory_bytes,
+        idle_boost_eligible: eligible,
+        reason,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_activity_evidence(
+    _state: &NativeState,
+    _settings: &DeviceSettings,
+) -> SystemActivityEvidence {
+    SystemActivityEvidence {
+        reason: "Supported Windows activity evidence is unavailable on this platform".into(),
+        ..Default::default()
+    }
+}
+
+fn configure_volume_governor(
+    state: &NativeState,
+    settings: &DeviceSettings,
+) -> SystemActivityEvidence {
+    let activity = system_activity_evidence(state, settings);
+    state.volume_governor.configure(
+        resource_governor::Profile::parse(&settings.resource_profile),
+        activity.idle_boost_eligible,
+        settings.background_processing_paused,
+        settings.gentle_scanning,
+    );
+    activity
+}
+
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     let mut hash = Sha256::new();
@@ -1379,6 +3532,236 @@ fn sha256(path: &Path) -> Result<String, String> {
         hash.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn inventory_was_cancelled(state: &NativeState, operation_id: &str) -> bool {
+    state
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .contains(operation_id)
+}
+
+fn update_inventory_operation(
+    state: &NativeState,
+    operation_id: &str,
+    update: impl FnOnce(&mut BackgroundOperation),
+) {
+    let mut status = state.inventory_status.lock().unwrap();
+    if let Some(operation) = status
+        .as_mut()
+        .filter(|operation| operation.id == operation_id)
+    {
+        update(operation);
+        operation.updated_at = Utc::now().to_rfc3339();
+    }
+}
+
+fn check_inventory_cancelled(state: &NativeState, operation_id: &str) -> Result<(), String> {
+    if inventory_was_cancelled(state, operation_id) {
+        Err("Inventory cancelled safely".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn sha256_inventory(
+    path: &Path,
+    state: &NativeState,
+    operation_id: &str,
+    total_bytes_read: &mut u64,
+) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| {
+        format!(
+            "Cannot read source while calculating its checksum {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut next_update = 0_u64;
+    let hash = sha256_reader_cancellable(
+        &mut file,
+        || inventory_was_cancelled(state, operation_id),
+        |read| {
+            *total_bytes_read = total_bytes_read.saturating_add(read);
+            if *total_bytes_read >= next_update {
+                update_inventory_operation(state, operation_id, |operation| {
+                    operation.bytes_completed = *total_bytes_read;
+                    operation.current_item = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string());
+                });
+                next_update = total_bytes_read.saturating_add(8 * 1024 * 1024);
+            }
+        },
+    )
+    .map_err(|error| {
+        if error == "Inventory cancelled safely" {
+            error
+        } else {
+            format!("Source read failed for {}: {error}", path.display())
+        }
+    })?;
+    update_inventory_operation(state, operation_id, |operation| {
+        operation.bytes_completed = *total_bytes_read;
+    });
+    Ok(hash)
+}
+
+fn sha256_reader_cancellable(
+    reader: &mut impl Read,
+    mut cancelled: impl FnMut() -> bool,
+    mut progress: impl FnMut(u64),
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        if cancelled() {
+            return Err("Inventory cancelled safely".into());
+        }
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        progress(read as u64);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[tauri::command]
+fn cancel_inventory(state: State<'_, NativeState>, operation_id: String) -> Result<(), String> {
+    let active = state
+        .inventory_status
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|operation| {
+            operation.id == operation_id
+                && matches!(
+                    operation.state.as_str(),
+                    "queued" | "running" | "cancelling"
+                )
+        });
+    if !active {
+        return Ok(());
+    }
+    state
+        .inventory_cancelled
+        .lock()
+        .unwrap()
+        .insert(operation_id.clone());
+    update_inventory_operation(&state, &operation_id, |operation| {
+        if matches!(operation.state.as_str(), "queued" | "running") {
+            operation.state = "cancelling".into();
+            operation.stage = "Stopping after the current read".into();
+            operation.cancellable = false;
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn list_background_operations(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Vec<BackgroundOperation> {
+    let mut operations = Vec::new();
+    if let Some(inventory) = state.inventory_status.lock().unwrap().clone() {
+        operations.push(inventory);
+    }
+    operations.extend(
+        state
+            .playback_proxy_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
+    operations.extend(
+        state
+            .project_inventory_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
+    operations.extend(
+        state
+            .static_thumbnail_status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned(),
+    );
+    operations.extend(state.hover_preview_status.lock().unwrap().values().cloned());
+    let discovery = state.discovery_status.lock().unwrap().clone();
+    if discovery.running {
+        operations.push(BackgroundOperation {
+            id: "library-discovery".into(),
+            kind: "library-scan".into(),
+            title: if discovery.full {
+                "Full Library integrity verification".into()
+            } else {
+                "Library scan".into()
+            },
+            state: "running".into(),
+            stage: "Inspecting Library files".into(),
+            current_item: None,
+            completed_items: discovery.files_processed,
+            total_items: Some(discovery.total_files),
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts {
+                new_files: discovery.registered,
+                attention_files: discovery.errors,
+                ..Default::default()
+            },
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: discovery.started_at.unwrap_or_default(),
+            updated_at: Utc::now().to_rfc3339(),
+        });
+    }
+    let enrichment = state.enrichment_status.lock().unwrap().clone();
+    let enrichment_active = *state.enrichment_worker_active.lock().unwrap();
+    if let Some(enrichment) = enrichment {
+        if enrichment.state != "completed" || enrichment_active {
+            operations.push(enrichment);
+        }
+    }
+    let backup_jobs = {
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app).unwrap_or_default()
+    };
+    for job in backup_jobs
+        .into_iter()
+        .filter(|job| matches!(job.state.as_str(), "prepared" | "copying" | "verifying"))
+    {
+        operations.push(BackgroundOperation {
+            id: format!("backup:{}", job.id),
+            kind: "backup".into(),
+            title: format!("Project backup: {}", job.project_name),
+            state: "running".into(),
+            stage: job.state.clone(),
+            current_item: job.current_file,
+            completed_items: job.files_completed,
+            total_items: Some(job.manifest.source_file_count),
+            bytes_completed: job.bytes_completed,
+            bytes_total: Some(job.manifest.source_bytes),
+            counts: OperationCounts::default(),
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: job.error,
+            started_at: job.created_at,
+            updated_at: job.updated_at,
+        });
+    }
+    operations
 }
 fn destination_date(
     settings: &DeviceSettings,
@@ -1410,6 +3793,10 @@ fn destination_date_from_modified(
             batch_timestamp.date_naive() - Duration::days(1),
             batch_timestamp.time(),
         ),
+        Some("original-file-dates") => modified
+            .as_ref()
+            .map(|value| (value.date_naive(), value.time()))
+            .unwrap_or((batch_timestamp.date_naive(), batch_timestamp.time())),
         Some(date) => {
             let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
                 .map_err(|_| "Date override must use YYYY-MM-DD".to_string())?;
@@ -1553,6 +3940,17 @@ struct VerifiedCopy {
 struct RecoverySummary {
     recovered: usize,
     needs_review: usize,
+}
+
+fn verify_approved_source_hash(actual: &str, approved: &str) -> Result<(), String> {
+    if actual == approved {
+        Ok(())
+    } else {
+        Err(
+            "Source bytes no longer match the approved inventory SHA-256; staged copy was rejected"
+                .into(),
+        )
+    }
 }
 
 fn update_job_progress(
@@ -1741,7 +4139,29 @@ fn copy_verified(
     total_bytes: u64,
     file_index: usize,
     file_total: usize,
+    approved_hash: &str,
+    source_volume_identity: Option<&str>,
 ) -> Result<VerifiedCopy, String> {
+    configure_volume_governor(state, settings);
+    let source_volume = volume_resource_id(source)?;
+    let destination_volume = volume_resource_id(Path::new(&settings.master_bin_path))?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            format!("Verified ingest: {}", source.display()),
+            resource_governor::PRIORITY_FOREGROUND,
+            false,
+            vec![
+                resource_governor::VolumeNeed::read(source_volume.clone()),
+                resource_governor::VolumeNeed::write(destination_volume.clone()),
+            ],
+        ),
+        || state.cancelled_jobs.lock().unwrap().contains(job_id),
+    )?;
+    if let Some(expected_volume) = source_volume_identity {
+        if volume_identity_for_path(source)?.as_deref() != Some(expected_volume) {
+            return Err("The source volume changed after approval; rescan the card".into());
+        }
+    }
     let before = fs_safe::snapshot(source)?;
     let staging = fs_safe::staging_root(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let staged_name = format!("{}.part", Uuid::new_v4());
@@ -1820,15 +4240,23 @@ fn copy_verified(
             },
         );
         let copied_source_hash = format!("{:x}", source_hash.finalize());
+        verify_approved_source_hash(&copied_source_hash, approved_hash)?;
         let after = fs_safe::snapshot(source)?;
         if before != after || copied != before.length {
             return Err("Source changed during transfer; staged copy was rejected".into());
         }
         let post_copy_source_hash = sha256(source)?;
-        if post_copy_source_hash != copied_source_hash {
+        if post_copy_source_hash != approved_hash {
             return Err("Source content changed during transfer; staged copy was rejected".into());
         }
-        if sha256(&temp)? != copied_source_hash {
+        if let Some(expected_volume) = source_volume_identity {
+            if volume_identity_for_path(source)?.as_deref() != Some(expected_volume) {
+                return Err(
+                    "The source volume changed during transfer; staged copy was rejected".into(),
+                );
+            }
+        }
+        if sha256(&temp)? != approved_hash {
             return Err("Independent SHA-256 verification failed".into());
         }
         journal.status = "verified".into();
@@ -1839,8 +4267,15 @@ fn copy_verified(
         Ok(copied_source_hash)
     })();
     match operation {
-        Ok(hash) => Ok(VerifiedCopy { hash, journal_path }),
+        Ok(hash) => {
+            volume_permit.add_bytes_for(&source_volume, before.length.saturating_mul(2), 0);
+            volume_permit.add_bytes_for(&destination_volume, before.length, before.length);
+            Ok(VerifiedCopy { hash, journal_path })
+        }
         Err(error) => {
+            if error != "__cancelled__" && likely_io_error(&error) {
+                volume_permit.record_error(error.clone());
+            }
             let _ = fs::remove_file(&temp);
             journal.status = if error == "__cancelled__" {
                 "cancelled".into()
@@ -2056,6 +4491,38 @@ fn commit_job_file(
     Ok(())
 }
 
+fn complete_duplicate_job_file(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+    file_id: &str,
+    media_id: &str,
+) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or("Ingest job no longer exists")?;
+        let file = job
+            .files
+            .iter_mut()
+            .find(|file| file.id == file_id)
+            .ok_or("Ingest job file no longer exists")?;
+        file.media_id = media_id.into();
+        file.state = "completed".into();
+        file.bytes_transferred = 0;
+        file.error = None;
+        job.files_completed = job
+            .files
+            .iter()
+            .filter(|file| file.state == "completed")
+            .count();
+        job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
+        job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
 fn all_job_files_completed(job: &IngestJob) -> bool {
     job.inventory_issues.is_empty()
         && !job.files.is_empty()
@@ -2179,18 +4646,89 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             )?;
             continue;
         }
+        if planned.duplicate_existing_relative_path.is_some() {
+            let expected_hash = planned
+                .approved_sha256
+                .as_deref()
+                .ok_or("Approved duplicate is missing its source hash")?;
+            let source_before = fs_safe::snapshot(&source);
+            let destination_before = fs_safe::snapshot(&destination);
+            let source_volume_before = volume_identity_for_path(&source).ok().flatten();
+            let source_hash = sha256(&source);
+            let destination_hash = sha256(&destination);
+            let volume_matches = planned
+                .source_volume_identity
+                .as_deref()
+                .is_none_or(|expected| source_volume_before.as_deref() == Some(expected));
+            let trustworthy = volume_matches
+                && source_before.as_ref().is_ok_and(|snapshot| {
+                    snapshot.length == planned.size_bytes
+                        && snapshot.modified_millis == planned.source_modified_millis
+                })
+                && source_hash.as_deref() == Ok(expected_hash)
+                && fs_safe::snapshot(&source).as_ref() == source_before.as_ref()
+                && planned
+                    .source_volume_identity
+                    .as_deref()
+                    .is_none_or(|expected| {
+                        volume_identity_for_path(&source).ok().flatten().as_deref()
+                            == Some(expected)
+                    })
+                && destination_before
+                    .as_ref()
+                    .is_ok_and(|snapshot| snapshot.length == planned.size_bytes)
+                && destination_hash.as_deref() == Ok(expected_hash)
+                && fs_safe::snapshot(&destination).as_ref() == destination_before.as_ref();
+            let existing = load_catalogue_file(&settings)?
+                .media
+                .into_iter()
+                .find(|item| {
+                    item.id == planned.media_id
+                        && item.relative_path == planned.relative_path
+                        && item.sha256 == expected_hash
+                });
+            if trustworthy && existing.is_some() {
+                complete_duplicate_job_file(app, &state, job_id, &planned.id, &planned.media_id)?;
+                continue;
+            }
+            update_job_progress(
+                app,
+                &state,
+                job_id,
+                &planned.id,
+                "failed",
+                0,
+                Some("The previously verified duplicate is no longer trustworthy; no file was skipped".into()),
+            )?;
+            continue;
+        }
         if destination.exists() {
             match (sha256(&source), sha256(&destination)) {
                 (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
-                    commit_job_file(
-                        app,
-                        &state,
-                        &settings,
-                        job_id,
-                        &planned.id,
-                        destination_hash,
-                        None,
-                    )?;
+                    let catalogue = load_catalogue_file(&settings)?;
+                    if let Some(existing) = catalogue.media.iter().find(|item| {
+                        item.relative_path == planned.relative_path
+                            && item.sha256 == destination_hash
+                    }) {
+                        complete_duplicate_job_file(
+                            app,
+                            &state,
+                            job_id,
+                            &planned.id,
+                            &existing.id,
+                        )?;
+                    } else {
+                        commit_job_file(
+                            app,
+                            &state,
+                            &settings,
+                            job_id,
+                            &planned.id,
+                            destination_hash,
+                            None,
+                        )?;
+                        kick_enrichment_worker(app.clone());
+                    }
                     completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
                     continue;
                 }
@@ -2220,6 +4758,11 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             job.bytes_total,
             index,
             job.files.len(),
+            planned
+                .approved_sha256
+                .as_deref()
+                .ok_or("Approved ingest file is missing its SHA-256")?,
+            planned.source_volume_identity.as_deref(),
         ) {
             Ok(copy) => {
                 if let Err(error) = commit_job_file(
@@ -2244,6 +4787,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     )?;
                 } else {
                     completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                    kick_enrichment_worker(app.clone());
                 }
             }
             Err(error) if error == "__cancelled__" => {
@@ -2330,6 +4874,22 @@ fn active_destination_reservations(jobs: &[IngestJob]) -> HashSet<String> {
         .collect()
 }
 
+fn active_content_reservations(jobs: &[IngestJob]) -> HashMap<String, (String, String)> {
+    jobs.iter()
+        .filter(|job| !matches!(job.state.as_str(), "completed" | "cancelled"))
+        .flat_map(|job| &job.files)
+        .filter(|file| !file.intentional_duplicate && file.state != "cancelled")
+        .filter_map(|file| {
+            file.approved_sha256.as_ref().map(|hash| {
+                (
+                    hash.clone(),
+                    (file.relative_path.clone(), file.media_id.clone()),
+                )
+            })
+        })
+        .collect()
+}
+
 fn initial_batch_metadata(kind: &str, batch_tags: &[String]) -> ProvisionalMetadata {
     if matches!(kind, "video" | "audio" | "image") && !batch_tags.is_empty() {
         ProvisionalMetadata {
@@ -2348,75 +4908,139 @@ fn start_ingest(
     state: State<'_, NativeState>,
     request: IngestRequest,
 ) -> Result<IngestJob, String> {
-    let update_guard = state.update_installing.lock().unwrap();
-    if *update_guard {
-        return Err(UPDATE_OPERATION_BLOCKED.into());
-    }
+    let _operation = begin_critical_operation(&state.operations, "ingest start")?;
+    let _plan_guard = state.approved_plan_store.lock().unwrap();
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
-    let inventory = build_source_inventory(&request.sources);
+    let plan_id = request
+        .approved_plan_id
+        .as_deref()
+        .ok_or("Scan and review the source before starting ingest")?;
+    let plan = current_approved_plan(&app, plan_id)?;
+    if plan.id != plan_id {
+        return Err("This approved ingest plan was superseded; review the latest plan".into());
+    }
+    let plan_lineage = approved_plan_lineage(&plan).to_owned();
+    if plan.schema_version != 1
+        || plan.master_bin_path != settings.master_bin_path
+        || plan.sources != request.sources
+        || plan.date_override != request.date_override
+    {
+        return Err("The approved ingest plan no longer matches this request; scan again".into());
+    }
+    if !request.renamed_destinations.is_empty() {
+        return Err("Destination renames require a new reviewed ingest plan".into());
+    }
+    let inventory = plan.inventory.clone();
     let unsupported = inventory
         .files
         .iter()
         .filter(|file| !file.analysis_supported)
         .map(|file| file.source_path.clone())
         .collect();
-    let batch_timestamp = Local::now();
-    let reserved = active_destination_reservations(&snapshot_jobs(&app, &state)?);
+    let batch_timestamp = DateTime::parse_from_rfc3339(&plan.batch_timestamp)
+        .map_err(|_| "Approved ingest plan has an invalid timestamp")?
+        .with_timezone(&Local);
+    let existing_jobs = snapshot_jobs(&app, &state)?;
+    let reserved = active_destination_reservations(&existing_jobs);
+    let reserved_content = active_content_reservations(&existing_jobs);
     let mut planned_paths = HashSet::new();
     let mut files = Vec::new();
     let batch_tags = normalized(&request.batch_tags);
-    for inventory_file in &inventory.files {
+    let media_ids_by_relative = plan
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.inventory.planned_relative_path.clone(),
+                Uuid::new_v4().to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for approved in &plan.files {
+        let inventory_file = &approved.inventory;
         let source = PathBuf::from(&inventory_file.source_path);
-        let filename = request
-            .renamed_destinations
-            .get(&source.to_string_lossy().to_string())
-            .cloned()
-            .unwrap_or_else(|| source.file_name().unwrap().to_string_lossy().to_string());
-        if Path::new(&filename)
-            .file_name()
-            .and_then(|value| value.to_str())
-            != Some(filename.as_str())
-        {
-            return Err(format!(
-                "{} has an invalid destination filename",
-                source.display()
-            ));
-        }
-        let relative_path = planned_relative_path(
-            &settings,
-            &master,
-            inventory_file,
-            &request.date_override,
-            &batch_timestamp,
-            &filename,
-        )?;
+        let source_changed = !approved_source_snapshot_matches(&source, approved);
+        let active_duplicate = approved
+            .source_sha256
+            .as_ref()
+            .and_then(|hash| reserved_content.get(hash));
+        let intentional_duplicate = request.allow_duplicate_copies
+            && (inventory_file.disposition == "already-imported" || active_duplicate.is_some());
+        let is_duplicate = (inventory_file.disposition == "already-imported"
+            || active_duplicate.is_some())
+            && !intentional_duplicate;
+        let relative_path = if is_duplicate {
+            active_duplicate
+                .map(|value| value.0.clone())
+                .or_else(|| inventory_file.existing_relative_path.clone())
+                .ok_or("Approved duplicate is missing its verified destination")?
+        } else {
+            inventory_file.planned_relative_path.clone()
+        };
         let destination = fs_safe::resolve_for_create(&master, &relative_path)?;
         let destination_path = destination.to_string_lossy().to_string();
-        let collision =
-            reserved.contains(&destination_path) || !planned_paths.insert(destination_path.clone());
+        let collision = !is_duplicate
+            && (reserved.contains(&destination_path)
+                || !planned_paths.insert(destination_path.clone()));
+        let attention =
+            inventory_file.disposition == "attention" && !request.allow_unverified_reimport;
+        let failed = collision || source_changed || attention;
+        let media_id = if is_duplicate {
+            active_duplicate
+                .map(|value| value.1.clone())
+                .or_else(|| approved.existing_media_id.clone())
+                .or_else(|| media_ids_by_relative.get(&relative_path).cloned())
+                .ok_or("Approved duplicate has no stable media identity")?
+        } else {
+            media_ids_by_relative
+                .get(&inventory_file.planned_relative_path)
+                .cloned()
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        };
         files.push(IngestJobFile {
             id: Uuid::new_v4().to_string(),
-            media_id: Uuid::new_v4().to_string(),
+            media_id,
             source_path: source.to_string_lossy().to_string(),
             source_relative_path: inventory_file.source_relative_path.clone(),
             destination_path,
-            relative_path,
+            relative_path: relative_path.clone(),
             original_filename: source.file_name().unwrap().to_string_lossy().to_string(),
             size_bytes: inventory_file.size_bytes,
             bytes_transferred: 0,
-            state: if collision { "failed" } else { "queued" }.into(),
-            error: collision
-                .then(|| "Another queued ingest already reserves this destination".into()),
+            state: if failed { "failed" } else { "queued" }.into(),
+            error: if source_changed {
+                Some("Source changed or disappeared after the approved scan; scan again".into())
+            } else if attention {
+                inventory_file.detail.clone().or_else(|| {
+                    Some("This file requires review before it can be transferred".into())
+                })
+            } else if collision {
+                Some("Another queued ingest already reserves this destination".into())
+            } else {
+                None
+            },
             metadata: initial_batch_metadata(&inventory_file.kind, &batch_tags),
             pending_metadata: None,
             metadata_error: None,
+            source_modified_millis: approved.source_modified_millis,
+            approved_sha256: approved.source_sha256.clone(),
+            source_volume_identity: approved.source_volume_identity.clone(),
+            duplicate_existing_relative_path: is_duplicate.then_some(relative_path.clone()),
+            intentional_duplicate,
         });
     }
     let now = Utc::now().to_rfc3339();
+    let bytes_total = files
+        .iter()
+        .filter(|file| file.duplicate_existing_relative_path.is_none() && file.state == "queued")
+        .map(|file| file.size_bytes)
+        .sum();
     let job = IngestJob {
         schema_version: 3,
         id: request.job_id,
+        approved_plan_id: Some(plan_id.into()),
+        approved_plan_lineage_id: Some(plan_lineage.clone()),
         state: if files.iter().any(|file| file.state == "queued") {
             "queued"
         } else {
@@ -2427,7 +5051,7 @@ fn start_ingest(
         updated_at: now,
         batch_timestamp: batch_timestamp.to_rfc3339(),
         date_override: request.date_override,
-        bytes_total: files.iter().map(|file| file.size_bytes).sum(),
+        bytes_total,
         bytes_transferred: 0,
         files_completed: 0,
         current_file: None,
@@ -2443,10 +5067,24 @@ fn start_ingest(
         if jobs.iter().any(|existing| existing.id == job.id) {
             return Err("An ingest job with this ID already exists".into());
         }
+        if jobs.iter().any(|existing| {
+            existing.approved_plan_lineage_id.as_deref() == Some(plan_lineage.as_str())
+                || (existing.approved_plan_lineage_id.is_none()
+                    && existing.approved_plan_id.as_deref() == Some(plan_id))
+        }) {
+            return Err("This approved ingest plan has already been used".into());
+        }
         jobs.push(job.clone());
         Ok(())
     })?;
-    drop(update_guard);
+    if let Err(error) = remove_approved_plan_lineage(&app, &plan_lineage) {
+        diagnostic_log(
+            &app,
+            "WARN",
+            "approved-plan-cleanup",
+            &format!("Ingest started, but consumed plan cleanup was incomplete: {error}"),
+        );
+    }
     kick_ingest_worker(app);
     Ok(job)
 }
@@ -2818,10 +5456,7 @@ fn resume_ingest(
     state: State<'_, NativeState>,
     job_id: String,
 ) -> Result<(), String> {
-    let update_guard = state.update_installing.lock().unwrap();
-    if *update_guard {
-        return Err(UPDATE_OPERATION_BLOCKED.into());
-    }
+    let _operation = begin_critical_operation(&state.operations, "ingest resume")?;
     let current = snapshot_jobs(&app, &state)?
         .into_iter()
         .find(|job| job.id == job_id)
@@ -2846,7 +5481,6 @@ fn resume_ingest(
         state.paused_jobs.lock().unwrap().insert(job_id);
         return Err(error);
     }
-    drop(update_guard);
     kick_ingest_worker(app);
     Ok(())
 }
@@ -2857,10 +5491,7 @@ fn retry_ingest(
     state: State<'_, NativeState>,
     job_id: String,
 ) -> Result<(), String> {
-    let update_guard = state.update_installing.lock().unwrap();
-    if *update_guard {
-        return Err(UPDATE_OPERATION_BLOCKED.into());
-    }
+    let _operation = begin_critical_operation(&state.operations, "ingest retry")?;
     let current = snapshot_jobs(&app, &state)?
         .into_iter()
         .find(|job| job.id == job_id)
@@ -2877,7 +5508,6 @@ fn retry_ingest(
         prepare_job_retry(job);
         Ok(())
     })?;
-    drop(update_guard);
     kick_ingest_worker(app);
     Ok(())
 }
@@ -3068,16 +5698,17 @@ where
     let mut state: ProjectManifestSyncState = read_json(state_path)?;
     let original = state.clone();
     for (project_id, directory) in requested {
-        let pending = state
-            .pending
-            .entry(project_id.clone())
-            .or_insert_with(|| PendingProjectManifest {
-                project_id,
-                directory: directory.clone(),
-                attempts: 0,
-                last_error: "Manifest synchronization is pending".into(),
-                updated_at: Utc::now().to_rfc3339(),
-            });
+        let pending =
+            state
+                .pending
+                .entry(project_id.clone())
+                .or_insert_with(|| PendingProjectManifest {
+                    project_id,
+                    directory: directory.clone(),
+                    attempts: 0,
+                    last_error: "Manifest synchronization is pending".into(),
+                    updated_at: Utc::now().to_rfc3339(),
+                });
         if pending.directory.is_none() && directory.is_some() {
             pending.directory = directory;
             pending.updated_at = Utc::now().to_rfc3339();
@@ -3165,7 +5796,11 @@ where
     let durable_state = state.clone();
     let project_ids: BTreeSet<String> = state.pending.keys().cloned().collect();
     for project_id in project_ids {
-        let Some(project) = catalogue.projects.iter().find(|project| project.id == project_id) else {
+        let Some(project) = catalogue
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+        else {
             state.pending.remove(&project_id);
             continue;
         };
@@ -3287,10 +5922,9 @@ where
             "Project registration failed before a new manifest was created; the folder was preserved and recovery intent remains durable: {error}"
         )
     })?;
-    settings.project_paths.insert(
-        project.id.clone(),
-        directory.to_string_lossy().into_owned(),
-    );
+    settings
+        .project_paths
+        .insert(project.id.clone(), directory.to_string_lossy().into_owned());
     write_json_if_changed(settings_file, settings).map_err(|error| {
         format!(
             "Project registration was saved, but its local folder association is pending automatic recovery: {error}"
@@ -3472,16 +6106,20 @@ async fn update_media(
             });
         }
         if let Some(notes) = &update.notes {
-            events.push(CatalogueEvent::MediaNotesSet {
-                media_id: item.id.clone(),
-                value: notes.clone(),
-            });
+            if &item.notes != notes {
+                events.push(CatalogueEvent::MediaNotesSet {
+                    media_id: item.id.clone(),
+                    value: notes.clone(),
+                });
+            }
         }
         if let Some(favourite) = update.favourite {
-            events.push(CatalogueEvent::MediaFavouriteSet {
-                media_id: item.id.clone(),
-                value: favourite,
-            });
+            if item.favourite != favourite {
+                events.push(CatalogueEvent::MediaFavouriteSet {
+                    media_id: item.id.clone(),
+                    value: favourite,
+                });
+            }
         }
     }
     events.retain(|event| match event {
@@ -3594,12 +6232,8 @@ fn create_project(
         .as_ref()
         .map(project_manifest_identity)
         .transpose()?;
-    let recovered_id = project_identity_for_directory(
-        &sync_path,
-        &settings,
-        &directory,
-        manifest_id.as_deref(),
-    )?;
+    let recovered_id =
+        project_identity_for_directory(&sync_path, &settings, &directory, manifest_id.as_deref())?;
     let manifest_project = manifest_value
         .as_ref()
         .map(|value| project_from_manifest(value, name.trim()))
@@ -3679,7 +6313,11 @@ fn retry_project_synchronization(
         let _catalogue_guard = state.catalogue_write.lock().unwrap();
         load_catalogue_file(&settings)?
     };
-    if !catalogue.projects.iter().any(|project| project.id == project_id) {
+    if !catalogue
+        .projects
+        .iter()
+        .any(|project| project.id == project_id)
+    {
         return Err("The project is not present in the authoritative catalogue".into());
     }
     let directory = settings.project_paths.get(&project_id).cloned();
@@ -3702,7 +6340,10 @@ fn resolve_known_project_directory(
 }
 
 fn project_asset_category(relative_path: &Path) -> String {
-    let lower_path = relative_path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let lower_path = relative_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
     let extension = relative_path
         .extension()
         .and_then(|value| value.to_str())
@@ -3755,13 +6396,7 @@ fn inventory_project_directory(
     project_name: &str,
     directory: &Path,
 ) -> Result<ProjectInventory, String> {
-    inventory_project_directory_with_limits(
-        project_id,
-        project_name,
-        directory,
-        100_000,
-        64,
-    )
+    inventory_project_directory_with_limits(project_id, project_name, directory, 100_000, 64)
 }
 
 fn inventory_project_directory_with_limits(
@@ -3823,9 +6458,9 @@ fn inventory_project_directory_with_limits(
         })
         .map(|item| item.relative_path.clone());
     let size_bytes = items.iter().try_fold(0_u64, |total, item| {
-        total.checked_add(item.size_bytes).ok_or_else(|| {
-            "Project inventory size exceeds the supported range".to_string()
-        })
+        total
+            .checked_add(item.size_bytes)
+            .ok_or_else(|| "Project inventory size exceeds the supported range".to_string())
     })?;
     Ok(ProjectInventory {
         project_id: project_id.into(),
@@ -3835,7 +6470,55 @@ fn inventory_project_directory_with_limits(
         main_premiere_project,
         scanned_at: Utc::now().to_rfc3339(),
         items,
+        premiere_index: None,
     })
+}
+
+fn premiere_index_path(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
+    if project_id.is_empty()
+        || !project_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+    {
+        return Err("Project identifier is not safe for local index storage".into());
+    }
+    Ok(settings_path(app)?
+        .parent()
+        .ok_or("Application settings path has no parent")?
+        .join("premiere-indexes")
+        .join(format!("{project_id}.json")))
+}
+
+fn associate_premiere_media(
+    index: &mut PremiereProjectIndex,
+    project_directory: &Path,
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+) {
+    let Ok(master) = Path::new(&settings.master_bin_path).canonicalize() else {
+        return;
+    };
+    let known = catalogue
+        .media
+        .iter()
+        .filter_map(|media| {
+            fs_safe::resolve_existing(&master, &media.relative_path)
+                .ok()
+                .and_then(|path| path.canonicalize().ok())
+                .map(|path| (path, media.id.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    for reference in &mut index.media_references {
+        let path = PathBuf::from(&reference.path);
+        let candidate = if path.is_absolute() {
+            path
+        } else {
+            project_directory.join(path)
+        };
+        if let Ok(canonical) = candidate.canonicalize() {
+            reference.media_id = known.get(&canonical).cloned();
+        }
+    }
 }
 
 #[tauri::command]
@@ -3848,12 +6531,140 @@ async fn inventory_project(app: AppHandle, project_id: String) -> Result<Project
         .find(|project| project.id == project_id)
         .ok_or("Unknown project")?;
     let project_name = project.name.clone();
-    let directory = resolve_known_project_directory(&settings, &project_id)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        inventory_project_directory(&project_id, &project_name, &directory)
-    })
-    .await
-    .map_err(|error| format!("Project inventory task failed: {error}"))?
+    let operation_id = format!("project-index:{project_id}");
+    let now = Utc::now().to_rfc3339();
+    app.state::<NativeState>()
+        .project_inventory_status
+        .lock()
+        .unwrap()
+        .insert(
+            operation_id.clone(),
+            BackgroundOperation {
+                id: operation_id.clone(),
+                kind: "premiere-index".into(),
+                title: format!("Premiere project index: {project_name}"),
+                state: "running".into(),
+                stage: "Reading project folder".into(),
+                current_item: None,
+                completed_items: 0,
+                total_items: None,
+                bytes_completed: 0,
+                bytes_total: None,
+                counts: OperationCounts::default(),
+                cancellable: false,
+                pausable: false,
+                retryable: false,
+                error: None,
+                started_at: now.clone(),
+                updated_at: now,
+            },
+        );
+
+    let result: Result<ProjectInventory, String> = async {
+        let directory = resolve_known_project_directory(&settings, &project_id)?;
+        let task_directory = directory.clone();
+        let task_project_id = project_id.clone();
+        let task_operation_id = operation_id.clone();
+        let task_app = app.clone();
+        let (mut inventory, parsed_index) = tauri::async_runtime::spawn_blocking(move || {
+            let inventory =
+                inventory_project_directory(&task_project_id, &project_name, &task_directory)?;
+            update_project_inventory_operation(
+                &task_app.state::<NativeState>(),
+                &task_operation_id,
+                |operation| {
+                    operation.completed_items = inventory.items.len();
+                    operation.stage = if inventory.main_premiere_project.is_some() {
+                        "Reading saved Premiere project".into()
+                    } else {
+                        "Project folder indexed".into()
+                    };
+                    operation.current_item = inventory.main_premiere_project.clone();
+                },
+            );
+            let parsed = inventory.main_premiere_project.as_ref().map(|relative| {
+                fs_safe::resolve_existing(&task_directory, relative).and_then(|path| {
+                    premiere_index::index_project(&path, relative, Utc::now().to_rfc3339())
+                })
+            });
+            Ok::<_, String>((inventory, parsed))
+        })
+        .await
+        .map_err(|error| format!("Project inventory task failed: {error}"))??;
+        if let Some(parsed_index) = parsed_index {
+            update_project_inventory_operation(
+                &app.state::<NativeState>(),
+                &operation_id,
+                |operation| {
+                    operation.stage = "Resolving saved media references".into();
+                },
+            );
+            let relative = inventory.main_premiere_project.clone().unwrap_or_default();
+            match parsed_index {
+                Ok(mut index) => {
+                    let path = premiere_index_path(&app, &project_id)?;
+                    if path.is_file() {
+                        if let Ok(previous) = read_json::<PremiereProjectIndex>(&path) {
+                            premiere_index::carry_forward_historical_evidence(
+                                &mut index, &previous,
+                            );
+                        }
+                    }
+                    associate_premiere_media(&mut index, &directory, &settings, &catalogue);
+                    write_json(&path, &index)?;
+                    inventory.premiere_index = Some(index);
+                }
+                Err(error) => {
+                    inventory.premiere_index = Some(PremiereProjectIndex {
+                        parser_version: premiere_index::PARSER_VERSION.into(),
+                        source_relative_path: relative,
+                        indexed_at: Utc::now().to_rfc3339(),
+                        status: "unsupported".into(),
+                        issues: vec![error],
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        Ok(inventory)
+    }
+    .await;
+
+    if let Err(error) = &result {
+        update_project_inventory_operation(
+            &app.state::<NativeState>(),
+            &operation_id,
+            |operation| {
+                operation.state = "failed".into();
+                operation.stage = "Project indexing failed".into();
+                operation.error = Some(error.clone());
+                operation.retryable = true;
+            },
+        );
+    } else {
+        app.state::<NativeState>()
+            .project_inventory_status
+            .lock()
+            .unwrap()
+            .remove(&operation_id);
+    }
+    result
+}
+
+fn update_project_inventory_operation(
+    state: &NativeState,
+    operation_id: &str,
+    update: impl FnOnce(&mut BackgroundOperation),
+) {
+    if let Some(operation) = state
+        .project_inventory_status
+        .lock()
+        .unwrap()
+        .get_mut(operation_id)
+    {
+        update(operation);
+        operation.updated_at = Utc::now().to_rfc3339();
+    }
 }
 
 #[tauri::command]
@@ -3910,11 +6721,71 @@ fn fail_discovery_scan(
     error
 }
 
+fn evidence_matches(
+    item: &MediaItem,
+    device_id: &str,
+    observed_size: u64,
+    observed_modified_millis: Option<u64>,
+    observed_sha256: Option<&str>,
+    needs_review: bool,
+) -> bool {
+    item.integrity_by_device
+        .get(device_id)
+        .is_some_and(|evidence| {
+            evidence.observed_size == observed_size
+                && evidence.observed_modified_millis == observed_modified_millis
+                && evidence.observed_sha256.as_deref() == observed_sha256
+                && evidence.needs_review == needs_review
+        })
+}
+
+fn evidence_observation_event(
+    item: &MediaItem,
+    device_id: &str,
+    snapshot: &fs_safe::FileSnapshot,
+    observed_sha256: String,
+) -> Option<CatalogueEvent> {
+    let observed_modified_millis = snapshot.modified_millis.map(|value| value as u64);
+    let needs_review = observed_sha256 != item.sha256;
+    (!evidence_matches(
+        item,
+        device_id,
+        snapshot.length,
+        observed_modified_millis,
+        Some(&observed_sha256),
+        needs_review,
+    ))
+    .then(|| CatalogueEvent::MediaEvidenceObserved {
+        media_id: item.id.clone(),
+        observed_size: snapshot.length,
+        observed_modified_millis,
+        observed_sha256: Some(observed_sha256),
+        needs_review,
+    })
+}
+
 #[tauri::command]
 fn get_discovery_status(
     app: AppHandle,
     state: State<'_, NativeState>,
 ) -> Result<DiscoveryStatus, String> {
+    load_discovery_status(&app, &state)
+}
+
+#[tauri::command]
+fn get_resource_governor_status(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+) -> Result<ResourceGovernorStatus, String> {
+    let settings = load_settings_file(&app)?;
+    let system_activity = configure_volume_governor(&state, &settings);
+    Ok(ResourceGovernorStatus {
+        governor: state.volume_governor.snapshot(),
+        system_activity,
+    })
+}
+
+fn load_discovery_status(app: &AppHandle, state: &NativeState) -> Result<DiscoveryStatus, String> {
     let current = state.discovery_status.lock().unwrap().clone();
     if current.running || current.last_completed_at.is_some() {
         return Ok(current);
@@ -3936,14 +6807,21 @@ fn log_ui_error(app: AppHandle, message: String) {
 }
 
 #[tauri::command]
-async fn rescan(
-    app: AppHandle,
-    state: State<'_, NativeState>,
-    full: Option<bool>,
-) -> Result<RescanResult, String> {
-    let settings = load_settings_file(&app)?;
-    let master = PathBuf::from(&settings.master_bin_path);
+async fn rescan(app: AppHandle, full: Option<bool>) -> Result<RescanResult, String> {
     let full = full.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _operation = begin_critical_operation(&state.operations, "library scan")?;
+        run_rescan(&app, &state, full)
+    })
+    .await
+    .map_err(|error| format!("Library scan worker failed: {error}"))?
+}
+
+fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<RescanResult, String> {
+    let settings = load_settings_file(&app)?;
+    configure_volume_governor(state, &settings);
+    let master = PathBuf::from(&settings.master_bin_path);
     let _discovery_guard = state
         .discovery_write
         .try_lock()
@@ -3953,7 +6831,7 @@ async fn rescan(
         running: true,
         full,
         started_at: Some(started_at),
-        ..get_discovery_status(app.clone(), state.clone())?
+        ..load_discovery_status(app, state)?
     };
     status.running = true;
     status.full = full;
@@ -3979,29 +6857,24 @@ async fn rescan(
         .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     let now = Utc::now().timestamp();
     let mut events = Vec::new();
+    let mut verified_paths = Vec::new();
     let mut result = RescanResult {
         full,
         ..Default::default()
     };
     let batch_timestamp = Local::now();
-    let mut entries = Vec::new();
     for entry in WalkDir::new(&master).follow_links(false) {
-        match entry {
-            Ok(entry)
-                if entry.file_type().is_file()
-                    && !ignored(entry.path())
-                    && supported(entry.path()) =>
-            {
-                entries.push(entry)
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
             }
-            Ok(_) => {}
-            Err(_) => result.errors += 1,
+        };
+        if !entry.file_type().is_file() || ignored(entry.path()) || !supported(entry.path()) {
+            continue;
         }
-    }
-    status.total_files = entries.len();
-    status.errors = result.errors;
-    publish_discovery_status(&app, &state, &status);
-    for entry in entries {
         let path = entry.path();
         result.scanned += 1;
         status.files_processed = result.scanned;
@@ -4041,9 +6914,49 @@ async fn rescan(
             status.pending = result.pending;
             continue;
         }
-        let hash = match sha256(path) {
-            Ok(hash) => hash,
+        if !full {
+            // Quick inventory deliberately stops at directory/file metadata.
+            // A later explicit full verification is required before content
+            // identity or registration can be established.
+            result.pending += 1;
+            status.pending = result.pending;
+            continue;
+        }
+        let volume_id = match volume_resource_id(path) {
+            Ok(volume_id) => volume_id,
             Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
+            }
+        };
+        let mut volume_permit = match state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Library verification: {relative}"),
+                if full {
+                    resource_governor::PRIORITY_EXPLICIT_SCAN
+                } else {
+                    resource_governor::PRIORITY_MAINTENANCE
+                },
+                !full,
+                vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+            ),
+            || false,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                result.errors += 1;
+                status.errors = result.errors;
+                continue;
+            }
+        };
+        let hash = match sha256(path) {
+            Ok(hash) => {
+                volume_permit.add_bytes_for(&volume_id, snapshot.length, 0);
+                hash
+            }
+            Err(_) => {
+                volume_permit.record_error(format!("Could not read {relative}"));
                 result.errors += 1;
                 status.errors = result.errors;
                 continue;
@@ -4055,13 +6968,11 @@ async fn rescan(
             continue;
         }
         if let Some(item) = known.get(&relative) {
-            events.push(CatalogueEvent::MediaEvidenceObserved {
-                media_id: item.id.clone(),
-                observed_size: snapshot.length,
-                observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
-                observed_sha256: Some(hash.clone()),
-                needs_review: hash != item.sha256,
-            });
+            if let Some(event) =
+                evidence_observation_event(item, &settings.device_id, &snapshot, hash.clone())
+            {
+                events.push(event);
+            }
         } else {
             let (_, capture, provenance) =
                 match destination_date(&settings, path, &None, &batch_timestamp) {
@@ -4090,11 +7001,13 @@ async fn rescan(
             };
             events.push(CatalogueEvent::MediaRegistered { media: item });
         }
-        observations.verified(&relative);
+        verified_paths.push(relative);
         if result.scanned % 25 == 0 {
             publish_discovery_status(&app, &state, &status);
         }
     }
+    status.total_files = result.scanned;
+    publish_discovery_status(&app, &state, &status);
     discovery::save(&discovery_path, &observations)
         .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     let _guard = state.catalogue_write.lock().unwrap();
@@ -4105,9 +7018,26 @@ async fn rescan(
             .media
             .iter()
             .any(|item| item.id == media.id || item.relative_path == media.relative_path),
-        CatalogueEvent::MediaEvidenceObserved { media_id, .. } => {
-            current.media.iter().any(|item| item.id == *media_id)
-        }
+        CatalogueEvent::MediaEvidenceObserved {
+            media_id,
+            observed_size,
+            observed_modified_millis,
+            observed_sha256,
+            needs_review,
+        } => current
+            .media
+            .iter()
+            .find(|item| item.id == *media_id)
+            .is_some_and(|item| {
+                !evidence_matches(
+                    item,
+                    &settings.device_id,
+                    *observed_size,
+                    *observed_modified_millis,
+                    observed_sha256.as_deref(),
+                    *needs_review,
+                )
+            }),
         _ => true,
     });
     result.registered = events
@@ -4116,18 +7046,15 @@ async fn rescan(
         .count();
     result.changed = events
         .iter()
-        .filter(|event| {
-            matches!(
-                event,
-                CatalogueEvent::MediaEvidenceObserved {
-                    needs_review: true,
-                    ..
-                }
-            )
-        })
+        .filter(|event| matches!(event, CatalogueEvent::MediaEvidenceObserved { .. }))
         .count();
     let changed_catalogue = !events.is_empty();
     append_events(&settings, events)
+        .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
+    for relative in verified_paths {
+        observations.verified(&relative);
+    }
+    discovery::save(&discovery_path, &observations)
         .map_err(|error| fail_discovery_scan(&app, &state, &mut status, error))?;
     result.completed_at = Utc::now().to_rfc3339();
     status.running = false;
@@ -4163,60 +7090,537 @@ fn verify_media_integrity(
     state: State<'_, NativeState>,
     media_id: String,
 ) -> Result<bool, String> {
+    let _operation = begin_critical_operation(&state.operations, "integrity verification")?;
     let settings = load_settings_file(&app)?;
-    let _guard = state.catalogue_write.lock().unwrap();
     let catalogue = load_catalogue_file(&settings)?;
     let item = catalogue
         .media
         .iter()
         .find(|item| item.id == media_id)
+        .cloned()
         .ok_or("Unknown media item")?;
     let path =
         fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &item.relative_path)?;
-    let snapshot = fs_safe::snapshot(&path)?;
-    let observed_sha256 = sha256(&path)?;
-    let matches = observed_sha256 == item.sha256;
-    append_events(
-        &settings,
-        vec![CatalogueEvent::MediaEvidenceObserved {
-            media_id,
-            observed_size: snapshot.length,
-            observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
-            observed_sha256: Some(observed_sha256),
-            needs_review: !matches,
-        }],
+    configure_volume_governor(&state, &settings);
+    let volume_id = volume_resource_id(&path)?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            format!("Verify {}", item.original_filename),
+            resource_governor::PRIORITY_EXPLICIT_SCAN,
+            false,
+            vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+        ),
+        || false,
     )?;
-    let _ = app.emit("catalogue-changed", ());
+    let snapshot = fs_safe::snapshot(&path)?;
+    let observed_sha256 = match sha256(&path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            volume_permit.record_error(error.clone());
+            return Err(error);
+        }
+    };
+    volume_permit.add_bytes_for(&volume_id, snapshot.length, 0);
+    let matches = observed_sha256 == item.sha256;
+    if fs_safe::snapshot(&path)? != snapshot {
+        return Err("Media changed while its integrity was being verified".into());
+    }
+    let _guard = state.catalogue_write.lock().unwrap();
+    let current = load_catalogue_file(&settings)?;
+    let current_item = current
+        .media
+        .iter()
+        .find(|candidate| candidate.id == media_id)
+        .ok_or("Media changed while its integrity was being verified")?;
+    if let Some(event) = evidence_observation_event(
+        current_item,
+        &settings.device_id,
+        &snapshot,
+        observed_sha256,
+    ) {
+        append_events(&settings, vec![event])?;
+        let _ = app.emit("catalogue-changed", ());
+    }
     Ok(matches)
 }
 #[tauri::command]
-async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<usize, String> {
+async fn enrich_media(app: AppHandle, explicit_request: Option<bool>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _operation = begin_critical_operation(&state.operations, "media enrichment")?;
+        let now = Utc::now().to_rfc3339();
+        *state.enrichment_status.lock().unwrap() = Some(BackgroundOperation {
+            id: "media-enrichment".into(),
+            kind: "media-enrichment".into(),
+            title: "Shared thumbnail migration and media enrichment".into(),
+            state: "queued".into(),
+            stage: "Waiting for background capacity".into(),
+            current_item: None,
+            completed_items: 0,
+            total_items: None,
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: false,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: now.clone(),
+            updated_at: now,
+        });
+        run_enrichment(&app, &state, explicit_request.unwrap_or(true))
+    })
+    .await
+    .map_err(|error| format!("Media enrichment worker failed: {error}"))?
+}
+
+fn kick_enrichment_worker(app: AppHandle) {
+    let state = app.state::<NativeState>();
+    let mut active = state.enrichment_worker_active.lock().unwrap();
+    *state.enrichment_requested.lock().unwrap() = true;
+    if *active {
+        return;
+    }
+    *active = true;
+    let now = Utc::now().to_rfc3339();
+    *state.enrichment_status.lock().unwrap() = Some(BackgroundOperation {
+        id: "media-enrichment".into(),
+        kind: "media-enrichment".into(),
+        title: "Shared thumbnail migration and media enrichment".into(),
+        state: "queued".into(),
+        stage: "Waiting for background capacity".into(),
+        current_item: None,
+        completed_items: 0,
+        total_items: None,
+        bytes_completed: 0,
+        bytes_total: None,
+        counts: OperationCounts::default(),
+        cancellable: false,
+        pausable: false,
+        retryable: false,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    });
+    drop(active);
+    std::thread::spawn(move || loop {
+        let state = app.state::<NativeState>();
+        {
+            let _active = state.enrichment_worker_active.lock().unwrap();
+            *state.enrichment_requested.lock().unwrap() = false;
+        }
+        if let Ok(_operation) = begin_critical_operation(&state.operations, "media enrichment") {
+            if let Err(error) = run_enrichment(&app, &state, false) {
+                if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                    status.state = "failed".into();
+                    status.stage = "Enrichment failed".into();
+                    status.error = Some(error.clone());
+                    status.retryable = true;
+                    status.updated_at = Utc::now().to_rfc3339();
+                }
+                diagnostic_log(&app, "ERROR", "media-enrichment", &error);
+            }
+        }
+        let mut active = state.enrichment_worker_active.lock().unwrap();
+        if *state.enrichment_requested.lock().unwrap() {
+            drop(active);
+            continue;
+        }
+        *active = false;
+        break;
+    });
+}
+
+fn thumbnail_generation_lock(state: &NativeState, media_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.thumbnail_generations.lock().unwrap();
+    if locks.len() > 2_048 {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    locks
+        .entry(media_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn valid_cached_thumbnail(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.len() < 4
+        || metadata.len() > 10 * 1024 * 1024
+    {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 3];
+    let mut footer = [0_u8; 2];
+    file.read_exact(&mut header).is_ok()
+        && header == [0xFF, 0xD8, 0xFF]
+        && file.seek(SeekFrom::End(-2)).is_ok()
+        && file.read_exact(&mut footer).is_ok()
+        && footer == [0xFF, 0xD9]
+}
+
+fn static_thumbnail_reference(item: &MediaItem, seek_seconds: f64) -> String {
+    let mut identity = Sha256::new();
+    identity.update(b"kairix-static-thumbnail-v1\0");
+    identity.update(item.sha256.as_bytes());
+    identity.update(b"\0jpeg-q4-scale640\0");
+    identity.update(format!("{seek_seconds:.3}").as_bytes());
+    format!("{:x}.jpg", identity.finalize())
+}
+
+fn legacy_static_thumbnail_reference(item: &MediaItem) -> String {
+    let mut identity = Sha256::new();
+    identity.update(b"kairix-static-thumbnail-v1\0");
+    identity.update(item.sha256.as_bytes());
+    identity.update(b"\0legacy-selected-frame-unknown\0");
+    identity.update(item.id.as_bytes());
+    format!("{:x}.jpg", identity.finalize())
+}
+
+fn selected_static_thumbnail_reference(item: &MediaItem) -> String {
+    match item.thumbnail_path.as_deref() {
+        Some(reference) if reference == format!("{}.jpg", item.id) => {
+            legacy_static_thumbnail_reference(item)
+        }
+        Some(reference) if catalogue::safe_cache_reference(reference) => reference.to_string(),
+        _ => static_thumbnail_reference(item, 0.1),
+    }
+}
+
+fn shared_thumbnail_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
+    let catalogue = catalogue_dir(settings)?
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve shared catalogue: {error}"))?;
+    let root = catalogue.join("thumbnails").join("v1");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Cannot create shared thumbnail store: {error}"))?;
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("Cannot inspect shared thumbnail store: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("Shared thumbnail store is not a real directory".into());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve shared thumbnail store: {error}"))?;
+    if !root.starts_with(&catalogue) {
+        return Err("Shared thumbnail store resolves outside the catalogue".into());
+    }
+    Ok(root)
+}
+
+fn validated_legacy_static_thumbnail(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+) -> Option<PathBuf> {
+    if settings.thumbnail_cache_path.trim().is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(&settings.thumbnail_cache_path)
+        .canonicalize()
+        .ok()?;
+    let candidate = root.join(format!("{}.jpg", item.id));
+    let candidate = candidate.canonicalize().ok()?;
+    (candidate.starts_with(&root) && valid_cached_thumbnail(&candidate)).then_some(candidate)
+}
+
+fn migrate_legacy_static_thumbnail(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+    destination: &Path,
+) -> Result<bool, String> {
+    if valid_cached_thumbnail(destination) {
+        return Ok(true);
+    }
+    if destination.exists() {
+        return Err("Shared thumbnail identity is occupied by invalid or incompatible bytes".into());
+    }
+    let Some(legacy) = validated_legacy_static_thumbnail(settings, item) else {
+        return Ok(false);
+    };
+    let parent = destination.parent().ok_or("Invalid shared thumbnail path")?;
+    let temporary = parent.join(format!(".migrate-{}-{}.jpg", settings.device_id, Uuid::new_v4()));
+    fs::copy(&legacy, &temporary)
+        .map_err(|error| format!("Cannot stage legacy thumbnail migration: {error}"))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Cannot flush migrated thumbnail: {error}"))?;
+    if !valid_cached_thumbnail(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err("Legacy thumbnail failed JPEG validation during migration".into());
+    }
+    match fs::rename(&temporary, destination) {
+        Ok(()) => Ok(true),
+        Err(_) if valid_cached_thumbnail(destination) => {
+            let _ = fs::remove_file(&temporary);
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(format!("Cannot publish migrated shared thumbnail: {error}"))
+        }
+    }
+}
+
+fn thumbnail_reference_is_available(
+    settings: &DeviceSettings,
+    shared: &Path,
+    item: &MediaItem,
+) -> bool {
+    let reference = selected_static_thumbnail_reference(item);
+    let destination = shared.join(reference);
+    valid_cached_thumbnail(&destination)
+        || migrate_legacy_static_thumbnail(settings, item, &destination).unwrap_or(false)
+}
+
+fn enrichment_video_type(file_type: &str) -> bool {
+    matches!(
+        file_type.to_ascii_lowercase().as_str(),
+        "mp4"
+            | "mov"
+            | "m4v"
+            | "mxf"
+            | "mts"
+            | "m2ts"
+            | "avi"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "r3d"
+            | "braw"
+    )
+}
+
+fn validate_thumbnail_frame(seconds: f64, duration: Option<f64>) -> Result<(), String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("Thumbnail frame time must be a finite non-negative value".into());
+    }
+    if duration.is_some_and(|duration| seconds > duration) {
+        return Err("Thumbnail frame time is beyond the recording duration".into());
+    }
+    Ok(())
+}
+
+fn generate_thumbnail_atomic(
+    source: &Path,
+    destination: &Path,
+    seek_seconds: f64,
+) -> Result<bool, String> {
+    validate_thumbnail_frame(seek_seconds, None)?;
+    let parent = destination
+        .parent()
+        .ok_or("Thumbnail destination has no cache directory")?;
+    let temporary = parent.join(format!(".thumbnail-{}.jpg", Uuid::new_v4()));
+    let seek = format!("{seek_seconds:.3}");
+    let mut child = media_tool_command("ffmpeg")
+        .args(["-y", "-nostdin", "-ss", &seek, "-i"])
+        .arg(source)
+        .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
+        .arg(&temporary)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start FFmpeg thumbnail generation: {error}"))?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not monitor FFmpeg thumbnail generation: {error}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= StdDuration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&temporary);
+            return Err("FFmpeg thumbnail generation timed out after 60 seconds".into());
+        }
+        std::thread::sleep(StdDuration::from_millis(25));
+    };
+    if !status.success() || !valid_cached_thumbnail(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "FFmpeg did not produce a valid thumbnail (exit status {})",
+            status
+        ));
+    }
+    if destination.exists() {
+        if valid_cached_thumbnail(destination) {
+            let _ = fs::remove_file(&temporary);
+            return Ok(false);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err("Thumbnail identity is occupied by invalid or incompatible bytes".into());
+    }
+    match fs::rename(&temporary, destination) {
+        Ok(()) => Ok(true),
+        Err(_) if valid_cached_thumbnail(destination) => {
+            let _ = fs::remove_file(&temporary);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(format!("Cannot commit generated thumbnail: {error}"))
+        }
+    }
+}
+
+fn run_enrichment(
+    app: &AppHandle,
+    state: &NativeState,
+    explicit_request: bool,
+) -> Result<usize, String> {
     let settings = load_settings_file(&app)?;
+    configure_volume_governor(state, &settings);
     let _enrichment_guard = state.enrichment_write.lock().unwrap();
     let master = PathBuf::from(&settings.master_bin_path);
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let shared = shared_thumbnail_root(&settings)?;
     let catalogue = load_catalogue_file(&settings)?;
+    let total = catalogue
+        .media
+        .iter()
+        .filter(|item| {
+            enrichment_video_type(&item.file_type)
+                && (item.technical.codec.is_none()
+                    || !thumbnail_reference_is_available(&settings, &shared, item))
+        })
+        .count();
+    let existing = catalogue
+        .media
+        .iter()
+        .filter(|item| {
+            enrichment_video_type(&item.file_type)
+                && item.technical.codec.is_some()
+                && thumbnail_reference_is_available(&settings, &shared, item)
+        })
+        .count();
+    if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+        status.state = "running".into();
+        status.stage = "Inspecting technical metadata and thumbnails".into();
+        status.completed_items = 0;
+        status.total_items = Some(total);
+        status.counts = OperationCounts {
+            existing_files: existing,
+            pending_files: total,
+            ..OperationCounts::default()
+        };
+        status.error = None;
+        status.updated_at = Utc::now().to_rfc3339();
+    }
     let mut candidates = Vec::new();
+    let mut processed = 0_usize;
     for item in &catalogue.media {
+        let potentially_eligible = enrichment_video_type(&item.file_type)
+            && (item.technical.codec.is_none()
+                || !thumbnail_reference_is_available(&settings, &shared, item));
+        if !potentially_eligible {
+            continue;
+        }
+        let generation_lock = thumbnail_generation_lock(state, &item.id);
+        let _generation_guard = generation_lock.lock().unwrap();
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.stage = format!(
+                "Migrating or generating shared thumbnails and metadata ({}/{total})",
+                processed + 1
+            );
+            status.current_item = Some(item.original_filename.clone());
+            status.updated_at = Utc::now().to_rfc3339();
+        }
         let source = match fs_safe::resolve_existing(&master, &item.relative_path) {
             Ok(path) if path.is_file() => path,
-            _ => continue,
+            _ => {
+                processed += 1;
+                if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                    status.completed_items = processed;
+                    status.counts.failed_files += 1;
+                    status.counts.pending_files = total.saturating_sub(processed);
+                }
+                continue;
+            }
         };
         let source_before = match fs_safe::snapshot(&source) {
             Ok(snapshot) => snapshot,
-            Err(_) => continue,
+            Err(_) => {
+                processed += 1;
+                if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                    status.completed_items = processed;
+                    status.counts.failed_files += 1;
+                    status.counts.pending_files = total.saturating_sub(processed);
+                }
+                continue;
+            }
         };
-        let thumbnail_ref = format!("{}.jpg", item.id);
+        let source_volume = match volume_resource_id(&source) {
+            Ok(value) => value,
+            Err(_) => {
+                processed += 1;
+                continue;
+            }
+        };
+        let cache_volume = match volume_resource_id(&shared) {
+            Ok(value) => value,
+            Err(_) => {
+                processed += 1;
+                continue;
+            }
+        };
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.stage = "Waiting for source and cache volumes".into();
+            status.updated_at = Utc::now().to_rfc3339();
+        }
+        let mut volume_permit = match state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Background enrichment: {}", item.original_filename),
+                if explicit_request {
+                    resource_governor::PRIORITY_EXPLICIT_SCAN
+                } else {
+                    resource_governor::PRIORITY_BACKGROUND_DERIVATIVE
+                },
+                !explicit_request,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
+                ],
+            ),
+            || false,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                processed += 1;
+                continue;
+            }
+        };
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.stage = format!(
+                "Migrating or generating shared thumbnails and metadata ({}/{total})",
+                processed + 1
+            );
+            status.updated_at = Utc::now().to_rfc3339();
+        }
+        let thumbnail_ref = selected_static_thumbnail_reference(item);
         if !catalogue::safe_cache_reference(&thumbnail_ref) {
             continue;
         }
-        let thumbnail = cache.join(&thumbnail_ref);
-        let needs_probe = item.technical.codec.is_none()
-            && matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v");
-        let needs_thumbnail =
-            matches!(item.file_type.as_str(), "mp4" | "mov" | "m4v") && !thumbnail.is_file();
+        let thumbnail = shared.join(&thumbnail_ref);
+        let needs_probe = item.technical.codec.is_none();
+        let needs_thumbnail = !valid_cached_thumbnail(&thumbnail);
+        if !needs_thumbnail {
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.counts.existing_files += 1;
+            }
+        }
         if !needs_probe && !needs_thumbnail {
+            processed += 1;
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.completed_items = processed;
+            }
             continue;
         }
         let mut technical = item.technical.clone();
@@ -4260,15 +7664,55 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
                 }
             }
         }
+        let mut thumbnail_failed = false;
+        let mut published_thumbnail = false;
         if needs_thumbnail {
-            let _ = media_tool_command("ffmpeg")
-                .args(["-y", "-ss", "0.1", "-i"])
-                .arg(&source)
-                .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4"])
-                .arg(&thumbnail)
-                .output();
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.counts.attempted_files += 1;
+            }
+            let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+            let _admission = state.derivative_admission.acquire(3);
+            match generate_thumbnail_atomic(&source, &thumbnail, 0.1) {
+                Ok(published) => published_thumbnail = published,
+                Err(error) => {
+                    thumbnail_failed = true;
+                    diagnostic_log(
+                        app,
+                        "ERROR",
+                        "thumbnail-generation",
+                        &format!("{}: {error}", item.relative_path),
+                    );
+                }
+            }
+        }
+        if let Ok(metadata) = thumbnail.metadata() {
+            volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
         }
         if fs_safe::snapshot(&source).ok().as_ref() != Some(&source_before) {
+            if published_thumbnail {
+                let _ = fs::remove_file(&thumbnail);
+            }
+            processed += 1;
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.completed_items = processed;
+                status.counts.attention_files += 1;
+                status.counts.pending_files = total.saturating_sub(processed);
+            }
+            continue;
+        }
+        let generated_thumbnail_ref = valid_cached_thumbnail(&thumbnail).then_some(thumbnail_ref);
+        let generated_thumbnail = needs_thumbnail && generated_thumbnail_ref.is_some();
+        if thumbnail_failed {
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.counts.failed_files += 1;
+            }
+        }
+        if technical == item.technical && generated_thumbnail_ref == item.thumbnail_path {
+            processed += 1;
+            if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+                status.completed_items = processed;
+                status.counts.pending_files = total.saturating_sub(processed);
+            }
             continue;
         }
         candidates.push((
@@ -4280,9 +7724,15 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
             CatalogueEvent::MediaEnriched {
                 media_id: item.id.clone(),
                 technical,
-                thumbnail_ref: thumbnail.is_file().then_some(thumbnail_ref),
+                thumbnail_ref: generated_thumbnail_ref,
             },
         ));
+        processed += 1;
+        if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+            status.completed_items = processed;
+            status.counts.new_files += usize::from(generated_thumbnail);
+            status.counts.pending_files = total.saturating_sub(processed);
+        }
     }
     let _guard = state.catalogue_write.lock().unwrap();
     let current = load_catalogue_file(&settings)?;
@@ -4306,6 +7756,18 @@ async fn enrich_media(app: AppHandle, state: State<'_, NativeState>) -> Result<u
         .collect();
     let changed = events.len();
     append_events(&settings, events)?;
+    if changed > 0 {
+        let _ = app.emit("catalogue-changed", ());
+    }
+    if let Some(status) = state.enrichment_status.lock().unwrap().as_mut() {
+        status.state = "completed".into();
+        status.stage = "Thumbnail and metadata pass complete".into();
+        status.current_item = None;
+        status.completed_items = total;
+        status.counts.pending_files = 0;
+        status.retryable = status.counts.failed_files > 0;
+        status.updated_at = Utc::now().to_rfc3339();
+    }
     Ok(changed)
 }
 fn resolve_catalogue_media_path(
@@ -4332,12 +7794,1161 @@ fn resolve_catalogue_media_path(
     Ok(path)
 }
 
+fn resolve_native_drag_media_paths(
+    master_bin: &Path,
+    catalogue: &Catalogue,
+    media_ids: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    if media_ids.is_empty() {
+        return Err("Select at least one locally available recording to drag".into());
+    }
+    if media_ids.len() > MAX_NATIVE_DRAG_ITEMS {
+        return Err(format!(
+            "A native drag is limited to {MAX_NATIVE_DRAG_ITEMS} recordings"
+        ));
+    }
+    let master = master_bin
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    let mut expanded_ids = Vec::with_capacity(media_ids.len() * 2);
+    let mut seen_ids = HashSet::new();
+    for media_id in media_ids {
+        if !seen_ids.insert(media_id.clone()) {
+            continue;
+        }
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == *media_id)
+            .ok_or_else(|| format!("Unknown selected media item: {media_id}"))?;
+        expanded_ids.push(item.id.clone());
+        if let Some(audio_id) = item.attached_audio_id.as_ref() {
+            if seen_ids.insert(audio_id.clone()) {
+                expanded_ids.push(audio_id.clone());
+            }
+        }
+    }
+    if expanded_ids.len() > MAX_NATIVE_DRAG_ITEMS {
+        return Err(format!(
+            "A native drag is limited to {MAX_NATIVE_DRAG_ITEMS} physical files including associated audio"
+        ));
+    }
+    let mut seen_paths = HashSet::new();
+    let mut paths = Vec::with_capacity(expanded_ids.len());
+    for media_id in expanded_ids {
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or_else(|| format!("Unknown associated media item: {media_id}"))?;
+        fs_safe::validate_relative(&item.relative_path)?;
+        let path = fs_safe::resolve_existing(&master, &item.relative_path)?;
+        if !path.is_file() {
+            return Err(format!(
+                "{} is not a locally available recording",
+                item.original_filename
+            ));
+        }
+        let snapshot = fs_safe::snapshot(&path)?;
+        if item
+            .observed_size
+            .is_some_and(|observed| observed != snapshot.length)
+            || item.observed_modified_millis.is_some_and(|observed| {
+                snapshot.modified_millis.map(|value| value as u64) != Some(observed)
+            })
+        {
+            return Err(format!(
+                "{} changed since it was catalogued; rescan before dragging it",
+                item.original_filename
+            ));
+        }
+        if seen_paths.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn resolve_native_drag_folder(master_bin: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let master = master_bin
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    let folder = if relative_path.is_empty() {
+        master.clone()
+    } else {
+        fs_safe::validate_relative(relative_path)?;
+        fs_safe::resolve_existing(&master, relative_path)?
+    };
+    if !folder.is_dir() {
+        return Err("The selected Library folder is not available locally".into());
+    }
+    Ok(folder)
+}
+
+#[cfg(target_os = "windows")]
+struct OleInitialization;
+
+#[cfg(target_os = "windows")]
+impl OleInitialization {
+    fn initialize() -> Result<Self, String> {
+        unsafe { OleInitialize(None) }
+            .map_err(|error| format!("Windows OLE drag initialization failed: {error}"))?;
+        Ok(Self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for OleInitialization {
+    fn drop(&mut self) {
+        unsafe { OleUninitialize() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct ShellItemIds(Vec<*mut ITEMIDLIST>);
+
+#[cfg(target_os = "windows")]
+impl Drop for ShellItemIds {
+    fn drop(&mut self) {
+        for item in self.0.drain(..) {
+            unsafe { ILFree(Some(item)) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn shell_drag_parsing_path(path: &Path) -> PathBuf {
+    let value = path.as_os_str().to_string_lossy();
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(ordinary) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(ordinary)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_native_drag_data_object(
+    paths: &[PathBuf],
+) -> Result<(IDataObject, ShellItemIds), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut item_ids = ShellItemIds(Vec::with_capacity(paths.len()));
+    for (index, path) in paths.iter().enumerate() {
+        let shell_path = shell_drag_parsing_path(path);
+        let wide = shell_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut item = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut item, 0, None) }.map_err(
+            |error| format!("Windows Shell could not represent selected item {}: {error}", index + 1),
+        )?;
+        if item.is_null() {
+            return Err(format!(
+                "Windows Shell returned no drag identity for selected item {}",
+                index + 1
+            ));
+        }
+        item_ids.0.push(item);
+    }
+    let absolute_items = item_ids
+        .0
+        .iter()
+        .map(|item| *item as *const ITEMIDLIST)
+        .collect::<Vec<_>>();
+    let data_object: IDataObject = unsafe { SHCreateDataObject(None, Some(&absolute_items), None) }
+        .map_err(|error| format!("Windows could not create the file drag payload: {error}"))?;
+    let file_drop_format = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    unsafe { data_object.QueryGetData(&file_drop_format) }
+        .ok()
+        .map_err(|error| {
+            format!("Windows file drag payload does not expose CF_HDROP: {error}")
+        })?;
+    Ok((data_object, item_ids))
+}
+
+#[cfg(target_os = "windows")]
+fn run_native_file_drag(paths: &[PathBuf]) -> Result<NativeDragOutcome, String> {
+    // Tauri runs synchronous commands on its Windows UI thread. DoDragDrop must
+    // stay on that OLE-initialized STA so its modal loop can track the held button.
+    let _ole = OleInitialization::initialize()?;
+    let (data_object, _item_ids) = create_native_drag_data_object(paths)?;
+    let drop_source: IDropSource = NativeDropSource.into();
+    let mut completed_effect = DROPEFFECT(0);
+    let result = unsafe {
+        DoDragDrop(
+            &data_object,
+            &drop_source,
+            DROPEFFECT_COPY,
+            &mut completed_effect,
+        )
+    };
+    if result == DRAGDROP_S_CANCEL {
+        return Ok(NativeDragOutcome::Cancelled);
+    }
+    if result != DRAGDROP_S_DROP {
+        return Err(format!("Windows file drag failed: {result:?}"));
+    }
+    if (completed_effect.0 & DROPEFFECT_COPY.0) != 0 {
+        Ok(NativeDragOutcome::Dropped)
+    } else {
+        Ok(NativeDragOutcome::Rejected)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn drag_rs_safe_for_paths(paths: &[PathBuf]) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+    paths.iter().all(|path| {
+        let path = shell_drag_parsing_path(path);
+        let value = path.as_os_str().to_string_lossy();
+        if value.starts_with(r"\\") || value.encode_utf16().count() >= 260 {
+            return false;
+        }
+        let bytes = value.as_bytes();
+        if bytes.len() < 3 || bytes[1] != b':' || !matches!(bytes[2], b'\\' | b'/') {
+            return false;
+        }
+        let root = &value[..3];
+        let wide = std::ffi::OsStr::new(root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        (unsafe { GetDriveTypeW(wide.as_ptr()) }) != DRIVE_REMOTE
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn run_established_file_drag(
+    window: &tauri::WebviewWindow,
+    paths: &[PathBuf],
+) -> Result<NativeDragOutcome, String> {
+    use drag::{DragItem, DragMode, DragResult, Image, Options};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // drag 2.1.1 is proven for ordinary local paths but has an open upstream
+    // panic for UNC/mapped-share and long paths. Route only its supported
+    // subset here; PIMP's guarded Shell implementation remains the safe
+    // no-panic fallback for those canonical path forms.
+    let shell_paths = paths
+        .iter()
+        .map(|path| shell_drag_parsing_path(path))
+        .collect();
+    let outcome = Arc::new(Mutex::new(None));
+    let callback_outcome = Arc::clone(&outcome);
+    let operation = catch_unwind(AssertUnwindSafe(|| {
+        drag::start_drag(
+            window,
+            DragItem::Files(shell_paths),
+            Image::Raw(include_bytes!("../icons/32x32.png").to_vec()),
+            move |result, _position| {
+                *callback_outcome.lock().unwrap() = Some(result);
+            },
+            Options {
+                mode: DragMode::Copy,
+                ..Default::default()
+            },
+        )
+    }))
+    .map_err(|_| "The native drag library failed safely before starting the drag".to_string())?;
+    operation.map_err(|error| format!("The native drag library could not start: {error}"))?;
+    let completed = outcome.lock().unwrap().take();
+    match completed {
+        Some(DragResult::Dropped) => Ok(NativeDragOutcome::Dropped),
+        Some(DragResult::Cancel) => Ok(NativeDragOutcome::Cancelled),
+        None => Ok(NativeDragOutcome::Rejected),
+    }
+}
+
+#[tauri::command]
+fn native_drag_threshold() -> NativeDragThreshold {
+    #[cfg(target_os = "windows")]
+    {
+        NativeDragThreshold {
+            horizontal: unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1) as u32,
+            vertical: unsafe { GetSystemMetrics(SM_CYDRAG) }.max(1) as u32,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        NativeDragThreshold {
+            horizontal: 4,
+            vertical: 4,
+        }
+    }
+}
+
+#[tauri::command]
+fn start_native_media_drag(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    media_ids: Vec<String>,
+) -> Result<NativeDragOutcome, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let paths = resolve_native_drag_media_paths(
+        Path::new(&settings.master_bin_path),
+        &catalogue,
+        &media_ids,
+    )?;
+    #[cfg(target_os = "windows")]
+    {
+        diagnostic_log(
+            &app,
+            "INFO",
+            "native-drag",
+            &format!(
+                "Starting copy-only media drag with {} physical item(s)",
+                paths.len()
+            ),
+        );
+        let result = if drag_rs_safe_for_paths(&paths) {
+            run_established_file_drag(&window, &paths)
+        } else {
+            run_native_file_drag(&paths)
+        };
+        diagnostic_log(
+            &app,
+            if result.is_ok() { "INFO" } else { "ERROR" },
+            "native-drag",
+            &format!(
+                "Media drag completed: {}",
+                result.as_ref().map_or("error", |_| "handled")
+            ),
+        );
+        return result;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = paths;
+        Err("Native file dragging is available only in the Windows build".into())
+    }
+}
+
+#[tauri::command]
+fn start_native_folder_drag(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    relative_path: String,
+) -> Result<NativeDragOutcome, String> {
+    let settings = load_settings_file(&app)?;
+    let path = resolve_native_drag_folder(Path::new(&settings.master_bin_path), &relative_path)?;
+    #[cfg(target_os = "windows")]
+    {
+        diagnostic_log(
+            &app,
+            "INFO",
+            "native-drag",
+            "Starting copy-only physical-folder drag",
+        );
+        let result = if drag_rs_safe_for_paths(std::slice::from_ref(&path)) {
+            run_established_file_drag(&window, &[path])
+        } else {
+            run_native_file_drag(&[path])
+        };
+        diagnostic_log(
+            &app,
+            if result.is_ok() { "INFO" } else { "ERROR" },
+            "native-drag",
+            &format!(
+                "Folder drag completed: {}",
+                result.as_ref().map_or("error", |_| "handled")
+            ),
+        );
+        return result;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("Native folder dragging is available only in the Windows build".into())
+    }
+}
+
+fn compatible_windows_handoff_path(value: &str) -> String {
+    let Some(without_prefix) = value.strip_prefix(r"\\?\") else {
+        return value.to_string();
+    };
+    let bytes = without_prefix.as_bytes();
+    let ordinary_drive_path = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let legacy_safe_segments = without_prefix
+        .split(['\\', '/'])
+        .all(|segment| !segment.ends_with(' ') && !segment.ends_with('.'));
+    if ordinary_drive_path && legacy_safe_segments && without_prefix.encode_utf16().count() < 260 {
+        without_prefix.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn explorer_boundary_path(value: &str) -> Result<String, String> {
+    let candidate = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(drive) = value.strip_prefix(r"\\?\") {
+        drive.to_string()
+    } else {
+        value.to_string()
+    };
+    if candidate.encode_utf16().count() >= 260 {
+        return Err(
+            "Windows Explorer cannot reliably select this path because it exceeds the Shell's supported path length; open its containing folder manually"
+                .into(),
+        );
+    }
+    if candidate
+        .split(['\\', '/'])
+        .any(|segment| segment.ends_with(' ') || segment.ends_with('.'))
+    {
+        return Err(
+            "Windows Explorer cannot safely select a path whose name ends in a space or period"
+                .into(),
+        );
+    }
+    Ok(candidate)
+}
+
+fn handoff_path(path: &Path) -> String {
+    compatible_windows_handoff_path(&path.to_string_lossy())
+}
+
 #[tauri::command]
 fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String> {
     let settings = load_settings_file(&app)?;
-    Ok(resolve_catalogue_media_path(&settings, &media_id)?
-        .to_string_lossy()
-        .to_string())
+    Ok(handoff_path(&resolve_catalogue_media_path(
+        &settings, &media_id,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaybackProbeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
+    duration: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaybackProbeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaybackProbe {
+    #[serde(default)]
+    streams: Vec<PlaybackProbeStream>,
+    format: Option<PlaybackProbeFormat>,
+}
+
+fn probe_playback_media(path: &Path) -> Result<PlaybackProbe, String> {
+    let output = media_tool_command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt,duration:format=format_name,duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Could not start FFprobe: {error}"))?;
+    if !output.status.success() {
+        return Err("FFprobe could not read the playback proxy".into());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("FFprobe returned invalid proxy metadata: {error}"))
+}
+
+fn parsed_duration_millis(value: Option<&str>) -> Option<u64> {
+    let seconds = value?.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds > 0.0).then(|| (seconds * 1_000.0).round() as u64)
+}
+
+fn probe_duration_millis(probe: &PlaybackProbe) -> Option<u64> {
+    parsed_duration_millis(
+        probe
+            .format
+            .as_ref()
+            .and_then(|format| format.duration.as_deref()),
+    )
+    .or_else(|| {
+        probe.streams.iter().find_map(|stream| {
+            (stream.codec_type.as_deref() == Some("video"))
+                .then(|| parsed_duration_millis(stream.duration.as_deref()))
+                .flatten()
+        })
+    })
+}
+
+fn playback_proxy_probe_is_valid(probe: &PlaybackProbe) -> bool {
+    let Some(format) = &probe.format else {
+        return false;
+    };
+    let mp4_container = format
+        .format_name
+        .as_deref()
+        .is_some_and(|names| names.split(',').any(|name| matches!(name, "mov" | "mp4")));
+    let video = probe.streams.iter().find(|stream| {
+        stream.codec_type.as_deref() == Some("video")
+            && stream.codec_name.as_deref() == Some("h264")
+            && stream
+                .pix_fmt
+                .as_deref()
+                .is_some_and(|format| format.starts_with("yuv420p"))
+    });
+    let audio_valid = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .all(|stream| stream.codec_name.as_deref() == Some("aac"));
+    mp4_container && video.is_some() && audio_valid && probe_duration_millis(probe).is_some()
+}
+
+fn valid_playback_proxy(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 1_024)
+        && probe_playback_media(path).is_ok_and(|probe| playback_proxy_probe_is_valid(&probe))
+}
+
+fn playback_proxy_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
+    let cache = PathBuf::from(&settings.thumbnail_cache_path);
+    fs::create_dir_all(&cache)
+        .map_err(|error| format!("Cannot create device cache root: {error}"))?;
+    let root = cache.join("playback-proxies");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Cannot create playback proxy cache: {error}"))?;
+    if fs::symlink_metadata(&root)
+        .map_err(|error| error.to_string())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Playback proxy cache may not be a link or junction".into());
+    }
+    let canonical_cache = cache
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve device cache root: {error}"))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve playback proxy cache: {error}"))?;
+    if !fs_safe::within(&canonical_cache, &canonical_root) {
+        return Err("Playback proxy cache resolved outside PIMP's device cache".into());
+    }
+    Ok(canonical_root)
+}
+
+fn playback_proxy_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pimp-playback-proxy-v2\0");
+    digest.update(item.id.as_bytes());
+    digest.update(item.sha256.as_bytes());
+    digest.update(snapshot.length.to_le_bytes());
+    digest.update([u8::from(snapshot.modified_millis.is_some())]);
+    digest.update(snapshot.modified_millis.unwrap_or_default().to_le_bytes());
+    digest.update(b"1280-h264-aac-crf23-fastdecode-2s-keyframes");
+    format!("{:x}", digest.finalize())
+}
+
+fn playback_proxy_path(root: &Path, item: &MediaItem, fingerprint: &str) -> PathBuf {
+    root.join(format!("{}-{}.mp4", item.id, &fingerprint[..24]))
+}
+
+fn enforce_playback_proxy_limit(
+    root: &Path,
+    limit: u64,
+    protected: &HashSet<PathBuf>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| format!("Cannot inspect playback proxy cache: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            let metadata = entry.metadata().ok()?;
+            (file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("mp4")))
+            .then(|| (entry.path(), metadata.len(), metadata.modified().ok()))
+        })
+        .collect::<Vec<_>>();
+    let mut total = entries.iter().map(|entry| entry.1).sum::<u64>();
+    entries.sort_by_key(|entry| entry.2);
+    for (path, size, _) in entries {
+        if total <= limit {
+            break;
+        }
+        if protected.contains(&path) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|error| format!("Cannot evict playback proxy: {error}"))?;
+        total = total.saturating_sub(size);
+    }
+    Ok(())
+}
+
+fn update_playback_proxy_status(
+    state: &NativeState,
+    operation_id: &str,
+    update: impl FnOnce(&mut BackgroundOperation),
+) {
+    if let Some(operation) = state
+        .playback_proxy_status
+        .lock()
+        .unwrap()
+        .get_mut(operation_id)
+    {
+        update(operation);
+        operation.updated_at = Utc::now().to_rfc3339();
+    }
+}
+
+fn playback_progress_millis(line: &str) -> Option<u64> {
+    if let Some(value) = line.strip_prefix("out_time_us=") {
+        return value.parse::<u64>().ok().map(|value| value / 1_000);
+    }
+    let value = line.strip_prefix("out_time=")?;
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<f64>().ok()?;
+    let minutes = parts.next()?.parse::<f64>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    Some(((hours * 3_600.0 + minutes * 60.0 + seconds) * 1_000.0) as u64)
+}
+
+struct ManagedChild(std::process::Child);
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+struct PlaybackProcessGuard<'a> {
+    processes: &'a Mutex<HashMap<String, u32>>,
+    operation_id: String,
+}
+
+impl Drop for PlaybackProcessGuard<'_> {
+    fn drop(&mut self) {
+        self.processes.lock().unwrap().remove(&self.operation_id);
+    }
+}
+
+fn terminate_playback_proxy_process(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = media_tool_command("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+fn cancel_all_playback_proxy_processes(state: &NativeState) {
+    let processes = state.playback_proxy_processes.lock().unwrap().clone();
+    for (operation_id, pid) in processes {
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .insert(operation_id.clone());
+        update_playback_proxy_status(state, &operation_id, |operation| {
+            operation.state = "cancelling".into();
+            operation.stage = "Application is closing; stopping FFmpeg".into();
+            operation.cancellable = false;
+        });
+        terminate_playback_proxy_process(pid);
+    }
+}
+
+fn protected_playback_proxy_paths(state: &NativeState, current: &Path) -> HashSet<PathBuf> {
+    let mut paths = state
+        .active_playback_proxies
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<HashSet<_>>();
+    paths.insert(current.to_path_buf());
+    paths.extend(
+        state
+            .playback_proxy_temporaries
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    paths
+}
+
+struct PlaybackTemporaryGuard<'a> {
+    paths: &'a Mutex<HashSet<PathBuf>>,
+    path: PathBuf,
+}
+
+impl Drop for PlaybackTemporaryGuard<'_> {
+    fn drop(&mut self) {
+        self.paths.lock().unwrap().remove(&self.path);
+    }
+}
+
+fn protect_playback_temporary<'a>(
+    state: &'a NativeState,
+    path: &Path,
+) -> PlaybackTemporaryGuard<'a> {
+    state
+        .playback_proxy_temporaries
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf());
+    PlaybackTemporaryGuard {
+        paths: &state.playback_proxy_temporaries,
+        path: path.to_path_buf(),
+    }
+}
+
+fn cleanup_abandoned_playback_temporaries(state: &NativeState, root: &Path) -> Result<(), String> {
+    let active = state.playback_proxy_temporaries.lock().unwrap().clone();
+    for entry in fs::read_dir(root)
+        .map_err(|error| format!("Cannot inspect playback proxy cache: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if active.contains(&path)
+            || !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            || !entry.file_name().to_string_lossy().starts_with(".proxy-")
+        {
+            continue;
+        }
+        fs::remove_file(path)
+            .map_err(|error| format!("Cannot remove abandoned playback proxy output: {error}"))?;
+    }
+    Ok(())
+}
+
+fn fail_playback_proxy_status(state: &NativeState, operation_id: &str, error: &str) {
+    update_playback_proxy_status(state, operation_id, |operation| {
+        if operation.state != "cancelled" {
+            operation.state = "failed".into();
+            operation.stage = "Proxy generation failed".into();
+            operation.error = Some(error.to_owned());
+            operation.cancellable = false;
+            operation.retryable = true;
+        }
+    });
+}
+
+fn run_playback_proxy_generation(
+    state: &NativeState,
+    operation_id: &str,
+    source: &Path,
+    temporary: &Path,
+    duration_millis: Option<u64>,
+) -> Result<(), String> {
+    let mut command = media_tool_command("ffmpeg");
+    command
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(source)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            "scale=min(1280\\,iw):-2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*2)",
+            "-tune",
+            "fastdecode",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-n",
+        ])
+        .arg(temporary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child =
+        ManagedChild(command.spawn().map_err(|error| {
+            format!("Could not start FFmpeg playback proxy generation: {error}")
+        })?);
+    state
+        .playback_proxy_processes
+        .lock()
+        .unwrap()
+        .insert(operation_id.to_owned(), child.0.id());
+    let _process_guard = PlaybackProcessGuard {
+        processes: &state.playback_proxy_processes,
+        operation_id: operation_id.to_owned(),
+    };
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or("FFmpeg progress stream is unavailable")?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or("FFmpeg diagnostic stream is unavailable")?;
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut processed = 0_u64;
+    let status = loop {
+        while let Ok(line) = receiver.try_recv() {
+            if let Some(value) = playback_progress_millis(&line) {
+                processed = processed.max(value);
+                update_playback_proxy_status(state, operation_id, |operation| {
+                    operation.completed_items =
+                        usize::try_from(processed / 1_000).unwrap_or(usize::MAX);
+                });
+            }
+        }
+        if state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .contains(operation_id)
+        {
+            child
+                .0
+                .kill()
+                .map_err(|error| format!("Could not stop FFmpeg safely: {error}"))?;
+            let _ = child.0.wait();
+            update_playback_proxy_status(state, operation_id, |operation| {
+                operation.state = "cancelled".into();
+                operation.stage = "Cancelled; partial output removed".into();
+                operation.cancellable = false;
+            });
+            return Err("Playback proxy generation was cancelled safely".into());
+        }
+        if let Some(status) = child
+            .0
+            .try_wait()
+            .map_err(|error| format!("Could not monitor FFmpeg: {error}"))?
+        {
+            break status;
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    };
+    let mut diagnostics = String::new();
+    BufReader::new(stderr)
+        .read_to_string(&mut diagnostics)
+        .map_err(|error| format!("Could not read FFmpeg diagnostics: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "FFmpeg could not create a compatible playback proxy (exit status {status}): {}",
+            diagnostics.trim()
+        ));
+    }
+    update_playback_proxy_status(state, operation_id, |operation| {
+        operation.completed_items = duration_millis
+            .map(|value| usize::try_from(value / 1_000).unwrap_or(usize::MAX))
+            .unwrap_or(operation.completed_items);
+        operation.stage = "Validating completed proxy".into();
+        operation.cancellable = false;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn resolve_media_playback_source(
+    app: AppHandle,
+    media_id: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let settings = load_settings_file(&app)?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or("Unknown media item")?;
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        if !enrichment_video_type(&item.file_type) {
+            return Ok(source.to_string_lossy().into_owned());
+        }
+        let snapshot = fs_safe::snapshot(&source)?;
+        let fingerprint = playback_proxy_fingerprint(item, &snapshot);
+        let root = playback_proxy_root(&settings)?;
+        let proxy = playback_proxy_path(&root, item, &fingerprint);
+        if valid_playback_proxy(&proxy) {
+            state
+                .active_playback_proxies
+                .lock()
+                .unwrap()
+                .insert(media_id, proxy.clone());
+            return Ok(proxy.to_string_lossy().into_owned());
+        }
+        Ok(source.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| format!("Playback source resolution task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _operation = begin_critical_operation(&state.operations, "playback proxy generation")?;
+        let settings = load_settings_file(&app)?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .cloned()
+            .ok_or("Unknown media item")?;
+        if !enrichment_video_type(&item.file_type) {
+            return Err(
+                "Playback proxies are available only for supported video recordings".into(),
+            );
+        }
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        let before = fs_safe::snapshot(&source)?;
+        let source_probe = probe_playback_media(&source)?;
+        let duration_millis = probe_duration_millis(&source_probe);
+        let fingerprint = playback_proxy_fingerprint(&item, &before);
+        let operation_id = format!("playback-proxy:{}", &fingerprint[..24]);
+        let generation = {
+            let mut generations = state.playback_proxy_generations.lock().unwrap();
+            generations
+                .entry(operation_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _generation_guard = generation.lock().unwrap();
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .remove(&operation_id);
+        let root = playback_proxy_root(&settings)?;
+        cleanup_abandoned_playback_temporaries(&state, &root)?;
+        let destination = playback_proxy_path(&root, &item, &fingerprint);
+        if valid_playback_proxy(&destination) {
+            state
+                .active_playback_proxies
+                .lock()
+                .unwrap()
+                .insert(media_id.clone(), destination.clone());
+            enforce_playback_proxy_limit(
+                &root,
+                settings.playback_proxy_cache_limit_bytes,
+                &protected_playback_proxy_paths(&state, &destination),
+            )?;
+            return Ok(destination.to_string_lossy().into_owned());
+        }
+        if fs::symlink_metadata(&destination).is_ok() {
+            fs::remove_file(&destination)
+                .map_err(|error| format!("Cannot remove invalid cached proxy: {error}"))?;
+        }
+        let temporary = root.join(format!(".proxy-{}.mp4", Uuid::new_v4()));
+        let _temporary_guard = protect_playback_temporary(&state, &temporary);
+        let now = Utc::now().to_rfc3339();
+        state.playback_proxy_status.lock().unwrap().insert(
+            operation_id.clone(),
+            BackgroundOperation {
+                id: operation_id.clone(),
+                kind: "playback-proxy".into(),
+                title: format!("Playback proxy: {}", item.original_filename),
+                state: "running".into(),
+                stage: "Transcoding H.264/AAC preview".into(),
+                current_item: Some(item.original_filename.clone()),
+                completed_items: 0,
+                total_items: duration_millis
+                    .map(|value| usize::try_from(value / 1_000).unwrap_or(usize::MAX)),
+                bytes_completed: 0,
+                bytes_total: None,
+                counts: OperationCounts::default(),
+                cancellable: true,
+                pausable: false,
+                retryable: false,
+                error: None,
+                started_at: now.clone(),
+                updated_at: now,
+            },
+        );
+        configure_volume_governor(&state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let cache_volume = volume_resource_id(&root)?;
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            operation.state = "queued".into();
+            operation.stage = "Waiting for source and cache volumes".into();
+        });
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Playback proxy: {}", item.original_filename),
+                resource_governor::PRIORITY_FOREGROUND,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
+                ],
+            ),
+            || {
+                state
+                    .playback_proxy_cancelled
+                    .lock()
+                    .unwrap()
+                    .contains(&operation_id)
+            },
+        )?;
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            operation.state = "running".into();
+            operation.stage = "Transcoding H.264/AAC preview".into();
+        });
+        let generated = {
+            let _admission = state.derivative_admission.acquire(0);
+            run_playback_proxy_generation(
+                &state,
+                &operation_id,
+                &source,
+                &temporary,
+                duration_millis,
+            )
+        };
+        if let Err(error) = generated {
+            let _ = fs::remove_file(&temporary);
+            fail_playback_proxy_status(&state, &operation_id, &error);
+            return Err(error);
+        }
+        if !valid_playback_proxy(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            let error = "The generated playback proxy failed codec/container validation";
+            fail_playback_proxy_status(&state, &operation_id, error);
+            return Err(error.into());
+        }
+        if let Ok(metadata) = temporary.metadata() {
+            volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
+        }
+        let after = match fs_safe::snapshot(&source) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                fail_playback_proxy_status(&state, &operation_id, &error);
+                return Err(error);
+            }
+        };
+        if after != before {
+            let _ = fs::remove_file(&temporary);
+            let error = "Source changed while its playback proxy was being generated";
+            fail_playback_proxy_status(&state, &operation_id, error);
+            return Err(error.into());
+        }
+        if destination.exists() {
+            let _ = fs::remove_file(&temporary);
+        } else {
+            if let Err(error) = fs::rename(&temporary, &destination) {
+                let error = format!("Cannot commit playback proxy: {error}");
+                fail_playback_proxy_status(&state, &operation_id, &error);
+                return Err(error);
+            }
+        }
+        if !valid_playback_proxy(&destination) {
+            let error = "The generated playback proxy failed validation";
+            fail_playback_proxy_status(&state, &operation_id, error);
+            return Err(error.into());
+        }
+        state
+            .active_playback_proxies
+            .lock()
+            .unwrap()
+            .insert(media_id, destination.clone());
+        if let Err(error) = enforce_playback_proxy_limit(
+            &root,
+            settings.playback_proxy_cache_limit_bytes,
+            &protected_playback_proxy_paths(&state, &destination),
+        ) {
+            fail_playback_proxy_status(&state, &operation_id, &error);
+            return Err(error);
+        }
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            operation.state = "completed".into();
+            operation.stage = "Compatible proxy ready".into();
+            operation.cancellable = false;
+        });
+        Ok(destination.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| format!("Playback proxy worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn release_playback_proxy(state: State<'_, NativeState>, media_id: String) {
+    state
+        .active_playback_proxies
+        .lock()
+        .unwrap()
+        .remove(&media_id);
+}
+
+#[tauri::command]
+fn cancel_background_operation(
+    state: State<'_, NativeState>,
+    operation_id: String,
+) -> Result<(), String> {
+    if operation_id.starts_with("playback-proxy:") {
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .insert(operation_id.clone());
+        update_playback_proxy_status(&state, &operation_id, |operation| {
+            if operation.state == "running" {
+                operation.state = "cancelling".into();
+                operation.stage = "Stopping FFmpeg and removing partial output".into();
+                operation.cancellable = false;
+            }
+        });
+        Ok(())
+    } else {
+        cancel_inventory(state, operation_id)
+    }
 }
 
 fn build_premiere_import_manifest(
@@ -4365,7 +8976,10 @@ fn build_premiere_import_manifest(
         let relative = fs_safe::validate_relative(&item.relative_path)?;
         let absolute = fs_safe::resolve_existing(&master, &item.relative_path)?;
         if !absolute.is_file() {
-            return Err(format!("{} is not available locally", item.original_filename));
+            return Err(format!(
+                "{} is not available locally",
+                item.original_filename
+            ));
         }
         let bin_path = relative
             .parent()
@@ -4378,7 +8992,7 @@ fn build_premiere_import_manifest(
             .map(|candidate| candidate.id.clone());
         items.push(PremiereImportItem {
             media_id: item.id.clone(),
-            absolute_path: absolute.to_string_lossy().into_owned(),
+            absolute_path: handoff_path(&absolute),
             relative_path: item.relative_path.replace('\\', "/"),
             original_filename: item.original_filename.clone(),
             sha256: item.sha256.clone(),
@@ -4455,6 +9069,7 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
     #[link(name = "shell32")]
     extern "system" {
         fn ILCreateFromPathW(path: *const u16) -> *mut c_void;
+        fn ILFindLastID(pidl: *const c_void) -> *const c_void;
         fn ILFree(pidl: *mut c_void);
         fn SHOpenFolderAndSelectItems(
             folder: *const c_void,
@@ -4468,7 +9083,21 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
     const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
     const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
 
-    let wide_path = path.as_os_str().encode_wide().chain(once(0)).collect::<Vec<_>>();
+    let shell_path = explorer_boundary_path(&path.to_string_lossy())?;
+    let shell_path = PathBuf::from(shell_path);
+    let parent = shell_path
+        .parent()
+        .ok_or("Windows Explorer could not determine the containing folder")?;
+    let wide_path = shell_path
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    let wide_parent = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
     unsafe {
         let initialized = CoInitializeEx(
             ptr::null_mut(),
@@ -4481,19 +9110,25 @@ fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
             ));
         }
 
+        let folder = ILCreateFromPathW(wide_parent.as_ptr());
         let item = ILCreateFromPathW(wide_path.as_ptr());
-        if item.is_null() {
+        if folder.is_null() || item.is_null() {
+            if !folder.is_null() {
+                ILFree(folder);
+            }
+            if !item.is_null() {
+                ILFree(item);
+            }
             if initialized >= 0 {
                 CoUninitialize();
             }
             return Err("Windows Explorer could not resolve this recording".into());
         }
-
-        // With item_count zero, the Shell opens the parent and selects this item.
-        // This avoids explorer.exe command-line quoting ambiguity for commas,
-        // whitespace and Unicode names and lets an existing Explorer window be reused.
-        let selected = SHOpenFolderAndSelectItems(item, 0, ptr::null(), 0);
+        let child = ILFindLastID(item);
+        let children = [child];
+        let selected = SHOpenFolderAndSelectItems(folder, 1, children.as_ptr(), 0);
         ILFree(item);
+        ILFree(folder);
         if initialized >= 0 {
             CoUninitialize();
         }
@@ -4570,11 +9205,12 @@ fn support_url(destination: &str) -> Option<&'static str> {
     match destination {
         "github" => Some("https://github.com/Dubcodes/kairix-pimp"),
         "releases" => Some("https://github.com/Dubcodes/kairix-pimp/releases"),
-        "test-builds" => Some(
-            "https://github.com/Dubcodes/kairix-pimp/actions/workflows/windows-beta.yml",
-        ),
+        "test-builds" => {
+            Some("https://github.com/Dubcodes/kairix-pimp/actions/workflows/windows-beta.yml")
+        }
         "website" => Some("https://www.dubcodesmedia.com/kairix/kairix-pimp"),
         "coffee" => Some("https://buymeacoffee.com/dubcodes"),
+        "degoo" => Some("https://app.degoo.com/"),
         _ => None,
     }
 }
@@ -4603,19 +9239,49 @@ fn open_logs_folder(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn app_info(app: AppHandle) -> AppInfo {
+    let version = app.package_info().version.to_string();
+    let display_version = version
+        .strip_suffix(".0")
+        .filter(|value| value.matches('.').count() == 1)
+        .unwrap_or(&version)
+        .to_string();
+    let release_classification = if option_env!("PIMP_RELEASE_CLASSIFICATION")
+        .is_some_and(|value| value.eq_ignore_ascii_case("stable"))
+    {
+        "Stable"
+    } else {
+        "Development"
+    };
     AppInfo {
-        version: app.package_info().version.to_string(),
+        version,
+        display_version,
         build_commit: option_env!("PIMP_BUILD_COMMIT")
             .unwrap_or("development")
             .to_string(),
         edition: "Kairix PIMP Light".into(),
-        release_channel: "Beta".into(),
+        release_classification: release_classification.into(),
+        release_date: option_env!("PIMP_RELEASE_DATE")
+            .unwrap_or("Unpublished development build")
+            .into(),
     }
 }
 
-fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfiguration {
+fn updater_configuration_for_key(
+    public_key: Option<&str>,
+    requested_channel: &str,
+) -> UpdaterConfiguration {
     const ENDPOINT: &str =
-        "https://github.com/Dubcodes/kairix-pimp/releases/download/beta-channel/latest.json";
+        "https://github.com/Dubcodes/kairix-pimp/releases/download/{{target}}/latest.json";
+    let channel = if requested_channel == "stable" {
+        "Stable"
+    } else {
+        "Development"
+    };
+    let target = if requested_channel == "stable" {
+        "stable-channel"
+    } else {
+        "development-channel"
+    };
     let key = public_key.map(str::trim).filter(|key| !key.is_empty());
     let configured = key.is_some_and(|key| {
         BASE64
@@ -4626,8 +9292,9 @@ fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfigurati
     });
     UpdaterConfiguration {
         configured,
-        channel: "Beta".into(),
+        channel: channel.into(),
         endpoint: ENDPOINT.into(),
+        target: target.into(),
         reason: (!configured).then(|| match key {
             Some(_) => "The embedded updater public key is invalid. Use the reviewed NSIS installer from GitHub Releases.".into(),
             None => "Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.".into(),
@@ -4636,20 +9303,102 @@ fn updater_configuration_for_key(public_key: Option<&str>) -> UpdaterConfigurati
 }
 
 #[tauri::command]
-fn updater_configuration() -> UpdaterConfiguration {
-    updater_configuration_for_key(option_env!("PIMP_UPDATER_PUBLIC_KEY"))
+fn updater_configuration(app: AppHandle) -> UpdaterConfiguration {
+    let channel = load_settings_file(&app)
+        .map(|settings| settings.update_channel)
+        .unwrap_or_else(|_| default_update_channel());
+    updater_configuration_for_key(option_env!("PIMP_UPDATER_PUBLIC_KEY"), &channel)
 }
 
 #[tauri::command]
 fn begin_update_installation(app: AppHandle, state: State<'_, NativeState>) -> Result<(), String> {
-    let mut installing = state.update_installing.lock().unwrap();
-    let jobs = snapshot_jobs(&app, &state)?;
-    begin_update_gate(&mut installing, &jobs)
+    let mut coordinator = state.operations.lock().unwrap();
+    let ingest_jobs = snapshot_jobs(&app, &state)?;
+    let backup_jobs = {
+        let _guard = state.backup_job_store.lock().unwrap();
+        load_backup_jobs_unlocked(&app)?
+    };
+    begin_update_gate(&mut coordinator, &ingest_jobs, &backup_jobs)
 }
 
 #[tauri::command]
 fn end_update_installation(state: State<'_, NativeState>) {
-    end_update_gate(&state.update_installing);
+    end_update_gate(&state.operations);
+}
+
+#[tauri::command]
+fn set_media_thumbnail_frame(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    media_id: String,
+    seconds: f64,
+) -> Result<String, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let item = catalogue
+        .media
+        .iter()
+        .find(|item| item.id == media_id)
+        .cloned()
+        .ok_or("Unknown media item")?;
+    if !enrichment_video_type(&item.file_type) {
+        return Err("Custom thumbnail frames are supported only for video recordings".into());
+    }
+    validate_thumbnail_frame(seconds, item.technical.duration_seconds)?;
+    let source = resolve_catalogue_media_path(&settings, &media_id)?;
+    let before = fs_safe::snapshot(&source)?;
+    let shared = shared_thumbnail_root(&settings)?;
+    let thumbnail_ref = static_thumbnail_reference(&item, seconds);
+    let destination = shared.join(&thumbnail_ref);
+    let generation_lock = thumbnail_generation_lock(&state, &media_id);
+    let _generation_guard = generation_lock.lock().unwrap();
+    configure_volume_governor(&state, &settings);
+    let source_volume = volume_resource_id(&source)?;
+    let cache_volume = volume_resource_id(&shared)?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            format!("Custom thumbnail: {}", item.original_filename),
+            resource_governor::PRIORITY_FOREGROUND,
+            false,
+            vec![
+                resource_governor::VolumeNeed::read(source_volume.clone()),
+                resource_governor::VolumeNeed::write(cache_volume.clone()),
+            ],
+        ),
+        || false,
+    )?;
+    let published_thumbnail = {
+        let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(0);
+        generate_thumbnail_atomic(&source, &destination, seconds)?
+    };
+    if let Ok(metadata) = destination.metadata() {
+        volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
+    }
+    if fs_safe::snapshot(&source).ok().as_ref() != Some(&before) {
+        if published_thumbnail {
+            let _ = fs::remove_file(&destination);
+        }
+        return Err(
+            "Source changed while selecting the thumbnail frame; retry after writes finish".into(),
+        );
+    }
+    if item.thumbnail_path.as_deref() != Some(&thumbnail_ref) {
+        let _catalogue_guard = state.catalogue_write.lock().unwrap();
+        append_events(
+            &settings,
+            vec![CatalogueEvent::MediaEnriched {
+                media_id: item.id,
+                technical: item.technical,
+                thumbnail_ref: Some(thumbnail_ref),
+            }],
+        )?;
+    }
+    let _ = app.emit("catalogue-changed", ());
+    app.asset_protocol_scope()
+        .allow_file(&destination)
+        .map_err(|error| format!("Cannot authorize validated thumbnail: {error}"))?;
+    Ok(destination.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -4661,30 +9410,30 @@ fn load_thumbnail(app: AppHandle, media_id: String) -> Result<Option<String>, St
         .iter()
         .find(|item| item.id == media_id)
         .ok_or("Unknown media item")?;
-    let Some(reference) = &item.thumbnail_path else {
-        return Ok(None);
-    };
-    if !catalogue::safe_cache_reference(reference) || reference != &format!("{}.jpg", item.id) {
+    let reference = selected_static_thumbnail_reference(item);
+    if !catalogue::safe_cache_reference(&reference) {
         return Err("Catalogue contains an unsafe thumbnail reference".into());
     }
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    let cache = cache
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
-    let path = cache.join(reference);
+    let shared = shared_thumbnail_root(&settings)?;
+    let path = shared.join(&reference);
+    if !path.exists() && !migrate_legacy_static_thumbnail(&settings, item, &path)? {
+        return Ok(None);
+    }
     if !path.is_file() {
         return Ok(None);
     }
     let path = path
         .canonicalize()
         .map_err(|error| format!("Cannot resolve thumbnail: {error}"))?;
-    if !path.starts_with(&cache) {
-        return Err("Thumbnail resolved outside the configured cache".into());
+    if !path.starts_with(&shared) {
+        return Err("Thumbnail resolved outside the shared thumbnail store".into());
     }
     let metadata = path.metadata().map_err(|e| e.to_string())?;
     if metadata.len() > 10 * 1024 * 1024 {
         return Err("Thumbnail exceeds the 10 MB safety limit".into());
+    }
+    if !valid_cached_thumbnail(&path) {
+        return Ok(None);
     }
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     Ok(Some(format!(
@@ -4704,32 +9453,160 @@ fn load_thumbnail_sources(
     let requested = media_ids.into_iter().collect::<HashSet<_>>();
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
-    let cache = PathBuf::from(&settings.thumbnail_cache_path);
-    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    let cache = cache
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve thumbnail cache: {error}"))?;
+    let shared = shared_thumbnail_root(&settings)?;
+    let sources = thumbnail_sources_for_items(
+        &settings, &catalogue, &shared, &requested,
+    );
+    // The static config deliberately grants no filesystem glob. Only native-
+    // validated JPEGs are exposed to the WebView, one exact file at a time.
+    // This supports a user-selected shared catalogue without granting the
+    // WebView access to the rest of that volume or Master Bin.
+    let asset_scope = app.asset_protocol_scope();
+    for path in sources.values() {
+        asset_scope
+            .allow_file(path)
+            .map_err(|error| format!("Cannot authorize validated thumbnail: {error}"))?;
+    }
+    Ok(sources)
+}
+
+fn thumbnail_sources_for_items(
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+    shared: &Path,
+    requested: &HashSet<String>,
+) -> HashMap<String, String> {
     let mut sources = HashMap::new();
     for item in catalogue
         .media
         .iter()
         .filter(|item| requested.contains(&item.id))
     {
-        let Some(reference) = &item.thumbnail_path else {
-            continue;
-        };
-        if !catalogue::safe_cache_reference(reference) || reference != &format!("{}.jpg", item.id) {
+        let reference = selected_static_thumbnail_reference(item);
+        if !catalogue::safe_cache_reference(&reference) {
             continue;
         }
-        let path = cache.join(reference);
-        let Ok(path) = path.canonicalize() else {
-            continue;
-        };
-        if path.starts_with(&cache) && path.is_file() {
-            sources.insert(item.id.clone(), path.to_string_lossy().into_owned());
+        let path = shared.join(&reference);
+        if let Ok(path) = path.canonicalize() {
+            if path.starts_with(&shared) && valid_cached_thumbnail(&path) {
+                sources.insert(item.id.clone(), path.to_string_lossy().into_owned());
+                continue;
+            }
+        }
+        // Keep the old image visible while the background enrichment worker
+        // incrementally publishes its validated shared equivalent.
+        if let Some(legacy) = validated_legacy_static_thumbnail(&settings, item) {
+            sources.insert(item.id.clone(), legacy.to_string_lossy().into_owned());
         }
     }
-    Ok(sources)
+    sources
+}
+
+#[tauri::command]
+async fn prepare_media_thumbnail(
+    app: AppHandle,
+    media_id: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        let _operation =
+            begin_critical_operation(&state.operations, "visible thumbnail generation")?;
+        let generation_lock = thumbnail_generation_lock(&state, &media_id);
+        let _generation_guard = generation_lock.lock().unwrap();
+        let settings = load_settings_file(&app)?;
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .cloned()
+            .ok_or("Unknown media item")?;
+        if !enrichment_video_type(&item.file_type) {
+            return Ok(None);
+        }
+        let cache = shared_thumbnail_root(&settings)?;
+        let thumbnail_ref = selected_static_thumbnail_reference(&item);
+        if !catalogue::safe_cache_reference(&thumbnail_ref) {
+            return Err("Media identity is not safe for the thumbnail cache".into());
+        }
+        let thumbnail = cache.join(&thumbnail_ref);
+        if !valid_cached_thumbnail(&thumbnail) {
+            let operation = begin_transient_operation(
+                &state.static_thumbnail_status,
+                format!("static-thumbnail:{}:{}", item.id, Uuid::new_v4()),
+                "static-thumbnail",
+                "Generating static thumbnail",
+                "Waiting for thumbnail worker",
+                Some(item.original_filename.clone()),
+            );
+            let master = PathBuf::from(&settings.master_bin_path);
+            let source = fs_safe::resolve_existing(&master, &item.relative_path)?;
+            let before = fs_safe::snapshot(&source)?;
+            configure_volume_governor(&state, &settings);
+            let source_volume = volume_resource_id(&source)?;
+            let cache_volume = volume_resource_id(&cache)?;
+            operation.set_stage("Waiting for source and cache volumes");
+            let mut volume_permit = state.volume_governor.acquire(
+                resource_governor::Request::new(
+                    format!("Visible thumbnail: {}", item.original_filename),
+                    resource_governor::PRIORITY_VISIBLE,
+                    false,
+                    vec![
+                        resource_governor::VolumeNeed::read(source_volume.clone()),
+                        resource_governor::VolumeNeed::write(cache_volume.clone()),
+                    ],
+                ),
+                || false,
+            )?;
+            let published_thumbnail = {
+                let _static_lane = state.static_thumbnail_generation.lock().unwrap();
+                let _admission = state.derivative_admission.acquire(1);
+                operation.set_stage("Extracting representative frame");
+                generate_thumbnail_atomic(&source, &thumbnail, 0.1)?
+            };
+            if let Ok(metadata) = thumbnail.metadata() {
+                volume_permit.add_bytes_for(&cache_volume, 0, metadata.len());
+            }
+            if fs_safe::snapshot(&source)? != before {
+                if published_thumbnail {
+                    let _ = fs::remove_file(&thumbnail);
+                }
+                return Err("Media changed while its thumbnail was being generated".into());
+            }
+        }
+        if item.thumbnail_path.as_deref() != Some(&thumbnail_ref) {
+            let _catalogue_guard = state.catalogue_write.lock().unwrap();
+            let current = load_catalogue_file(&settings)?;
+            let current_item = current
+                .media
+                .iter()
+                .find(|candidate| candidate.id == media_id)
+                .ok_or("Media changed while its thumbnail was being generated")?;
+            if current_item.relative_path != item.relative_path
+                || current_item.sha256 != item.sha256
+            {
+                return Err("Media changed while its thumbnail was being generated".into());
+            }
+            append_events(
+                &settings,
+                vec![CatalogueEvent::MediaEnriched {
+                    media_id: item.id.clone(),
+                    technical: current_item.technical.clone(),
+                    thumbnail_ref: Some(thumbnail_ref),
+                }],
+            )?;
+            let _ = app.emit("catalogue-changed", ());
+        }
+        if !valid_cached_thumbnail(&thumbnail) {
+            return Ok(None);
+        }
+        app.asset_protocol_scope()
+            .allow_file(&thumbnail)
+            .map_err(|error| format!("Cannot authorize validated thumbnail: {error}"))?;
+        Ok(Some(thumbnail.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| format!("Visible thumbnail worker failed: {error}"))?
 }
 
 fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
@@ -4742,7 +9619,7 @@ fn hover_preview_root(settings: &DeviceSettings) -> Result<PathBuf, String> {
 
 fn hover_preview_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"pimp-hover-preview-v2\0");
+    digest.update(b"pimp-hover-preview-v3-sparse-seek\0");
     digest.update(item.id.as_bytes());
     digest.update(b"\0");
     digest.update(item.sha256.as_bytes());
@@ -4770,13 +9647,93 @@ fn hover_preview_frame_times(duration_seconds: f64) -> Result<Vec<f64>, String> 
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return Err("Hover preview requires a known positive duration".into());
     }
-    let count = ((duration_seconds * 2.0).floor() as usize).clamp(1, 16);
+    let count = ((duration_seconds * 2.0).floor() as usize).clamp(1, 8);
     if count == 1 {
         return Ok(vec![duration_seconds / 2.0]);
     }
     Ok((0..count)
         .map(|index| duration_seconds * index as f64 / (count - 1) as f64)
         .collect())
+}
+
+fn hover_preview_seek_time(sample_time: f64, duration_seconds: f64) -> f64 {
+    if duration_seconds <= 0.2 {
+        return duration_seconds / 2.0;
+    }
+    sample_time.clamp(0.0, duration_seconds - 0.1)
+}
+
+fn generate_hover_preview_frame(
+    source: &Path,
+    destination: &Path,
+    seek_seconds: f64,
+    timeout: StdDuration,
+) -> Result<f64, String> {
+    let seek = format!("{seek_seconds:.6}");
+    let mut child = ManagedChild(
+        media_tool_command("ffmpeg")
+            .args(["-v", "info", "-nostdin", "-copyts", "-ss", &seek, "-i"])
+            .arg(source)
+            .args([
+                "-an",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=320:-2:force_original_aspect_ratio=decrease,showinfo",
+                "-q:v",
+                "7",
+                "-n",
+            ])
+            .arg(destination)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("FFmpeg is unavailable for hover previews: {error}"))?,
+    );
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or("FFmpeg hover-preview diagnostics are unavailable")?;
+    let diagnostics = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = BufReader::new(stderr).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().map_err(|error| {
+            format!("Could not monitor FFmpeg hover-preview generation: {error}")
+        })? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            let _ = diagnostics.join();
+            return Err("FFmpeg hover-preview generation timed out after 60 seconds".into());
+        }
+        std::thread::sleep(StdDuration::from_millis(25));
+    };
+    let (read_result, diagnostics) = diagnostics
+        .join()
+        .map_err(|_| "FFmpeg hover-preview diagnostics worker failed")?;
+    read_result
+        .map_err(|error| format!("Cannot read FFmpeg hover-preview diagnostics: {error}"))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&diagnostics);
+        return Err(format!(
+            "FFmpeg could not generate a hover-preview frame: {}",
+            detail.trim()
+        ));
+    }
+    if !valid_cached_thumbnail(destination) {
+        return Err("FFmpeg produced an invalid hover-preview frame".into());
+    }
+    parse_hover_preview_frame_times(&diagnostics)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "FFmpeg did not report the sampled hover-preview timestamp".into())
 }
 
 fn validate_hover_preview(
@@ -4789,7 +9746,7 @@ fn validate_hover_preview(
             .map_err(|error| format!("Cannot read hover preview manifest: {error}"))?,
     )
     .map_err(|error| format!("Invalid hover preview manifest: {error}"))?;
-    if manifest.version != 2 || manifest.fingerprint != expected_fingerprint {
+    if manifest.version != 3 || manifest.fingerprint != expected_fingerprint {
         return Err("Hover preview cache fingerprint does not match the source".into());
     }
     if manifest.frame_files.len() != manifest.frame_times.len() || manifest.frame_files.is_empty() {
@@ -4822,7 +9779,45 @@ fn validate_hover_preview(
     Ok(manifest)
 }
 
-fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<HoverPreview, String> {
+#[tauri::command]
+fn load_hover_preview_statuses(
+    app: AppHandle,
+    media_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if media_ids.len() > 10_000 {
+        return Err("Hover preview status request exceeds the 10,000 item safety limit".into());
+    }
+    let requested = media_ids.into_iter().collect::<HashSet<_>>();
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let root = hover_preview_root(&settings)?;
+    let mut ready = Vec::new();
+    for item in catalogue.media.iter().filter(|item| {
+        requested.contains(&item.id)
+            && matches!(
+                item.file_type.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
+            )
+    }) {
+        let Ok(source) = fs_safe::resolve_existing(&master, &item.relative_path) else {
+            continue;
+        };
+        let Ok(snapshot) = fs_safe::snapshot(&source) else {
+            continue;
+        };
+        let fingerprint = hover_preview_fingerprint(item, &snapshot);
+        if validate_hover_preview(&root.join(&fingerprint), &fingerprint).is_ok() {
+            ready.push(item.id.clone());
+        }
+    }
+    Ok(ready)
+}
+
+fn read_hover_preview(
+    directory: &Path,
+    expected_fingerprint: &str,
+) -> Result<HoverPreview, String> {
     let manifest = validate_hover_preview(directory, expected_fingerprint)?;
     let mut frames = Vec::with_capacity(manifest.frame_files.len());
     for reference in &manifest.frame_files {
@@ -4877,6 +9872,14 @@ fn evict_hover_preview_cache(root: &Path, budget: u64, keep: &Path) -> Result<()
     Ok(())
 }
 
+struct UnpublishedHoverPreview(PathBuf);
+
+impl Drop for UnpublishedHoverPreview {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn ensure_hover_preview(
     settings: &DeviceSettings,
     item: &MediaItem,
@@ -4900,42 +9903,32 @@ fn ensure_hover_preview(
     }
 
     let temporary = root.join(format!(".generating-{}", Uuid::new_v4()));
-    fs::create_dir(&temporary)
-        .map_err(|error| format!("Cannot stage hover preview: {error}"))?;
-    let output_pattern = temporary.join("frame-%03d.jpg");
-    let filter = format!(
-        "fps={}/{duration_seconds},scale=320:-2:force_original_aspect_ratio=decrease,showinfo",
-        frame_times.len()
-    );
-    let output = media_tool_command("ffmpeg")
-        .args(["-v", "info", "-nostdin", "-i"])
-        .arg(source)
-        .args(["-an", "-vf", &filter, "-frames:v"])
-        .arg(frame_times.len().to_string())
-        .args(["-q:v", "7"])
-        .arg(&output_pattern)
-        .output()
-        .map_err(|error| format!("FFmpeg is unavailable for hover previews: {error}"));
-    let output = match output {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
+    fs::create_dir(&temporary).map_err(|error| format!("Cannot stage hover preview: {error}"))?;
+    let _unpublished = UnpublishedHoverPreview(temporary.clone());
+    let generation_started = Instant::now();
+    let generation_timeout = StdDuration::from_secs(60);
+    let mut actual_frame_times = Vec::with_capacity(frame_times.len());
+    for (index, sample_time) in frame_times.iter().enumerate() {
+        let remaining = generation_timeout.saturating_sub(generation_started.elapsed());
+        if remaining.is_zero() {
             let _ = fs::remove_dir_all(&temporary);
-            return Err(format!(
-                "FFmpeg could not generate a hover preview: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            return Err("FFmpeg hover-preview generation timed out after 60 seconds".into());
         }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&temporary);
-            return Err(error);
-        }
-    };
-    let actual_frame_times = parse_hover_preview_frame_times(&output.stderr);
-    if actual_frame_times.len() != frame_times.len() {
-        let _ = fs::remove_dir_all(&temporary);
-        return Err("FFmpeg did not report every sampled hover-preview timestamp".into());
+        let destination = temporary.join(format!("frame-{:03}.jpg", index + 1));
+        let actual_time = match generate_hover_preview_frame(
+            source,
+            &destination,
+            hover_preview_seek_time(*sample_time, duration_seconds),
+            remaining,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&temporary);
+                return Err(error);
+            }
+        };
+        actual_frame_times.push(actual_time);
     }
-    drop(output);
     if fs_safe::snapshot(source)? != before {
         let _ = fs::remove_dir_all(&temporary);
         return Err("Source changed while generating its hover preview".into());
@@ -4952,7 +9945,7 @@ fn ensure_hover_preview(
         return Err("FFmpeg produced an incomplete hover preview".into());
     }
     let manifest = HoverPreviewManifest {
-        version: 2,
+        version: 3,
         media_id: item.id.clone(),
         fingerprint: fingerprint.clone(),
         duration_seconds,
@@ -4984,7 +9977,6 @@ fn generate_hover_preview(
 async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
-        let _guard = state.preview_generation.lock().unwrap();
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -4994,7 +9986,8 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             .media
             .iter()
             .find(|item| item.id == media_id)
-            .ok_or("Unknown media item")?;
+            .ok_or("Unknown media item")?
+            .clone();
         if !matches!(
             item.file_type.to_ascii_lowercase().as_str(),
             "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
@@ -5002,7 +9995,62 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             return Err("Hover previews are available only for supported video files".into());
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
-        generate_hover_preview(&settings, item, &source)
+        let snapshot = fs_safe::snapshot(&source)?;
+        let fingerprint = hover_preview_fingerprint(&item, &snapshot);
+        let cache_root = hover_preview_root(&settings)?;
+        let cached_directory = cache_root.join(&fingerprint);
+        if cached_directory.is_dir() {
+            let cached_operation = begin_transient_operation(
+                &state.hover_preview_status,
+                format!("hover-preview-load:{media_id}:{}", Uuid::new_v4()),
+                "hover-preview-load",
+                "Loading cached hover preview",
+                "Validating stored scrub frames",
+                None,
+            );
+            if let Ok(preview) = read_hover_preview(&cached_directory, &fingerprint) {
+                cached_operation.set_stage("Scrub frames loaded and ready");
+                return Ok(preview);
+            }
+        }
+
+        let _operation = begin_critical_operation(&state.operations, "hover preview generation")?;
+        let preview_operation = begin_transient_operation(
+            &state.hover_preview_status,
+            format!("hover-preview:{media_id}:{}", Uuid::new_v4()),
+            "hover-preview",
+            "Generating hover preview",
+            "Waiting for preview worker",
+            None,
+        );
+        configure_volume_governor(&state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let cache_volume = volume_resource_id(&cache_root)?;
+        preview_operation.set_stage("Waiting for source and cache volumes");
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Interactive hover preview: {}", item.original_filename),
+                resource_governor::PRIORITY_INTERACTIVE_PREVIEW,
+                false,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
+        let _guard = state.preview_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(2);
+        preview_operation.set_stage("Generating and validating scrub frames");
+        let result = generate_hover_preview(&settings, &item, &source);
+        if result.is_ok() {
+            volume_permit.add_bytes_for(
+                &cache_volume,
+                0,
+                preview_cache_usage(&cached_directory),
+            );
+        }
+        result
     })
     .await
     .map_err(|error| format!("Hover preview task failed: {error}"))?
@@ -5012,10 +10060,18 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
 async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
+        let _operation = begin_critical_operation(&state.operations, "hover preview preparation")?;
         if has_active_ingest(&snapshot_jobs(&app, &state)?) {
             return Err("Background preview preparation is deferred while ingest is active".into());
         }
-        let _guard = state.preview_generation.lock().unwrap();
+        let preview_operation = begin_transient_operation(
+            &state.hover_preview_status,
+            format!("hover-preview:{media_id}:{}", Uuid::new_v4()),
+            "hover-preview",
+            "Preparing hover preview",
+            "Waiting for preview worker",
+            None,
+        );
         let settings = load_settings_file(&app)?;
         if !settings.hover_previews_enabled {
             return Err("Hover previews are disabled in Settings".into());
@@ -5033,7 +10089,38 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
             return Err("Hover previews are available only for supported video files".into());
         }
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
-        ensure_hover_preview(&settings, item, &source).map(|_| ())
+        configure_volume_governor(&state, &settings);
+        let source_volume = volume_resource_id(&source)?;
+        let cache_root = hover_preview_root(&settings)?;
+        let cache_volume = volume_resource_id(&cache_root)?;
+        preview_operation.set_stage("Waiting for source and cache volumes");
+        let mut volume_permit = state.volume_governor.acquire(
+            resource_governor::Request::new(
+                format!("Background hover preview: {}", item.original_filename),
+                resource_governor::PRIORITY_BACKGROUND_DERIVATIVE,
+                true,
+                vec![
+                    resource_governor::VolumeNeed::read(source_volume.clone()),
+                    resource_governor::VolumeNeed::write(cache_volume.clone()),
+                ],
+            ),
+            || false,
+        )?;
+        let _guard = state.preview_generation.lock().unwrap();
+        let _admission = state.derivative_admission.acquire(3);
+        preview_operation.set_stage("Generating and validating scrub frames");
+        let result = ensure_hover_preview(&settings, item, &source);
+        match result {
+            Ok((directory, _)) => {
+                volume_permit.add_bytes_for(
+                    &cache_volume,
+                    0,
+                    preview_cache_usage(&directory),
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     })
     .await
     .map_err(|error| format!("Hover preview preparation task failed: {error}"))?
@@ -5049,6 +10136,7 @@ fn hover_preview_cache_usage(app: AppHandle) -> Result<u64, String> {
 async fn clear_hover_preview_cache(app: AppHandle) -> Result<u64, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeState>();
+        let _operation = begin_critical_operation(&state.operations, "preview cache clear")?;
         let settings = load_settings_file(&app)?;
         let root = hover_preview_root(&settings)?;
         clear_hover_preview_cache_synchronized(&state.preview_generation, &root)
@@ -5073,7 +10161,10 @@ fn clear_hover_preview_cache_contents(root: &Path) -> Result<u64, String> {
         let path = entry.path();
         if entry.file_type().is_ok_and(|kind| kind.is_dir())
             && (path.join("manifest.json").is_file()
-                || entry.file_name().to_string_lossy().starts_with(".generating-"))
+                || entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".generating-"))
         {
             fs::remove_dir_all(path)
                 .map_err(|error| format!("Cannot clear hover preview cache: {error}"))?;
@@ -5150,7 +10241,12 @@ pub fn run() {
                 .tooltip("Kairix PIMP Light")
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => restore_main_window(app, "tray menu"),
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        let state = app.state::<NativeState>();
+                        state.volume_governor.shutdown();
+                        cancel_all_playback_proxy_processes(&state);
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -5196,6 +10292,39 @@ pub fn run() {
                         if tray_available && close_to_tray {
                             api.prevent_close();
                             let _ = close_window.hide();
+                        } else {
+                            let state = app.state::<NativeState>();
+                            state.volume_governor.shutdown();
+                            cancel_all_playback_proxy_processes(&state);
+                            let inventory_operation = {
+                                state
+                                    .inventory_status
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .filter(|operation| {
+                                    matches!(
+                                        operation.state.as_str(),
+                                        "queued" | "running" | "cancelling"
+                                    )
+                                })
+                            };
+                            if let Some(operation) = inventory_operation {
+                                state
+                                    .inventory_cancelled
+                                    .lock()
+                                    .unwrap()
+                                    .insert(operation.id.clone());
+                                diagnostic_log(
+                                    &app,
+                                    "INFO",
+                                    "inventory-shutdown",
+                                    &format!(
+                                        "Cancellation requested for {} before application close",
+                                        operation.id
+                                    ),
+                                );
+                            }
                         }
                     }
                 });
@@ -5228,6 +10357,13 @@ pub fn run() {
             catalogue_signature,
             refresh_media_availability,
             inventory_sources,
+            inventory_sd_card,
+            cancel_inventory,
+            cancel_background_operation,
+            list_background_operations,
+            reapprove_ingest_destinations,
+            replan_ingest_destinations,
+            list_removable_volumes,
             start_ingest,
             initialize_ingest_jobs,
             list_ingest_jobs,
@@ -5242,10 +10378,17 @@ pub fn run() {
             create_project,
             retry_project_synchronization,
             inventory_project,
+            initialize_backup_jobs,
+            list_backup_jobs,
+            start_project_backup,
+            retry_project_backup,
+            verify_project_backup,
+            test_project_backup_restore,
             open_project_folder,
             reveal_project_asset,
             rescan,
             get_discovery_status,
+            get_resource_governor_status,
             log_ui_error,
             verify_media_integrity,
             enrich_media,
@@ -5257,11 +10400,20 @@ pub fn run() {
             open_support_link,
             open_logs_folder,
             resolve_media_path,
+            resolve_media_playback_source,
+            native_drag_threshold,
+            start_native_media_drag,
+            start_native_folder_drag,
+            prepare_playback_proxy,
+            release_playback_proxy,
             export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
+            set_media_thumbnail_frame,
             load_thumbnail,
             load_thumbnail_sources,
+            prepare_media_thumbnail,
+            load_hover_preview_statuses,
             load_hover_preview,
             prepare_hover_preview,
             hover_preview_cache_usage,
@@ -5275,6 +10427,78 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transient_operations_expose_authoritative_worker_lifetime() {
+        let statuses = Mutex::new(HashMap::new());
+        {
+            let operation = begin_transient_operation(
+                &statuses,
+                "thumbnail:test".into(),
+                "static-thumbnail",
+                "Generating static thumbnail",
+                "Waiting for thumbnail worker",
+                Some("clip.mp4".into()),
+            );
+            let queued = statuses.lock().unwrap()["thumbnail:test"].clone();
+            assert_eq!(queued.state, "queued");
+            assert_eq!(queued.current_item.as_deref(), Some("clip.mp4"));
+            operation.set_stage("Extracting representative frame");
+            let running = statuses.lock().unwrap()["thumbnail:test"].clone();
+            assert_eq!(running.state, "running");
+            assert_eq!(running.stage, "Extracting representative frame");
+        }
+        assert!(statuses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn derivative_admission_serializes_ffmpeg_and_prioritizes_foreground_waiters() {
+        let admission = Arc::new(DerivativeAdmission::default());
+        let active = admission.acquire(2);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let low_admission = admission.clone();
+        let low_sender = sender.clone();
+        let low = std::thread::spawn(move || {
+            let _permit = low_admission.acquire(3);
+            low_sender.send("background").unwrap();
+        });
+        let foreground_admission = admission.clone();
+        let foreground = std::thread::spawn(move || {
+            let _permit = foreground_admission.acquire(0);
+            sender.send("foreground").unwrap();
+        });
+        while admission
+            .state
+            .lock()
+            .unwrap()
+            .waiting
+            .iter()
+            .sum::<usize>()
+            < 2
+        {
+            std::thread::yield_now();
+        }
+        drop(active);
+        assert_eq!(receiver.recv().unwrap(), "foreground");
+        assert_eq!(receiver.recv().unwrap(), "background");
+        foreground.join().unwrap();
+        low.join().unwrap();
+    }
+
+    #[test]
+    fn active_backup_jobs_become_explicitly_interrupted_after_restart() {
+        let mut jobs = [BackupJob {
+            state: "copying".into(),
+            ..BackupJob::default()
+        }];
+        assert!(mark_interrupted_backup_jobs(&mut jobs));
+        assert_eq!(jobs[0].state, "interrupted");
+        assert!(jobs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("retry")));
+        assert!(!mark_interrupted_backup_jobs(&mut jobs));
+    }
+
     fn temporary(name: &str) -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -5284,10 +10508,333 @@ mod tests {
         root
     }
 
+    fn approved_file_for_replan(
+        relative_path: &str,
+        source_modified_millis: u128,
+        planning_modified_millis: Option<u128>,
+    ) -> ApprovedIngestFile {
+        ApprovedIngestFile {
+            inventory: InventoryFile {
+                source_path: format!("card/{relative_path}"),
+                source_relative_path: relative_path.into(),
+                planned_relative_path: format!("2026-01-01/{relative_path}"),
+                ..InventoryFile::default()
+            },
+            source_size: 64,
+            source_modified_millis: Some(source_modified_millis),
+            planning_modified_millis,
+            source_sha256: Some("approved-hash".into()),
+            source_volume_identity: Some("volume-a".into()),
+            existing_media_id: None,
+        }
+    }
+
+    #[test]
+    fn date_reapproval_preserves_package_suffix_and_approved_evidence() {
+        let root = temporary("date-reapproval-package");
+        let mut settings = DeviceSettings {
+            master_bin_path: root.to_string_lossy().into_owned(),
+            date_folder_pattern: "yyyy-MM-dd".into(),
+            ..DeviceSettings::default()
+        };
+        let first_millis = 1_767_268_800_000_u128;
+        let package_millis = 1_767_355_200_000_u128;
+        let mxf = approved_file_for_replan(
+            "PRIVATE/AVCHD/BDMV/STREAM/clip.mxf",
+            first_millis,
+            Some(package_millis),
+        );
+        let xml = approved_file_for_replan(
+            "PRIVATE/AVCHD/BDMV/CLIPINF/clip.xml",
+            first_millis + 172_800_000,
+            Some(package_millis),
+        );
+        let batch = Local::now();
+        let expected_date = local_datetime_from_millis(Some(package_millis))
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mxf_path =
+            replan_approved_relative_path(&settings, &root, &mxf, "original-file-dates", &batch)
+                .unwrap();
+        let xml_path =
+            replan_approved_relative_path(&settings, &root, &xml, "original-file-dates", &batch)
+                .unwrap();
+        assert!(mxf_path.starts_with(&expected_date));
+        assert!(xml_path.starts_with(&expected_date));
+        assert!(mxf_path.ends_with("PRIVATE/AVCHD/BDMV/STREAM/clip.mxf"));
+        assert!(xml_path.ends_with("PRIVATE/AVCHD/BDMV/CLIPINF/clip.xml"));
+        assert_eq!(mxf.source_sha256.as_deref(), Some("approved-hash"));
+        assert_eq!(mxf.source_volume_identity.as_deref(), Some("volume-a"));
+
+        settings.date_folder_pattern = "yyyyMMdd".into();
+        assert!(replan_approved_relative_path(
+            &settings,
+            &root,
+            &approved_file_for_replan("PRIVATE/clip.mxf", first_millis, None),
+            "original-file-dates",
+            &batch,
+        )
+        .unwrap_err()
+        .contains("predates safe date reapproval"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_reapproval_keeps_independent_clip_dates_separate() {
+        let root = temporary("date-reapproval-independent");
+        let settings = DeviceSettings {
+            master_bin_path: root.to_string_lossy().into_owned(),
+            date_folder_pattern: "yyyy-MM-dd".into(),
+            ..DeviceSettings::default()
+        };
+        let first = approved_file_for_replan("card-a/clip.mp4", 1_767_268_800_000, None);
+        let second = approved_file_for_replan("card-b/clip.mp4", 1_767_441_600_000, None);
+        let batch = Local::now();
+        let first_path =
+            replan_approved_relative_path(&settings, &root, &first, "original-file-dates", &batch)
+                .unwrap();
+        let second_path =
+            replan_approved_relative_path(&settings, &root, &second, "original-file-dates", &batch)
+                .unwrap();
+        assert_ne!(
+            Path::new(&first_path).components().next(),
+            Path::new(&second_path).components().next()
+        );
+        assert!(first_path.ends_with("card-a/clip.mp4"));
+        assert!(second_path.ends_with("card-b/clip.mp4"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approved_plan_revisions_preserve_lineage_and_leave_prior_plan_immutable() {
+        let original_id = Uuid::new_v4().to_string();
+        let original = ApprovedIngestPlan {
+            schema_version: 1,
+            id: original_id.clone(),
+            lineage_id: original_id.clone(),
+            revision: 0,
+            ..ApprovedIngestPlan::default()
+        };
+        let revised = begin_approved_plan_revision(original.clone());
+        assert_eq!(original.id, original_id);
+        assert_eq!(original.revision, 0);
+        assert_ne!(revised.id, original.id);
+        assert_eq!(revised.lineage_id, original_id);
+        assert_eq!(revised.revision, 1);
+        assert_eq!(revised.inventory.plan_id, revised.id);
+    }
+
+    fn playback_probe(json: &str) -> PlaybackProbe {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn playback_proxy_validation_requires_finalized_h264_yuv420_and_aac() {
+        let valid = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"12.500"}}"#,
+        );
+        assert!(playback_proxy_probe_is_valid(&valid));
+
+        let wrong_video = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"hevc","pix_fmt":"yuv420p10le"}],"format":{"format_name":"mov,mp4","duration":"12.5"}}"#,
+        );
+        assert!(!playback_proxy_probe_is_valid(&wrong_video));
+        let wrong_audio = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"pcm_s16le"}],"format":{"format_name":"mov,mp4","duration":"12.5"}}"#,
+        );
+        assert!(!playback_proxy_probe_is_valid(&wrong_audio));
+        let unfinished = playback_probe(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"}],"format":{"format_name":"mov,mp4","duration":"0"}}"#,
+        );
+        assert!(!playback_proxy_probe_is_valid(&unfinished));
+    }
+
+    #[test]
+    fn cached_playback_proxy_identity_tracks_source_snapshot() {
+        let root = temporary("playback-proxy-identity");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"synthetic clip").unwrap();
+        let item = new_media(
+            &source,
+            "clip.mp4".into(),
+            None,
+            sha256(&source).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        let fingerprint = playback_proxy_fingerprint(&item, &snapshot);
+        assert_eq!(fingerprint, playback_proxy_fingerprint(&item, &snapshot));
+        let changed = fs_safe::FileSnapshot {
+            length: snapshot.length + 1,
+            modified_millis: snapshot.modified_millis,
+        };
+        assert_ne!(
+            fingerprint,
+            playback_proxy_fingerprint(&item, &changed)
+        );
+        assert!(playback_proxy_path(&root, &item, &fingerprint)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("{}-", item.id)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn playback_proxy_progress_parses_ffmpeg_machine_output() {
+        assert_eq!(
+            playback_progress_millis("out_time_us=13450000"),
+            Some(13_450)
+        );
+        assert_eq!(
+            playback_progress_millis("out_time=00:02:14.250000"),
+            Some(134_250)
+        );
+        assert_eq!(playback_progress_millis("progress=continue"), None);
+    }
+
+    #[test]
+    fn playback_proxy_cache_honors_budget_and_protects_active_and_partial_files() {
+        let root = temporary("playback-proxy-cache");
+        let old = root.join("old.mp4");
+        let protected = root.join("protected.mp4");
+        let abandoned = root.join(".proxy-abandoned.mp4");
+        let active_partial = root.join(".proxy-active.mp4");
+        fs::write(&old, vec![1_u8; 32]).unwrap();
+        fs::write(&protected, vec![2_u8; 32]).unwrap();
+        fs::write(&abandoned, vec![3_u8; 32]).unwrap();
+        fs::write(&active_partial, vec![4_u8; 32]).unwrap();
+        let state = NativeState::default();
+        state
+            .playback_proxy_temporaries
+            .lock()
+            .unwrap()
+            .insert(active_partial.clone());
+        cleanup_abandoned_playback_temporaries(&state, &root).unwrap();
+        assert!(!abandoned.exists());
+        assert!(active_partial.exists());
+
+        let protected_paths = HashSet::from([protected.clone(), active_partial.clone()]);
+        enforce_playback_proxy_limit(&root, 1, &protected_paths).unwrap();
+        assert!(!old.exists());
+        assert!(protected.exists());
+        assert!(active_partial.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_playback_proxy_transcodes_hevc_and_cancels_without_touching_source() {
+        if tool_version("ffmpeg").is_none() || tool_version("ffprobe").is_none() {
+            return;
+        }
+        let root = temporary("playback-proxy-managed");
+        let source = root.join("synthetic-hevc.mp4");
+        let generated = media_tool_command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=30",
+                "-t",
+                "1",
+                "-c:v",
+                "libx265",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status();
+        if !generated.is_ok_and(|status| status.success()) {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let source_hash = sha256(&source).unwrap();
+        let state = NativeState::default();
+        let operation_id = "playback-proxy:managed-test";
+        let operation = BackgroundOperation {
+            id: operation_id.into(),
+            kind: "playback-proxy".into(),
+            title: "Playback proxy: synthetic-hevc.mp4".into(),
+            state: "running".into(),
+            stage: "Transcoding H.264/AAC preview".into(),
+            current_item: Some("synthetic-hevc.mp4".into()),
+            completed_items: 0,
+            total_items: Some(1),
+            bytes_completed: 0,
+            bytes_total: None,
+            counts: OperationCounts::default(),
+            cancellable: true,
+            pausable: false,
+            retryable: false,
+            error: None,
+            started_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        state
+            .playback_proxy_status
+            .lock()
+            .unwrap()
+            .insert(operation_id.into(), operation.clone());
+        let output = root.join("managed.mp4");
+        run_playback_proxy_generation(&state, operation_id, &source, &output, Some(1_000)).unwrap();
+        assert!(valid_playback_proxy(&output));
+        assert_eq!(sha256(&source).unwrap(), source_hash);
+        assert!(state.playback_proxy_processes.lock().unwrap().is_empty());
+
+        let cancel_id = "playback-proxy:cancel-test";
+        state.playback_proxy_status.lock().unwrap().insert(
+            cancel_id.into(),
+            BackgroundOperation {
+                id: cancel_id.into(),
+                ..operation
+            },
+        );
+        state
+            .playback_proxy_cancelled
+            .lock()
+            .unwrap()
+            .insert(cancel_id.into());
+        let cancelled_output = root.join("cancelled.mp4");
+        let error = run_playback_proxy_generation(
+            &state,
+            cancel_id,
+            &source,
+            &cancelled_output,
+            Some(1_000),
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled safely"));
+        assert_eq!(
+            state
+                .playback_proxy_status
+                .lock()
+                .unwrap()
+                .get(cancel_id)
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+        assert!(state.playback_proxy_processes.lock().unwrap().is_empty());
+        assert_eq!(sha256(&source).unwrap(), source_hash);
+        let _ = fs::remove_file(cancelled_output);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn ingest_job(state: &str, file_state: &str) -> IngestJob {
         IngestJob {
             schema_version: 2,
             id: "job-1".into(),
+            approved_plan_id: None,
+            approved_plan_lineage_id: None,
             state: state.into(),
             created_at: "2026-10-24T00:00:00Z".into(),
             updated_at: "2026-10-24T00:00:00Z".into(),
@@ -5319,6 +10866,11 @@ mod tests {
                 },
                 pending_metadata: None,
                 metadata_error: None,
+                source_modified_millis: None,
+                approved_sha256: None,
+                source_volume_identity: None,
+                duplicate_existing_relative_path: None,
+                intentional_duplicate: false,
             }],
             unsupported: Vec::new(),
             failures: vec!["previous failure".into()],
@@ -5364,6 +10916,11 @@ mod tests {
             metadata: ProvisionalMetadata::default(),
             pending_metadata: None,
             metadata_error: None,
+            source_modified_millis: None,
+            approved_sha256: None,
+            source_volume_identity: None,
+            duplicate_existing_relative_path: None,
+            intentional_duplicate: false,
         };
         let catalogue = Catalogue {
             media: vec![media],
@@ -5511,13 +11068,57 @@ mod tests {
         assert_eq!(fs::read(&output).unwrap(), first_bytes);
 
         fs::remove_file(&audio_path).unwrap();
-        assert!(build_premiere_import_manifest(
-            &settings,
-            &catalogue,
-            &["audio-a".into()]
-        )
-        .is_err());
+        assert!(
+            build_premiere_import_manifest(&settings, &catalogue, &["audio-a".into()]).is_err()
+        );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premiere_handoff_paths_strip_only_safe_short_drive_prefixes() {
+        assert_eq!(
+            compatible_windows_handoff_path(r"C:\Media\Unicode カード\clip 1.mp4"),
+            r"C:\Media\Unicode カード\clip 1.mp4"
+        );
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\server\share\clip 1.mp4"),
+            r"\\server\share\clip 1.mp4"
+        );
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\?\C:\Media\Unicode カード\clip 1.mp4"),
+            r"C:\Media\Unicode カード\clip 1.mp4"
+        );
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\?\UNC\server\share\clip.mp4"),
+            r"\\?\UNC\server\share\clip.mp4"
+        );
+        let long = format!(r"\\?\C:\Media\{}\clip.mp4", "x".repeat(260));
+        assert_eq!(compatible_windows_handoff_path(&long), long);
+        assert_eq!(
+            compatible_windows_handoff_path(r"\\?\C:\Media\legacy.\clip.mp4"),
+            r"\\?\C:\Media\legacy.\clip.mp4"
+        );
+    }
+
+    #[test]
+    fn explorer_boundary_converts_short_drive_and_unc_paths_only() {
+        assert_eq!(
+            explorer_boundary_path(r"\\?\C:\Media\Unicode カード, 1\clip.mp4").unwrap(),
+            r"C:\Media\Unicode カード, 1\clip.mp4"
+        );
+        assert_eq!(
+            explorer_boundary_path(r"\\?\UNC\server\share\clip.wav").unwrap(),
+            r"\\server\share\clip.wav"
+        );
+        assert_eq!(
+            explorer_boundary_path(r"\\server\share\clip.wav").unwrap(),
+            r"\\server\share\clip.wav"
+        );
+        let long = format!(r"\\?\C:\Media\{}\clip.mp4", "x".repeat(260));
+        assert!(explorer_boundary_path(&long)
+            .unwrap_err()
+            .contains("path length"));
+        assert!(explorer_boundary_path(r"\\?\C:\Media\legacy.\clip.mp4").is_err());
     }
 
     #[test]
@@ -5821,6 +11422,358 @@ mod tests {
     }
 
     #[test]
+    fn sd_grabber_filters_case_insensitive_mp4_and_wav_recursively() {
+        let root = temporary("sd-filter");
+        let card = root.join("card");
+        fs::create_dir_all(card.join("PRIVATE/deep")).unwrap();
+        fs::write(card.join("CLIP.MP4"), b"video").unwrap();
+        fs::write(card.join("PRIVATE/deep/audio.WaV"), b"audio").unwrap();
+        fs::write(card.join("PRIVATE/deep/metadata.XML"), b"metadata").unwrap();
+        let allowed = HashSet::from(["mp4".to_string(), "wav".to_string()]);
+        let inventory = build_source_inventory_filtered(
+            &[card.to_string_lossy().into_owned()],
+            Some(&allowed),
+            true,
+        );
+        assert_eq!(inventory.files.len(), 2);
+        assert!(inventory
+            .files
+            .iter()
+            .any(|file| file.source_relative_path.ends_with("CLIP.MP4")));
+        assert!(inventory
+            .files
+            .iter()
+            .any(|file| file.source_relative_path.ends_with("audio.WaV")));
+        assert!(inventory
+            .excluded
+            .iter()
+            .any(|file| file.path.ends_with("metadata.XML")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn global_duplicate_requires_a_fresh_verified_local_copy() {
+        let root = temporary("global-duplicate");
+        let master = root.join("master");
+        let existing = master.join("20261001/original.mp4");
+        let incoming = root.join("renamed.mp4");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, b"same-bytes").unwrap();
+        fs::write(&incoming, b"same-bytes").unwrap();
+        let hash = sha256(&incoming).unwrap();
+        let mut item = new_media(
+            &existing,
+            "20261001/original.mp4".into(),
+            None,
+            hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        item.tags = vec!["keep-me".into()];
+        item.project_ids = vec!["project-a".into()];
+        let mut catalogue = Catalogue {
+            media: vec![item.clone()],
+            ..Default::default()
+        };
+        let mut settings = DeviceSettings::default();
+        settings.master_bin_path = master.to_string_lossy().into_owned();
+        let verified = classify_global_duplicate(
+            &settings,
+            &[&catalogue.media[0]],
+            fs::metadata(&incoming).unwrap().len(),
+            &hash,
+            None,
+            None,
+        );
+        assert_eq!(verified.0, "already-imported");
+        assert_eq!(verified.1.as_deref(), Some(item.id.as_str()));
+        assert_eq!(item.tags, vec!["keep-me"]);
+        assert_eq!(item.project_ids, vec!["project-a"]);
+
+        catalogue.media[0].observed_size = None;
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &hash,
+                None,
+                None,
+            )
+            .0,
+            "already-imported"
+        );
+
+        fs::write(&incoming, b"other-data").unwrap();
+        let different_hash = sha256(&incoming).unwrap();
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &different_hash,
+                None,
+                None,
+            )
+            .0,
+            "new"
+        );
+        fs::write(&incoming, b"same-bytes").unwrap();
+
+        fs::write(&existing, b"bad!-bytes").unwrap();
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &hash,
+                None,
+                None,
+            )
+            .0,
+            "attention"
+        );
+        fs::remove_file(&existing).unwrap();
+        assert_eq!(
+            classify_global_duplicate(
+                &settings,
+                &[&catalogue.media[0]],
+                fs::metadata(&incoming).unwrap().len(),
+                &hash,
+                None,
+                None,
+            )
+            .0,
+            "attention"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approved_hash_rejects_same_size_content_changes_before_promotion() {
+        let root = temporary("approved-plan-change");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"expected").unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        let approved = ApprovedIngestFile {
+            inventory: InventoryFile::default(),
+            source_size: snapshot.length,
+            source_modified_millis: snapshot.modified_millis,
+            planning_modified_millis: snapshot.modified_millis,
+            source_sha256: Some(sha256(&source).unwrap()),
+            source_volume_identity: None,
+            existing_media_id: None,
+        };
+        assert!(approved_source_snapshot_matches(&source, &approved));
+        fs::write(&source, b"modified").unwrap();
+        let changed_hash = sha256(&source).unwrap();
+        assert!(verify_approved_source_hash(
+            &changed_hash,
+            approved.source_sha256.as_deref().unwrap()
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checksum_inventory_cancels_before_another_large_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancelled = AtomicBool::new(false);
+        let mut source = std::io::Cursor::new(vec![7_u8; 3 * 1024 * 1024]);
+        let result = sha256_reader_cancellable(
+            &mut source,
+            || cancelled.load(Ordering::SeqCst),
+            |_| cancelled.store(true, Ordering::SeqCst),
+        );
+        assert_eq!(result.unwrap_err(), "Inventory cancelled safely");
+        assert_eq!(source.position(), 1024 * 1024);
+    }
+
+    #[test]
+    fn newer_inventory_cancels_the_stale_request_before_queueing() {
+        let state = NativeState::default();
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        begin_inventory_operation(&state, &first, "First scan").unwrap();
+        update_inventory_operation(&state, &first, |operation| {
+            operation.state = "running".into();
+        });
+        begin_inventory_operation(&state, &second, "Second scan").unwrap();
+        assert!(state.inventory_cancelled.lock().unwrap().contains(&first));
+        assert_eq!(
+            state.inventory_status.lock().unwrap().as_ref().unwrap().id,
+            second
+        );
+    }
+
+    #[test]
+    fn source_overlap_detection_is_bidirectional() {
+        let root = temporary("source-overlap");
+        let master = root.join("master");
+        let child = master.join("DCIM");
+        let separate = root.join("card");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&separate).unwrap();
+        let master = master.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        let separate = separate.canonicalize().unwrap();
+        assert!(paths_overlap(&master, &child));
+        assert!(paths_overlap(&child, &master));
+        assert!(!paths_overlap(&master, &separate));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_content_reservation_prevents_concurrent_duplicate_copy() {
+        let mut job = ingest_job("copying", "copying");
+        job.files[0].approved_sha256 = Some("same-hash".into());
+        job.files[0].relative_path = "20261030/first.mp4".into();
+        job.files[0].media_id = "media-first".into();
+        let reservations = active_content_reservations(&[job]);
+        assert_eq!(
+            reservations.get("same-hash"),
+            Some(&("20261030/first.mp4".into(), "media-first".into()))
+        );
+        let mut intentional = ingest_job("copying", "copying");
+        intentional.files[0].approved_sha256 = Some("same-hash".into());
+        intentional.files[0].intentional_duplicate = true;
+        assert!(active_content_reservations(&[intentional]).is_empty());
+    }
+
+    #[test]
+    fn thumbnail_generation_locks_are_per_media_identity() {
+        let state = NativeState::default();
+        let first = thumbnail_generation_lock(&state, "media-a");
+        let same = thumbnail_generation_lock(&state, "media-a");
+        let different = thumbnail_generation_lock(&state, "media-b");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &different));
+        let _first_guard = first.lock().unwrap();
+        assert!(different.try_lock().is_ok());
+    }
+
+    #[test]
+    fn packaged_webview_enables_only_runtime_scoped_thumbnail_assets() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &config["app"]["security"];
+        assert_eq!(security["assetProtocol"]["enable"], true);
+        assert_eq!(security["assetProtocol"]["scope"], serde_json::json!([]));
+        let csp = security["csp"].as_str().unwrap();
+        assert!(csp.contains("img-src 'self' asset: http://asset.localhost data:"));
+    }
+
+    #[test]
+    fn missing_empty_and_invalid_thumbnail_cache_entries_require_regeneration() {
+        let (root, _, _, mut catalogue) = completion_fixture("thumbnail-validity");
+        let cache = root.join("cache");
+        let master = root.join("master");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(master.join(".pimp")).unwrap();
+        let settings = DeviceSettings {
+            master_bin_path: master.to_string_lossy().into_owned(),
+            thumbnail_cache_path: cache.to_string_lossy().into_owned(),
+            ..DeviceSettings::default()
+        };
+        let mut item = catalogue.media.remove(0);
+        item.id = "media-a".into();
+        item.thumbnail_path = Some("media-a.jpg".into());
+        let shared = shared_thumbnail_root(&settings).unwrap();
+        let reference = selected_static_thumbnail_reference(&item);
+        let thumbnail = shared.join(&reference);
+        assert!(!thumbnail_reference_is_available(&settings, &shared, &item));
+        let legacy = cache.join("media-a.jpg");
+        fs::write(&legacy, b"not-a-jpeg").unwrap();
+        assert!(!thumbnail_reference_is_available(&settings, &shared, &item));
+        fs::write(&legacy, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert!(thumbnail_reference_is_available(&settings, &shared, &item));
+        assert!(valid_cached_thumbnail(&thumbnail));
+        fs::write(&thumbnail, b"corrupt").unwrap();
+        assert!(!thumbnail_reference_is_available(&settings, &shared, &item));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_thumbnail_identity_is_content_and_transform_deterministic() {
+        let (_, _, _, mut catalogue) = completion_fixture("thumbnail-identity");
+        let mut first = catalogue.media.remove(0);
+        let mut same_content = first.clone();
+        same_content.id = "another-device-id".into();
+        same_content.relative_path = "another/root/clip.mp4".into();
+        assert_eq!(
+            static_thumbnail_reference(&first, 0.1),
+            static_thumbnail_reference(&same_content, 0.1)
+        );
+        assert_ne!(
+            static_thumbnail_reference(&first, 0.1),
+            static_thumbnail_reference(&first, 5.0)
+        );
+        first.thumbnail_path = Some(format!("{}.jpg", first.id));
+        assert_ne!(
+            selected_static_thumbnail_reference(&first),
+            static_thumbnail_reference(&first, 0.1)
+        );
+    }
+
+    #[test]
+    fn synchronized_thumbnail_is_reused_on_an_independent_device_without_source_media() {
+        let (root, _, _, mut catalogue) = completion_fixture("thumbnail-cross-device");
+        let item = catalogue.media.remove(0);
+        let reference = selected_static_thumbnail_reference(&item);
+        let device_a = root.join("device-a");
+        let device_b = root.join("device-b");
+        let shared_a = device_a.join("catalogue").join("thumbnails").join("v1");
+        let shared_b = device_b.join("catalogue").join("thumbnails").join("v1");
+        fs::create_dir_all(&shared_a).unwrap();
+        fs::create_dir_all(&shared_b).unwrap();
+        fs::create_dir_all(device_a.join("master")).unwrap();
+        fs::create_dir_all(device_b.join("master")).unwrap();
+        let source_a = device_a.join("master").join(&item.relative_path);
+        fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+        fs::write(&source_a, b"source").unwrap();
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
+        fs::write(shared_a.join(&reference), jpeg).unwrap();
+        fs::copy(shared_a.join(&reference), shared_b.join(&reference)).unwrap();
+
+        let settings_b = DeviceSettings {
+            master_bin_path: device_b.join("master").to_string_lossy().into_owned(),
+            shared_catalogue_path: device_b.join("catalogue").to_string_lossy().into_owned(),
+            catalogue_in_master_bin: false,
+            ..DeviceSettings::default()
+        };
+        let requested = HashSet::from([item.id.clone()]);
+        let sources = thumbnail_sources_for_items(
+            &settings_b,
+            &Catalogue {
+                media: vec![item.clone()],
+                ..Catalogue::default()
+            },
+            &shared_b.canonicalize().unwrap(),
+            &requested,
+        );
+
+        assert!(!device_b.join("master").join(&item.relative_path).exists());
+        assert_eq!(
+            sources.get(&item.id).map(PathBuf::from),
+            Some(shared_b.join(reference).canonicalize().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_thumbnail_frame_rejects_invalid_or_out_of_range_times() {
+        assert!(validate_thumbnail_frame(0.0, Some(10.0)).is_ok());
+        assert!(validate_thumbnail_frame(10.0, Some(10.0)).is_ok());
+        assert!(validate_thumbnail_frame(-0.1, Some(10.0)).is_err());
+        assert!(validate_thumbnail_frame(10.1, Some(10.0)).is_err());
+        assert!(validate_thumbnail_frame(f64::NAN, None).is_err());
+        assert!(validate_thumbnail_frame(f64::INFINITY, None).is_err());
+    }
+
+    #[test]
     fn independent_selected_roots_keep_distinct_destination_hierarchies() {
         let root = temporary("inventory-independent-roots");
         let card_a = root.join("card-a");
@@ -6100,9 +12053,7 @@ mod tests {
         assert!(jobs.iter().any(|job| job.id == "pending-metadata"));
         assert!(jobs.iter().any(|job| job.id == "failed"));
         assert!(jobs.iter().any(|job| job.id == "cancelled-retryable"));
-        assert!(jobs
-            .iter()
-            .any(|job| job.id == "interrupted-with-journal"));
+        assert!(jobs.iter().any(|job| job.id == "interrupted-with-journal"));
         assert!(jobs.iter().any(|job| job.id == "active"));
     }
 
@@ -6140,12 +12091,9 @@ mod tests {
         let mut jobs = vec![completed];
         let recovery = HashSet::from(["completed-with-journal".to_string()]);
 
-        assert!(clear_finalized_jobs(
-            &mut jobs,
-            Some("completed-with-journal"),
-            &recovery
-        )
-        .is_err());
+        assert!(
+            clear_finalized_jobs(&mut jobs, Some("completed-with-journal"), &recovery).is_err()
+        );
         assert_eq!(clear_finalized_jobs(&mut jobs, None, &recovery).unwrap(), 0);
         assert_eq!(jobs.len(), 1);
     }
@@ -6213,6 +12161,35 @@ mod tests {
         assert!(!settings.sidebar_collapsed);
         assert_eq!(settings.library_folder_sort, "newest");
         assert!(settings.library_folder_order.is_empty());
+        assert_eq!(settings.resource_profile, "balanced");
+        assert!(settings.gentle_scanning);
+        assert!(settings.increase_processing_while_idle);
+        assert_eq!(settings.resource_idle_delay_minutes, 10);
+        assert!(!settings.background_processing_paused);
+        assert_eq!(settings.update_channel, "development");
+    }
+
+    #[test]
+    fn legacy_settings_receive_conservative_resource_defaults() {
+        let mut value = serde_json::to_value(DeviceSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "resourceProfile",
+            "gentleScanning",
+            "increaseProcessingWhileIdle",
+            "resourceIdleDelayMinutes",
+            "backgroundProcessingPaused",
+            "updateChannel",
+        ] {
+            object.remove(key);
+        }
+        let settings: DeviceSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.resource_profile, "balanced");
+        assert!(settings.gentle_scanning);
+        assert!(settings.increase_processing_while_idle);
+        assert_eq!(settings.resource_idle_delay_minutes, 10);
+        assert!(!settings.background_processing_paused);
+        assert_eq!(settings.update_channel, "development");
     }
 
     #[test]
@@ -6237,10 +12214,14 @@ mod tests {
     }
 
     #[test]
-    fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-6");
-        let configuration = updater_configuration();
-        assert_eq!(configuration.channel, "Beta");
+    fn updater_is_a_higher_development_release_and_fails_closed_without_a_public_key() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        let configuration = updater_configuration_for_key(
+            option_env!("PIMP_UPDATER_PUBLIC_KEY"),
+            "development",
+        );
+        assert_eq!(configuration.channel, "Development");
+        assert_eq!(configuration.target, "development-channel");
         assert!(configuration.endpoint.starts_with("https://"));
         if option_env!("PIMP_UPDATER_PUBLIC_KEY").is_none() {
             assert!(!configuration.configured);
@@ -6251,47 +12232,165 @@ mod tests {
                 "release builds must reject an invalid embedded updater public key"
             );
         }
-        assert!(!updater_configuration_for_key(Some("not-a-minisign-key")).configured);
+        assert!(!updater_configuration_for_key(Some("not-a-minisign-key"), "stable").configured);
         let encoded_public_key = BASE64.encode(
             "untrusted comment: minisign public key\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n",
         );
-        assert!(updater_configuration_for_key(Some(&encoded_public_key)).configured);
+        let stable = updater_configuration_for_key(Some(&encoded_public_key), "stable");
+        assert!(stable.configured);
+        assert_eq!(stable.channel, "Stable");
+        assert_eq!(stable.target, "stable-channel");
     }
 
     #[test]
     fn update_gate_serializes_installation_with_ingest_lifecycle() {
         for state in ["queued", "copying", "verifying", "paused", "interrupted"] {
-            let mut installing = false;
-            assert!(begin_update_gate(&mut installing, &[ingest_job(state, state)]).is_err());
-            assert!(!installing);
+            let mut coordinator = OperationCoordinator::default();
+            assert!(begin_update_gate(&mut coordinator, &[ingest_job(state, state)], &[]).is_err());
+            assert!(!coordinator.update_installing);
         }
 
         for state in ["failed", "cancelled"] {
-            let mut installing = false;
-            assert!(begin_update_gate(&mut installing, &[ingest_job(state, state)]).is_err());
-            assert!(!installing);
+            let mut coordinator = OperationCoordinator::default();
+            assert!(begin_update_gate(&mut coordinator, &[ingest_job(state, state)], &[]).is_err());
+            assert!(!coordinator.update_installing);
         }
 
         let mut completed = ingest_job("completed", "completed");
         completed.failures.clear();
-        let mut installing = false;
-        begin_update_gate(&mut installing, &[completed]).unwrap();
-        assert!(installing);
-        assert!(begin_update_gate(&mut installing, &[]).is_err());
-        end_update_gate(&Mutex::new(installing));
-
-        let gate = Mutex::new(false);
+        let gate = Mutex::new(OperationCoordinator::default());
         {
-            let mut installing = gate.lock().unwrap();
-            begin_update_gate(&mut installing, &[]).unwrap();
+            let mut coordinator = gate.lock().unwrap();
+            begin_update_gate(&mut coordinator, &[completed], &[]).unwrap();
         }
-        assert_eq!(
-            *gate.lock().unwrap(),
-            true,
-            "new ingest commands observe the installation gate"
-        );
+        assert!(gate.lock().unwrap().update_installing);
+        assert!(begin_critical_operation(&gate, "library scan").is_err());
         end_update_gate(&gate);
-        assert!(!*gate.lock().unwrap());
+        assert!(!gate.lock().unwrap().update_installing);
+    }
+
+    #[test]
+    fn update_gate_waits_for_every_critical_filesystem_operation() {
+        let gate = Mutex::new(OperationCoordinator::default());
+        let operation = begin_critical_operation(&gate, "project backup").unwrap();
+        assert!(begin_update_gate(&mut gate.lock().unwrap(), &[], &[]).is_err());
+        drop(operation);
+        begin_update_gate(&mut gate.lock().unwrap(), &[], &[]).unwrap();
+        assert!(gate.lock().unwrap().update_installing);
+    }
+
+    #[test]
+    fn update_gate_rejects_a_durable_active_backup_job() {
+        let root = temporary("update-active-backup");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("project.prproj"), b"project").unwrap();
+        let job = backup::plan_backup("project-a", "Project A", &source, &destination).unwrap();
+        let mut coordinator = OperationCoordinator::default();
+        assert!(begin_update_gate(&mut coordinator, &[], &[job]).is_err());
+        assert!(!coordinator.update_installing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_full_verification_emits_no_redundant_evidence() {
+        let root = temporary("unchanged-full-verification");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"verified bytes").unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        let hash = sha256(&source).unwrap();
+        let item = new_media(
+            &source,
+            "clip.mp4".into(),
+            None,
+            hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let catalogue_root = root.join("catalogue");
+        catalogue::append(
+            &catalogue_root,
+            "desktop",
+            vec![CatalogueEvent::MediaRegistered {
+                media: item.clone(),
+            }],
+        )
+        .unwrap();
+        let first_observation =
+            evidence_observation_event(&item, "desktop", &snapshot, hash.clone()).unwrap();
+        catalogue::append(&catalogue_root, "desktop", vec![first_observation]).unwrap();
+        let event_stream = catalogue_root.join("events").join("desktop.jsonl");
+        let before = event_stream.metadata().unwrap().len();
+        let current = catalogue::load(&catalogue_root).unwrap();
+        let current_item = current
+            .media
+            .iter()
+            .find(|media| media.id == item.id)
+            .unwrap();
+        let repeated = evidence_observation_event(current_item, "desktop", &snapshot, hash);
+        assert!(repeated.is_none());
+        catalogue::append(&catalogue_root, "desktop", repeated.into_iter().collect()).unwrap();
+        assert_eq!(event_stream.metadata().unwrap().len(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_verification_records_same_size_changes_and_recovery() {
+        let root = temporary("full-verification-change-recovery");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"expected").unwrap();
+        let expected_hash = sha256(&source).unwrap();
+        let mut item = new_media(
+            &source,
+            "clip.mp4".into(),
+            None,
+            expected_hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        fs::write(&source, b"modified").unwrap();
+        let changed_snapshot = fs_safe::snapshot(&source).unwrap();
+        let changed_hash = sha256(&source).unwrap();
+        let changed =
+            evidence_observation_event(&item, "desktop", &changed_snapshot, changed_hash.clone())
+                .unwrap();
+        assert!(matches!(
+            changed,
+            CatalogueEvent::MediaEvidenceObserved {
+                needs_review: true,
+                ..
+            }
+        ));
+        item.integrity_by_device.insert(
+            "desktop".into(),
+            catalogue::IntegrityEvidence {
+                observed_size: changed_snapshot.length,
+                observed_modified_millis: changed_snapshot
+                    .modified_millis
+                    .map(|value| value as u64),
+                observed_sha256: Some(changed_hash),
+                needs_review: true,
+            },
+        );
+        fs::write(&source, b"expected").unwrap();
+        let recovered_snapshot = fs_safe::snapshot(&source).unwrap();
+        let recovered =
+            evidence_observation_event(&item, "desktop", &recovered_snapshot, expected_hash)
+                .unwrap();
+        assert!(matches!(
+            recovered,
+            CatalogueEvent::MediaEvidenceObserved {
+                needs_review: false,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6328,9 +12427,7 @@ mod tests {
     fn known_media_resolution_preserves_spaces_commas_unicode_and_offline_errors() {
         let root = temporary("explorer-special-path");
         let master = root.join("master");
-        let path = master
-            .join("20261027")
-            .join("DJI clip, kōrero 音声.WAV");
+        let path = master.join("20261027").join("DJI clip, kōrero 音声.WAV");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"disposable audio").unwrap();
         let media = new_media(
@@ -6346,11 +12443,7 @@ mod tests {
         let media_id = media.id.clone();
         let mut settings = DeviceSettings::default();
         settings.master_bin_path = master.to_string_lossy().into();
-        append_events(
-            &settings,
-            vec![CatalogueEvent::MediaRegistered { media }],
-        )
-        .unwrap();
+        append_events(&settings, vec![CatalogueEvent::MediaRegistered { media }]).unwrap();
 
         assert_eq!(
             resolve_catalogue_media_path(&settings, &media_id).unwrap(),
@@ -6364,6 +12457,166 @@ mod tests {
     }
 
     #[test]
+    fn native_drag_resolution_is_bounded_canonical_and_identity_checked() {
+        let root = temporary("native-drag-paths");
+        let master = root.join("Master Bin");
+        let first = master.join("20261108").join("clip one.mp4");
+        let audio = master.join("20261108").join("clip one.wav");
+        let second = master.join("kōrero 音声").join("clip two.mp4");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, b"first synthetic clip").unwrap();
+        fs::write(&audio, b"associated synthetic audio").unwrap();
+        fs::write(&second, b"second synthetic clip").unwrap();
+        let mut first_item = new_media(
+            &first,
+            "20261108/clip one.mp4".into(),
+            None,
+            sha256(&first).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let audio_item = new_media(
+            &audio,
+            "20261108/clip one.wav".into(),
+            None,
+            sha256(&audio).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        first_item.attached_audio_id = Some(audio_item.id.clone());
+        let second_item = new_media(
+            &second,
+            "kōrero 音声/clip two.mp4".into(),
+            None,
+            sha256(&second).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let ids = vec![first_item.id.clone(), second_item.id.clone()];
+        let catalogue = Catalogue {
+            media: vec![first_item, audio_item.clone(), second_item],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_native_drag_media_paths(&master, &catalogue, &ids).unwrap(),
+            vec![
+                first.canonicalize().unwrap(),
+                audio.canonicalize().unwrap(),
+                second.canonicalize().unwrap()
+            ]
+        );
+        assert_eq!(
+            resolve_native_drag_media_paths(
+                &master,
+                &catalogue,
+                &[ids[0].clone(), audio_item.id.clone()]
+            )
+            .unwrap(),
+            vec![first.canonicalize().unwrap(), audio.canonicalize().unwrap()]
+        );
+        assert!(resolve_native_drag_media_paths(
+            &master,
+            &catalogue,
+            &vec![ids[0].clone(); MAX_NATIVE_DRAG_ITEMS + 1]
+        )
+        .unwrap_err()
+        .contains("limited"));
+        fs::write(&first, b"changed synthetic clip bytes").unwrap();
+        assert!(
+            resolve_native_drag_media_paths(&master, &catalogue, &ids[..1])
+                .unwrap_err()
+                .contains("changed since it was catalogued")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_folder_drag_resolves_only_existing_master_bin_directories() {
+        let root = temporary("native-folder-drag");
+        let master = root.join("master");
+        let nested = master.join("Card A").join("PRIVATE");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(master.join("not-a-folder.mp4"), b"clip").unwrap();
+        assert_eq!(
+            resolve_native_drag_folder(&master, "Card A/PRIVATE").unwrap(),
+            nested.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_native_drag_folder(&master, "").unwrap(),
+            master.canonicalize().unwrap()
+        );
+        assert!(resolve_native_drag_folder(&master, "../outside").is_err());
+        assert!(resolve_native_drag_folder(&master, "not-a-folder.mp4")
+            .unwrap_err()
+            .contains("not available locally"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn established_drag_library_is_limited_to_ordinary_local_shell_paths() {
+        assert!(drag_rs_safe_for_paths(&[PathBuf::from(
+            r"C:\Media\clip one.mp4"
+        )]));
+        assert!(!drag_rs_safe_for_paths(&[PathBuf::from(
+            r"\\server\share\clip.mp4"
+        )]));
+        assert!(!drag_rs_safe_for_paths(&[PathBuf::from(format!(
+            r"C:\Media\{}\clip.mp4",
+            "a".repeat(260)
+        ))]));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_drag_data_object_exposes_cf_hdrop_for_files_and_a_unicode_folder() {
+        let root = temporary("native-drag-cf-hdrop");
+        let folder = root.join("Card kōrero 音声");
+        let first = root.join("clip one.mp4");
+        let second = root.join("clip two.mp4");
+        let long_folder = root
+            .join("long supported path")
+            .join("a".repeat(90))
+            .join("b".repeat(90))
+            .join("c".repeat(90));
+        let long_file = long_folder.join("long clip.mp4");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(&long_folder).unwrap();
+        fs::write(&first, b"first synthetic clip").unwrap();
+        fs::write(&second, b"second synthetic clip").unwrap();
+        fs::write(&long_file, b"long synthetic clip").unwrap();
+        let _ole = OleInitialization::initialize().unwrap();
+
+        for paths in [
+            vec![first.canonicalize().unwrap(), second.canonicalize().unwrap()],
+            vec![folder.canonicalize().unwrap()],
+            vec![long_file.canonicalize().unwrap()],
+        ] {
+            let (data_object, _item_ids) = create_native_drag_data_object(&paths).unwrap();
+            let file_drop_format = FORMATETC {
+                cfFormat: CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            assert!(unsafe { data_object.QueryGetData(&file_drop_format) }.is_ok());
+        }
+
+        let threshold = native_drag_threshold();
+        assert!(threshold.horizontal > 0);
+        assert!(threshold.vertical > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_settings_without_a_date_mode_keep_the_previous_default() {
         let mut value = serde_json::to_value(DeviceSettings::default()).unwrap();
         value
@@ -6373,11 +12626,16 @@ mod tests {
         value.as_object_mut().unwrap().remove("sidebarCollapsed");
         value.as_object_mut().unwrap().remove("libraryFolderSort");
         value.as_object_mut().unwrap().remove("libraryFolderOrder");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("libraryThumbnailWidth");
         let settings: DeviceSettings = serde_json::from_value(value).unwrap();
         assert_eq!(settings.ingest_date_organization, "original-file-dates");
         assert!(!settings.sidebar_collapsed);
         assert_eq!(settings.library_folder_sort, "newest");
         assert!(settings.library_folder_order.is_empty());
+        assert_eq!(settings.library_thumbnail_width, 240);
     }
 
     #[test]
@@ -6451,6 +12709,36 @@ mod tests {
             &batch,
         )
         .is_err());
+    }
+
+    #[test]
+    fn every_explicit_ingest_date_choice_overrides_both_saved_modes() {
+        let batch = Local.with_ymd_and_hms(2026, 11, 5, 12, 34, 56).unwrap();
+        let modified = Local.with_ymd_and_hms(2026, 10, 20, 8, 15, 1).unwrap();
+        for saved_mode in ["today", "original-file-dates"] {
+            let mut settings = DeviceSettings::default();
+            settings.ingest_date_organization = saved_mode.into();
+            settings.date_folder_pattern = "yyyymmdd".into();
+            for (choice, expected) in [
+                ("today", "20261105"),
+                ("yesterday", "20261104"),
+                ("2026-10-31", "20261031"),
+                ("original-file-dates", "20261020"),
+            ] {
+                assert_eq!(
+                    destination_date_from_modified(
+                        &settings,
+                        Some(modified),
+                        &Some(choice.into()),
+                        &batch,
+                    )
+                    .unwrap()
+                    .0,
+                    expected,
+                    "saved mode {saved_mode}, explicit choice {choice}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -6895,7 +13183,10 @@ mod tests {
         settings.working_projects_path = projects_root.to_string_lossy().into_owned();
         persist_project_manifest_intents(
             &state_path,
-            [("project-a".into(), Some(directory.to_string_lossy().into_owned()))],
+            [(
+                "project-a".into(),
+                Some(directory.to_string_lossy().into_owned()),
+            )],
         )
         .unwrap();
 
@@ -6916,13 +13207,9 @@ mod tests {
         settings
             .project_paths
             .insert("project-b".into(), directory.to_string_lossy().into_owned());
-        let conflict = project_identity_for_directory(
-            &state_path,
-            &settings,
-            &directory,
-            Some("project-c"),
-        )
-        .unwrap_err();
+        let conflict =
+            project_identity_for_directory(&state_path, &settings, &directory, Some("project-c"))
+                .unwrap_err();
         assert!(conflict.contains("conflicting project identities"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -6957,16 +13244,14 @@ mod tests {
             tags: vec![],
             created_at: "2026-10-28T00:00:00Z".into(),
         };
-        let event = |device: &str, sequence: u64, event: CatalogueEvent| {
-            catalogue::EventEnvelope {
-                schema_version: catalogue::EVENT_SCHEMA_VERSION,
-                event_id: format!("{device}-{sequence}"),
-                device_id: device.into(),
-                sequence,
-                occurred_at: "2026-10-28T00:00:00Z".into(),
-                observed: BTreeMap::new(),
-                event,
-            }
+        let event = |device: &str, sequence: u64, event: CatalogueEvent| catalogue::EventEnvelope {
+            schema_version: catalogue::EVENT_SCHEMA_VERSION,
+            event_id: format!("{device}-{sequence}"),
+            device_id: device.into(),
+            sequence,
+            occurred_at: "2026-10-28T00:00:00Z".into(),
+            observed: BTreeMap::new(),
+            event,
         };
         let catalogue = catalogue::rebuild(catalogue::EventRead {
             events: vec![
@@ -7037,13 +13322,13 @@ mod tests {
         )
         .unwrap();
         assert!(issues.is_empty());
-        let manifest: serde_json::Value =
-            read_json(&directory.join(".pimp-project.json")).unwrap();
+        let manifest: serde_json::Value = read_json(&directory.join(".pimp-project.json")).unwrap();
         assert_eq!(manifest["customField"], "preserved");
         assert_eq!(manifest["media"][0]["id"], canonical_id);
         assert!(project_manifest_drift_requests(&settings, &catalogue).is_empty());
-        assert!(!write_project_manifest(&directory, &catalogue.projects[0], &catalogue.media)
-            .unwrap());
+        assert!(
+            !write_project_manifest(&directory, &catalogue.projects[0], &catalogue.media).unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7063,7 +13348,10 @@ mod tests {
         let fixtures = [
             ("Simple Vlog 057.prproj", b"project".as_slice()),
             ("description.txt", b"notes".as_slice()),
-            ("Adobe Premiere Pro Auto-Save/backup.prproj", b"backup".as_slice()),
+            (
+                "Adobe Premiere Pro Auto-Save/backup.prproj",
+                b"backup".as_slice(),
+            ),
             ("assets/video/b-roll.mov", b"video".as_slice()),
             ("assets/audio/music.wav", b"audio".as_slice()),
             ("assets/graphics/title.png", b"graphic".as_slice()),
@@ -7081,15 +13369,15 @@ mod tests {
             inventory.main_premiere_project.as_deref(),
             Some("Simple Vlog 057.prproj")
         );
-        assert_eq!(inventory.items[0].relative_path, "Adobe Premiere Pro Auto-Save/backup.prproj");
+        assert_eq!(
+            inventory.items[0].relative_path,
+            "Adobe Premiere Pro Auto-Save/backup.prproj"
+        );
         assert!(inventory
             .items
             .iter()
             .any(|item| item.category == "premiere-auto-save"));
-        assert!(inventory
-            .items
-            .iter()
-            .any(|item| item.category == "video"));
+        assert!(inventory.items.iter().any(|item| item.category == "video"));
         assert!(inventory
             .items
             .iter()
@@ -7126,21 +13414,12 @@ mod tests {
         let directory = root.join("project");
         fs::create_dir_all(&directory).unwrap();
         for index in 0..4 {
-            fs::write(
-                directory.join(format!("asset-{index}.mp4")),
-                b"media",
-            )
-            .unwrap();
+            fs::write(directory.join(format!("asset-{index}.mp4")), b"media").unwrap();
         }
 
-        let error = inventory_project_directory_with_limits(
-            "project-a",
-            "Budget Test",
-            &directory,
-            3,
-            64,
-        )
-        .unwrap_err();
+        let error =
+            inventory_project_directory_with_limits("project-a", "Budget Test", &directory, 3, 64)
+                .unwrap_err();
         assert!(error.contains("stopped after 3 files"));
         assert_eq!(fs::read(directory.join("asset-0.mp4")).unwrap(), b"media");
         fs::remove_dir_all(root).unwrap();
@@ -7151,9 +13430,11 @@ mod tests {
         assert_eq!(hover_preview_frame_times(0.4).unwrap().len(), 1);
         assert_eq!(hover_preview_frame_times(3.0).unwrap().len(), 6);
         let long = hover_preview_frame_times(600.0).unwrap();
-        assert_eq!(long.len(), 16);
+        assert_eq!(long.len(), 8);
         assert_eq!(long.first().copied(), Some(0.0));
         assert_eq!(long.last().copied(), Some(600.0));
+        assert_eq!(hover_preview_seek_time(600.0, 600.0), 599.9);
+        assert_eq!(hover_preview_seek_time(0.1, 0.1), 0.05);
         assert!(hover_preview_frame_times(0.0).is_err());
     }
 
@@ -7168,10 +13449,10 @@ mod tests {
             parse_hover_preview_frame_times(stderr),
             vec![10.01, 43.3804, 76.7508]
         );
-        assert!(parse_hover_preview_frame_times(
-            b"[Parsed_showinfo_2] pts_time:not-a-number"
-        )
-        .is_empty());
+        assert!(
+            parse_hover_preview_frame_times(b"[Parsed_showinfo_2] pts_time:not-a-number")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7182,7 +13463,7 @@ mod tests {
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
         let manifest = HoverPreviewManifest {
-            version: 2,
+            version: 3,
             media_id: "media-a".into(),
             fingerprint: "fingerprint-a".into(),
             duration_seconds: 5.0,
@@ -7246,6 +13527,20 @@ mod tests {
         assert!(unrelated_cache_directory.exists());
         assert_eq!(fs::read(master_media).unwrap(), b"original-media");
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn unpublished_hover_preview_guard_removes_partial_directory() {
+        let root = temporary("hover-preview-partial-cleanup");
+        let partial = root.join(".generating-test");
+        fs::create_dir_all(&partial).unwrap();
+        fs::write(partial.join("frame-001.jpg"), b"partial").unwrap();
+        {
+            let _guard = UnpublishedHoverPreview(partial.clone());
+            assert!(partial.is_dir());
+        }
+        assert!(!partial.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7497,7 +13792,11 @@ mod tests {
             &catalogue
         )
         .unwrap());
-        let expected = directory.canonicalize().unwrap().to_string_lossy().into_owned();
+        let expected = directory
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(settings.project_paths.get("project-a"), Some(&expected));
         let issues = reconcile_project_manifests_with(
             &state_path,
@@ -7596,11 +13895,7 @@ mod tests {
         let first_catalogue = catalogue.clone();
         let updater = thread::spawn(move || {
             let _guard = first_state.project_manifest_write.lock().unwrap();
-            persist_project_manifest_intents(
-                &first_path,
-                [("project-a".into(), None)],
-            )
-            .unwrap();
+            persist_project_manifest_intents(&first_path, [("project-a".into(), None)]).unwrap();
             held_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             reconcile_project_manifests_with(

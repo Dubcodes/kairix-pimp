@@ -1,6 +1,6 @@
 # Windows beta installation and upgrades
 
-Download the public beta from the [Kairix PIMP Light 0.1.1-5 GitHub Release](https://github.com/Dubcodes/kairix-pimp/releases/tag/v0.1.1-5). The recommended package is the plainly named **NSIS per-user Setup executable**. It installs without elevation under the current Windows profile and preserves PIMP's device-local settings, diagnostic logs, thumbnail cache configuration and recoverable ingest-job history across an upgrade. Shared catalogue records remain in the configured catalogue location and are not installer-owned data. Verify the file against `SHA256SUMS.txt` before running it.
+Download approved builds from the permanent [Kairix PIMP GitHub Releases page](https://github.com/Dubcodes/kairix-pimp/releases). The historical public beta is `v0.1.1-5`; do not assume source version `0.2` is available until its Development Release appears there. The recommended package is the plainly named **NSIS per-user Setup executable**. It installs without elevation under the current Windows profile and preserves device settings, identity, recoverable jobs and local caches. Shared catalogue records and `.pimp/thumbnails/v1` derivatives remain in the configured catalogue location and are not installer-owned data. Verify the installer against `SHA256SUMS.txt` and `BUILD-INFO.txt` before running it.
 
 The beta installers are not Authenticode signed. Windows may show a SmartScreen warning; confirm the publisher warning, version, checksum and GitHub Release source rather than downloading a copy from elsewhere.
 
@@ -21,4 +21,4 @@ The installers do not silently uninstall another scope because that could requir
 
 ## Automatic-update bootstrap
 
-Older builds without the approved updater public key cannot authenticate an update. Install a reviewed public-key-enabled NSIS release manually once. Settings → Updates must then identify the signed Beta channel as configured before a later higher-version signed update can be offered. Never use an unsigned Actions artifact as an automatic-update payload. See [Windows beta distribution and signed updates](UPDATES.md).
+Older builds without the approved updater public key cannot authenticate an update. Install a reviewed public-key-enabled NSIS release manually once. Settings → Updates must then identify the selected signed Development or Stable channel as configured before a later higher version can be offered. Never use an unsigned Actions artifact as an automatic-update payload. See [Windows releases and signed updates](UPDATES.md).
