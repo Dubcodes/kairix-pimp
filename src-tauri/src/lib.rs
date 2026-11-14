@@ -7810,10 +7810,10 @@ fn resolve_native_drag_media_paths(
     let master = master_bin
         .canonicalize()
         .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
-    let mut seen = HashSet::new();
-    let mut paths = Vec::with_capacity(media_ids.len());
+    let mut expanded_ids = Vec::with_capacity(media_ids.len() * 2);
+    let mut seen_ids = HashSet::new();
     for media_id in media_ids {
-        if !seen.insert(media_id) {
+        if !seen_ids.insert(media_id.clone()) {
             continue;
         }
         let item = catalogue
@@ -7821,6 +7821,26 @@ fn resolve_native_drag_media_paths(
             .iter()
             .find(|item| item.id == *media_id)
             .ok_or_else(|| format!("Unknown selected media item: {media_id}"))?;
+        expanded_ids.push(item.id.clone());
+        if let Some(audio_id) = item.attached_audio_id.as_ref() {
+            if seen_ids.insert(audio_id.clone()) {
+                expanded_ids.push(audio_id.clone());
+            }
+        }
+    }
+    if expanded_ids.len() > MAX_NATIVE_DRAG_ITEMS {
+        return Err(format!(
+            "A native drag is limited to {MAX_NATIVE_DRAG_ITEMS} physical files including associated audio"
+        ));
+    }
+    let mut seen_paths = HashSet::new();
+    let mut paths = Vec::with_capacity(expanded_ids.len());
+    for media_id in expanded_ids {
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or_else(|| format!("Unknown associated media item: {media_id}"))?;
         fs_safe::validate_relative(&item.relative_path)?;
         let path = fs_safe::resolve_existing(&master, &item.relative_path)?;
         if !path.is_file() {
@@ -7842,7 +7862,9 @@ fn resolve_native_drag_media_paths(
                 item.original_filename
             ));
         }
-        paths.push(path);
+        if seen_paths.insert(path.clone()) {
+            paths.push(path);
+        }
     }
     Ok(paths)
 }
@@ -7983,6 +8005,73 @@ fn run_native_file_drag(paths: &[PathBuf]) -> Result<NativeDragOutcome, String> 
     }
 }
 
+#[cfg(target_os = "windows")]
+fn drag_rs_safe_for_paths(paths: &[PathBuf]) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+    paths.iter().all(|path| {
+        let path = shell_drag_parsing_path(path);
+        let value = path.as_os_str().to_string_lossy();
+        if value.starts_with(r"\\") || value.encode_utf16().count() >= 260 {
+            return false;
+        }
+        let bytes = value.as_bytes();
+        if bytes.len() < 3 || bytes[1] != b':' || !matches!(bytes[2], b'\\' | b'/') {
+            return false;
+        }
+        let root = &value[..3];
+        let wide = std::ffi::OsStr::new(root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        (unsafe { GetDriveTypeW(wide.as_ptr()) }) != DRIVE_REMOTE
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn run_established_file_drag(
+    window: &tauri::WebviewWindow,
+    paths: &[PathBuf],
+) -> Result<NativeDragOutcome, String> {
+    use drag::{DragItem, DragMode, DragResult, Image, Options};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // drag 2.1.1 is proven for ordinary local paths but has an open upstream
+    // panic for UNC/mapped-share and long paths. Route only its supported
+    // subset here; PIMP's guarded Shell implementation remains the safe
+    // no-panic fallback for those canonical path forms.
+    let shell_paths = paths
+        .iter()
+        .map(|path| shell_drag_parsing_path(path))
+        .collect();
+    let outcome = Arc::new(Mutex::new(None));
+    let callback_outcome = Arc::clone(&outcome);
+    let operation = catch_unwind(AssertUnwindSafe(|| {
+        drag::start_drag(
+            window,
+            DragItem::Files(shell_paths),
+            Image::Raw(include_bytes!("../icons/32x32.png").to_vec()),
+            move |result, _position| {
+                *callback_outcome.lock().unwrap() = Some(result);
+            },
+            Options {
+                mode: DragMode::Copy,
+                ..Default::default()
+            },
+        )
+    }))
+    .map_err(|_| "The native drag library failed safely before starting the drag".to_string())?;
+    operation.map_err(|error| format!("The native drag library could not start: {error}"))?;
+    let completed = outcome.lock().unwrap().take();
+    match completed {
+        Some(DragResult::Dropped) => Ok(NativeDragOutcome::Dropped),
+        Some(DragResult::Cancel) => Ok(NativeDragOutcome::Cancelled),
+        None => Ok(NativeDragOutcome::Rejected),
+    }
+}
+
 #[tauri::command]
 fn native_drag_threshold() -> NativeDragThreshold {
     #[cfg(target_os = "windows")]
@@ -8004,6 +8093,7 @@ fn native_drag_threshold() -> NativeDragThreshold {
 #[tauri::command]
 fn start_native_media_drag(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     media_ids: Vec<String>,
 ) -> Result<NativeDragOutcome, String> {
     let settings = load_settings_file(&app)?;
@@ -8014,7 +8104,32 @@ fn start_native_media_drag(
         &media_ids,
     )?;
     #[cfg(target_os = "windows")]
-    return run_native_file_drag(&paths);
+    {
+        diagnostic_log(
+            &app,
+            "INFO",
+            "native-drag",
+            &format!(
+                "Starting copy-only media drag with {} physical item(s)",
+                paths.len()
+            ),
+        );
+        let result = if drag_rs_safe_for_paths(&paths) {
+            run_established_file_drag(&window, &paths)
+        } else {
+            run_native_file_drag(&paths)
+        };
+        diagnostic_log(
+            &app,
+            if result.is_ok() { "INFO" } else { "ERROR" },
+            "native-drag",
+            &format!(
+                "Media drag completed: {}",
+                result.as_ref().map_or("error", |_| "handled")
+            ),
+        );
+        return result;
+    }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = paths;
@@ -8025,12 +8140,35 @@ fn start_native_media_drag(
 #[tauri::command]
 fn start_native_folder_drag(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     relative_path: String,
 ) -> Result<NativeDragOutcome, String> {
     let settings = load_settings_file(&app)?;
     let path = resolve_native_drag_folder(Path::new(&settings.master_bin_path), &relative_path)?;
     #[cfg(target_os = "windows")]
-    return run_native_file_drag(&[path]);
+    {
+        diagnostic_log(
+            &app,
+            "INFO",
+            "native-drag",
+            "Starting copy-only physical-folder drag",
+        );
+        let result = if drag_rs_safe_for_paths(std::slice::from_ref(&path)) {
+            run_established_file_drag(&window, &[path])
+        } else {
+            run_native_file_drag(&[path])
+        };
+        diagnostic_log(
+            &app,
+            if result.is_ok() { "INFO" } else { "ERROR" },
+            "native-drag",
+            &format!(
+                "Folder drag completed: {}",
+                result.as_ref().map_or("error", |_| "handled")
+            ),
+        );
+        return result;
+    }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = path;
@@ -12323,12 +12461,14 @@ mod tests {
         let root = temporary("native-drag-paths");
         let master = root.join("Master Bin");
         let first = master.join("20261108").join("clip one.mp4");
+        let audio = master.join("20261108").join("clip one.wav");
         let second = master.join("kōrero 音声").join("clip two.mp4");
         fs::create_dir_all(first.parent().unwrap()).unwrap();
         fs::create_dir_all(second.parent().unwrap()).unwrap();
         fs::write(&first, b"first synthetic clip").unwrap();
+        fs::write(&audio, b"associated synthetic audio").unwrap();
         fs::write(&second, b"second synthetic clip").unwrap();
-        let first_item = new_media(
+        let mut first_item = new_media(
             &first,
             "20261108/clip one.mp4".into(),
             None,
@@ -12338,6 +12478,17 @@ mod tests {
             false,
         )
         .unwrap();
+        let audio_item = new_media(
+            &audio,
+            "20261108/clip one.wav".into(),
+            None,
+            sha256(&audio).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        first_item.attached_audio_id = Some(audio_item.id.clone());
         let second_item = new_media(
             &second,
             "kōrero 音声/clip two.mp4".into(),
@@ -12350,15 +12501,25 @@ mod tests {
         .unwrap();
         let ids = vec![first_item.id.clone(), second_item.id.clone()];
         let catalogue = Catalogue {
-            media: vec![first_item, second_item],
+            media: vec![first_item, audio_item.clone(), second_item],
             ..Default::default()
         };
         assert_eq!(
             resolve_native_drag_media_paths(&master, &catalogue, &ids).unwrap(),
             vec![
                 first.canonicalize().unwrap(),
+                audio.canonicalize().unwrap(),
                 second.canonicalize().unwrap()
             ]
+        );
+        assert_eq!(
+            resolve_native_drag_media_paths(
+                &master,
+                &catalogue,
+                &[ids[0].clone(), audio_item.id.clone()]
+            )
+            .unwrap(),
+            vec![first.canonicalize().unwrap(), audio.canonicalize().unwrap()]
         );
         assert!(resolve_native_drag_media_paths(
             &master,
@@ -12396,6 +12557,21 @@ mod tests {
             .unwrap_err()
             .contains("not available locally"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn established_drag_library_is_limited_to_ordinary_local_shell_paths() {
+        assert!(drag_rs_safe_for_paths(&[PathBuf::from(
+            r"C:\Media\clip one.mp4"
+        )]));
+        assert!(!drag_rs_safe_for_paths(&[PathBuf::from(
+            r"\\server\share\clip.mp4"
+        )]));
+        assert!(!drag_rs_safe_for_paths(&[PathBuf::from(format!(
+            r"C:\Media\{}\clip.mp4",
+            "a".repeat(260)
+        ))]));
     }
 
     #[cfg(target_os = "windows")]
