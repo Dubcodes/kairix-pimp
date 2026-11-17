@@ -706,6 +706,8 @@ export const desktopBridge = {
   getResourceGovernorStatus: () =>
     invoke<ResourceGovernorStatus>('get_resource_governor_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
+  logPlaybackEvent: (event: string, detail: string) =>
+    invoke<void>('log_playback_event', { event, detail }),
   appInfo: () => invoke<AppInfo>('app_info'),
   updaterConfiguration: () =>
     invoke<UpdaterConfiguration>('updater_configuration'),

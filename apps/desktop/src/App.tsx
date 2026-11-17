@@ -421,6 +421,8 @@ export function App() {
   const viewerVideoRef = useRef<HTMLVideoElement>(null);
   const viewerPlaybackStartedAt = useRef(0);
   const viewerSeekStartedAt = useRef(0);
+  const viewerMediaIdRef = useRef<string | undefined>(undefined);
+  const viewerProxyAttempted = useRef(false);
   const libraryScrollPosition = useRef(0);
   const projectInventoryGeneration = useRef(0);
   const thumbnailSourceGeneration = useRef(0);
@@ -1334,6 +1336,9 @@ export function App() {
     ? associatedMedia(viewerRecording, catalogue.media)
     : [];
   useEffect(() => {
+    viewerMediaIdRef.current = viewerMediaId;
+  }, [viewerMediaId]);
+  useEffect(() => {
     if (!viewerMediaId || !viewerRecording?.available || !native) return;
     viewerPlaybackStartedAt.current = performance.now();
     let current = true;
@@ -1343,12 +1348,19 @@ export function App() {
       setViewerSource(undefined);
       setViewerError('');
       setViewerProxyBusy(false);
+      viewerProxyAttempted.current = false;
     });
     void desktopBridge
       .resolveMediaPlaybackSource(viewerMediaId)
       .then((source) => {
         if (current) {
           setViewerSource(source);
+          void desktopBridge.logPlaybackEvent(
+            'source-ready',
+            `media source resolved in ${Math.round(
+              performance.now() - viewerPlaybackStartedAt.current,
+            )} ms`,
+          );
           setViewerPlaybackMetrics((metrics) => ({
             ...metrics,
             sourceResolvedMs: Math.round(
@@ -1409,14 +1421,18 @@ export function App() {
       setThumbnailFrameStatus(`Thumbnail failed: ${errorText(reason)}`);
     }
   };
-  const createPlaybackProxy = async () => {
+  const createPlaybackProxy = async (automatic = false) => {
     if (!viewerRecording) return;
+    const mediaId = viewerRecording.id;
+    viewerVideoRef.current?.pause();
     setViewerProxyBusy(true);
+    setViewerSource(undefined);
+    setViewerError('');
     const proxyStartedAt = performance.now();
     try {
-      setViewerSource(
-        await desktopBridge.preparePlaybackProxy(viewerRecording.id),
-      );
+      const source = await desktopBridge.preparePlaybackProxy(mediaId);
+      if (viewerMediaIdRef.current !== mediaId) return;
+      setViewerSource(source);
       viewerPlaybackStartedAt.current = performance.now();
       setViewerPlaybackMetrics({
         sourceResolvedMs: 0,
@@ -1424,13 +1440,42 @@ export function App() {
       });
       setViewerError('');
       setMessage(
-        'Compatible preview ready in the device-local cache. The original recording was unchanged.',
+        `${
+          automatic ? 'Automatic compatible preview' : 'Compatible preview'
+        } ready in the device-local cache. The original recording was unchanged.`,
       );
     } catch (reason) {
+      if (viewerMediaIdRef.current !== mediaId) return;
       setViewerError(`Compatible preview failed: ${errorText(reason)}`);
     } finally {
-      setViewerProxyBusy(false);
+      if (viewerMediaIdRef.current === mediaId) setViewerProxyBusy(false);
     }
+  };
+  const handleViewerPlaybackError = () => {
+    const video = viewerVideoRef.current;
+    const code = video?.error?.code ?? 0;
+    const meanings: Record<number, string> = {
+      1: 'playback was aborted',
+      2: 'the media request failed',
+      3: 'the media could not be decoded',
+      4: 'the media source or codec is unsupported',
+    };
+    const detail = `code ${code} (${meanings[code] ?? 'unknown media error'}), network state ${
+      video?.networkState ?? 'unknown'
+    }, ready state ${video?.readyState ?? 'unknown'}`;
+    void desktopBridge.logPlaybackEvent('error', detail);
+    if (
+      !viewerProxyAttempted.current &&
+      !viewerProxyBusy &&
+      mediaTools?.ffmpegAvailable
+    ) {
+      viewerProxyAttempted.current = true;
+      void createPlaybackProxy(true);
+      return;
+    }
+    setViewerError(
+      `WebView2 could not play the authorized media (${meanings[code] ?? `error code ${code}`}). The original media was not changed.`,
+    );
   };
   useEffect(() => {
     if (view !== 'Library' || !libraryLocateId) return;
@@ -4458,6 +4503,15 @@ export function App() {
                           device; it does not mean archived or deleted.
                         </span>
                       </div>
+                    ) : viewerProxyBusy ? (
+                      <div className="clip-player-state" role="status">
+                        <strong>Preparing compatible preview</strong>
+                        <span>
+                          PIMP is creating or validating a device-local
+                          H.264/AAC proxy. Progress is available in Background
+                          Operations; the original recording is unchanged.
+                        </span>
+                      </div>
                     ) : viewerError ? (
                       <div className="clip-player-state" role="alert">
                         <strong>Preview unavailable</strong>
@@ -4467,7 +4521,7 @@ export function App() {
                           disabled={
                             viewerProxyBusy || !mediaTools?.ffmpegAvailable
                           }
-                          onClick={() => void createPlaybackProxy()}
+                          onClick={() => void createPlaybackProxy(false)}
                         >
                           {!mediaTools?.ffmpegAvailable
                             ? 'FFmpeg is required for a compatible preview'
@@ -4481,58 +4535,66 @@ export function App() {
                         ref={viewerVideoRef}
                         src={viewerSource}
                         controls
+                        autoPlay
                         preload="metadata"
                         playsInline
                         aria-label={`Playback ${viewerRecording.originalFilename}`}
-                        onLoadedMetadata={() =>
+                        onLoadedMetadata={() => {
+                          const elapsed = Math.round(
+                            performance.now() - viewerPlaybackStartedAt.current,
+                          );
+                          void desktopBridge.logPlaybackEvent(
+                            'metadata-loaded',
+                            `metadata loaded in ${elapsed} ms`,
+                          );
                           setViewerPlaybackMetrics((metrics) => ({
                             ...metrics,
-                            metadataMs:
-                              metrics.metadataMs ??
-                              Math.round(
-                                performance.now() -
-                                  viewerPlaybackStartedAt.current,
-                              ),
-                          }))
-                        }
-                        onLoadedData={() =>
+                            metadataMs: metrics.metadataMs ?? elapsed,
+                          }));
+                        }}
+                        onLoadedData={() => {
+                          const elapsed = Math.round(
+                            performance.now() - viewerPlaybackStartedAt.current,
+                          );
+                          void desktopBridge.logPlaybackEvent(
+                            'first-frame',
+                            `first frame available in ${elapsed} ms`,
+                          );
                           setViewerPlaybackMetrics((metrics) => ({
                             ...metrics,
-                            firstFrameMs:
-                              metrics.firstFrameMs ??
-                              Math.round(
-                                performance.now() -
-                                  viewerPlaybackStartedAt.current,
-                              ),
-                          }))
-                        }
-                        onPlaying={() =>
+                            firstFrameMs: metrics.firstFrameMs ?? elapsed,
+                          }));
+                        }}
+                        onPlaying={() => {
+                          const elapsed = Math.round(
+                            performance.now() - viewerPlaybackStartedAt.current,
+                          );
+                          void desktopBridge.logPlaybackEvent(
+                            'playing',
+                            `playback started in ${elapsed} ms`,
+                          );
                           setViewerPlaybackMetrics((metrics) => ({
                             ...metrics,
-                            playingMs:
-                              metrics.playingMs ??
-                              Math.round(
-                                performance.now() -
-                                  viewerPlaybackStartedAt.current,
-                              ),
-                          }))
-                        }
+                            playingMs: metrics.playingMs ?? elapsed,
+                          }));
+                        }}
                         onSeeking={() => {
                           viewerSeekStartedAt.current = performance.now();
                         }}
-                        onSeeked={() =>
+                        onSeeked={() => {
+                          const elapsed = Math.round(
+                            performance.now() - viewerSeekStartedAt.current,
+                          );
+                          void desktopBridge.logPlaybackEvent(
+                            'seeked',
+                            `seek completed in ${elapsed} ms`,
+                          );
                           setViewerPlaybackMetrics((metrics) => ({
                             ...metrics,
-                            lastSeekMs: Math.round(
-                              performance.now() - viewerSeekStartedAt.current,
-                            ),
-                          }))
-                        }
-                        onError={() =>
-                          setViewerError(
-                            'WebView2 could not play this file or codec. The original media was not changed.',
-                          )
-                        }
+                            lastSeekMs: elapsed,
+                          }));
+                        }}
+                        onError={handleViewerPlaybackError}
                       />
                     ) : (
                       <div className="clip-player-state" role="status">

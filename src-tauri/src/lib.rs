@@ -6807,6 +6807,27 @@ fn log_ui_error(app: AppHandle, message: String) {
 }
 
 #[tauri::command]
+fn log_playback_event(app: AppHandle, event: String, detail: String) {
+    let allowed = [
+        "source-ready",
+        "metadata-loaded",
+        "first-frame",
+        "playing",
+        "seeked",
+        "error",
+    ];
+    if !allowed.contains(&event.as_str()) {
+        return;
+    }
+    diagnostic_log(
+        &app,
+        if event == "error" { "ERROR" } else { "INFO" },
+        &format!("playback-{event}"),
+        &detail,
+    );
+}
+
+#[tauri::command]
 async fn rescan(app: AppHandle, full: Option<bool>) -> Result<RescanResult, String> {
     let full = full.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
@@ -8367,6 +8388,19 @@ fn playback_proxy_path(root: &Path, item: &MediaItem, fingerprint: &str) -> Path
     root.join(format!("{}-{}.mp4", item.id, &fingerprint[..24]))
 }
 
+fn authorize_validated_playback_file(app: &AppHandle, path: &Path) -> Result<String, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve validated playback file: {error}"))?;
+    if !canonical.is_file() {
+        return Err("The validated playback file is no longer available".into());
+    }
+    app.asset_protocol_scope()
+        .allow_file(&canonical)
+        .map_err(|error| format!("Cannot authorize validated playback file: {error}"))?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
 fn enforce_playback_proxy_limit(
     root: &Path,
     limit: u64,
@@ -8700,6 +8734,7 @@ async fn resolve_media_playback_source(
     media_id: String,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
         let state = app.state::<NativeState>();
         let settings = load_settings_file(&app)?;
         let catalogue = load_catalogue_file(&settings)?;
@@ -8710,7 +8745,17 @@ async fn resolve_media_playback_source(
             .ok_or("Unknown media item")?;
         let source = resolve_catalogue_media_path(&settings, &media_id)?;
         if !enrichment_video_type(&item.file_type) {
-            return Ok(source.to_string_lossy().into_owned());
+            let authorized = authorize_validated_playback_file(&app, &source)?;
+            diagnostic_log(
+                &app,
+                "INFO",
+                "playback-source",
+                &format!(
+                    "authorized original media in {} ms",
+                    started.elapsed().as_millis()
+                ),
+            );
+            return Ok(authorized);
         }
         let snapshot = fs_safe::snapshot(&source)?;
         let fingerprint = playback_proxy_fingerprint(item, &snapshot);
@@ -8722,9 +8767,29 @@ async fn resolve_media_playback_source(
                 .lock()
                 .unwrap()
                 .insert(media_id, proxy.clone());
-            return Ok(proxy.to_string_lossy().into_owned());
+            let authorized = authorize_validated_playback_file(&app, &proxy)?;
+            diagnostic_log(
+                &app,
+                "INFO",
+                "playback-source",
+                &format!(
+                    "authorized cached proxy in {} ms",
+                    started.elapsed().as_millis()
+                ),
+            );
+            return Ok(authorized);
         }
-        Ok(source.to_string_lossy().into_owned())
+        let authorized = authorize_validated_playback_file(&app, &source)?;
+        diagnostic_log(
+            &app,
+            "INFO",
+            "playback-source",
+            &format!(
+                "authorized original video after proxy cache miss in {} ms",
+                started.elapsed().as_millis()
+            ),
+        );
+        Ok(authorized)
     })
     .await
     .map_err(|error| format!("Playback source resolution task failed: {error}"))?
@@ -8781,7 +8846,14 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
                 settings.playback_proxy_cache_limit_bytes,
                 &protected_playback_proxy_paths(&state, &destination),
             )?;
-            return Ok(destination.to_string_lossy().into_owned());
+            let authorized = authorize_validated_playback_file(&app, &destination)?;
+            diagnostic_log(
+                &app,
+                "INFO",
+                "playback-proxy",
+                "reused and authorized validated cached proxy",
+            );
+            return Ok(authorized);
         }
         if fs::symlink_metadata(&destination).is_ok() {
             fs::remove_file(&destination)
@@ -8912,7 +8984,14 @@ async fn prepare_playback_proxy(app: AppHandle, media_id: String) -> Result<Stri
             operation.stage = "Compatible proxy ready".into();
             operation.cancellable = false;
         });
-        Ok(destination.to_string_lossy().into_owned())
+        let authorized = authorize_validated_playback_file(&app, &destination)?;
+        diagnostic_log(
+            &app,
+            "INFO",
+            "playback-proxy",
+            "generated, validated and authorized compatible proxy",
+        );
+        Ok(authorized)
     })
     .await
     .map_err(|error| format!("Playback proxy worker failed: {error}"))?
@@ -10390,6 +10469,7 @@ pub fn run() {
             get_discovery_status,
             get_resource_governor_status,
             log_ui_error,
+            log_playback_event,
             verify_media_integrity,
             enrich_media,
             media_tools_status,
@@ -11656,7 +11736,7 @@ mod tests {
     }
 
     #[test]
-    fn packaged_webview_enables_only_runtime_scoped_thumbnail_assets() {
+    fn packaged_webview_enables_only_runtime_scoped_media_assets() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let security = &config["app"]["security"];
@@ -11664,6 +11744,7 @@ mod tests {
         assert_eq!(security["assetProtocol"]["scope"], serde_json::json!([]));
         let csp = security["csp"].as_str().unwrap();
         assert!(csp.contains("img-src 'self' asset: http://asset.localhost data:"));
+        assert!(csp.contains("media-src 'self' asset: http://asset.localhost"));
     }
 
     #[test]

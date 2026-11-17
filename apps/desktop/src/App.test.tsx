@@ -90,6 +90,7 @@ const mocks = vi.hoisted(() => ({
   listBackgroundOperations: vi.fn(),
   getResourceGovernorStatus: vi.fn(),
   logUiError: vi.fn(),
+  logPlaybackEvent: vi.fn(),
   verifyMediaIntegrity: vi.fn(),
   reapproveIngestDestinations: vi.fn(),
   replanIngestDestinations: vi.fn(),
@@ -165,6 +166,7 @@ vi.mock('./bridge', () => ({
       errors: 0,
     })),
     logUiError: mocks.logUiError,
+    logPlaybackEvent: mocks.logPlaybackEvent,
     appInfo: vi.fn(async () => ({
       version: '0.1.1-1',
       displayVersion: '0.1.1-1',
@@ -433,6 +435,8 @@ describe('native application integration', () => {
       ffmpegAvailable: true,
       ffprobeAvailable: true,
     });
+    mocks.logPlaybackEvent.mockReset();
+    mocks.logPlaybackEvent.mockResolvedValue(undefined);
     mocks.chooseFiles.mockReset();
     mocks.chooseFiles.mockResolvedValue([]);
     mocks.inventorySources.mockReset();
@@ -634,13 +638,18 @@ describe('native application integration', () => {
     ).toBeVisible();
     expect(mocks.resolveMediaPlaybackSource).toHaveBeenCalledWith('next-clip');
 
+    const automaticProxy = deferred<string>();
+    mocks.preparePlaybackProxy.mockReturnValueOnce(automaticProxy.promise);
     fireEvent.error(await screen.findByLabelText('Playback next.mp4'));
-    expect(await screen.findByText('Preview unavailable')).toBeVisible();
-    expect(screen.getByText(/original media was not changed/i)).toBeVisible();
-    await user.click(
-      screen.getByRole('button', { name: 'Create compatible preview' }),
-    );
+    expect(
+      await screen.findByText('Preparing compatible preview'),
+    ).toBeVisible();
     expect(mocks.preparePlaybackProxy).toHaveBeenCalledWith('next-clip');
+    expect(mocks.logPlaybackEvent).toHaveBeenCalledWith(
+      'error',
+      expect.stringContaining('code 0'),
+    );
+    automaticProxy.resolve('asset://localhost/playback-proxy.mp4');
     const proxyPlayer = await screen.findByLabelText('Playback next.mp4');
     expect(proxyPlayer).toHaveAttribute(
       'src',
@@ -651,6 +660,10 @@ describe('native application integration', () => {
     fireEvent.playing(proxyPlayer);
     fireEvent.seeking(proxyPlayer);
     fireEvent.seeked(proxyPlayer);
+    expect(mocks.logPlaybackEvent).toHaveBeenCalledWith(
+      'metadata-loaded',
+      expect.stringContaining('metadata loaded in'),
+    );
 
     await user.click(screen.getByRole('button', { name: 'Back to Library' }));
     expect(
