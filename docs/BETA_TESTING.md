@@ -50,7 +50,7 @@ the installed application, not `npm run dev`.
 - [ ] Drag a fixture folder into Ingest and retain the source fixtures.
 - [ ] Review the pre-copy inventory count, bytes, hierarchy-preserved files,
       exclusions and any issues before starting the ingest.
-- [ ] During a large-card review, confirm **Background Operations** advances through enumeration, inspection, checksums and duplicate checks while Library navigation remains responsive; cancel and confirm card reads settle without starting a copy.
+- [ ] During a large-card review, confirm **Background Operations** advances through enumeration, metadata inspection and destination planning without a full-card checksum pass while Library navigation remains responsive; cancel and confirm card activity settles without starting a copy.
 - [ ] Start another inventory while one is active and confirm only the newest review completes and no overlapping sustained card reads remain.
 - [ ] Confirm background byte/file progress and independently verified results.
 - [ ] While copying, add tags, project assignments, a description and favourite.

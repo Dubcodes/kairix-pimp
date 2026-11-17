@@ -304,6 +304,8 @@ struct DeviceSettings {
     library_folder_sort: String,
     #[serde(default)]
     library_folder_order: Vec<String>,
+    #[serde(default = "default_library_media_sort")]
+    library_media_sort: String,
     #[serde(default = "default_true")]
     sd_grabber_enabled: bool,
     #[serde(default = "default_true")]
@@ -440,6 +442,9 @@ fn default_library_thumbnail_width() -> u16 {
 fn default_library_folder_sort() -> String {
     "newest".into()
 }
+fn default_library_media_sort() -> String {
+    "ingested-newest".into()
+}
 fn default_preview_cache_limit_bytes() -> u64 {
     512 * 1024 * 1024
 }
@@ -503,6 +508,7 @@ impl Default for DeviceSettings {
             sidebar_collapsed: false,
             library_folder_sort: default_library_folder_sort(),
             library_folder_order: vec![],
+            library_media_sort: default_library_media_sort(),
             sd_grabber_enabled: true,
             sd_grabber_auto_detect: true,
             sd_grabber_extensions: default_sd_grabber_extensions(),
@@ -746,6 +752,19 @@ struct IngestProgress {
     files_total: usize,
     bytes_complete: u64,
     bytes_total: u64,
+    bytes_per_second: Option<u64>,
+    eta_seconds: Option<u64>,
+}
+
+fn possible_catalogue_matches(catalogue: &Catalogue, filename: &str, size_bytes: u64) -> usize {
+    catalogue
+        .media
+        .iter()
+        .filter(|item| {
+            item.original_filename.eq_ignore_ascii_case(filename)
+                && item.technical.size_bytes == size_bytes
+        })
+        .count()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1211,10 +1230,6 @@ fn replan_ingest_destinations_blocking(
                 source.display()
             ));
         }
-        let hash = approved
-            .source_sha256
-            .as_ref()
-            .ok_or("The approved plan predates safe date reapproval; scan the source again")?;
         inventory.planned_relative_path = replan_approved_relative_path(
             &settings,
             &master,
@@ -1223,27 +1238,32 @@ fn replan_ingest_destinations_blocking(
             &batch_timestamp,
         )?;
         approved.existing_media_id = None;
-        if let Some(relative_path) = selection_hashes.get(hash) {
-            inventory.disposition = "already-imported".into();
-            inventory.existing_relative_path = Some(relative_path.clone());
-            inventory.detail = Some("Duplicate recording within this approved selection".into());
-        } else {
-            let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
-            let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
-                &settings,
-                candidates,
-                approved.source_size,
-                hash,
-                Some(&state),
-                None,
-            );
-            inventory.disposition = disposition;
-            inventory.existing_relative_path = relative_path;
-            inventory.detail = detail;
-            approved.existing_media_id = media_id;
-            if inventory.disposition == "new" {
-                selection_hashes.insert(hash.clone(), inventory.planned_relative_path.clone());
+        if let Some(hash) = approved.source_sha256.as_ref() {
+            if let Some(relative_path) = selection_hashes.get(hash) {
+                inventory.disposition = "already-imported".into();
+                inventory.existing_relative_path = Some(relative_path.clone());
+                inventory.detail = Some("Duplicate recording within this approved selection".into());
+            } else {
+                let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
+                let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
+                    &settings,
+                    candidates,
+                    approved.source_size,
+                    hash,
+                    Some(&state),
+                    None,
+                );
+                inventory.disposition = disposition;
+                inventory.existing_relative_path = relative_path;
+                inventory.detail = detail;
+                approved.existing_media_id = media_id;
+                if inventory.disposition == "new" {
+                    selection_hashes.insert(hash.clone(), inventory.planned_relative_path.clone());
+                }
             }
+        } else {
+            inventory.disposition = "new".into();
+            inventory.existing_relative_path = None;
         }
         if inventory.disposition != "already-imported" {
             let destination =
@@ -2056,6 +2076,17 @@ fn save_settings(
     ) {
         return Err("Choose a supported Library folder ordering".into());
     }
+    if !matches!(
+        settings.library_media_sort.as_str(),
+        "ingested-newest"
+            | "ingested-oldest"
+            | "recorded-newest"
+            | "recorded-oldest"
+            | "filename-asc"
+            | "filename-desc"
+    ) {
+        return Err("Choose a supported Library media ordering".into());
+    }
     settings.sd_grabber_extensions = settings
         .sd_grabber_extensions
         .iter()
@@ -2794,13 +2825,6 @@ fn create_approved_inventory(
         operation.bytes_total = Some(inventory.files.iter().map(|file| file.size_bytes).sum());
     });
     let catalogue = load_catalogue_file(&settings)?;
-    let mut hash_index = HashMap::<String, Vec<&MediaItem>>::new();
-    for item in &catalogue.media {
-        hash_index
-            .entry(item.sha256.clone())
-            .or_default()
-            .push(item);
-    }
     let mut snapshots = Vec::with_capacity(inventory.files.len());
     let mut volume_identities = HashMap::<String, Option<String>>::new();
     for (index, file) in inventory.files.iter_mut().enumerate() {
@@ -2832,87 +2856,43 @@ fn create_approved_inventory(
     }
 
     update_inventory_operation(state, operation_id, |operation| {
-        operation.stage = "Calculating checksums".into();
+        operation.stage = "Planning destinations".into();
         operation.completed_items = 0;
         operation.bytes_completed = 0;
-    });
-    let mut source_hashes = Vec::with_capacity(inventory.files.len());
-    let mut bytes_read = 0_u64;
-    for (index, file) in inventory.files.iter().enumerate() {
-        check_inventory_cancelled(state, operation_id)?;
-        let source = PathBuf::from(&file.source_path);
-        let volume_id = volume_resource_id(&source)?;
-        update_inventory_operation(state, operation_id, |operation| {
-            operation.stage = "Waiting for source-volume access".into();
-            operation.current_item = source
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string());
-        });
-        let mut volume_permit = state.volume_governor.acquire(
-            resource_governor::Request::new(
-                format!("Approved source inventory: {}", source.display()),
-                resource_governor::PRIORITY_FOREGROUND,
-                false,
-                vec![resource_governor::VolumeNeed::read(volume_id.clone())],
-            ),
-            || inventory_was_cancelled(state, operation_id),
-        )?;
-        update_inventory_operation(state, operation_id, |operation| {
-            operation.stage = "Calculating checksums".into();
-        });
-        let hash = sha256_inventory(&source, state, operation_id, &mut bytes_read)?;
-        volume_permit.add_bytes_for(&volume_id, file.size_bytes, 0);
-        source_hashes.push(hash);
-        update_inventory_operation(state, operation_id, |operation| {
-            operation.completed_items = index + 1;
-            operation.current_item = source
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string());
-        });
-    }
-
-    update_inventory_operation(state, operation_id, |operation| {
-        operation.stage = "Checking duplicates".into();
-        operation.completed_items = 0;
+        operation.bytes_total = None;
     });
     let mut approved_files = Vec::new();
-    let mut selection_hashes = HashMap::<String, String>::new();
+    let mut planned_destinations = HashSet::new();
     for (index, file) in inventory.files.iter_mut().enumerate() {
         check_inventory_cancelled(state, operation_id)?;
         let (snapshot, source_volume_identity) = &snapshots[index];
-        let hash = &source_hashes[index];
         let source = PathBuf::from(&file.source_path);
-        let mut existing_media_id = None;
         if fs_safe::snapshot(&source)? != *snapshot {
             file.disposition = "attention".into();
             file.detail =
                 Some("Source changed while the approved inventory was being built".into());
-        } else if let Some(relative_path) = selection_hashes.get(hash) {
-            file.disposition = "already-imported".into();
-            file.existing_relative_path = Some(relative_path.clone());
-            file.detail = Some("Duplicate recording within this approved selection".into());
         } else {
-            let candidates = hash_index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
-            let (disposition, media_id, relative_path, detail) = classify_global_duplicate(
-                &settings,
-                candidates,
-                snapshot.length,
-                hash,
-                Some(state),
-                Some(operation_id),
-            );
-            file.disposition = disposition;
-            file.existing_relative_path = relative_path;
-            file.detail = detail;
-            existing_media_id = media_id;
-            if file.disposition == "new" {
-                selection_hashes.insert(hash.clone(), file.planned_relative_path.clone());
+            let filename = source
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let possible_matches =
+                possible_catalogue_matches(&catalogue, &filename, snapshot.length);
+            if possible_matches > 0 {
+                file.detail = Some(format!(
+                    "Possible duplicate: {possible_matches} catalogue item(s) share this filename and size. Content identity will be verified during copying."
+                ));
             }
         }
-        if file.disposition != "already-imported" {
+        if file.disposition != "attention" {
             let destination = fs_safe::resolve_for_create(&master, &file.planned_relative_path)?;
-            if destination.exists() {
-                let reason = "A different file already occupies the planned destination";
+            let unique = planned_destinations.insert(file.planned_relative_path.to_ascii_lowercase());
+            if destination.exists() || !unique {
+                let reason = if destination.exists() {
+                    "A file already occupies the planned destination"
+                } else {
+                    "Two selected files resolve to the same planned destination"
+                };
                 inventory.conflicts.push(InventoryConflict {
                     source_path: file.source_path.clone(),
                     destination_path: file.planned_relative_path.clone(),
@@ -2935,9 +2915,9 @@ fn create_approved_inventory(
                 .and_then(|path| fs_safe::snapshot(Path::new(path)).ok())
                 .and_then(|snapshot| snapshot.modified_millis)
                 .or(snapshot.modified_millis),
-            source_sha256: Some(hash.clone()),
+            source_sha256: None,
             source_volume_identity: source_volume_identity.clone(),
-            existing_media_id,
+            existing_media_id: None,
         });
         update_inventory_operation(state, operation_id, |operation| {
             operation.completed_items = index + 1;
@@ -2946,7 +2926,6 @@ fn create_approved_inventory(
                 .map(|name| name.to_string_lossy().to_string());
             match disposition.as_str() {
                 "new" => operation.counts.new_files += 1,
-                "already-imported" => operation.counts.duplicate_files += 1,
                 "attention" => operation.counts.attention_files += 1,
                 _ => operation.counts.failed_files += 1,
             }
@@ -3084,9 +3063,9 @@ async fn run_inventory_command(
             &state,
             &operation_id,
             if sd_grabber {
-                "SD-card inventory and duplicate verification"
+                "SD-card fast discovery"
             } else {
-                "Source inventory and duplicate verification"
+                "Source fast discovery"
             },
         )?;
     }
@@ -3565,71 +3544,6 @@ fn check_inventory_cancelled(state: &NativeState, operation_id: &str) -> Result<
     }
 }
 
-fn sha256_inventory(
-    path: &Path,
-    state: &NativeState,
-    operation_id: &str,
-    total_bytes_read: &mut u64,
-) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| {
-        format!(
-            "Cannot read source while calculating its checksum {}: {error}",
-            path.display()
-        )
-    })?;
-    let mut next_update = 0_u64;
-    let hash = sha256_reader_cancellable(
-        &mut file,
-        || inventory_was_cancelled(state, operation_id),
-        |read| {
-            *total_bytes_read = total_bytes_read.saturating_add(read);
-            if *total_bytes_read >= next_update {
-                update_inventory_operation(state, operation_id, |operation| {
-                    operation.bytes_completed = *total_bytes_read;
-                    operation.current_item = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string());
-                });
-                next_update = total_bytes_read.saturating_add(8 * 1024 * 1024);
-            }
-        },
-    )
-    .map_err(|error| {
-        if error == "Inventory cancelled safely" {
-            error
-        } else {
-            format!("Source read failed for {}: {error}", path.display())
-        }
-    })?;
-    update_inventory_operation(state, operation_id, |operation| {
-        operation.bytes_completed = *total_bytes_read;
-    });
-    Ok(hash)
-}
-
-fn sha256_reader_cancellable(
-    reader: &mut impl Read,
-    mut cancelled: impl FnMut() -> bool,
-    mut progress: impl FnMut(u64),
-) -> Result<String, String> {
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        if cancelled() {
-            return Err("Inventory cancelled safely".into());
-        }
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-        progress(read as u64);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
 #[tauri::command]
 fn cancel_inventory(state: State<'_, NativeState>, operation_id: String) -> Result<(), String> {
     let active = state
@@ -3934,6 +3848,7 @@ struct IngestJournal {
 struct VerifiedCopy {
     hash: String,
     journal_path: PathBuf,
+    staged_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -4139,7 +4054,7 @@ fn copy_verified(
     total_bytes: u64,
     file_index: usize,
     file_total: usize,
-    approved_hash: &str,
+    approved_hash: Option<&str>,
     source_volume_identity: Option<&str>,
 ) -> Result<VerifiedCopy, String> {
     configure_volume_governor(state, settings);
@@ -4192,6 +4107,9 @@ fn copy_verified(
         let mut source_hash = Sha256::new();
         let mut buffer = vec![0u8; 1024 * 1024];
         let mut next_persist = 0u64;
+        let mut next_emit = 0u64;
+        let started = Instant::now();
+        let mut last_emit = Instant::now();
         loop {
             if state.cancelled_jobs.lock().unwrap().contains(job_id) {
                 return Err("__cancelled__".into());
@@ -4211,18 +4129,33 @@ fn copy_verified(
                 update_job_progress(app, state, job_id, file_id, "copying", copied, None)?;
                 next_persist = copied.saturating_add(8 * 1024 * 1024);
             }
-            let _ = app.emit(
-                "ingest-progress",
-                IngestProgress {
-                    job_id: job_id.into(),
-                    phase: "copying".into(),
-                    current_file: source.to_string_lossy().to_string(),
-                    files_complete: file_index,
-                    files_total: file_total,
-                    bytes_complete: base_bytes + copied,
-                    bytes_total: total_bytes,
-                },
-            );
+            if copied >= next_emit || last_emit.elapsed() >= StdDuration::from_millis(250) {
+                let elapsed = started.elapsed().as_secs_f64();
+                let bytes_per_second = (elapsed >= 0.25)
+                    .then_some((copied as f64 / elapsed).round() as u64)
+                    .filter(|value| *value > 0);
+                let eta_seconds = bytes_per_second.map(|rate| {
+                    total_bytes
+                        .saturating_sub(base_bytes.saturating_add(copied))
+                        .div_ceil(rate)
+                });
+                let _ = app.emit(
+                    "ingest-progress",
+                    IngestProgress {
+                        job_id: job_id.into(),
+                        phase: "copying".into(),
+                        current_file: source.to_string_lossy().to_string(),
+                        files_complete: file_index,
+                        files_total: file_total,
+                        bytes_complete: base_bytes + copied,
+                        bytes_total: total_bytes,
+                        bytes_per_second,
+                        eta_seconds,
+                    },
+                );
+                next_emit = copied.saturating_add(8 * 1024 * 1024);
+                last_emit = Instant::now();
+            }
         }
         output.sync_all().map_err(|error| error.to_string())?;
         drop(output);
@@ -4237,17 +4170,17 @@ fn copy_verified(
                 files_total: file_total,
                 bytes_complete: base_bytes + copied,
                 bytes_total: total_bytes,
+                bytes_per_second: None,
+                eta_seconds: None,
             },
         );
         let copied_source_hash = format!("{:x}", source_hash.finalize());
-        verify_approved_source_hash(&copied_source_hash, approved_hash)?;
+        if let Some(approved_hash) = approved_hash {
+            verify_approved_source_hash(&copied_source_hash, approved_hash)?;
+        }
         let after = fs_safe::snapshot(source)?;
         if before != after || copied != before.length {
             return Err("Source changed during transfer; staged copy was rejected".into());
-        }
-        let post_copy_source_hash = sha256(source)?;
-        if post_copy_source_hash != approved_hash {
-            return Err("Source content changed during transfer; staged copy was rejected".into());
         }
         if let Some(expected_volume) = source_volume_identity {
             if volume_identity_for_path(source)?.as_deref() != Some(expected_volume) {
@@ -4256,21 +4189,22 @@ fn copy_verified(
                 );
             }
         }
-        if sha256(&temp)? != approved_hash {
+        if sha256(&temp)? != copied_source_hash {
             return Err("Independent SHA-256 verification failed".into());
         }
         journal.status = "verified".into();
-        write_json(&journal_path, &journal)?;
-        fs_safe::promote_no_overwrite(&temp, destination)?;
-        journal.status = "committed".into();
         write_json(&journal_path, &journal)?;
         Ok(copied_source_hash)
     })();
     match operation {
         Ok(hash) => {
-            volume_permit.add_bytes_for(&source_volume, before.length.saturating_mul(2), 0);
+            volume_permit.add_bytes_for(&source_volume, before.length, 0);
             volume_permit.add_bytes_for(&destination_volume, before.length, before.length);
-            Ok(VerifiedCopy { hash, journal_path })
+            Ok(VerifiedCopy {
+                hash,
+                journal_path,
+                staged_path: temp,
+            })
         }
         Err(error) => {
             if error != "__cancelled__" && likely_io_error(&error) {
@@ -4292,6 +4226,21 @@ fn copy_verified(
         }
     }
 }
+
+fn promote_verified_copy(copy: &VerifiedCopy, destination: &Path) -> Result<(), String> {
+    fs_safe::promote_no_overwrite(&copy.staged_path, destination)?;
+    let mut journal: IngestJournal = read_json(&copy.journal_path)?;
+    journal.status = "committed".into();
+    write_json(&copy.journal_path, &journal)
+}
+
+fn discard_verified_duplicate(copy: &VerifiedCopy) -> Result<(), String> {
+    if copy.staged_path.is_file() {
+        fs::remove_file(&copy.staged_path).map_err(|error| error.to_string())?;
+    }
+    remove_journal(&copy.journal_path)
+}
+
 fn new_media(
     source: &Path,
     relative: String,
@@ -4497,6 +4446,7 @@ fn complete_duplicate_job_file(
     job_id: &str,
     file_id: &str,
     media_id: &str,
+    bytes_processed: u64,
 ) -> Result<(), String> {
     mutate_jobs(app, state, |jobs| {
         let job = jobs
@@ -4510,7 +4460,7 @@ fn complete_duplicate_job_file(
             .ok_or("Ingest job file no longer exists")?;
         file.media_id = media_id.into();
         file.state = "completed".into();
-        file.bytes_transferred = 0;
+        file.bytes_transferred = bytes_processed;
         file.error = None;
         job.files_completed = job
             .files
@@ -4688,7 +4638,14 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                         && item.sha256 == expected_hash
                 });
             if trustworthy && existing.is_some() {
-                complete_duplicate_job_file(app, &state, job_id, &planned.id, &planned.media_id)?;
+                complete_duplicate_job_file(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    &planned.media_id,
+                    0,
+                )?;
                 continue;
             }
             update_job_progress(
@@ -4716,6 +4673,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                             job_id,
                             &planned.id,
                             &existing.id,
+                            planned.size_bytes,
                         )?;
                     } else {
                         commit_job_file(
@@ -4758,13 +4716,56 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             job.bytes_total,
             index,
             job.files.len(),
-            planned
-                .approved_sha256
-                .as_deref()
-                .ok_or("Approved ingest file is missing its SHA-256")?,
+            planned.approved_sha256.as_deref(),
             planned.source_volume_identity.as_deref(),
         ) {
             Ok(copy) => {
+                let catalogue = load_catalogue_file(&settings)?;
+                let candidates = catalogue
+                    .media
+                    .iter()
+                    .filter(|item| item.sha256 == copy.hash)
+                    .collect::<Vec<_>>();
+                let (disposition, existing_media_id, _, _) = classify_global_duplicate(
+                    &settings,
+                    &candidates,
+                    planned.size_bytes,
+                    &copy.hash,
+                    Some(&state),
+                    None,
+                );
+                if disposition == "already-imported" && !planned.intentional_duplicate {
+                    discard_verified_duplicate(&copy)?;
+                    complete_duplicate_job_file(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        existing_media_id
+                            .as_deref()
+                            .ok_or("Verified duplicate has no catalogue identity")?,
+                        planned.size_bytes,
+                    )?;
+                    completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
+                    continue;
+                }
+                if let Err(error) = promote_verified_copy(&copy, &destination) {
+                    let actionable = if error == "__destination_exists__" {
+                        actionable_ingest_error("__race__")
+                    } else {
+                        actionable_ingest_error(&error)
+                    };
+                    update_job_progress(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        "failed",
+                        planned.size_bytes,
+                        Some(actionable),
+                    )?;
+                    continue;
+                }
                 if let Err(error) = commit_job_file(
                     app,
                     &state,
@@ -11632,6 +11633,57 @@ mod tests {
     }
 
     #[test]
+    fn fast_inventory_uses_filename_and_size_only_as_a_duplicate_hint() {
+        let root = temporary("fast-inventory-hint");
+        let existing = root.join("clip.mp4");
+        fs::write(&existing, b"AAAAAAAA").unwrap();
+        let item = new_media(
+            &existing,
+            "20261118/clip.mp4".into(),
+            None,
+            sha256(&existing).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let catalogue = Catalogue {
+            media: vec![item],
+            ..Default::default()
+        };
+
+        // Metadata discovery may flag this for later verification, but cannot
+        // conclude that different bytes with the same name and size are equal.
+        let changed_same_size = root.join("incoming").join("clip.mp4");
+        fs::create_dir_all(changed_same_size.parent().unwrap()).unwrap();
+        fs::write(&changed_same_size, b"BBBBBBBB").unwrap();
+        assert_eq!(
+            possible_catalogue_matches(
+                &catalogue,
+                changed_same_size.file_name().unwrap().to_str().unwrap(),
+                fs::metadata(&changed_same_size).unwrap().len(),
+            ),
+            1
+        );
+        assert_ne!(sha256(&changed_same_size).unwrap(), catalogue.media[0].sha256);
+
+        // Identical bytes under another name are deliberately not discovered
+        // as duplicates until the copy-time content hash exists.
+        let renamed = root.join("incoming").join("renamed.mp4");
+        fs::write(&renamed, b"AAAAAAAA").unwrap();
+        assert_eq!(
+            possible_catalogue_matches(
+                &catalogue,
+                renamed.file_name().unwrap().to_str().unwrap(),
+                fs::metadata(&renamed).unwrap().len(),
+            ),
+            0
+        );
+        assert_eq!(sha256(&renamed).unwrap(), catalogue.media[0].sha256);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn approved_hash_rejects_same_size_content_changes_before_promotion() {
         let root = temporary("approved-plan-change");
         let source = root.join("clip.mp4");
@@ -11655,21 +11707,6 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn checksum_inventory_cancels_before_another_large_read() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let cancelled = AtomicBool::new(false);
-        let mut source = std::io::Cursor::new(vec![7_u8; 3 * 1024 * 1024]);
-        let result = sha256_reader_cancellable(
-            &mut source,
-            || cancelled.load(Ordering::SeqCst),
-            |_| cancelled.store(true, Ordering::SeqCst),
-        );
-        assert_eq!(result.unwrap_err(), "Inventory cancelled safely");
-        assert_eq!(source.position(), 1024 * 1024);
     }
 
     #[test]
@@ -12242,6 +12279,7 @@ mod tests {
         assert!(!settings.sidebar_collapsed);
         assert_eq!(settings.library_folder_sort, "newest");
         assert!(settings.library_folder_order.is_empty());
+        assert_eq!(settings.library_media_sort, "ingested-newest");
         assert_eq!(settings.resource_profile, "balanced");
         assert!(settings.gentle_scanning);
         assert!(settings.increase_processing_while_idle);
@@ -12707,6 +12745,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("sidebarCollapsed");
         value.as_object_mut().unwrap().remove("libraryFolderSort");
         value.as_object_mut().unwrap().remove("libraryFolderOrder");
+        value.as_object_mut().unwrap().remove("libraryMediaSort");
         value
             .as_object_mut()
             .unwrap()
@@ -12716,6 +12755,7 @@ mod tests {
         assert!(!settings.sidebar_collapsed);
         assert_eq!(settings.library_folder_sort, "newest");
         assert!(settings.library_folder_order.is_empty());
+        assert_eq!(settings.library_media_sort, "ingested-newest");
         assert_eq!(settings.library_thumbnail_width, 240);
     }
 

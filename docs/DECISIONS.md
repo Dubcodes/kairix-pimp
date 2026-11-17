@@ -566,3 +566,17 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted, pending installed cold-fallback and audible-output acceptance
 - **Decision:** Keep the configured Tauri asset scope empty. After resolving a known media ID beneath Master Bin or independently validating a finalized fingerprinted proxy, canonicalize that exact file and grant it runtime asset access; permit only the application and Tauri asset origins under `media-src`. Start the resolved source immediately. If WebView2 produces a structured media error, make at most one automatic request through the existing cancellable, per-fingerprint proxy pipeline, ignore stale completion after navigation and begin the validated result. Retain a manual retry only after genuine failure. Record bounded source/metadata/first-frame/playing/seek/error timing without absolute paths.
 - **Consequences:** Valid originals and completed proxies can reach WebView2 without exposing a folder or drive, while unsupported media no longer normally requires a conversion click. A repository-built packaged-app pass played production H.264 and HEVC originals and sought successfully with observed first-frame times of 154–777 ms. That pass did not need the proxy path and did not independently confirm audible output or installer-installed identity, so those remain explicit release gates.
+
+## ADR-078 — Discover ingest metadata first and establish content identity during verified staging
+
+- **Date:** 2026-11-18
+- **Status:** Accepted, pending physical-card performance acceptance
+- **Decision:** Build approved ingest inventories from traversal, filesystem metadata snapshots, package evidence and planned destinations without reading file content. Treat matching filename and size only as a visible hint. During transfer, revalidate the approved snapshot and volume, calculate SHA-256 while the same source read writes application-owned staging, independently hash staging, then recheck the source and resolve exact catalogue or same-batch duplicates before atomic no-overwrite promotion. Continue accepting schema-1 plans with optional historic hashes and require those hashes to match when present.
+- **Consequences:** Review no longer performs an unconditional full-card read, and a new file normally reads the source once plus staging once. Same-size different bytes still ingest independently, while renamed identical bytes are skipped only after actual content evidence and independent verification of the existing Master Bin object. Cancellation remains cooperative at metadata entries and copy chunks. Physical removable-card throughput, disconnect and installed-WebView responsiveness remain acceptance work.
+
+## ADR-079 — Sort media independently from folders
+
+- **Date:** 2026-11-18
+- **Status:** Accepted
+- **Decision:** Persist a device-local media ordering independent of folder ordering. Default to newest ingest timestamp first and offer oldest ingest, newest/oldest recorded date and filename A–Z/Z–A. Put missing recorded dates last in both recorded-date directions and break every tie by filename, relative path and stable media ID.
+- **Consequences:** Newly registered media appears at the top immediately after catalogue refresh without changing physical or virtual folder order. Results remain deterministic across refreshes and devices even when capture metadata is absent. The setting is presentation-only and emits no catalogue event.

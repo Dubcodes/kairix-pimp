@@ -543,7 +543,7 @@ describe('native application integration', () => {
           originalFilename: 'portrait.mp4',
           sha256: 'portrait',
           captureDateProvenance: 'filesystem',
-          ingestDate: '2026-11-04',
+          ingestDate: '2026-11-05',
           fileType: 'mp4',
           tags: ['interview'],
           projectIds: [],
@@ -1674,6 +1674,15 @@ describe('native application integration', () => {
       expect.objectContaining({ libraryFolderSort: 'name-asc' }),
     );
 
+    const mediaOrderSelect = screen.getByRole('combobox', {
+      name: 'Media order',
+    });
+    expect(mediaOrderSelect).toHaveValue('ingested-newest');
+    await user.selectOptions(mediaOrderSelect, 'recorded-oldest');
+    expect(mocks.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ libraryMediaSort: 'recorded-oldest' }),
+    );
+
     await user.selectOptions(orderSelect, 'custom');
     await user.click(screen.getByRole('button', { name: 'Move Zeta up' }));
     await waitFor(() =>
@@ -1721,6 +1730,46 @@ describe('native application integration', () => {
         'Scan complete: 2 registered, 0 changed, 1 pending, 0 errors.',
       ),
     ).toBeVisible();
+  });
+
+  it('ignores a stale catalogue refresh that completes after a newer one', async () => {
+    const first = deferred<typeof mocks.catalogue>();
+    const second = deferred<typeof mocks.catalogue>();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Media library' });
+    mocks.loadCatalogue
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+
+    await act(async () => {
+      mocks.catalogueListener?.();
+      mocks.catalogueListener?.();
+    });
+    second.resolve({
+      ...mocks.catalogue,
+      media: [
+        {
+          id: 'newest',
+          relativePath: '20261118/newest.mp4',
+          originalFilename: 'newest.mp4',
+          sha256: 'newest',
+          captureDateProvenance: 'unknown',
+          ingestDate: '2026-11-18T10:00:00Z',
+          fileType: 'mp4',
+          tags: [],
+          projectIds: [],
+          notes: '',
+          technical: { sizeBytes: 1 },
+          available: true,
+          needsReview: false,
+        },
+      ],
+    });
+    expect(await screen.findByText('newest.mp4')).toBeVisible();
+
+    first.resolve({ ...mocks.catalogue, media: [] });
+    await act(async () => first.promise);
+    expect(screen.getByText('newest.mp4')).toBeVisible();
   });
 
   it('starts conservative discovery automatically for a configured library', async () => {
@@ -2738,8 +2787,8 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(mocks.startNativeMediaDrag).toHaveBeenCalledWith([
         'media-1',
-        'media-2',
         'media-3',
+        'media-2',
       ]),
     );
     expect(await screen.findByText(/Windows drag cancelled/)).toBeVisible();
@@ -2780,14 +2829,14 @@ describe('native application integration', () => {
     await user.click(screen.getByRole('button', { name: 'More actions' }));
     await user.click(screen.getByRole('button', { name: 'Favourite' }));
     expect(mocks.updateMedia).toHaveBeenCalledWith({
-      mediaIds: ['media-1', 'media-2', 'media-3'],
+      mediaIds: ['media-1', 'media-3', 'media-2'],
       favourite: true,
     });
 
     await user.click(screen.getByRole('button', { name: /Copy file paths/ }));
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
-        'C:\\Master\\media-1.mp4\r\nC:\\Master\\media-2.mp4\r\nC:\\Master\\media-3.mp4',
+        'C:\\Master\\media-1.mp4\r\nC:\\Master\\media-3.mp4\r\nC:\\Master\\media-2.mp4',
       ),
     );
 

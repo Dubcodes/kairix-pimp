@@ -57,6 +57,13 @@ export interface DeviceSettings {
     | 'fewest-recordings'
     | 'custom';
   libraryFolderOrder?: string[];
+  libraryMediaSort?:
+    | 'ingested-newest'
+    | 'ingested-oldest'
+    | 'recorded-newest'
+    | 'recorded-oldest'
+    | 'filename-asc'
+    | 'filename-desc';
   sdGrabberEnabled: boolean;
   sdGrabberAutoDetect: boolean;
   sdGrabberExtensions: string[];
@@ -285,6 +292,8 @@ export interface IngestProgress {
   filesTotal: number;
   bytesComplete: number;
   bytesTotal: number;
+  bytesPerSecond?: number;
+  etaSeconds?: number;
 }
 export interface IngestResult {
   imported: MediaItem[];

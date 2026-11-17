@@ -99,6 +99,7 @@ import {
   logicalTags,
   visibleMedia,
 } from './media-grouping';
+import { sortLibraryMedia, type LibraryMediaSort } from './library-sort';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
 type SettingsSection =
@@ -233,6 +234,7 @@ export function App() {
   const native = nativeAvailable();
   const [settings, setSettings] = useState<DeviceSettings>(emptySettings);
   const [catalogue, setCatalogue] = useState<Catalogue>(emptyCatalogue);
+  const catalogueRequestGeneration = useRef(0);
   const [view, setView] = useState<View>('Library');
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>('General');
@@ -528,8 +530,14 @@ export function App() {
     return () =>
       window.removeEventListener('beforeunload', preservePendingSettings);
   }, [savingSettings]);
+  const commitCatalogue = useCallback((next: Catalogue) => {
+    catalogueRequestGeneration.current += 1;
+    setCatalogue(next);
+  }, []);
   const refresh = useCallback(async () => {
-    setCatalogue(await desktopBridge.loadCatalogue());
+    const generation = ++catalogueRequestGeneration.current;
+    const next = await desktopBridge.loadCatalogue();
+    if (generation === catalogueRequestGeneration.current) setCatalogue(next);
   }, []);
   const runDiscovery = useCallback(
     async (full = false, announce = false) => {
@@ -661,7 +669,7 @@ export function App() {
             if (after !== before)
               nextCatalogue = await desktopBridge.loadCatalogue();
             catalogueSignature.current = after;
-            setCatalogue(nextCatalogue);
+            commitCatalogue(nextCatalogue);
           }
         },
       )
@@ -678,7 +686,7 @@ export function App() {
       stopDiscovery?.();
       stopCatalogue?.();
     };
-  }, [native, refresh, savingSettings]);
+  }, [commitCatalogue, native, refresh, savingSettings]);
   useEffect(() => {
     if (!native) return;
     let stop: (() => void) | undefined;
@@ -949,7 +957,7 @@ export function App() {
         }
         if (!disposed) {
           catalogueSignature.current = observed;
-          setCatalogue(nextCatalogue);
+          commitCatalogue(nextCatalogue);
         }
       } catch {
         // A partial Syncthing delivery is retried on the next poll.
@@ -964,19 +972,19 @@ export function App() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [configured, native]);
+  }, [commitCatalogue, configured, native]);
   useEffect(() => {
     if (!native || !configured) return;
     const timer = window.setInterval(() => {
       void desktopBridge
         .refreshMediaAvailability()
         .then(async (changed) => {
-          if (changed) setCatalogue(await desktopBridge.loadCatalogue());
+          if (changed) await refresh();
         })
         .catch(() => undefined);
     }, 3_000);
     return () => window.clearInterval(timer);
-  }, [configured, native]);
+  }, [configured, native, refresh]);
   useEffect(() => {
     if (!native || !configured || settings.backgroundProcessingPaused) return;
     let stabilityTimer: number | undefined;
@@ -1247,22 +1255,33 @@ export function App() {
   }, [displayedMedia, settings.libraryFolderOrder, settings.libraryFolderSort]);
   const filtered = useMemo(
     () =>
-      displayedMedia.filter((item) => {
-        const itemFolder =
-          item.relativePath.split('/').slice(0, -1).join('/') ||
-          'Master Bin root';
-        return (
-          (includeUnavailable || item.available) &&
-          (folder === 'All media' || folder === itemFolder) &&
-          tagFilters.every((filter) =>
-            logicalTags(item, catalogue.media).some(
-              (tag) => tag.toLocaleLowerCase() === filter.toLocaleLowerCase(),
-            ),
-          ) &&
-          logicalMediaMatches(item, query, catalogue)
-        );
-      }),
-    [catalogue, displayedMedia, folder, includeUnavailable, query, tagFilters],
+      sortLibraryMedia(
+        displayedMedia.filter((item) => {
+          const itemFolder =
+            item.relativePath.split('/').slice(0, -1).join('/') ||
+            'Master Bin root';
+          return (
+            (includeUnavailable || item.available) &&
+            (folder === 'All media' || folder === itemFolder) &&
+            tagFilters.every((filter) =>
+              logicalTags(item, catalogue.media).some(
+                (tag) => tag.toLocaleLowerCase() === filter.toLocaleLowerCase(),
+              ),
+            ) &&
+            logicalMediaMatches(item, query, catalogue)
+          );
+        }),
+        settings.libraryMediaSort ?? 'ingested-newest',
+      ),
+    [
+      catalogue,
+      displayedMedia,
+      folder,
+      includeUnavailable,
+      query,
+      settings.libraryMediaSort,
+      tagFilters,
+    ],
   );
   const replaceSelection = useCallback(
     (ids: string[], anchor: string | undefined, recordHistory = true) => {
@@ -1848,7 +1867,7 @@ export function App() {
     try {
       const mediaIds = expandLogicalMediaIds(selected, catalogue.media);
       const updated = await desktopBridge.updateMedia({ mediaIds, ...next });
-      setCatalogue(updated);
+      commitCatalogue(updated);
       const pendingManifests =
         updated.issues?.filter(
           (issue) => issue.code === 'project-manifest-pending',
@@ -1867,7 +1886,7 @@ export function App() {
   ) => {
     try {
       const mediaIds = expandLogicalMediaIds([mediaId], catalogue.media);
-      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...next }));
+      commitCatalogue(await desktopBridge.updateMedia({ mediaIds, ...next }));
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -1962,7 +1981,7 @@ export function App() {
     try {
       const updated = await desktopBridge.updateMedia({ mediaIds, notes });
       if (requestId !== descriptionSaveGeneration.current) return;
-      setCatalogue(updated);
+      commitCatalogue(updated);
       if (selectionKeyRef.current === requestSelectionKey)
         setDescriptionSaveStatus({
           selectionKey: requestSelectionKey,
@@ -2134,7 +2153,7 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      setCatalogue(await desktopBridge.loadCatalogue());
+      await refresh();
       setMessage(
         'External-audio pairing re-evaluated from the current catalogue.',
       );
@@ -2400,7 +2419,7 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      setCatalogue(
+      commitCatalogue(
         await desktopBridge.updateProject({
           projectId: selectedProject.id,
           notes: projectNotes,
@@ -2429,7 +2448,7 @@ export function App() {
           ? { addProjectIds: [selectedProject.id] }
           : { removeProjectIds: [selectedProject.id] }),
       });
-      setCatalogue(updated);
+      commitCatalogue(updated);
       setProjectMediaSelection([]);
       setMessage(
         add
@@ -2478,7 +2497,7 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      setCatalogue(await desktopBridge.updateMedia({ mediaIds, ...patch }));
+      commitCatalogue(await desktopBridge.updateMedia({ mediaIds, ...patch }));
       setMessage('Selected project recording metadata saved.');
     } catch (reason) {
       setError(errorText(reason));
@@ -4915,6 +4934,34 @@ export function App() {
                     <h2>Media library</h2>
                     <span>{filtered.length} persisted items</span>
                   </div>
+                  <label>
+                    <span>Media order</span>
+                    <select
+                      aria-label="Media order"
+                      value={settings.libraryMediaSort ?? 'ingested-newest'}
+                      onChange={(event) =>
+                        persistPreference({
+                          libraryMediaSort: event.target
+                            .value as LibraryMediaSort,
+                        })
+                      }
+                    >
+                      <option value="ingested-newest">
+                        Newest ingested first
+                      </option>
+                      <option value="ingested-oldest">
+                        Oldest ingested first
+                      </option>
+                      <option value="recorded-newest">
+                        Newest recorded first
+                      </option>
+                      <option value="recorded-oldest">
+                        Oldest recorded first
+                      </option>
+                      <option value="filename-asc">Filename A–Z</option>
+                      <option value="filename-desc">Filename Z–A</option>
+                    </select>
+                  </label>
                   <label className="thumbnail-size-control">
                     <span>Thumbnail size</span>
                     <input
@@ -5860,10 +5907,25 @@ export function App() {
                 <small className="error">{inventoryError}</small>
               )}
               {progress && (
-                <progress
-                  value={progress.bytesComplete}
-                  max={progress.bytesTotal || 1}
-                />
+                <div className="ingest-transfer-progress" role="status">
+                  <progress
+                    value={progress.bytesComplete}
+                    max={progress.bytesTotal || 1}
+                  />
+                  <small>
+                    {progress.phase === 'verifying'
+                      ? 'Verifying staged copy'
+                      : 'Copying and hashing source'}{' '}
+                    · {size(progress.bytesComplete)} /{' '}
+                    {size(progress.bytesTotal)}
+                    {progress.bytesPerSecond
+                      ? ` · ${size(progress.bytesPerSecond)}/s`
+                      : ''}
+                    {progress.etaSeconds !== undefined
+                      ? ` · about ${duration(progress.etaSeconds)} remaining`
+                      : ''}
+                  </small>
+                </div>
               )}
             </div>
             <div className="mode">
