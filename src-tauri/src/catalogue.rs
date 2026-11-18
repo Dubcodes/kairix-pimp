@@ -1405,28 +1405,49 @@ pub fn migrate_legacy_snapshot(root: &Path, _device_id: &str) -> Result<(), Stri
             if !root.join(backup).is_file() {
                 return Err("Migration marker exists but its legacy backup is missing".into());
             }
-            let stream = value
-                .get("eventStream")
-                .and_then(Value::as_str)
-                .ok_or("Migration marker does not identify its event stream")?;
             let backup_bytes = fs::read(root.join(backup)).map_err(|error| error.to_string())?;
             let expected_hash = value
                 .get("sourceSha256")
                 .and_then(Value::as_str)
-                .ok_or("Migration marker does not identify the migrated source hash")?;
+                .map(str::to_owned)
+                .unwrap_or_else(|| sha256_bytes(&backup_bytes));
             if sha256_bytes(&backup_bytes) != expected_hash {
                 return Err("Migration backup does not match the completed source hash".into());
             }
             let legacy: Catalogue = serde_json::from_slice(&backup_bytes)
                 .map_err(|error| format!("Migration backup is invalid: {error}"))?;
-            let bytes = fs::read(event_dir(root).join(stream)).map_err(|_| {
+            let stream = match value.get("eventStream").and_then(Value::as_str) {
+                Some(stream) => stream.to_owned(),
+                None => recover_legacy_migration_stream(root, &legacy)?,
+            };
+            if Path::new(&stream).file_name().and_then(|name| name.to_str())
+                != Some(stream.as_str())
+                || !stream.ends_with(".jsonl")
+            {
+                return Err("Migration marker identifies an invalid event stream".into());
+            }
+            let bytes = fs::read(event_dir(root).join(&stream)).map_err(|_| {
                 "Migration marker exists but its event stream is missing".to_string()
             })?;
             if !bytes.is_empty() && !bytes.ends_with(b"\n") {
                 return Err("Migration event stream is truncated".into());
             }
-            if bytes != migration_content(&legacy).as_bytes() {
+            if !migration_stream_matches(&legacy, &stream, &bytes) {
                 return Err("Migration event stream does not match its source snapshot".into());
+            }
+            if value.get("eventStream").is_none() || value.get("sourceSha256").is_none() {
+                write_json(
+                    &marker,
+                    &serde_json::json!({
+                        "schemaVersion": 2,
+                        "migratedAt": value.get("migratedAt").cloned().unwrap_or_else(|| Value::String(Utc::now().to_rfc3339())),
+                        "source": "catalogue.json",
+                        "sourceSha256": expected_hash,
+                        "backup": backup,
+                        "eventStream": stream,
+                        "migrationOwner": "legacy-v2-recovered"
+                    }),
+                )?;
             }
             return Ok(());
         }
@@ -1498,7 +1519,19 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn migration_content(legacy: &Catalogue) -> String {
-    let migration_device = "migration-v2".to_string();
+    migration_content_for(legacy, "migration-v2", false)
+}
+
+fn legacy_migration_content(legacy: &Catalogue, migration_device: &str) -> String {
+    migration_content_for(legacy, migration_device, true)
+}
+
+fn migration_content_for(
+    legacy: &Catalogue,
+    migration_device: &str,
+    legacy_registration: bool,
+) -> String {
+    let migration_device = migration_device.to_string();
     let mut content = String::new();
     let mut sequence = 0u64;
     let mut push = |event: CatalogueEvent, identity: String| {
@@ -1517,12 +1550,16 @@ fn migration_content(legacy: &Catalogue) -> String {
         content.push('\n');
     };
     for media in &legacy.media {
-        push(
+        let event = if legacy_registration {
+            CatalogueEvent::MediaRegistered {
+                media: media.clone(),
+            }
+        } else {
             CatalogueEvent::MediaLegacySnapshotReplaced {
                 media: media.clone(),
-            },
-            format!("media-{}", media.id),
-        );
+            }
+        };
+        push(event, format!("media-{}", media.id));
     }
     for project in &legacy.projects {
         push(
@@ -1541,6 +1578,42 @@ fn migration_content(legacy: &Catalogue) -> String {
         );
     }
     content
+}
+
+fn migration_stream_matches(legacy: &Catalogue, stream: &str, bytes: &[u8]) -> bool {
+    if stream == "migration-v2.jsonl" {
+        return bytes == migration_content(legacy).as_bytes();
+    }
+    let Some(device) = stream.strip_suffix(".jsonl") else {
+        return false;
+    };
+    device.starts_with("migration-")
+        && bytes == legacy_migration_content(legacy, device).as_bytes()
+}
+
+fn recover_legacy_migration_stream(root: &Path, legacy: &Catalogue) -> Result<String, String> {
+    let directory = event_dir(root);
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&directory)
+        .map_err(|_| "Migration marker does not identify its event stream".to_string())?
+    {
+        let entry = entry.map_err(|error| format!("Cannot inspect migration events: {error}"))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("migration-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let bytes = fs::read(entry.path())
+            .map_err(|error| format!("Cannot read migration event stream: {error}"))?;
+        if migration_stream_matches(legacy, &name, &bytes) {
+            matches.push(name);
+        }
+    }
+    matches.sort();
+    match matches.as_slice() {
+        [stream] => Ok(stream.clone()),
+        [] => Err("Migration marker does not identify its event stream".into()),
+        _ => Err("Migration marker matches multiple event streams; recovery is ambiguous".into()),
+    }
 }
 
 #[cfg(test)]
@@ -2603,6 +2676,81 @@ mod tests {
         assert_eq!(rebuilt.projects[0].id, "legacy-project");
         assert_eq!(rebuilt.folders[0].id, "legacy-folder");
         assert!(root.join("catalogue.pre-events-v1.backup.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_upgrades_exact_legacy_marker_without_rewriting_events() {
+        let root = temporary("legacy-migration-marker");
+        let legacy = Catalogue {
+            media: vec![item("legacy-media", "2026-10-22/clip.mp4", "mp4")],
+            ..Default::default()
+        };
+        let backup = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(root.join("catalogue.json"), &backup).unwrap();
+        fs::write(
+            root.join("catalogue.pre-events-v1.backup.json"),
+            &backup,
+        )
+        .unwrap();
+        fs::create_dir_all(event_dir(&root)).unwrap();
+        let stream_name = "migration-desktop.jsonl";
+        let stream = legacy_migration_content(&legacy, "migration-desktop");
+        fs::write(event_dir(&root).join(stream_name), &stream).unwrap();
+        fs::write(
+            root.join("migration-v2.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "migratedAt": "2026-10-22T00:00:00Z",
+                "source": "catalogue.json",
+                "backup": "catalogue.pre-events-v1.backup.json"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_legacy_snapshot(&root, "desktop").unwrap();
+
+        assert_eq!(fs::read_to_string(event_dir(&root).join(stream_name)).unwrap(), stream);
+        let marker: Value = serde_json::from_slice(
+            &fs::read(root.join("migration-v2.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["eventStream"], stream_name);
+        assert_eq!(marker["sourceSha256"], sha256_bytes(&backup));
+        assert_eq!(load(&root).unwrap().media[0].id, "legacy-media");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_does_not_guess_between_multiple_legacy_streams() {
+        let root = temporary("ambiguous-legacy-migration-marker");
+        let legacy = Catalogue {
+            media: vec![item("legacy-media", "2026-10-22/clip.mp4", "mp4")],
+            ..Default::default()
+        };
+        let backup = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(root.join("catalogue.pre-events-v1.backup.json"), &backup).unwrap();
+        fs::create_dir_all(event_dir(&root)).unwrap();
+        for device in ["migration-desktop", "migration-laptop"] {
+            fs::write(
+                event_dir(&root).join(format!("{device}.jsonl")),
+                legacy_migration_content(&legacy, device),
+            )
+            .unwrap();
+        }
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "source": "catalogue.json",
+            "backup": "catalogue.pre-events-v1.backup.json"
+        }))
+        .unwrap();
+        fs::write(root.join("migration-v2.json"), &marker).unwrap();
+
+        let error = migrate_legacy_snapshot(&root, "desktop").unwrap_err();
+
+        assert!(error.contains("ambiguous"));
+        assert_eq!(fs::read(root.join("migration-v2.json")).unwrap(), marker);
         fs::remove_dir_all(root).unwrap();
     }
 

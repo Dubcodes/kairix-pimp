@@ -17,14 +17,23 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented Projects workspace: navigable project details, read-only categorized folder inventory, local status/size/main-project evidence, portable notes/tags, linked logical recordings and Library/Explorer navigation
 - Implemented Projects workspace resilience: stale-request suppression, bounded read-only inventory, independent accessible row controls, grouped recording metadata actions and focus-preserving Library location
 - Implemented Library usability: persistent icon-only sidebar, six deterministic folder sort modes plus accessible custom order, logical video/WAV metadata and counts, clean thumbnail placeholders, themed batch editing and content scroll-to-top
+- Implemented compact floating Library selection workflow: configurable device-local position/actions, all/some/none tag state, bounded selection undo/redo, grid focus/navigation, viewer/search shortcuts and an accessible shortcut reference
+- Implemented same-window Clip Viewer foundation: WebView2 playback controls and error states, responsive portrait/landscape layout, previous/next navigation, catalogue metadata editing, associated-file reveal and explicit device-local thumbnail-frame selection
+- Implemented conservative saved-project observation: bounded stable gzip-XML/XML parsing, canonical object-definition/reference graph, named sequence deduplication, established root/nested bin placement, imported/used/unclassified path evidence, timeline placement counts, exact canonical-path association and explicit partial/unsupported status; real-file acceptance and verified time ranges remain open
 - Implemented installed-app P0 corrections: responsive scroll-bounded ingest destination mapping and one validated batched thumbnail-source lookup with near-viewport lazy decoding
+- Implemented visible-thumbnail prioritization: missing near-viewport static images use one bounded fingerprint-keyed request, share the canonical media-ID source across Library and Projects, and complete before automatic hover-preview preparation for that card
 - Implemented: persistent device-local ingest jobs, bounded background worker, startup reconciliation, between-file pause, cancellation/retry, per-file job inspection and ingest-time tags/projects/notes/favourites
 - Implemented: active/completed/attention job separation with collapsed summaries and native-revalidated individual/all completed-history clearing
 - Implemented: normalized batch tags seed all eligible recording files while preserving later per-file tags; verified-copy source cleanup remains design-only and disabled
 - Implemented: updater configuration is preflighted before network access, unconfigured builds show manual test-build and Releases routes separately, and the official website is native-allowlisted
+- Implemented reliability correction: updater checks/installations are single-flight, failed checks and interrupted downloads cannot leave reusable stale state, critical filesystem operations share a native exclusion gate with installation, and publication verifies version/build/checksum/signature evidence before promoting a channel manifest
+- Implemented discovery correction: filesystem traversal/hashing runs on a blocking worker with streamed entries, repeated unchanged full verification emits no synchronized evidence event, and append failure retains stable retry evidence
+- Implemented approved ingest plans and global content deduplication: exact reviewed sources/destinations survive into the durable job; SHA-256 candidates are skipped only after a fresh stable local Master Bin verification; concurrent jobs reserve hashes
+- Implemented initial SD Card Grabber: Windows removable-volume enumeration with volume identity, manual folder fallback, recursive configurable MP4/WAV filtering, new/imported/attention summary, and copy-only verified ingest
+- Implemented ingest-triggered coalesced enrichment and ordinary-thumbnail byte-limit eviction; physical-card and installed Windows acceptance remain
 - Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history
-- Native notification watcher, bounded thumbnail eviction, folder notes and field-level conflict resolution workflow
+- Native notification watcher, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
 - Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
@@ -34,6 +43,19 @@ UI implemented and component-test covered: application shell, primary navigation
 - Evidence-scored and reversible DJI camera/audio pairing
 - Implemented: configurable date/time folder naming with live preview, requested `yyyymmdd` new-install default, separators, 12-/24-hour patterns, validation, and legacy preference preservation
 - Remaining rich Library interaction: saved filters, richer previews and explicit review/conflict-resolution flows
+- Implemented Library reliability repair: correct Windows Shell parent/child reveal boundary, selection-keyed description persistence with failure/stale-response handling, and bounded regeneration of missing/invalid/evicted thumbnail JPEGs
+- Implemented thumbnail retry hardening: in-flight-only deduplication, bounded failure backoff, visible/near-static priority ahead of hover work, refresh-safe shared URLs, per-media native generation coordination and protected cache eviction
+- Implemented independent derivative lanes: static and hover work use separate single-active queues/native admission, static FFmpeg has a bounded timeout, and validated hover readiness is shown without per-card filesystem checks
+- Implemented responsive Library sizing: persistent 160–360 pixel tiles, auto-fill columns, stable 16:9 cards, independent folder/media scrolling and lower-right media scroll control
+- Implemented lightweight date reapproval: exact approved-file stat checks, zero source-content rereads, package-date evidence, immutable serialized plan revisions and stale-plan rejection
+- Implemented managed playback proxies: per-fingerprint deduplication, real time progress, safe FFmpeg cancellation, strict codec/container validation, active-file protection and a separate cache budget
+- Implemented keyboard ownership and conservative Premiere evidence: editable/combo/modal surfaces retain native keys and undo; arbitrary saved-project paths stay unclassified, historical labels require prior positive evidence and incomplete timeline relationships report Unknown
+- Implemented background observability hardening: actual thumbnail-enrichment counts, playback processed/total time, saved-Premiere folder/read/resolve stages and volume-governor evidence remain device-local
+- Implemented native derivative observability: active static/hover workers join Background Operations and one real primary operation drives supported window-title/taskbar state; installed Windows acceptance remains open
+- Implemented volume-aware admission: stable Windows volume identity, atomic multi-volume permits, one full-content accessor per volume, independent-volume profile limits, safe pause, gentle pacing, measured local diagnostics and bounded error backoff now cover ingest, verification, backup/restore and derivatives; installed slow/removable-drive acceptance and reliable physical-disk grouping remain open
+- Implemented release transition: source `0.2.0` with explicit Development/Stable classification, integer SemVer policy, permanent protected public-release promotion, separate signed channel targets and user-selectable automatic checking. Owner key/environment provisioning and installed signed upgrade acceptance remain open.
+- Implemented shared static thumbnails: deterministic source/transform identities under the shared catalogue, atomic no-overwrite publication, legacy local-JPEG migration and retained stable frontend URLs. Hover previews/proxies remain local; real two-device arrival/conflict and 1,000-record installed scrolling acceptance remain open.
+- Implemented scroll ownership correction: Library parent overflow is disabled and folder/media panels own the remaining viewport; other workspaces retain conditional natural scrolling. Installed high-DPI/narrow/ultrawide acceptance remains open.
 
 ## Milestone 3 — Premiere extension
 
@@ -45,9 +67,13 @@ Keep direct DCM Master Bin references, dated bins and an optional virtual Audio 
 
 Add a separately packaged worker protocol, queue, resource governor, cache, and versioned results. Evaluate whisper.cpp for compact cross-platform distribution and faster-whisper where CUDA throughput justifies Python/CTranslate2 packaging. Add frame-sampled vision and audio-event models only after benchmark and licensing review. No model is bundled in Light.
 
+The proposed offline staged pipeline, timestamped observation/result schema, model provenance boundary and phased resource-validation plan are recorded in `LOCAL_AI_ANALYSIS_DESIGN.md`; implementation and model selection remain future work.
+
 ## Milestone 5 — verified consolidation/archive
 
 Inventory dependencies, support complete-source archives first, integrate Premiere Project Manager and/or PlumePack through supported interfaces, verify the output project, then add opt-in transcode/trim modes with handles and provenance. Transcodes receive new hashes linked by derivation records.
+
+Implemented foundation: persistent project backup jobs create a complete, no-overwrite external-drive copy with a portable SHA-256 manifest, destination-volume identity, restart recovery, independent re-verification and an empty-folder restore test. This is backup evidence, not Premiere collection or cleanup eligibility. Degoo currently uses an explicit manual browser handoff because no supported public unattended API was found; remote verification remains pending unless every object can be independently downloaded and hashed.
 
 Retain lightweight completed-project records in catalogue search and a portable project-local archive carrying stable project identity and its media manifest. Public sharing links and YouTube metadata remain deferred.
 
@@ -65,4 +91,4 @@ The versioned background job foundation is implemented for ingest: it persists i
 
 ## Milestone 7 — packaging and additional platforms
 
-Implemented for the public Light beta: keyless PR installer artifacts, a protected permanent manual-prerelease workflow, a separately protected signed-update workflow that publishes the channel manifest last, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: provision the updater key pair and protected environments, complete a real signed installed upgrade, complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, add Authenticode signing, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.
+Implemented for the public Light beta: keyless PR installer artifacts, draft-until-verified manual prerelease publication, a separately protected signed-update workflow that validates the reviewed installer and reads back immutable signed assets before publishing the channel manifest last, a console-free release GUI subsystem, release-only media-tool console suppression, centralized tray/single-instance restore behavior and Windows Shell file selection. Remaining release work: provision the updater key pair and protected environments, complete a real signed installed upgrade including interruption/race/restart/data-preservation acceptance, complete installed console/focus/tray/Explorer acceptance, verify binary dependency contents, complete schema-2 and two-device Syncthing acceptance, add Authenticode signing, split future Full packaging, then validate Linux WebKit/FFmpeg packaging and macOS signing/notarization and sandbox behavior.

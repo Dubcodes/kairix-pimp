@@ -45,9 +45,12 @@ async function findChildBin(parent, name) {
   return undefined;
 }
 
-async function getOrCreateBin(project, parent, name) {
+async function getOrCreateBin(project, parent, name, binCounts) {
   const existing = await findChildBin(parent, name);
-  if (existing) return existing;
+  if (existing) {
+    binCounts.reused += 1;
+    return existing;
+  }
   project.lockedAccess(() => {
     project.executeTransaction((compoundAction) => {
       compoundAction.addAction(parent.createBinAction(name, false));
@@ -55,15 +58,22 @@ async function getOrCreateBin(project, parent, name) {
   });
   const created = await findChildBin(parent, name);
   if (!created) throw new Error(`Premiere did not create bin “${name}”.`);
+  binCounts.created += 1;
   return created;
 }
 
-async function resolveTargetBin(project, root, targetName, relativePath) {
+async function resolveTargetBin(
+  project,
+  root,
+  targetName,
+  relativePath,
+  binCounts,
+) {
   let current = targetName
-    ? await getOrCreateBin(project, root, targetName)
+    ? await getOrCreateBin(project, root, targetName, binCounts)
     : root;
   for (const name of relativePath.split('/').filter(Boolean))
-    current = await getOrCreateBin(project, current, name);
+    current = await getOrCreateBin(project, current, name, binCounts);
   return current;
 }
 
@@ -121,6 +131,7 @@ importButton.addEventListener('click', async () => {
     let imported = 0;
     let skipped = 0;
     let failed = 0;
+    const binCounts = { created: 0, reused: 0 };
     const targetName = targetBinInput.value.trim();
 
     for (const group of groups) {
@@ -129,6 +140,7 @@ importButton.addEventListener('click', async () => {
         root,
         targetName,
         group.binPath,
+        binCounts,
       );
       for (const item of group.items) {
         if (existingPaths.has(PimpManifest.normalizePath(item.absolutePath))) {
@@ -157,7 +169,9 @@ importButton.addEventListener('click', async () => {
         }
       }
     }
-    setStatus(`${imported} imported · ${skipped} skipped · ${failed} failed`);
+    setStatus(
+      `${imported} imported · ${skipped} skipped · ${failed} failed · ${binCounts.created} bins created · ${binCounts.reused} bins reused`,
+    );
   } catch (error) {
     setStatus(`Import stopped: ${error.message ?? error}`);
   } finally {

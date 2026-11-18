@@ -1,22 +1,38 @@
-name: Publish public Windows beta
+name: Publish approved public Windows release
 
 on:
   workflow_dispatch:
     inputs:
       confirm_version:
-        description: Exact package version to publish (for example 0.1.1-5)
+        description: Exact internal SemVer to publish (for example 0.2.0)
         required: true
+        type: string
+      classification:
+        description: Explicit release classification
+        required: true
+        type: choice
+        options:
+          - development
+          - stable
+      stable_approval:
+        description: For Stable only, enter APPROVE STABLE followed by the exact version
+        required: false
         type: string
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: public-windows-release-publication
+  cancel-in-progress: false
 
 jobs:
-  publish-manual-beta:
+  publish-approved-release:
     if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 50
-    environment: public-beta-release
+    environment: ${{ inputs.classification == 'stable' && 'stable-release' || 'public-beta-release' }}
     steps:
       - name: Check out reviewed main source
         uses: actions/checkout@v7
@@ -58,17 +74,28 @@ jobs:
           $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           $version = $package.version
           if ($version -ne '${{ inputs.confirm_version }}') { throw 'Confirmation does not match package.json.' }
-          if ($version -notmatch '^\d+\.\d+\.\d+-\d+$') { throw 'Beta version must use a numeric prerelease.' }
           if ($desktop.version -ne $version -or $tauri.version -ne $version -or $cargoVersion -ne $version) {
             throw 'Version metadata disagrees across package, Cargo and Tauri.'
           }
+          node tools/release-policy.mjs validate $version '${{ inputs.classification }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Version policy validation failed.' }
+          if ('${{ inputs.classification }}' -eq 'stable' -and '${{ inputs.stable_approval }}' -ne "APPROVE STABLE $version") {
+            throw 'Stable publication requires the exact protected approval phrase.'
+          }
           $tag = "v$version"
           $remoteTag = git ls-remote --tags origin "refs/tags/$tag"
-          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) { throw "Tag $tag already exists." }
+          $tagExists = -not [string]::IsNullOrWhiteSpace($remoteTag)
+          if ($tagExists) {
+            $tagSha = ($remoteTag -split "`t")[0]
+            if ($tagSha -ne $head) { throw "Tag $tag already names a different source commit." }
+          }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "short_sha=$($head.Substring(0,12))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "classification=${{ inputs.classification }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_date=$((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Run complete verification
         run: |
@@ -88,7 +115,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:PIMP_UPDATER_PUBLIC_KEY)) {
             'UPDATER_STATUS=Automatic updates disabled; no public key was embedded.' | Out-File $env:GITHUB_ENV -Append
           } else {
-            cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_beta_and_fails_closed_without_a_public_key
+            cargo test --manifest-path src-tauri/Cargo.toml updater_is_a_higher_development_release_and_fails_closed_without_a_public_key
             if ($LASTEXITCODE -ne 0) { throw 'The configured updater public key is invalid.' }
             'UPDATER_STATUS=Automatic updates configured with the validated repository public key.' | Out-File $env:GITHUB_ENV -Append
           }
@@ -97,6 +124,8 @@ jobs:
         env:
           PIMP_BUILD_COMMIT: ${{ steps.identity.outputs.sha }}
           PIMP_UPDATER_PUBLIC_KEY: ${{ vars.PIMP_UPDATER_PUBLIC_KEY }}
+          PIMP_RELEASE_CLASSIFICATION: ${{ steps.identity.outputs.classification }}
+          PIMP_RELEASE_DATE: ${{ steps.identity.outputs.release_date }}
         run: npm run tauri -- build --bundles msi,nsis
 
       - name: Verify and stage public assets
@@ -116,8 +145,10 @@ jobs:
             "$hash  $($_.Name)"
           } | Set-Content (Join-Path $stage 'SHA256SUMS.txt')
           @(
-            'Kairix PIMP Light — Windows Beta'
+            'Kairix PIMP Light — Windows Release'
             "Version: $version"
+            "Classification: ${{ steps.identity.outputs.classification }}"
+            "Release date: ${{ steps.identity.outputs.release_date }}"
             "Source commit: ${{ steps.identity.outputs.sha }}"
             'Authenticode signed: no'
             $env:UPDATER_STATUS
@@ -126,13 +157,63 @@ jobs:
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
           if ([BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68) -ne 2) { throw 'Release executable is not a Windows GUI application.' }
 
-      - name: Create permanent public prerelease
+      - name: Stage and publish permanent public release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ steps.identity.outputs.tag }}'
-          git tag $tag '${{ steps.identity.outputs.sha }}'
-          git push origin "refs/tags/$tag"
+          if ('${{ steps.identity.outputs.tag_exists }}' -ne 'true') {
+            git tag $tag '${{ steps.identity.outputs.sha }}'
+            git push origin "refs/tags/$tag"
+          }
           $assets = Get-ChildItem release-assets -File
-          gh release create $tag $assets.FullName --verify-tag --prerelease --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title 'Kairix PIMP Light — Windows Beta'
+          $classification = '${{ steps.identity.outputs.classification }}'
+          $displayVersion = node -e "const v=process.argv[1].split('.'); console.log(v[2]==='0'?v.slice(0,2).join('.'):process.argv[1])" '${{ steps.identity.outputs.version }}'
+          $title = "Kairix PIMP Light $displayVersion — $($classification.Substring(0,1).ToUpper())$($classification.Substring(1))"
+          $release = gh release view $tag --json isDraft 2>$null | ConvertFrom-Json
+          if ($LASTEXITCODE -eq 0) {
+            if (-not $release.isDraft) { throw 'The version is already publicly released and is immutable.' }
+            gh release edit $tag --notes-file docs/BETA_RELEASE_NOTES.md --title $title
+          } else {
+            gh release create $tag --verify-tag --draft --latest=false --notes-file docs/BETA_RELEASE_NOTES.md --title $title
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the draft public release.' }
+          $published = gh release view $tag --json assets | ConvertFrom-Json
+          foreach ($asset in $assets) {
+            $remote = @($published.assets | Where-Object { $_.name -eq $asset.Name })
+            if ($remote.Count -eq 0) {
+              gh release upload $tag $asset.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Could not upload $($asset.Name); the release remains a draft." }
+            } elseif ($remote.Count -ne 1 -or [long]$remote[0].size -ne $asset.Length) {
+              throw "Existing draft asset $($asset.Name) is not the reviewed file; refusing replacement."
+            }
+          }
+          $readback = New-Item -ItemType Directory -Force release-readback
+          gh release download $tag --dir $readback
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read back the draft release assets.' }
+          foreach ($asset in $assets) {
+            $remotePath = Join-Path $readback $asset.Name
+            if (-not (Test-Path -LiteralPath $remotePath)) { throw "Draft asset $($asset.Name) is missing." }
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash
+            $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $remotePath).Hash
+            if ($localHash -ne $remoteHash) { throw "Draft asset $($asset.Name) differs from the reviewed bytes." }
+          }
+          $published = gh release view $tag --json assets | ConvertFrom-Json
+          foreach ($asset in $assets) {
+            $remote = @($published.assets | Where-Object { $_.name -eq $asset.Name -and [long]$_.size -eq $asset.Length })
+            if ($remote.Count -ne 1) { throw "Published asset verification failed for $($asset.Name); the release remains a draft." }
+          }
+          if ($classification -eq 'stable') {
+            gh release edit $tag --draft=false --prerelease=false --latest
+          } else {
+            gh release edit $tag --draft=false --prerelease --latest=false
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not promote the verified draft to a public release.' }
+
+      - name: Request protected signed updater publication when configured
+        if: vars.PIMP_UPDATER_PUBLIC_KEY != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run signed-beta-update.yml --ref main -f release_tag='${{ steps.identity.outputs.tag }}'

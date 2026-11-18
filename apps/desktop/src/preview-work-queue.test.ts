@@ -2,31 +2,81 @@ import { describe, expect, it, vi } from 'vitest';
 import { PreviewWorkQueue } from './preview-work-queue';
 
 describe('preview work queue', () => {
-  it('runs hover work before queued visible, nearby and idle preparation', async () => {
+  it('runs higher-priority queued work first within one lane', async () => {
     const queue = new PreviewWorkQueue();
     const order: string[] = [];
     let release!: () => void;
     const active = queue.schedule(
       'active',
-      2,
+      4,
       'nearby',
       () =>
         new Promise<void>((resolve) => {
           release = resolve;
         }),
     );
-    const idle = queue.schedule('idle', 3, 'idle', async () => {
+    const idle = queue.schedule('idle', 5, 'idle', async () => {
       order.push('idle');
     });
-    const visible = queue.schedule('visible', 1, 'visible', async () => {
-      order.push('visible');
+    const automatic = queue.schedule('automatic', 3, 'automatic', async () => {
+      order.push('automatic');
     });
-    const hover = queue.schedule('hover', 0, 'hover', async () => {
+    const hover = queue.schedule('hover', 2, 'hover', async () => {
       order.push('hover');
     });
+    const nearbyStatic = queue.schedule(
+      'static-nearby',
+      1,
+      'static nearby',
+      async () => {
+        order.push('static-nearby');
+      },
+    );
+    const visibleStatic = queue.schedule(
+      'static-visible',
+      0,
+      'static visible',
+      async () => {
+        order.push('static-visible');
+      },
+    );
     release();
-    await Promise.all([active, idle, visible, hover]);
-    expect(order).toEqual(['hover', 'visible', 'idle']);
+    await Promise.all([
+      active,
+      idle,
+      automatic,
+      hover,
+      nearbyStatic,
+      visibleStatic,
+    ]);
+    expect(order).toEqual([
+      'static-visible',
+      'static-nearby',
+      'hover',
+      'automatic',
+      'idle',
+    ]);
+  });
+
+  it('allows a static lane to progress while hover generation is blocked', async () => {
+    const hoverQueue = new PreviewWorkQueue();
+    const staticQueue = new PreviewWorkQueue();
+    let releaseHover!: () => void;
+    const hover = hoverQueue.schedule(
+      'hover',
+      0,
+      'hover',
+      () => new Promise<void>((resolve) => (releaseHover = resolve)),
+    );
+    const staticRun = vi.fn(async () => 'thumbnail');
+
+    await expect(
+      staticQueue.schedule('static', 0, 'static', staticRun),
+    ).resolves.toBe('thumbnail');
+    expect(staticRun).toHaveBeenCalledOnce();
+
+    releaseHover();
+    await hover;
   });
 
   it('deduplicates a key and bounds queued low-priority work', async () => {
@@ -72,5 +122,21 @@ describe('preview work queue', () => {
     release();
     await Promise.all([active, load, other]);
     expect(order).toEqual(['clip', 'other']);
+  });
+
+  it('cancels queued work that leaves the active viewport', async () => {
+    const queue = new PreviewWorkQueue();
+    let release!: () => void;
+    const active = queue.schedule(
+      'active',
+      0,
+      'active',
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    const queued = queue.schedule('static:clip', 0, 'static', async () => {});
+    expect(queue.cancel('static:clip')).toBe(true);
+    await expect(queued).rejects.toThrow(/active viewport/);
+    release();
+    await active;
   });
 });
