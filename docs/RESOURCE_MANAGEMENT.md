@@ -52,6 +52,8 @@ Separate derivative lanes do not grant unlimited I/O. The global FFmpeg gate and
 
 Quick Library inventory and approved ingest discovery enumerate paths, sizes and timestamps only. They never silently hash, register or treat metadata similarity as content identity. Explicit Library verification performs SHA-256 under a volume permit. Ingest obtains its source SHA-256 during the same read that writes staging, independently hashes staged bytes, rechecks the source snapshot and volume, and resolves global duplicates before promotion.
 
+Background discovery retries only actively stabilizing metadata snapshots after 16 seconds. A failed scan retries after 30 seconds; an unchanged scan or one containing only stable candidates awaiting explicit full verification backs off to two minutes. This cadence does not weaken the stability or full-content verification rules and remains a polling fallback until a native notification watcher exists.
+
 ## Required evidence and acceptance
 
 Automated synthetic tests cover per-volume serialization, independent volumes, reused drive-letter identities, atomic source/destination acquisition, foreground ordering, profile/idle transitions, cancellation, shutdown, bounded error backoff and measured byte counters. Installed acceptance must still use disposable fast and deliberately slow external media under concurrent ingest/playback, disconnect/reconnect and safe pause/resume. Record drive type, connection, corpus, elapsed time, throughput, process count, CPU/RAM and worker states. No production card or Master Bin deletion is part of this acceptance.

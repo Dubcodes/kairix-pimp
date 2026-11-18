@@ -580,3 +580,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Persist a device-local media ordering independent of folder ordering. Default to newest ingest timestamp first and offer oldest ingest, newest/oldest recorded date and filename A–Z/Z–A. Put missing recorded dates last in both recorded-date directions and break every tie by filename, relative path and stable media ID.
 - **Consequences:** Newly registered media appears at the top immediately after catalogue refresh without changing physical or virtual folder order. Results remain deterministic across refreshes and devices even when capture metadata is absent. The setting is presentation-only and emits no catalogue event.
+
+## ADR-080 — Commit ingest evidence and classify discovery pending work
+
+- **Date:** 2026-11-18
+- **Status:** Accepted
+- **Decision:** Append current-device integrity evidence with every successfully verified ingest registration, using the independently hashed staging identity and promoted destination snapshot. Keep quick inventory metadata-only, but expose separate counts for snapshots still stabilizing, stable candidates requiring an explicit full verification, and files changed during hashing. Retry only stabilizing work after 16 seconds, retry errors after 30 seconds and back unchanged or explicit-verification-only inventory off to two minutes.
+- **Consequences:** Newly ingested MP4/WAV pairs are visible immediately without physical files remaining under one unexplained pending number. Quick scans cannot treat mismatched hash/review evidence as verified. External files still require the conservative observation window and an explicit content read, and a notification watcher remains future work.

@@ -262,9 +262,15 @@ export interface RescanResult {
   registered: number;
   changed: number;
   pending: number;
+  pendingDetails: PendingDiscoveryCounts;
   errors: number;
   full: boolean;
   completedAt: string;
+}
+export interface PendingDiscoveryCounts {
+  stabilizing: number;
+  needsFullVerification: number;
+  changedDuringScan: number;
 }
 export interface DiscoveryStatus {
   running: boolean;
@@ -274,6 +280,7 @@ export interface DiscoveryStatus {
   registered: number;
   changed: number;
   pending: number;
+  pendingDetails: PendingDiscoveryCounts;
   errors: number;
   startedAt?: string;
   lastCompletedAt?: string;

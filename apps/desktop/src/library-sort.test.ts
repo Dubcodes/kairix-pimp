@@ -55,4 +55,44 @@ describe('Library media ordering', () => {
       sortLibraryMedia(tied, 'recorded-oldest').map(({ id }) => id),
     ).toEqual(['a', 'z', 'm']);
   });
+
+  it('orders filtered folder, search, tag, project, and unavailable subsets by ingest time', () => {
+    const older = {
+      ...item('older', 'older.mp4', '2026-11-01T10:00:00Z'),
+      relativePath: 'older/older.mp4',
+      tags: ['archive'],
+      projectIds: ['project-a'],
+      available: false,
+    };
+    const newer = {
+      ...item('newer', 'newer.mp4', '2026-11-18T10:00:00Z'),
+      relativePath: 'current/newer.mp4',
+      tags: ['selected'],
+      projectIds: ['project-a'],
+    };
+    const newest = {
+      ...item('newest', 'matching.mp4', '2026-11-19T10:00:00Z'),
+      relativePath: 'current/matching.mp4',
+      tags: ['selected'],
+      projectIds: ['project-b'],
+    };
+    const all = [older, newer, newest];
+    const ids = (subset: MediaItem[]) =>
+      sortLibraryMedia(subset, 'ingested-newest').map(({ id }) => id);
+
+    expect(ids(all)).toEqual(['newest', 'newer', 'older']);
+    expect(
+      ids(all.filter((entry) => entry.relativePath.startsWith('current/'))),
+    ).toEqual(['newest', 'newer']);
+    expect(
+      ids(all.filter((entry) => entry.originalFilename.includes('match'))),
+    ).toEqual(['newest']);
+    expect(ids(all.filter((entry) => entry.tags.includes('selected')))).toEqual(
+      ['newest', 'newer'],
+    );
+    expect(
+      ids(all.filter((entry) => entry.projectIds.includes('project-a'))),
+    ).toEqual(['newer', 'older']);
+    expect(ids(all.filter((entry) => !entry.available))).toEqual(['older']);
+  });
 });

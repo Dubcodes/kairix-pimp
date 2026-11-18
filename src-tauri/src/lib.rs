@@ -866,9 +866,25 @@ struct RescanResult {
     registered: usize,
     changed: usize,
     pending: usize,
+    #[serde(default)]
+    pending_details: PendingDiscoveryCounts,
     errors: usize,
     full: bool,
     completed_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PendingDiscoveryCounts {
+    stabilizing: usize,
+    needs_full_verification: usize,
+    changed_during_scan: usize,
+}
+
+impl PendingDiscoveryCounts {
+    fn total(&self) -> usize {
+        self.stabilizing + self.needs_full_verification + self.changed_during_scan
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -881,6 +897,8 @@ struct DiscoveryStatus {
     registered: usize,
     changed: usize,
     pending: usize,
+    #[serde(default)]
+    pending_details: PendingDiscoveryCounts,
     errors: usize,
     started_at: Option<String>,
     last_completed_at: Option<String>,
@@ -4387,7 +4405,7 @@ fn commit_job_file(
         &destination,
         file.relative_path.clone(),
         Some(file.source_relative_path.clone()),
-        hash,
+        hash.clone(),
         capture,
         provenance,
         false,
@@ -4414,6 +4432,24 @@ fn commit_job_file(
         events.push(CatalogueEvent::MediaRegistered {
             media: item.clone(),
         });
+    }
+    // The destination bytes were independently hashed in staging and then
+    // promoted atomically without overwrite. Record that verified identity for
+    // this device at commit time so a successful ingest is not presented as an
+    // unverified discovery candidate on every quick inventory.
+    let committed_snapshot = fs_safe::snapshot(&destination)?;
+    let evidence_item = catalogue
+        .media
+        .iter()
+        .find(|existing| existing.id == item.id || existing.relative_path == item.relative_path)
+        .unwrap_or(&item);
+    if let Some(event) = evidence_observation_event(
+        evidence_item,
+        &settings.device_id,
+        &committed_snapshot,
+        hash,
+    ) {
+        events.push(event);
     }
     if let Some(journal_path) = journal_path {
         let mut journal: IngestJournal = read_json(journal_path)?;
@@ -6740,6 +6776,22 @@ fn evidence_matches(
         })
 }
 
+fn has_verified_snapshot(
+    item: &MediaItem,
+    device_id: &str,
+    snapshot: &fs_safe::FileSnapshot,
+) -> bool {
+    item.integrity_by_device
+        .get(device_id)
+        .is_some_and(|evidence| {
+            evidence.observed_size == snapshot.length
+                && evidence.observed_modified_millis
+                    == snapshot.modified_millis.map(|value| value as u64)
+                && evidence.observed_sha256.as_deref() == Some(item.sha256.as_str())
+                && !evidence.needs_review
+        })
+}
+
 fn evidence_observation_event(
     item: &MediaItem,
     device_id: &str,
@@ -6862,6 +6914,7 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
     status.registered = 0;
     status.changed = 0;
     status.pending = 0;
+    status.pending_details = PendingDiscoveryCounts::default();
     status.errors = 0;
     publish_discovery_status(&app, &state, &status);
     let catalogue = load_catalogue_file(&settings)
@@ -6914,12 +6967,7 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
             }
         };
         if let Some(item) = known.get(&relative) {
-            let evidence = item.integrity_by_device.get(&settings.device_id);
-            let verified_snapshot = evidence.is_some_and(|evidence| {
-                evidence.observed_size == snapshot.length
-                    && evidence.observed_modified_millis
-                        == snapshot.modified_millis.map(|value| value as u64)
-            });
+            let verified_snapshot = has_verified_snapshot(item, &settings.device_id, &snapshot);
             if !full && verified_snapshot {
                 observations.verified(&relative);
                 continue;
@@ -6927,21 +6975,27 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
             if !verified_snapshot
                 && discovery::Decision::Wait == observations.observe(&relative, &snapshot, now)
             {
-                result.pending += 1;
+                result.pending_details.stabilizing += 1;
+                result.pending = result.pending_details.total();
                 status.pending = result.pending;
+                status.pending_details = result.pending_details.clone();
                 continue;
             }
         } else if discovery::Decision::Wait == observations.observe(&relative, &snapshot, now) {
-            result.pending += 1;
+            result.pending_details.stabilizing += 1;
+            result.pending = result.pending_details.total();
             status.pending = result.pending;
+            status.pending_details = result.pending_details.clone();
             continue;
         }
         if !full {
             // Quick inventory deliberately stops at directory/file metadata.
             // A later explicit full verification is required before content
             // identity or registration can be established.
-            result.pending += 1;
+            result.pending_details.needs_full_verification += 1;
+            result.pending = result.pending_details.total();
             status.pending = result.pending;
+            status.pending_details = result.pending_details.clone();
             continue;
         }
         let volume_id = match volume_resource_id(path) {
@@ -6985,8 +7039,10 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
             }
         };
         if fs_safe::snapshot(path).ok().as_ref() != Some(&snapshot) {
-            result.pending += 1;
+            result.pending_details.changed_during_scan += 1;
+            result.pending = result.pending_details.total();
             status.pending = result.pending;
+            status.pending_details = result.pending_details.clone();
             continue;
         }
         if let Some(item) = known.get(&relative) {
@@ -7083,6 +7139,7 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
     status.registered = result.registered;
     status.changed = result.changed;
     status.pending = result.pending;
+    status.pending_details = result.pending_details.clone();
     status.errors = result.errors;
     status.last_completed_at = Some(result.completed_at.clone());
     publish_discovery_status(&app, &state, &status);
@@ -7091,12 +7148,15 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
         "INFO",
         "library-scan",
         &format!(
-            "mode={} scanned={} registered={} changed={} pending={} errors={}",
+            "mode={} scanned={} registered={} changed={} pending={} stabilizing={} needs_full_verification={} changed_during_scan={} errors={}",
             if full { "full" } else { "quick" },
             result.scanned,
             result.registered,
             result.changed,
             result.pending,
+            result.pending_details.stabilizing,
+            result.pending_details.needs_full_verification,
+            result.pending_details.changed_during_scan,
             result.errors
         ),
     );
@@ -10257,6 +10317,15 @@ fn should_start_hidden(arguments: &[String], tray_available: bool) -> bool {
     tray_available && arguments.iter().any(|argument| argument == "--minimized")
 }
 
+fn window_geometry_needs_recovery(width: u32, height: u32, scale_factor: f64) -> bool {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return true;
+    }
+    let logical_width = f64::from(width) / scale_factor;
+    let logical_height = f64::from(height) / scale_factor;
+    logical_width < 640.0 || logical_height < 480.0
+}
+
 fn restore_main_window(app: &AppHandle, source: &str) {
     let Some(window) = app.get_webview_window("main") else {
         diagnostic_log(
@@ -10273,6 +10342,29 @@ fn restore_main_window(app: &AppHandle, source: &str) {
     }
     if let Err(error) = window.unminimize() {
         failures.push(format!("unminimize failed: {error}"));
+    }
+    match (window.outer_size(), window.scale_factor()) {
+        (Ok(size), Ok(scale_factor))
+            if window_geometry_needs_recovery(size.width, size.height, scale_factor) =>
+        {
+            diagnostic_log(
+                app,
+                "WARN",
+                "window-geometry",
+                &format!(
+                    "{source}: recovered invalid window geometry {}x{} at scale {:.2}",
+                    size.width, size.height, scale_factor
+                ),
+            );
+            if let Err(error) = window.set_size(tauri::LogicalSize::new(1024.0, 680.0)) {
+                failures.push(format!("size recovery failed: {error}"));
+            } else if let Err(error) = window.center() {
+                failures.push(format!("position recovery failed: {error}"));
+            }
+        }
+        (Err(error), _) => failures.push(format!("geometry read failed: {error}")),
+        (_, Err(error)) => failures.push(format!("scale-factor read failed: {error}")),
+        _ => {}
     }
     if let Err(error) = window.set_focus() {
         failures.push(format!("focus request failed: {error}"));
@@ -12414,6 +12506,107 @@ mod tests {
     }
 
     #[test]
+    fn verified_ingest_batch_does_not_leave_fourteen_recordings_pending() {
+        let root = temporary("verified-ingest-pairs");
+        let master = root.join("master");
+        let catalogue_root = root.join("catalogue");
+        fs::create_dir_all(&master).unwrap();
+        let mut events = Vec::new();
+        let mut snapshots = HashMap::new();
+
+        for index in 0..14 {
+            let video_relative = format!("2026-11-18/recording-{index:02}.mp4");
+            let audio_relative = format!("2026-11-18/recording-{index:02}.wav");
+            let video_path = master.join(&video_relative);
+            let audio_path = master.join(&audio_relative);
+            fs::create_dir_all(video_path.parent().unwrap()).unwrap();
+            fs::write(&video_path, format!("video-{index}")).unwrap();
+            fs::write(&audio_path, format!("audio-{index}")).unwrap();
+
+            let video_hash = sha256(&video_path).unwrap();
+            let audio_hash = sha256(&audio_path).unwrap();
+            let mut video = new_media(
+                &video_path,
+                video_relative.clone(),
+                None,
+                video_hash.clone(),
+                Some("2026-11-18T00:00:00Z".into()),
+                "ingest-batch".into(),
+                false,
+            )
+            .unwrap();
+            let audio = new_media(
+                &audio_path,
+                audio_relative.clone(),
+                None,
+                audio_hash.clone(),
+                Some("2026-11-18T00:00:00Z".into()),
+                "ingest-batch".into(),
+                false,
+            )
+            .unwrap();
+            video.attached_audio_id = Some(audio.id.clone());
+            let video_snapshot = fs_safe::snapshot(&video_path).unwrap();
+            let audio_snapshot = fs_safe::snapshot(&audio_path).unwrap();
+            events.push(CatalogueEvent::MediaRegistered {
+                media: video.clone(),
+            });
+            events.push(
+                evidence_observation_event(&video, "desktop", &video_snapshot, video_hash).unwrap(),
+            );
+            events.push(CatalogueEvent::MediaRegistered {
+                media: audio.clone(),
+            });
+            events.push(
+                evidence_observation_event(&audio, "desktop", &audio_snapshot, audio_hash).unwrap(),
+            );
+            snapshots.insert(video_relative, video_snapshot);
+            snapshots.insert(audio_relative, audio_snapshot);
+        }
+
+        let older_path = master.join("2020-01-01/older.mp4");
+        fs::create_dir_all(older_path.parent().unwrap()).unwrap();
+        fs::write(&older_path, b"older-media").unwrap();
+        let older_hash = sha256(&older_path).unwrap();
+        let older = new_media(
+            &older_path,
+            "2020-01-01/older.mp4".into(),
+            None,
+            older_hash.clone(),
+            Some("2020-01-01T00:00:00Z".into()),
+            "ingest-batch".into(),
+            false,
+        )
+        .unwrap();
+        let older_snapshot = fs_safe::snapshot(&older_path).unwrap();
+        events.push(CatalogueEvent::MediaRegistered {
+            media: older.clone(),
+        });
+        events.push(
+            evidence_observation_event(&older, "desktop", &older_snapshot, older_hash).unwrap(),
+        );
+        snapshots.insert(older.relative_path.clone(), older_snapshot);
+
+        catalogue::append(&catalogue_root, "desktop", events).unwrap();
+        let loaded = catalogue::load(&catalogue_root).unwrap();
+        assert_eq!(loaded.media.len(), 29);
+        assert_eq!(
+            loaded
+                .media
+                .iter()
+                .filter(|item| item.attached_audio_id.is_some())
+                .count(),
+            14
+        );
+        assert!(loaded.media.iter().all(|item| has_verified_snapshot(
+            item,
+            "desktop",
+            &snapshots[&item.relative_path]
+        )));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unchanged_full_verification_emits_no_redundant_evidence() {
         let root = temporary("unchanged-full-verification");
         let source = root.join("clip.mp4");
@@ -12533,6 +12726,16 @@ mod tests {
         assert!(should_start_hidden(&minimized, true));
         assert!(!should_start_hidden(&minimized, false));
         assert!(!should_start_hidden(&["kairix-pimp.exe".into()], true));
+    }
+
+    #[test]
+    fn tiny_or_invalid_window_geometry_is_recovered_across_dpi_scales() {
+        assert!(window_geometry_needs_recovery(120, 80, 1.0));
+        assert!(window_geometry_needs_recovery(900, 600, 2.0));
+        assert!(window_geometry_needs_recovery(1024, 680, 0.0));
+        assert!(window_geometry_needs_recovery(1024, 680, f64::NAN));
+        assert!(!window_geometry_needs_recovery(1024, 680, 1.0));
+        assert!(!window_geometry_needs_recovery(2048, 1360, 2.0));
     }
 
     #[test]

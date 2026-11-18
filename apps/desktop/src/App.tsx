@@ -100,6 +100,7 @@ import {
   visibleMedia,
 } from './media-grouping';
 import { sortLibraryMedia, type LibraryMediaSort } from './library-sort';
+import { nextDiscoveryDelay } from './discovery-schedule';
 
 type View = 'Ingest' | 'Library' | 'Projects' | 'Archive' | 'Settings';
 type SettingsSection =
@@ -335,6 +336,11 @@ export function App() {
     registered: 0,
     changed: 0,
     pending: 0,
+    pendingDetails: {
+      stabilizing: 0,
+      needsFullVerification: 0,
+      changedDuringScan: 0,
+    },
     errors: 0,
   });
   const [batchTags, setBatchTags] = useState<string[]>([]);
@@ -554,7 +560,7 @@ export function App() {
         }
         if (announce) {
           setMessage(
-            `${full ? 'Full verification' : 'Scan'} complete: ${result.registered} registered, ${result.changed} changed, ${result.pending} pending, ${result.errors} errors.`,
+            `${full ? 'Full verification' : 'Scan'} complete: ${result.registered} registered, ${result.changed} changed, ${result.pending} pending (${result.pendingDetails.stabilizing} stabilizing, ${result.pendingDetails.needsFullVerification} require full verification, ${result.pendingDetails.changedDuringScan} changed during scan), ${result.errors} errors.`,
           );
         }
         return result;
@@ -987,23 +993,19 @@ export function App() {
   }, [configured, native, refresh]);
   useEffect(() => {
     if (!native || !configured || settings.backgroundProcessingPaused) return;
-    let stabilityTimer: number | undefined;
-    const startupTimer = window.setTimeout(() => {
-      void runDiscovery().then((result) => {
-        if (result?.pending) {
-          stabilityTimer = window.setTimeout(() => {
-            void runDiscovery();
-          }, 16_000);
-        }
-      });
-    }, 0);
-    const timer = window.setInterval(() => {
-      void runDiscovery();
-    }, 30_000);
+    let disposed = false;
+    let timer: number | undefined;
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(() => {
+        void runDiscovery().then((result) => {
+          if (!disposed) schedule(nextDiscoveryDelay(result));
+        });
+      }, delay);
+    };
+    schedule(0);
     return () => {
-      window.clearInterval(timer);
-      window.clearTimeout(startupTimer);
-      if (stabilityTimer !== undefined) window.clearTimeout(stabilityTimer);
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [configured, native, runDiscovery, settings.backgroundProcessingPaused]);
 
@@ -1112,10 +1114,19 @@ export function App() {
   );
   const projectMedia = useMemo(() => {
     if (!selectedProjectId) return [];
-    return displayedMedia.filter((item) =>
-      logicalMediaMatches(item, projectMediaQuery, catalogue),
+    return sortLibraryMedia(
+      displayedMedia.filter((item) =>
+        logicalMediaMatches(item, projectMediaQuery, catalogue),
+      ),
+      settings.libraryMediaSort ?? 'ingested-newest',
     );
-  }, [catalogue, displayedMedia, projectMediaQuery, selectedProjectId]);
+  }, [
+    catalogue,
+    displayedMedia,
+    projectMediaQuery,
+    selectedProjectId,
+    settings.libraryMediaSort,
+  ]);
   const linkedProjectMedia = useMemo(
     () =>
       projectMedia.filter((item) =>
@@ -2205,6 +2216,7 @@ export function App() {
         `Catalogue items: ${catalogue.media.length}`,
         `Last scan: ${discoveryStatus.lastCompletedAt ?? 'never'}`,
         `Scan pending/errors: ${discoveryStatus.pending}/${discoveryStatus.errors}`,
+        `Pending detail: ${discoveryStatus.pendingDetails.stabilizing} stabilizing, ${discoveryStatus.pendingDetails.needsFullVerification} require full verification, ${discoveryStatus.pendingDetails.changedDuringScan} changed during scan`,
         `Jobs: ${JSON.stringify(jobCounts)}`,
         `FFmpeg: ${mediaTools?.ffmpegAvailable ? 'available' : 'unavailable'}`,
         `FFprobe: ${mediaTools?.ffprobeAvailable ? 'available' : 'unavailable'}`,
@@ -3348,6 +3360,25 @@ export function App() {
                           <dd>{discoveryStatus.pending}</dd>
                         </div>
                         <div>
+                          <dt>Waiting for stable files</dt>
+                          <dd>{discoveryStatus.pendingDetails.stabilizing}</dd>
+                        </div>
+                        <div>
+                          <dt>Requires full verification</dt>
+                          <dd>
+                            {
+                              discoveryStatus.pendingDetails
+                                .needsFullVerification
+                            }
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Changed during scan</dt>
+                          <dd>
+                            {discoveryStatus.pendingDetails.changedDuringScan}
+                          </dd>
+                        </div>
+                        <div>
                           <dt>Scan errors</dt>
                           <dd>{discoveryStatus.errors}</dd>
                         </div>
@@ -4217,8 +4248,13 @@ export function App() {
                       <dt>Last indexing result</dt>
                       <dd>
                         {discoveryStatus.registered} registered ·{' '}
-                        {discoveryStatus.pending} pending ·{' '}
-                        {discoveryStatus.errors} errors
+                        {discoveryStatus.pending} pending (
+                        {discoveryStatus.pendingDetails.stabilizing}{' '}
+                        stabilizing,{' '}
+                        {discoveryStatus.pendingDetails.needsFullVerification}{' '}
+                        require full verification,{' '}
+                        {discoveryStatus.pendingDetails.changedDuringScan}{' '}
+                        changed during scan) · {discoveryStatus.errors} errors
                       </dd>
                     </div>
                     <div>

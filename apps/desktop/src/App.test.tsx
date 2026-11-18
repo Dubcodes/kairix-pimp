@@ -163,6 +163,11 @@ vi.mock('./bridge', () => ({
       registered: 0,
       changed: 0,
       pending: 0,
+      pendingDetails: {
+        stabilizing: 0,
+        needsFullVerification: 0,
+        changedDuringScan: 0,
+      },
       errors: 0,
     })),
     logUiError: mocks.logUiError,
@@ -388,6 +393,11 @@ describe('native application integration', () => {
       registered: 0,
       changed: 0,
       pending: 0,
+      pendingDetails: {
+        stabilizing: 0,
+        needsFullVerification: 0,
+        changedDuringScan: 0,
+      },
       errors: 0,
       full: false,
       completedAt: '2026-10-26T00:00:00Z',
@@ -1713,6 +1723,11 @@ describe('native application integration', () => {
       registered: 2,
       changed: 0,
       pending: 1,
+      pendingDetails: {
+        stabilizing: 0,
+        needsFullVerification: 1,
+        changedDuringScan: 0,
+      },
       errors: 0,
       full: false,
       completedAt: '2026-10-26T00:00:00Z',
@@ -1727,7 +1742,7 @@ describe('native application integration', () => {
     expect(mocks.rescan).toHaveBeenCalledWith(false);
     expect(
       await screen.findByText(
-        'Scan complete: 2 registered, 0 changed, 1 pending, 0 errors.',
+        'Scan complete: 2 registered, 0 changed, 1 pending (0 stabilizing, 1 require full verification, 0 changed during scan), 0 errors.',
       ),
     ).toBeVisible();
   });
