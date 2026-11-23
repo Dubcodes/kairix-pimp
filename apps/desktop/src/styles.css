@@ -1986,6 +1986,40 @@ select:disabled {
   margin: 3px 0 0;
   color: var(--text-muted);
 }
+.relocation-dialog {
+  width: min(820px, 100%);
+}
+.relocation-results {
+  display: grid;
+  gap: 8px;
+  max-height: 52vh;
+  overflow: auto;
+}
+.relocation-results article {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.relocation-results article > small {
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+}
+.relocation-results article[data-status='exact'] > span {
+  color: var(--success);
+}
+.relocation-results article[data-status='ambiguous'] > span,
+.relocation-results article[data-status='mismatched'] > span {
+  color: var(--warning);
+}
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
 
 .settings-explainer,
 .info-card {

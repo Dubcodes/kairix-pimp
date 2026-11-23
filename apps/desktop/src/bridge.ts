@@ -127,6 +127,30 @@ export interface MediaItem {
   needsReview: boolean;
   observedSize?: number;
   observedModifiedMillis?: number;
+  integrityByDevice?: Record<
+    string,
+    {
+      observedSize: number;
+      observedModifiedMillis?: number;
+      observedSha256?: string;
+      needsReview: boolean;
+    }
+  >;
+}
+export interface RelocationMatch {
+  mediaId: string;
+  previousRelativePath: string;
+  candidateRelativePath?: string;
+  originalFilename: string;
+  status: 'exact' | 'unresolved' | 'ambiguous' | 'mismatched';
+  detail: string;
+}
+export interface RelocationReview {
+  matches: RelocationMatch[];
+  exact: number;
+  unresolved: number;
+  ambiguous: number;
+  mismatched: number;
 }
 export interface ProjectRecord {
   id: string;
@@ -736,6 +760,14 @@ export const desktopBridge = {
   openLogsFolder: () => invoke<void>('open_logs_folder'),
   verifyMediaIntegrity: (mediaId: string) =>
     invoke<boolean>('verify_media_integrity', { mediaId }),
+  reviewMediaRelocation: (mediaIds: string[], selectedPath: string) =>
+    invoke<RelocationReview>('review_media_relocation', {
+      mediaIds,
+      selectedPath,
+    }),
+  approveMediaRelocation: (
+    approvals: Array<{ mediaId: string; relativePath: string }>,
+  ) => invoke<number>('approve_media_relocation', { approvals }),
   enrichMedia: (explicitRequest = true) =>
     invoke<number>('enrich_media', { explicitRequest }),
   mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
@@ -763,6 +795,8 @@ export const desktopBridge = {
     invoke<void>('reveal_media_in_explorer', { mediaId }),
   openMediaFolder: (mediaId: string) =>
     invoke<void>('open_media_folder', { mediaId }),
+  revealLibraryFolder: (relativePath: string) =>
+    invoke<void>('reveal_library_folder', { relativePath }),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),
   loadThumbnailSources: async (mediaIds: string[]) => {

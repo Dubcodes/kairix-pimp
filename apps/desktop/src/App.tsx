@@ -57,6 +57,7 @@ import {
   type IngestProgress,
   type IngestResult,
   type MediaToolsStatus,
+  type RelocationReview,
   type HoverPreview,
   type ProjectInventory,
   type ProjectRecord,
@@ -402,6 +403,13 @@ export function App() {
     x: number;
     y: number;
   }>();
+  const [folderContextMenu, setFolderContextMenu] = useState<{
+    folder: string;
+    x: number;
+    y: number;
+  }>();
+  const [relocationReview, setRelocationReview] = useState<RelocationReview>();
+  const [relocationBusy, setRelocationBusy] = useState(false);
   const [projectName, setProjectName] = useState('');
   const [projectDirectory, setProjectDirectory] = useState('');
   const [backupProjectId, setBackupProjectId] = useState<string>();
@@ -1588,6 +1596,11 @@ export function App() {
         return;
       }
       if (event.key === 'Escape') {
+        if (relocationReview && !relocationBusy) {
+          event.preventDefault();
+          setRelocationReview(undefined);
+          return;
+        }
         if (showShortcutHelp) {
           event.preventDefault();
           setShowShortcutHelp(false);
@@ -1613,6 +1626,8 @@ export function App() {
     contextMenu,
     filtered,
     redoSelection,
+    relocationBusy,
+    relocationReview,
     replaceSelection,
     selected.length,
     showShortcutHelp,
@@ -1621,8 +1636,11 @@ export function App() {
     viewerMediaId,
   ]);
   useEffect(() => {
-    if (!contextMenu) return;
-    const close = () => setContextMenu(undefined);
+    if (!contextMenu && !folderContextMenu) return;
+    const close = () => {
+      setContextMenu(undefined);
+      setFolderContextMenu(undefined);
+    };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') close();
     };
@@ -1632,7 +1650,7 @@ export function App() {
       window.removeEventListener('click', close);
       window.removeEventListener('keydown', closeOnEscape);
     };
-  }, [contextMenu]);
+  }, [contextMenu, folderContextMenu]);
   const saveConfiguration = async () => {
     setError('');
     setBusy(true);
@@ -2033,6 +2051,88 @@ export function App() {
       }
     } catch (reason) {
       setError(errorText(reason));
+    }
+  };
+  const folderMedia = (folderName: string) =>
+    displayedMedia.filter((item) => {
+      const itemFolder =
+        item.relativePath.split('/').slice(0, -1).join('/') ||
+        'Master Bin root';
+      return itemFolder === folderName;
+    });
+  const selectFolderRecordings = (
+    folderName: string,
+    purpose: 'select' | 'tags' | 'project',
+  ) => {
+    const ids = folderMedia(folderName).map((item) => item.id);
+    if (
+      ids.length >= 50 &&
+      !window.confirm(
+        `${purpose === 'select' ? 'Select' : 'Prepare to update'} ${ids.length} recordings in ${folderName}?`,
+      )
+    )
+      return;
+    replaceSelection(ids, ids.at(-1));
+    setFolder(folderName);
+    if (purpose !== 'select')
+      setMessage(
+        `${ids.length} recording${ids.length === 1 ? '' : 's'} selected. Use the ${purpose === 'tags' ? 'Tags' : 'Projects'} control in the selection toolbar to apply the authoritative bulk update.`,
+      );
+  };
+  const locateRecordingInLibrary = (
+    recording: (typeof catalogue.media)[number],
+  ) => {
+    const targetFolder =
+      recording.relativePath.split('/').slice(0, -1).join('/') ||
+      'Master Bin root';
+    setQuery('');
+    setTagFilters([]);
+    setFolder(targetFolder);
+    setLibraryLocateId(recording.id);
+    setView('Library');
+  };
+  const beginRelocationReview = async (mediaIds: string[]) => {
+    const selectedPath = await desktopBridge.chooseFolder();
+    if (!selectedPath) return;
+    setRelocationBusy(true);
+    setError('');
+    try {
+      setRelocationReview(
+        await desktopBridge.reviewMediaRelocation(mediaIds, selectedPath),
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setRelocationBusy(false);
+    }
+  };
+  const approveRelocationReview = async () => {
+    const approvals =
+      relocationReview?.matches.flatMap((match) =>
+        match.status === 'exact' && match.candidateRelativePath
+          ? [
+              {
+                mediaId: match.mediaId,
+                relativePath: match.candidateRelativePath,
+              },
+            ]
+          : [],
+      ) ?? [];
+    if (!approvals.length) return;
+    setRelocationBusy(true);
+    setError('');
+    try {
+      const count = await desktopBridge.approveMediaRelocation(approvals);
+      setRelocationReview(undefined);
+      await refresh();
+      setFolder('All media');
+      setMessage(
+        `${count} physical file reference${count === 1 ? '' : 's'} relinked. No media was moved or copied.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setRelocationBusy(false);
     }
   };
   const beginNativeDrag = (
@@ -4924,6 +5024,42 @@ export function App() {
                         }
                         setFolder(name);
                       }}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        setContextMenu(undefined);
+                        setFolderContextMenu({
+                          folder: name,
+                          x: Math.max(
+                            8,
+                            Math.min(event.clientX, window.innerWidth - 280),
+                          ),
+                          y: Math.max(
+                            8,
+                            Math.min(event.clientY, window.innerHeight - 330),
+                          ),
+                        });
+                      }}
+                      onKeyDown={(event) => {
+                        if (
+                          event.key !== 'ContextMenu' &&
+                          !(event.shiftKey && event.key === 'F10')
+                        )
+                          return;
+                        event.preventDefault();
+                        const bounds =
+                          event.currentTarget.getBoundingClientRect();
+                        setFolderContextMenu({
+                          folder: name,
+                          x: Math.max(
+                            8,
+                            Math.min(bounds.left + 20, window.innerWidth - 280),
+                          ),
+                          y: Math.max(
+                            8,
+                            Math.min(bounds.top + 20, window.innerHeight - 330),
+                          ),
+                        });
+                      }}
                     >
                       <Folder size={16} />
                       <span>
@@ -5103,6 +5239,32 @@ export function App() {
                         onDoubleClick={() => openClipViewer(item.id)}
                         onKeyDown={(event) => {
                           if (
+                            event.key === 'ContextMenu' ||
+                            (event.shiftKey && event.key === 'F10')
+                          ) {
+                            event.preventDefault();
+                            const bounds =
+                              event.currentTarget.getBoundingClientRect();
+                            setContextMenu({
+                              mediaId: item.id,
+                              x: Math.max(
+                                8,
+                                Math.min(
+                                  bounds.left + 24,
+                                  window.innerWidth - 250,
+                                ),
+                              ),
+                              y: Math.max(
+                                8,
+                                Math.min(
+                                  bounds.top + 24,
+                                  window.innerHeight - 300,
+                                ),
+                              ),
+                            });
+                            return;
+                          }
+                          if (
                             [
                               'ArrowLeft',
                               'ArrowUp',
@@ -5160,8 +5322,14 @@ export function App() {
                           }
                           setContextMenu({
                             mediaId: item.id,
-                            x: event.clientX,
-                            y: event.clientY,
+                            x: Math.max(
+                              8,
+                              Math.min(event.clientX, window.innerWidth - 250),
+                            ),
+                            y: Math.max(
+                              8,
+                              Math.min(event.clientY, window.innerHeight - 300),
+                            ),
                           });
                         }}
                       >
@@ -5622,6 +5790,16 @@ export function App() {
               >
                 <button
                   role="menuitem"
+                  autoFocus
+                  onClick={() => {
+                    setContextMenu(undefined);
+                    locateRecordingInLibrary(contextRecording);
+                  }}
+                >
+                  Go to folder in PIMP
+                </button>
+                <button
+                  role="menuitem"
                   disabled={!contextRecording.available}
                   onClick={() => {
                     setContextMenu(undefined);
@@ -5638,7 +5816,16 @@ export function App() {
                     void runSelectedFileAction('folder', contextRecording);
                   }}
                 >
-                  Open containing folder
+                  Open containing folder in Explorer
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setContextMenu(undefined);
+                    void beginRelocationReview([contextRecording.id]);
+                  }}
+                >
+                  Locate moved recording
                 </button>
                 <button
                   role="menuitem"
@@ -5663,6 +5850,144 @@ export function App() {
                     ? 'Remove favourite'
                     : 'Favourite'}
                 </button>
+              </div>
+            )}
+            {folderContextMenu && (
+              <div
+                className="context-menu"
+                role="menu"
+                aria-label="Folder context menu"
+                style={{
+                  left: folderContextMenu.x,
+                  top: folderContextMenu.y,
+                }}
+              >
+                <button
+                  role="menuitem"
+                  autoFocus
+                  onClick={() => {
+                    setFolder(folderContextMenu.folder);
+                    setFolderContextMenu(undefined);
+                  }}
+                >
+                  Open folder in PIMP
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    const relativePath =
+                      folderContextMenu.folder === 'Master Bin root'
+                        ? ''
+                        : folderContextMenu.folder;
+                    setFolderContextMenu(undefined);
+                    void desktopBridge
+                      .revealLibraryFolder(relativePath)
+                      .catch((reason) => setError(errorText(reason)));
+                  }}
+                >
+                  Reveal folder in Windows Explorer
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    const ids = expandLogicalMediaIds(
+                      folderMedia(folderContextMenu.folder).map(
+                        (item) => item.id,
+                      ),
+                      catalogue.media,
+                    );
+                    setFolderContextMenu(undefined);
+                    void beginRelocationReview(ids);
+                  }}
+                >
+                  Locate moved folder
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    selectFolderRecordings(folderContextMenu.folder, 'tags');
+                    setFolderContextMenu(undefined);
+                  }}
+                >
+                  Add tags to all contained recordings…
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    selectFolderRecordings(folderContextMenu.folder, 'project');
+                    setFolderContextMenu(undefined);
+                  }}
+                >
+                  Assign all contained recordings to a project…
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    selectFolderRecordings(folderContextMenu.folder, 'select');
+                    setFolderContextMenu(undefined);
+                  }}
+                >
+                  Select all recordings in folder
+                </button>
+              </div>
+            )}
+            {relocationReview && (
+              <div className="modal-backdrop" role="presentation">
+                <section
+                  className="shortcut-dialog relocation-dialog"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="relocation-title"
+                >
+                  <div className="section-head">
+                    <div>
+                      <h2 id="relocation-title">Review moved media</h2>
+                      <span>
+                        {relocationReview.exact} exact ·{' '}
+                        {relocationReview.unresolved} unresolved ·{' '}
+                        {relocationReview.ambiguous} ambiguous ·{' '}
+                        {relocationReview.mismatched} mismatched
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setRelocationReview(undefined)}
+                      disabled={relocationBusy}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <p>
+                    Approval updates catalogue paths only. PIMP will not move,
+                    copy, rename or delete media.
+                  </p>
+                  <div className="relocation-results">
+                    {relocationReview.matches.map((match) => (
+                      <article key={match.mediaId} data-status={match.status}>
+                        <strong>{match.originalFilename}</strong>
+                        <span>{match.status}</span>
+                        <small>{match.previousRelativePath}</small>
+                        {match.candidateRelativePath && (
+                          <small>→ {match.candidateRelativePath}</small>
+                        )}
+                        <small>{match.detail}</small>
+                      </article>
+                    ))}
+                  </div>
+                  <div className="dialog-actions">
+                    <button
+                      type="button"
+                      className="primary"
+                      autoFocus
+                      disabled={relocationBusy || relocationReview.exact === 0}
+                      onClick={() => void approveRelocationReview()}
+                    >
+                      {relocationBusy
+                        ? 'Rechecking files…'
+                        : `Approve ${relocationReview.exact} exact match${relocationReview.exact === 1 ? '' : 'es'}`}
+                    </button>
+                  </div>
+                </section>
               </div>
             )}
             {showShortcutHelp && (

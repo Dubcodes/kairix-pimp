@@ -120,6 +120,13 @@ export type CatalogueEvent =
       observedSha256?: string;
       needsReview: boolean;
     }
+  | {
+      type: 'media.relocated';
+      mediaId: string;
+      previousRelativePath: string;
+      relativePath: string;
+      sha256: string;
+    }
   | { type: 'folder.upserted'; folder: FolderRecord }
   | { type: 'folder.moved'; folderId: string; relativePath: string }
   | { type: 'project.upserted'; project: ProjectRecord };

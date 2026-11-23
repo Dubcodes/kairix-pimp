@@ -83,6 +83,10 @@ const mocks = vi.hoisted(() => ({
   openMediaFolder: vi.fn(),
   mediaToolsStatus: vi.fn(),
   chooseFiles: vi.fn(),
+  chooseFolder: vi.fn(),
+  reviewMediaRelocation: vi.fn(),
+  approveMediaRelocation: vi.fn(),
+  revealLibraryFolder: vi.fn(),
   inventorySources: vi.fn(),
   inventorySdCard: vi.fn(),
   cancelInventory: vi.fn(),
@@ -184,7 +188,7 @@ vi.mock('./bridge', () => ({
     openLogsFolder: vi.fn(),
     updaterConfiguration: mocks.updaterConfiguration,
     onFileDrop: vi.fn(async () => () => undefined),
-    chooseFolder: vi.fn(),
+    chooseFolder: mocks.chooseFolder,
     chooseFiles: mocks.chooseFiles,
     inventorySources: mocks.inventorySources,
     inventorySdCard: mocks.inventorySdCard,
@@ -213,6 +217,8 @@ vi.mock('./bridge', () => ({
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
     verifyMediaIntegrity: mocks.verifyMediaIntegrity,
+    reviewMediaRelocation: mocks.reviewMediaRelocation,
+    approveMediaRelocation: mocks.approveMediaRelocation,
     mediaToolsStatus: mocks.mediaToolsStatus,
     resolveMediaPath: mocks.resolveMediaPath,
     nativeDragThreshold: mocks.nativeDragThreshold,
@@ -224,6 +230,7 @@ vi.mock('./bridge', () => ({
     setMediaThumbnailFrame: mocks.setMediaThumbnailFrame,
     revealMediaInExplorer: mocks.revealMediaInExplorer,
     openMediaFolder: mocks.openMediaFolder,
+    revealLibraryFolder: mocks.revealLibraryFolder,
     loadThumbnail: vi.fn(async () => null),
     loadThumbnailSources: mocks.loadThumbnailSources,
     prepareMediaThumbnail: mocks.prepareMediaThumbnail,
@@ -449,6 +456,13 @@ describe('native application integration', () => {
     mocks.logPlaybackEvent.mockResolvedValue(undefined);
     mocks.chooseFiles.mockReset();
     mocks.chooseFiles.mockResolvedValue([]);
+    mocks.chooseFolder.mockReset();
+    mocks.chooseFolder.mockResolvedValue(undefined);
+    mocks.reviewMediaRelocation.mockReset();
+    mocks.approveMediaRelocation.mockReset();
+    mocks.approveMediaRelocation.mockResolvedValue(0);
+    mocks.revealLibraryFolder.mockReset();
+    mocks.revealLibraryFolder.mockResolvedValue(undefined);
     mocks.inventorySources.mockReset();
     mocks.inventorySources.mockResolvedValue({
       planId: '00000000-0000-4000-8000-000000000001',
@@ -2862,6 +2876,12 @@ describe('native application integration', () => {
     expect(
       screen.getByRole('menu', { name: 'Recording context menu' }),
     ).toBeVisible();
+    await user.click(
+      screen.getByRole('menuitem', { name: 'Go to folder in PIMP' }),
+    );
+    expect(screen.getByRole('option', { name: /two.mp4/ })).toHaveClass(
+      'located',
+    );
 
     const content = document.querySelector('.library-panel') as HTMLElement;
     const scrollTo = vi.fn();
@@ -2884,6 +2904,97 @@ describe('native application integration', () => {
     );
     expect(scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'auto' });
     vi.unstubAllGlobals();
+  });
+
+  it('opens keyboard-accessible folder actions and reviews relocation before approval', async () => {
+    mocks.catalogue = {
+      media: ['clip.mp4', 'clip.wav'].map((name, index) => ({
+        id: index === 0 ? 'video' : 'audio',
+        relativePath: `20261120/DCIM/DJI_001/${name}`,
+        originalFilename: name,
+        sha256: `hash-${index}`,
+        captureDateProvenance: 'unknown' as const,
+        ingestDate: '2026-11-20',
+        fileType: index === 0 ? 'mp4' : 'wav',
+        tags: ['DJI'],
+        projectIds: ['project-1'],
+        notes: 'preserved',
+        attachedAudioId: index === 0 ? 'audio' : undefined,
+        technical: { sizeBytes: 10 },
+        available: false,
+        needsReview: true,
+      })),
+      projects: [],
+      updatedAt: '2026-11-20T00:00:00Z',
+    };
+    mocks.chooseFolder.mockResolvedValue('C:\\Master\\20261120');
+    mocks.reviewMediaRelocation.mockResolvedValue({
+      exact: 2,
+      unresolved: 0,
+      ambiguous: 0,
+      mismatched: 0,
+      matches: [
+        {
+          mediaId: 'video',
+          previousRelativePath: '20261120/DCIM/DJI_001/clip.mp4',
+          candidateRelativePath: '20261120/clip.mp4',
+          originalFilename: 'clip.mp4',
+          status: 'exact',
+          detail: 'Filename, size and SHA-256 match',
+        },
+        {
+          mediaId: 'audio',
+          previousRelativePath: '20261120/DCIM/DJI_001/clip.wav',
+          candidateRelativePath: '20261120/clip.wav',
+          originalFilename: 'clip.wav',
+          status: 'exact',
+          detail: 'Filename, size and SHA-256 match',
+        },
+      ],
+    });
+    mocks.approveMediaRelocation.mockResolvedValue(2);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const folder = await screen.findByRole('button', {
+      name: /20261120\/DCIM\/DJI_001/,
+    });
+    folder.focus();
+    await user.keyboard('{Shift>}{F10}{/Shift}');
+    expect(
+      screen.getByRole('menu', { name: 'Folder context menu' }),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole('menuitem', {
+        name: 'Select all recordings in folder',
+      }),
+    );
+    expect(screen.getByText('1 selected')).toBeVisible();
+
+    folder.focus();
+    await user.keyboard('{Shift>}{F10}{/Shift}');
+    await user.click(
+      screen.getByRole('menuitem', { name: 'Locate moved folder' }),
+    );
+    expect(
+      await screen.findByRole('dialog', { name: 'Review moved media' }),
+    ).toBeVisible();
+    expect(mocks.reviewMediaRelocation).toHaveBeenCalledWith(
+      ['video', 'audio'],
+      'C:\\Master\\20261120',
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Approve 2 exact matches' }),
+    );
+    expect(mocks.approveMediaRelocation).toHaveBeenCalledWith([
+      { mediaId: 'video', relativePath: '20261120/clip.mp4' },
+      { mediaId: 'audio', relativePath: '20261120/clip.wav' },
+    ]);
+    expect(
+      await screen.findByText(
+        '2 physical file references relinked. No media was moved or copied.',
+      ),
+    ).toBeVisible();
   });
 
   it('toggles independent Library checkboxes without collapsing multiselection', async () => {

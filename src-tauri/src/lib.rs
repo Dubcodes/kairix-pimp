@@ -948,6 +948,34 @@ struct MediaUpdate {
     favourite: Option<bool>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RelocationMatch {
+    media_id: String,
+    previous_relative_path: String,
+    candidate_relative_path: Option<String>,
+    original_filename: String,
+    status: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RelocationReview {
+    matches: Vec<RelocationMatch>,
+    exact: usize,
+    unresolved: usize,
+    ambiguous: usize,
+    mismatched: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelocationApproval {
+    media_id: String,
+    relative_path: String,
+}
+
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -7225,6 +7253,288 @@ fn verify_media_integrity(
     }
     Ok(matches)
 }
+
+fn relocation_candidates(
+    master: &Path,
+    selected: &Path,
+    media: &[MediaItem],
+) -> Result<Vec<RelocationMatch>, String> {
+    let master = master
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve Master Bin: {error}"))?;
+    let selected = selected
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve selected relocation location: {error}"))?;
+    if !fs_safe::within(&master, &selected) {
+        return Err("Choose a file or folder inside the configured Master Bin".into());
+    }
+    if selected == master {
+        return Err("Choose the moved file or its destination folder, not the entire Master Bin".into());
+    }
+    let files = if selected.is_file() {
+        vec![selected]
+    } else if selected.is_dir() {
+        let mut files = Vec::new();
+        for entry in WalkDir::new(&selected).follow_links(false) {
+            let entry = entry.map_err(|error| {
+                format!("Cannot inspect the selected relocation folder: {error}")
+            })?;
+            if entry.file_type().is_file() {
+                files.push(entry.into_path());
+            }
+        }
+        files
+    } else {
+        return Err("The selected relocation location is not a file or folder".into());
+    };
+
+    media
+        .iter()
+        .map(|item| {
+            let named = files
+                .iter()
+                .filter(|path| {
+                    path.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .eq_ignore_ascii_case(&item.original_filename)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if named.is_empty() {
+                return Ok(RelocationMatch {
+                    media_id: item.id.clone(),
+                    previous_relative_path: item.relative_path.clone(),
+                    candidate_relative_path: None,
+                    original_filename: item.original_filename.clone(),
+                    status: "unresolved".into(),
+                    detail: "No candidate with the original filename was found".into(),
+                });
+            }
+            let sized = named
+                .iter()
+                .filter(|path| {
+                    fs::metadata(path)
+                        .map(|metadata| metadata.len() == item.technical.size_bytes)
+                        .unwrap_or(false)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if sized.is_empty() {
+                return Ok(RelocationMatch {
+                    media_id: item.id.clone(),
+                    previous_relative_path: item.relative_path.clone(),
+                    candidate_relative_path: None,
+                    original_filename: item.original_filename.clone(),
+                    status: "mismatched".into(),
+                    detail: "Filename candidates exist, but their sizes do not match".into(),
+                });
+            }
+            let mut verified = Vec::new();
+            for path in sized {
+                if sha256(path)?.eq_ignore_ascii_case(&item.sha256) {
+                    verified.push(path);
+                }
+            }
+            if verified.len() != 1 {
+                return Ok(RelocationMatch {
+                    media_id: item.id.clone(),
+                    previous_relative_path: item.relative_path.clone(),
+                    candidate_relative_path: None,
+                    original_filename: item.original_filename.clone(),
+                    status: if verified.is_empty() {
+                        "mismatched".into()
+                    } else {
+                        "ambiguous".into()
+                    },
+                    detail: if verified.is_empty() {
+                        "Candidate bytes do not match the stored SHA-256".into()
+                    } else {
+                        "More than one candidate has the expected SHA-256".into()
+                    },
+                });
+            }
+            let relative = verified[0]
+                .strip_prefix(&master)
+                .map_err(|_| "Relocation candidate escaped the configured Master Bin")?;
+            let relative = portable_relative(relative);
+            fs_safe::validate_relative(&relative)?;
+            Ok(RelocationMatch {
+                media_id: item.id.clone(),
+                previous_relative_path: item.relative_path.clone(),
+                candidate_relative_path: Some(relative),
+                original_filename: item.original_filename.clone(),
+                status: "exact".into(),
+                detail: "Filename, size and SHA-256 match".into(),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn review_media_relocation(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    media_ids: Vec<String>,
+    selected_path: String,
+) -> Result<RelocationReview, String> {
+    if media_ids.is_empty() {
+        return Err("Choose at least one recording to locate".into());
+    }
+    let _operation = begin_critical_operation(&state.operations, "media relocation review")?;
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    configure_volume_governor(&state, &settings);
+    let selected_path = PathBuf::from(selected_path);
+    let volume_id = volume_resource_id(&selected_path)?;
+    let _volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            "Review moved media",
+            resource_governor::PRIORITY_EXPLICIT_SCAN,
+            false,
+            vec![resource_governor::VolumeNeed::read(volume_id)],
+        ),
+        || false,
+    )?;
+    let mut requested = media_ids.into_iter().collect::<BTreeSet<_>>();
+    for item in &catalogue.media {
+        if requested.contains(&item.id) {
+            if let Some(audio_id) = &item.attached_audio_id {
+                requested.insert(audio_id.clone());
+            }
+        } else if item
+            .attached_audio_id
+            .as_ref()
+            .is_some_and(|audio_id| requested.contains(audio_id))
+        {
+            requested.insert(item.id.clone());
+        }
+    }
+    let media = catalogue
+        .media
+        .iter()
+        .filter(|item| requested.contains(&item.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if media.len() != requested.len() {
+        return Err("One or more selected recordings no longer exist in the catalogue".into());
+    }
+    let matches = relocation_candidates(
+        Path::new(&settings.master_bin_path),
+        &selected_path,
+        &media,
+    )?;
+    Ok(RelocationReview {
+        exact: matches.iter().filter(|item| item.status == "exact").count(),
+        unresolved: matches
+            .iter()
+            .filter(|item| item.status == "unresolved")
+            .count(),
+        ambiguous: matches
+            .iter()
+            .filter(|item| item.status == "ambiguous")
+            .count(),
+        mismatched: matches
+            .iter()
+            .filter(|item| item.status == "mismatched")
+            .count(),
+        matches,
+    })
+}
+
+#[tauri::command]
+fn approve_media_relocation(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    approvals: Vec<RelocationApproval>,
+) -> Result<usize, String> {
+    if approvals.is_empty() {
+        return Err("There are no exact relocation matches to approve".into());
+    }
+    let _operation = begin_critical_operation(&state.operations, "media relocation approval")?;
+    let _manifest_guard = state.project_manifest_write.lock().unwrap();
+    let settings = load_settings_file(&app)?;
+    let master = Path::new(&settings.master_bin_path);
+    configure_volume_governor(&state, &settings);
+    let volume_id = volume_resource_id(master)?;
+    let mut volume_permit = state.volume_governor.acquire(
+        resource_governor::Request::new(
+            "Approve moved media",
+            resource_governor::PRIORITY_EXPLICIT_SCAN,
+            false,
+            vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+        ),
+        || false,
+    )?;
+    let _catalogue_guard = state.catalogue_write.lock().unwrap();
+    let catalogue = load_catalogue_file(&settings)?;
+    let mut destinations = BTreeSet::new();
+    let mut events = Vec::new();
+    let mut projects = BTreeSet::new();
+    for approval in &approvals {
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == approval.media_id)
+            .ok_or("A selected recording no longer exists")?;
+        let destination = fs_safe::resolve_existing(master, &approval.relative_path)?;
+        let relative = portable_relative(
+            destination
+                .strip_prefix(master.canonicalize().map_err(|error| error.to_string())?)
+                .map_err(|_| "Relocation destination escaped the Master Bin")?,
+        );
+        if !destinations.insert(relative.to_ascii_lowercase()) {
+            return Err("Two selected recordings resolve to the same destination".into());
+        }
+        if catalogue.media.iter().any(|candidate| {
+            candidate.id != item.id && candidate.relative_path.eq_ignore_ascii_case(&relative)
+        }) {
+            return Err("A different media identity already owns a relocation destination".into());
+        }
+        let snapshot = fs_safe::snapshot(&destination)?;
+        if snapshot.length != item.technical.size_bytes {
+            return Err(format!("{} changed size since review", item.original_filename));
+        }
+        let observed_sha256 = sha256(&destination)?;
+        if !observed_sha256.eq_ignore_ascii_case(&item.sha256) {
+            return Err(format!("{} no longer matches its stored SHA-256", item.original_filename));
+        }
+        if fs_safe::snapshot(&destination)? != snapshot {
+            return Err(format!("{} changed during relocation approval", item.original_filename));
+        }
+        volume_permit.add_bytes_for(&volume_id, snapshot.length, 0);
+        events.push(CatalogueEvent::MediaRelocated {
+            media_id: item.id.clone(),
+            previous_relative_path: item.relative_path.clone(),
+            relative_path: relative,
+            sha256: item.sha256.clone(),
+        });
+        if let Some(evidence) = evidence_observation_event(
+            item,
+            &settings.device_id,
+            &snapshot,
+            observed_sha256,
+        ) {
+            events.push(evidence);
+        }
+        projects.extend(item.project_ids.iter().cloned());
+    }
+    let sync_path = project_manifest_sync_path(&app)?;
+    persist_project_manifest_intents(
+        &sync_path,
+        projects.into_iter().map(|project_id| (project_id, None)),
+    )?;
+    append_events(&settings, events)?;
+    let next = load_catalogue_file(&settings)?;
+    drop(_catalogue_guard);
+    let _ = reconcile_project_manifests(
+        &app,
+        &settings,
+        &next,
+        std::iter::empty::<(String, Option<String>)>(),
+    )?;
+    let _ = app.emit("catalogue-changed", ());
+    Ok(approvals.len())
+}
 #[tauri::command]
 async fn enrich_media(app: AppHandle, explicit_request: Option<bool>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -9316,6 +9626,27 @@ fn open_media_folder(app: AppHandle, media_id: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn reveal_library_folder(app: AppHandle, relative_path: String) -> Result<(), String> {
+    let settings = load_settings_file(&app)?;
+    let master = Path::new(&settings.master_bin_path);
+    let path = if relative_path.is_empty() {
+        master
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve Master Bin: {error}"))?
+    } else {
+        fs_safe::resolve_existing(master, &relative_path)?
+    };
+    if !path.is_dir() {
+        return Err("The selected Library folder is not available on this computer".into());
+    }
+    #[cfg(target_os = "windows")]
+    reveal_path_in_explorer(&path)?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Reveal folder in Explorer is available only in the Windows build".into());
+    Ok(())
+}
+
 fn tool_version(command: &str) -> Option<String> {
     let output = media_tool_command(command).arg("-version").output().ok()?;
     if !output.status.success() {
@@ -10564,6 +10895,8 @@ pub fn run() {
             log_ui_error,
             log_playback_event,
             verify_media_integrity,
+            review_media_relocation,
+            approve_media_relocation,
             enrich_media,
             media_tools_status,
             app_info,
@@ -10582,6 +10915,7 @@ pub fn run() {
             export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
+            reveal_library_folder,
             set_media_thumbnail_frame,
             load_thumbnail,
             load_thumbnail_sources,
@@ -10679,6 +11013,82 @@ mod tests {
             .join(format!("pimp-native-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn relocation_review_matches_twenty_eight_flattened_dji_recording_pairs() {
+        let master = temporary("relocation-28-pairs");
+        let destination = master.join("20261120");
+        fs::create_dir_all(&destination).unwrap();
+        let mut media = Vec::new();
+        for index in 1..=28 {
+            for extension in ["mp4", "wav"] {
+                let filename = format!("DJI_{index:04}.{extension}");
+                let path = destination.join(&filename);
+                fs::write(&path, format!("synthetic-{index}-{extension}")).unwrap();
+                media.push(
+                    new_media(
+                        &path,
+                        format!("20261120/DCIM/DJI_001/{filename}"),
+                        None,
+                        sha256(&path).unwrap(),
+                        None,
+                        "filesystem-modified".into(),
+                        false,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let matches = relocation_candidates(&master, &destination, &media).unwrap();
+        assert_eq!(matches.len(), 56);
+        assert!(matches.iter().all(|candidate| candidate.status == "exact"));
+        assert!(matches.iter().all(|candidate| candidate
+            .candidate_relative_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with("20261120/"))));
+        fs::remove_dir_all(master).unwrap();
+    }
+
+    #[test]
+    fn relocation_review_reports_ambiguous_and_mismatched_candidates() {
+        let master = temporary("relocation-conflicts");
+        let destination = master.join("20261120");
+        let first = destination.join("A");
+        let second = destination.join("B");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("clip.mp4"), b"same").unwrap();
+        fs::write(second.join("clip.mp4"), b"same").unwrap();
+        fs::write(first.join("audio.wav"), b"wrong").unwrap();
+        let video_path = first.join("clip.mp4");
+        let mut video = new_media(
+            &video_path,
+            "old/clip.mp4".into(),
+            None,
+            sha256(&video_path).unwrap(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        video.relative_path = "old/clip.mp4".into();
+        let audio_path = first.join("audio.wav");
+        let mut audio = new_media(
+            &audio_path,
+            "old/audio.wav".into(),
+            None,
+            "0".repeat(64),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        audio.relative_path = "old/audio.wav".into();
+        let matches = relocation_candidates(&master, &destination, &[video, audio]).unwrap();
+        assert_eq!(matches[0].status, "ambiguous");
+        assert_eq!(matches[1].status, "mismatched");
+        fs::remove_dir_all(master).unwrap();
     }
 
     fn approved_file_for_replan(

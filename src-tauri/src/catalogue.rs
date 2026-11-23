@@ -214,6 +214,16 @@ pub enum CatalogueEvent {
         #[serde(rename = "needsReview")]
         needs_review: bool,
     },
+    #[serde(rename = "media.relocated")]
+    MediaRelocated {
+        #[serde(rename = "mediaId")]
+        media_id: String,
+        #[serde(rename = "previousRelativePath")]
+        previous_relative_path: String,
+        #[serde(rename = "relativePath")]
+        relative_path: String,
+        sha256: String,
+    },
     #[serde(rename = "folder.upserted")]
     FolderUpserted { folder: FolderRecord },
     #[serde(rename = "folder.moved")]
@@ -1066,6 +1076,88 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                     );
                 }
             }
+            CatalogueEvent::MediaRelocated {
+                media_id,
+                previous_relative_path: _,
+                relative_path,
+                sha256,
+            } => {
+                let media_id = canonical_media_id(&media_aliases, media_id).to_string();
+                let Some(existing) = media.get(&media_id) else {
+                    add_conflict(
+                        &mut catalogue,
+                        MetadataConflict {
+                            entity_id: media_id,
+                            field: "missing-media".into(),
+                            event_ids: vec![envelope.event_id.clone()],
+                            values: vec![serde_json::to_value(&envelope.event).unwrap()],
+                        },
+                    );
+                    continue;
+                };
+                if !existing.sha256.eq_ignore_ascii_case(sha256) {
+                    add_conflict(
+                        &mut catalogue,
+                        MetadataConflict {
+                            entity_id: media_id,
+                            field: "relocation-hash".into(),
+                            event_ids: vec![envelope.event_id.clone()],
+                            values: vec![
+                                Value::String(existing.sha256.clone()),
+                                Value::String(sha256.clone()),
+                            ],
+                        },
+                    );
+                    continue;
+                }
+                let destination = normalized_media_identity_path(relative_path);
+                if let Some(occupied) = media.values().find(|candidate| {
+                    candidate.id != media_id
+                        && normalized_media_identity_path(&candidate.relative_path) == destination
+                }) {
+                    add_conflict(
+                        &mut catalogue,
+                        MetadataConflict {
+                            entity_id: media_id,
+                            field: "relocation-destination".into(),
+                            event_ids: vec![envelope.event_id.clone()],
+                            values: vec![
+                                Value::String(occupied.id.clone()),
+                                Value::String(relative_path.clone()),
+                            ],
+                        },
+                    );
+                    continue;
+                }
+                let key = format!("{media_id}:relativePath");
+                let should_apply = if let Some((previous, previous_value)) = scalar_versions.get(&key) {
+                    if !happens_before(previous, &envelope) {
+                        add_conflict(
+                            &mut catalogue,
+                            MetadataConflict {
+                                entity_id: media_id.clone(),
+                                field: "relativePath".into(),
+                                event_ids: vec![previous.event_id.clone(), envelope.event_id.clone()],
+                                values: vec![previous_value.clone(), Value::String(relative_path.clone())],
+                            },
+                        );
+                        concurrent_key(&envelope) > concurrent_key(previous)
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if should_apply {
+                    if let Some(item) = media.get_mut(&media_id) {
+                        item.relative_path = relative_path.clone();
+                    }
+                }
+                scalar_versions.insert(
+                    key,
+                    (envelope.clone(), Value::String(relative_path.clone())),
+                );
+            }
             CatalogueEvent::FolderUpserted { folder } => {
                 let key = format!("{}:folder", folder.id);
                 let value = serde_json::to_value(folder).unwrap();
@@ -1681,6 +1773,98 @@ mod tests {
             "conflicts": catalogue.conflicts,
             "issues": catalogue.issues,
         })
+    }
+
+    #[test]
+    fn relocation_preserves_identity_metadata_and_pairing() {
+        let mut video = item("video", "20261120/DCIM/DJI_001/clip.mp4", "mp4");
+        video.tags = vec!["DJI".into()];
+        video.project_ids = vec!["project-1".into()];
+        video.notes = "keep me".into();
+        video.favourite = true;
+        video.thumbnail_path = Some("shared.jpg".into());
+        let video_hash = video.sha256.clone();
+        let audio = item("audio", "20261120/DCIM/DJI_001/clip.wav", "wav");
+        let audio_hash = audio.sha256.clone();
+        let catalogue = rebuild(EventRead {
+            events: vec![
+                envelope("device-a", 1, CatalogueEvent::MediaRegistered { media: video }),
+                envelope("device-a", 2, CatalogueEvent::MediaRegistered { media: audio }),
+                envelope(
+                    "device-a",
+                    3,
+                    CatalogueEvent::MediaRelocated {
+                        media_id: "video".into(),
+                        previous_relative_path: "20261120/DCIM/DJI_001/clip.mp4".into(),
+                        relative_path: "20261120/clip.mp4".into(),
+                        sha256: video_hash,
+                    },
+                ),
+                envelope(
+                    "device-a",
+                    4,
+                    CatalogueEvent::MediaRelocated {
+                        media_id: "audio".into(),
+                        previous_relative_path: "20261120/DCIM/DJI_001/clip.wav".into(),
+                        relative_path: "20261120/clip.wav".into(),
+                        sha256: audio_hash,
+                    },
+                ),
+            ],
+            ..Default::default()
+        });
+        let video = catalogue.media.iter().find(|item| item.id == "video").unwrap();
+        assert_eq!(video.relative_path, "20261120/clip.mp4");
+        assert_eq!(video.tags, vec!["DJI"]);
+        assert_eq!(video.project_ids, vec!["project-1"]);
+        assert_eq!(video.notes, "keep me");
+        assert!(video.favourite);
+        assert_eq!(video.thumbnail_path.as_deref(), Some("shared.jpg"));
+        assert_eq!(video.attached_audio_id.as_deref(), Some("audio"));
+    }
+
+    #[test]
+    fn relocation_rejects_hash_mismatch_and_occupied_destination() {
+        let first = item("first", "old/clip.mp4", "mp4");
+        let second = item("second", "new/clip.mp4", "mp4");
+        let catalogue = rebuild(EventRead {
+            events: vec![
+                envelope("device-a", 1, CatalogueEvent::MediaRegistered { media: first }),
+                envelope("device-a", 2, CatalogueEvent::MediaRegistered { media: second }),
+                envelope(
+                    "device-a",
+                    3,
+                    CatalogueEvent::MediaRelocated {
+                        media_id: "first".into(),
+                        previous_relative_path: "old/clip.mp4".into(),
+                        relative_path: "new/clip.mp4".into(),
+                        sha256: "hash-first".into(),
+                    },
+                ),
+                envelope(
+                    "device-a",
+                    4,
+                    CatalogueEvent::MediaRelocated {
+                        media_id: "first".into(),
+                        previous_relative_path: "old/clip.mp4".into(),
+                        relative_path: "other/clip.mp4".into(),
+                        sha256: "wrong".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            catalogue.media.iter().find(|item| item.id == "first").unwrap().relative_path,
+            "old/clip.mp4"
+        );
+        let fields = catalogue
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.field.as_str())
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&"relocation-destination"));
+        assert!(fields.contains(&"relocation-hash"));
     }
 
     #[test]

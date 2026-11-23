@@ -2,6 +2,13 @@
 
 Never mark a check passed unless it was executed against the reported revision. Browser UI tests do not verify native Tauri behavior.
 
+## Catalogue relocation
+
+- Core and native replay tests verify that `media.relocated` preserves stable IDs, manual metadata, projects, shared-thumbnail references and derived MP4/WAV pairing.
+- Native review tests model 28 MP4/WAV recording pairs moved from `20261120/DCIM/DJI_001/` to `20261120/`, plus ambiguous duplicate bytes and size/hash mismatches.
+- Component coverage opens folder actions by keyboard, requires a visible relocation review, and approves only exact matches.
+- Installed acceptance must use disposable synthetic files inside a configured Master Bin. Confirm Explorer navigation and that relinking changes no source bytes. Production media remains read-only.
+
 ## Current repository commands
 
 From `J:\projects\kairix-pimp`:

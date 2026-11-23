@@ -326,6 +326,61 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         observedSha256: event.observedSha256,
         needsReview: event.needsReview,
       };
+    } else if (event.type === 'media.relocated') {
+      const mediaId = canonicalMediaId(event.mediaId);
+      const item = state.media[mediaId];
+      if (!item) {
+        addConflict({
+          entityId: mediaId,
+          field: 'missing-media',
+          eventIds: [envelope.eventId],
+          values: [event],
+        });
+        continue;
+      }
+      if (item.sha256.toLowerCase() !== event.sha256.toLowerCase()) {
+        addConflict({
+          entityId: mediaId,
+          field: 'relocation-hash',
+          eventIds: [envelope.eventId],
+          values: [item.sha256, event.sha256],
+        });
+        continue;
+      }
+      const destinationIdentity = normalizedMediaIdentityPath(
+        event.relativePath,
+      );
+      const occupied = Object.values(state.media).find(
+        (candidate) =>
+          candidate.id !== mediaId &&
+          normalizedMediaIdentityPath(candidate.relativePath) ===
+            destinationIdentity,
+      );
+      if (occupied) {
+        addConflict({
+          entityId: mediaId,
+          field: 'relocation-destination',
+          eventIds: [envelope.eventId],
+          values: [occupied.id, event.relativePath],
+        });
+        continue;
+      }
+      const key = `${mediaId}:relativePath`;
+      const previous = fieldVersions.get(key);
+      if (previous && !happensBefore(previous.envelope, envelope)) {
+        addConflict({
+          entityId: mediaId,
+          field: 'relativePath',
+          eventIds: [previous.envelope.eventId, envelope.eventId],
+          values: [previous.value, event.relativePath],
+        });
+        const previousKey = `${previous.envelope.deviceId}:${previous.envelope.sequence}:${previous.envelope.eventId}`;
+        const nextKey = `${envelope.deviceId}:${envelope.sequence}:${envelope.eventId}`;
+        if (nextKey > previousKey) item.relativePath = event.relativePath;
+      } else {
+        item.relativePath = event.relativePath;
+      }
+      fieldVersions.set(key, { envelope, value: event.relativePath });
     } else if (event.type === 'folder.upserted') {
       const key = `${event.folder.id}:folder`;
       const previous = fieldVersions.get(key);

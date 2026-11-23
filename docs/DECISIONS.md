@@ -587,3 +587,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted
 - **Decision:** Append current-device integrity evidence with every successfully verified ingest registration, using the independently hashed staging identity and promoted destination snapshot. Keep quick inventory metadata-only, but expose separate counts for snapshots still stabilizing, stable candidates requiring an explicit full verification, and files changed during hashing. Retry only stabilizing work after 16 seconds, retry errors after 30 seconds and back unchanged or explicit-verification-only inventory off to two minutes.
 - **Consequences:** Newly ingested MP4/WAV pairs are visible immediately without physical files remaining under one unexplained pending number. Quick scans cannot treat mismatched hash/review evidence as verified. External files still require the conservative observation window and an explicit content read, and a notification watcher remains future work.
+
+## ADR-081 — Append-only verified media relocation
+
+- **Date:** 2026-11-24
+- **Status:** Accepted, pending installed production-catalogue acceptance
+- **Decision:** Represent an approved move as `media.relocated`. Native review is restricted to a user-selected Master Bin file/folder, narrows candidates by original filename and size, and hashes only those candidates. Approval repeats containment, size, SHA-256 and stable-snapshot checks before append.
+- **Consequences:** Stable IDs and metadata survive and offline devices can replay the path change before media arrives, while original media remains immutable. Ambiguous, mismatched and occupied destinations remain unresolved. Project manifests are reconciled as metadata projections; Premiere project files are never edited.
