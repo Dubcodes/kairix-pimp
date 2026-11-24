@@ -30,7 +30,7 @@ retry. A retry accepts an existing destination file only when its size and hash
 already match the manifest. The restore-test operation requires a separate empty
 folder, copies every backed-up asset, and independently verifies all hashes.
 
-No backup state authorizes deletion. The application contains no cleanup command
+No backup state authorizes deletion. SD-card cleanup authorization belongs only to the originating ingest job and cannot be inferred from this manifest; production source removal remains acceptance-gated. The application contains no project-backup cleanup command
 and does not remove source files, backup generations, staging evidence or cloud
 objects.
 

@@ -30,7 +30,7 @@ These are implementation claims backed by automated tests; installed production-
 
 - Requirements/ADR reconciliation: implemented in documentation.
 - Fast/Deep verification and method evidence: implemented and automated-test covered; Deep remains the compatibility default. Fast evidence stays pending until selective Deep verification.
-- Cleanup authorization/state machine: planned after Fast/Deep; production execution disabled pending disposable removable-media acceptance.
+- Cleanup authorization/state machine: job-specific revisioned authorization, complete-batch reconciliation, consolidated review, durable intent/outcome evidence and restart observation are implemented and automated-test covered. Production removal is hard-disabled pending disposable removable-media acceptance.
 - Temporary absence/return regression coverage: planned focused checkpoint; no destructive offload operation.
 - Completed-project restoration foundation: planned read-only checkpoint.
 

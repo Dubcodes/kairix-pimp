@@ -83,7 +83,7 @@ Unused-footage review, cross-project protection, synchronization preflight, reco
 
 Automation is opt-in and disabled by default. Per-file protection and successful finalization verification gate eligibility; Syncthing replicas are not treated as backups.
 
-The pre-implementation state machine, overlap/source-identity gates, package completeness rules, exact removal review, durable journal and failure-injection matrix are recorded in `SOURCE_CLEANUP_DESIGN.md`. No destructive command or UI control is enabled in the beta.
+The first SD-card checkpoint implements off-by-default job-specific authorization, revision locking, whole-batch/source/destination/catalogue reconciliation, support-file retention, consolidated review, durable per-file intent/outcome evidence and restart observation. Synthetic tests exercise exact handle-bound removal and no-repeat recovery. Production removal remains hard-disabled pending installed disposable-removable-media acceptance. Master Bin/project cleanup remains unimplemented and separately gated by archive independence.
 
 ## Cross-cutting — persistent background work
 

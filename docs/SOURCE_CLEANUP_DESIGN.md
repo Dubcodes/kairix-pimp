@@ -4,6 +4,10 @@ The owner has authorized development of optional automatic SD-card cleanup after
 
 Master Bin/project cleanup is a different lifecycle operation. It still requires verified project collection, archive independence, cross-project protection, recoverable quarantine and separate authorization.
 
+## Implementation checkpoint
+
+The durable ingest-job schema, job-specific revisioned authorization, whole-batch reconciliation, consolidated review, locked authorization revision, per-file intent/outcome journal and restart observation are implemented with synthetic native tests. The UI exposes the off-by-default authorization and current review state. Test builds exercise exact handle-bound deletion only inside disposable fixture roots. Production builds stop at `acceptance-required`; they cannot remove source files until the real installed disposable-removable-media matrix below passes and that gate is changed in a separately reviewed commit.
+
 ## Durable state model
 
 Cleanup is a phase of one persistent ingest job, never a per-file side effect of copying. The job records:

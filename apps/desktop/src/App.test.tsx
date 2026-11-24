@@ -63,6 +63,7 @@ const mocks = vi.hoisted(() => ({
   jobs: [] as import('./bridge').IngestJob[],
   initializeIngestJobs: vi.fn(),
   clearCompletedIngestJobs: vi.fn(),
+  setIngestCleanupAuthorization: vi.fn(),
   updateIngestFileMetadata: vi.fn(),
   jobListener: undefined as
     ((jobs: import('./bridge').IngestJob[]) => void) | undefined,
@@ -146,6 +147,7 @@ vi.mock('./bridge', () => ({
     initializeIngestJobs: mocks.initializeIngestJobs,
     listIngestJobs: vi.fn(async () => []),
     clearCompletedIngestJobs: mocks.clearCompletedIngestJobs,
+    setIngestCleanupAuthorization: mocks.setIngestCleanupAuthorization,
     updateIngestFileMetadata: mocks.updateIngestFileMetadata,
     pauseIngest: vi.fn(),
     resumeIngest: vi.fn(),
@@ -403,6 +405,7 @@ describe('native application integration', () => {
       },
     );
     mocks.updateIngestFileMetadata.mockReset();
+    mocks.setIngestCleanupAuthorization.mockReset();
     mocks.jobListener = undefined;
     mocks.catalogueListener = undefined;
     mocks.refreshMediaAvailability.mockReset();
@@ -2305,14 +2308,51 @@ describe('native application integration', () => {
     await user.type(tags, 'Race Day');
     await user.click(await screen.findByText('Create “Race Day”'));
     await user.click(
+      screen.getByRole('checkbox', {
+        name: 'Automatically delete ingested files from SD card',
+      }),
+    );
+    await user.click(
       screen.getByRole('button', { name: 'Start verified ingest' }),
     );
     expect(mocks.startIngest).toHaveBeenCalledWith(
       expect.objectContaining({
         batchTags: ['Race Day'],
         verificationMode: 'deep',
+        cleanupRequested: true,
       }),
     );
+  });
+
+  it('keeps job-specific cleanup editable until native revalidation locks it', async () => {
+    const user = userEvent.setup();
+    const job = {
+      ...testJob('cleanup', 'copying'),
+      cleanupRequested: false,
+      cleanupAuthorizationRevision: 4,
+      cleanupState: 'authorized',
+    };
+    const updated = {
+      ...job,
+      cleanupRequested: true,
+      cleanupAuthorizationRevision: 5,
+    };
+    mocks.jobs = [job];
+    mocks.setIngestCleanupAuthorization.mockResolvedValue(updated);
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(screen.getByRole('button', { name: /1 active/i }));
+    const checkboxes = await screen.findAllByRole('checkbox', {
+      name: 'Automatically delete ingested files from SD card',
+    });
+    checkboxes[0].focus();
+    await user.keyboard(' ');
+    expect(mocks.setIngestCleanupAuthorization).toHaveBeenCalledWith(
+      'cleanup',
+      4,
+      true,
+    );
+    expect(await screen.findByText(/changed from off to on/i)).toBeVisible();
   });
 
   it('offers keyboard-accessible Fast and Deep ingest verification choices', async () => {

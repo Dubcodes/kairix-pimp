@@ -297,6 +297,7 @@ export function App() {
   const [ingestVerificationMode, setIngestVerificationMode] = useState<
     'fast' | 'deep'
   >('deep');
+  const [cleanupRequested, setCleanupRequested] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -1902,6 +1903,7 @@ export function App() {
         allowDuplicateCopies,
         allowUnverifiedReimport,
         verificationMode: ingestVerificationMode,
+        cleanupRequested,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -1913,6 +1915,7 @@ export function App() {
       setIngestBatchTags([]);
       setAllowDuplicateCopies(false);
       setAllowUnverifiedReimport(false);
+      setCleanupRequested(false);
       setSdGrabberMode(false);
       setJobsOpen(true);
       setMessage(
@@ -1922,6 +1925,31 @@ export function App() {
       setError(errorText(reason));
     } finally {
       setStartingIngest(false);
+    }
+  };
+  const changeJobCleanupAuthorization = async (
+    job: IngestJob,
+    requested: boolean,
+  ) => {
+    setError('');
+    try {
+      const updated = await desktopBridge.setIngestCleanupAuthorization(
+        job.id,
+        job.cleanupAuthorizationRevision ?? 0,
+        requested,
+      );
+      setJobs((current) =>
+        current.map((candidate) =>
+          candidate.id === updated.id ? updated : candidate,
+        ),
+      );
+      setMessage(
+        requested
+          ? 'SD-card cleanup changed from off to on for this ingest. Source removal remains acceptance-gated in this Development build.'
+          : 'SD-card cleanup changed from on to off for this ingest. Source files will be retained.',
+      );
+    } catch (reason) {
+      setError(errorText(reason));
     }
   };
   const reviewRenamedDestinations = async () => {
@@ -2858,7 +2886,14 @@ export function App() {
     }
   };
   const activeJobs = jobs.filter((job) =>
-    ['queued', 'copying', 'verifying'].includes(job.state),
+    [
+      'queued',
+      'copying',
+      'verifying',
+      'reconciling',
+      'cleanup-revalidating',
+      'removing',
+    ].includes(job.state),
   );
   const completedJobs = jobs.filter(jobIsClearableHistory);
   const needsAttentionJobs = jobs.filter(
@@ -3204,7 +3239,13 @@ export function App() {
                           Retry
                         </button>
                       )}
-                    {!['completed', 'cancelled'].includes(job.state) && (
+                    {[
+                      'queued',
+                      'copying',
+                      'verifying',
+                      'paused',
+                      'interrupted',
+                    ].includes(job.state) && (
                       <button
                         onClick={() => desktopBridge.cancelIngest(job.id)}
                       >
@@ -3213,6 +3254,37 @@ export function App() {
                     )}
                   </div>
                 </header>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={job.cleanupRequested ?? false}
+                    disabled={
+                      job.cleanupAuthorizationLockedRevision !== undefined ||
+                      (![
+                        'queued',
+                        'copying',
+                        'verifying',
+                        'paused',
+                        'reconciling',
+                      ].includes(job.state) &&
+                        job.cleanupState !== 'acceptance-required')
+                    }
+                    onChange={(event) =>
+                      void changeJobCleanupAuthorization(
+                        job,
+                        event.target.checked,
+                      )
+                    }
+                  />{' '}
+                  Automatically delete ingested files from SD card
+                </label>
+                <small>
+                  {job.cleanupAuthorizationLockedRevision !== undefined
+                    ? `Locked at authorization revision ${job.cleanupAuthorizationLockedRevision} because cleanup revalidation began.`
+                    : 'Job-specific and editable until native cleanup revalidation begins.'}{' '}
+                  This Development build records and reviews cleanup but keeps
+                  removal acceptance-gated.
+                </small>
                 <progress
                   value={job.bytesTransferred}
                   max={job.bytesTotal || 1}
@@ -3230,6 +3302,32 @@ export function App() {
                     new ingest.
                   </small>
                 ))}
+                {(job.cleanupIssues?.length ?? 0) > 0 && (
+                  <section
+                    className="conflict-list"
+                    aria-label="Cleanup review"
+                  >
+                    <strong>
+                      Cleanup blocked — all unresolved sources retained
+                    </strong>
+                    {job.cleanupIssues?.map((issue, index) => (
+                      <div key={`${issue.sourcePath}-${index}`}>
+                        <small className="job-error">{issue.reason}</small>
+                        <small>
+                          {issue.sourcePath || 'Complete batch'}
+                          {issue.destinationPath
+                            ? ` → ${issue.destinationPath}`
+                            : ''}
+                        </small>
+                        <small>
+                          Expected: {issue.expected}. Observed: {issue.observed}
+                          .
+                        </small>
+                        <small>{issue.action}</small>
+                      </div>
+                    ))}
+                  </section>
+                )}
                 <div className="job-files">
                   {job.files.map((file) => (
                     <div className="job-file" key={file.id}>
@@ -6750,6 +6848,23 @@ export function App() {
                   missing or failed verification
                 </label>
               )}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={cleanupRequested}
+                  onChange={(event) =>
+                    setCleanupRequested(event.target.checked)
+                  }
+                />{' '}
+                Automatically delete ingested files from SD card
+              </label>
+              <small>
+                Irreversible cleanup is a separate whole-batch phase. Fast mode
+                does not independently reread destination content. This
+                Development build records your job-specific authorization and
+                reconciliation result but will retain source files until
+                disposable-removable-media acceptance enables execution.
+              </small>
               <button
                 className="primary"
                 disabled={

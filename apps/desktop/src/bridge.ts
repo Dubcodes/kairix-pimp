@@ -472,7 +472,11 @@ export type IngestJobState =
   | 'failed'
   | 'cancelled'
   | 'interrupted'
-  | 'paused';
+  | 'paused'
+  | 'reconciling'
+  | 'cleanup-revalidating'
+  | 'removing'
+  | 'needs-attention';
 export interface ProvisionalMetadata {
   tags: string[];
   projectIds: string[];
@@ -504,6 +508,20 @@ export interface IngestJobFile {
   destinationBytesRead?: number;
   copyDurationMillis?: number;
   verificationDurationMillis?: number;
+  sourceRootPath?: string;
+  mediaKind?: string;
+  verifiedSha256?: string;
+  cleanupState?: string;
+  cleanupIntentId?: string;
+  cleanupDetail?: string;
+}
+export interface CleanupIssue {
+  sourcePath: string;
+  destinationPath?: string;
+  expected: string;
+  observed: string;
+  reason: string;
+  action: string;
 }
 export interface IngestJob {
   schemaVersion: number;
@@ -526,6 +544,12 @@ export interface IngestJob {
   bytesTotal: number;
   bytesTransferred: number;
   filesCompleted: number;
+  cleanupRequested?: boolean;
+  cleanupAuthorizationRevision?: number;
+  cleanupAuthorizationLockedRevision?: number;
+  cleanupState?: string;
+  cleanupIssues?: CleanupIssue[];
+  cleanupScopeComplete?: boolean;
 }
 
 export const nativeAvailable = () => isTauri();
@@ -679,9 +703,20 @@ export const desktopBridge = {
     allowDuplicateCopies?: boolean;
     allowUnverifiedReimport?: boolean;
     verificationMode?: 'fast' | 'deep';
+    cleanupRequested?: boolean;
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
+  setIngestCleanupAuthorization: (
+    jobId: string,
+    expectedRevision: number,
+    requested: boolean,
+  ) =>
+    invoke<IngestJob>('set_ingest_cleanup_authorization', {
+      jobId,
+      expectedRevision,
+      requested,
+    }),
   clearCompletedIngestJobs: (jobId?: string) =>
     invoke<IngestJob[]>('clear_completed_ingest_jobs', { jobId }),
   updateIngestFileMetadata: (

@@ -14,7 +14,7 @@ An unchanged quick observation may reuse prior verified evidence for display, bu
 
 Content verification reads every byte and calculates SHA-256 only when verified ingest requires it, a possible duplicate must become a content-identity decision, the user explicitly requests integrity verification, or a safety-critical transition lacks current evidence. Verification records the volume and file snapshot before and after the read. Changed, disconnected, unreadable or throttled sources remain unresolved and retryable.
 
-Verified evidence is not cleanup authorization. Source cleanup additionally requires the complete state machine in `SOURCE_CLEANUP_DESIGN.md`, exact review and explicit confirmation.
+Verified evidence is not cleanup authorization. Source cleanup additionally requires the complete state machine in `SOURCE_CLEANUP_DESIGN.md`, exact review and explicit confirmation. Revalidation/removal acquires source write and destination read admission through the same stable-volume governor; production removal remains disabled pending installed disposable-media acceptance.
 
 ### Deep analysis
 
