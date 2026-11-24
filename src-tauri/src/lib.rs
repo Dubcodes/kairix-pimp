@@ -145,6 +145,7 @@ struct NativeState {
     approved_plan_store: Mutex<()>,
     inventory_worker: Mutex<()>,
     inventory_cancelled: Mutex<HashSet<String>>,
+    integrity_cancelled: Mutex<HashSet<String>>,
     inventory_status: Mutex<Option<BackgroundOperation>>,
     project_inventory_status: Mutex<HashMap<String, BackgroundOperation>>,
     volume_governor: resource_governor::VolumeGovernor,
@@ -902,6 +903,23 @@ struct DiscoveryStatus {
     errors: usize,
     started_at: Option<String>,
     last_completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PendingVerificationItem {
+    id: String,
+    media_id: Option<String>,
+    original_filename: String,
+    relative_path: String,
+    available: bool,
+    classification: String,
+    reason: String,
+    evidence_observed_at: Option<String>,
+    evidence_status: String,
+    expected_size: Option<u64>,
+    observed_size: Option<u64>,
+    selectable: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3550,6 +3568,23 @@ fn sha256(path: &Path) -> Result<String, String> {
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
+        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn sha256_cancellable(path: &Path, cancelled: impl Fn() -> bool) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        if cancelled() {
+            return Err("Integrity verification cancelled safely".into());
+        }
         let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
             break;
@@ -7194,11 +7229,168 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
     Ok(result)
 }
 
+fn classify_pending_media(
+    item: &MediaItem,
+    snapshot: Option<&fs_safe::FileSnapshot>,
+    evidence: Option<&catalogue::IntegrityEvidence>,
+) -> (&'static str, &'static str, &'static str) {
+    match (snapshot, evidence) {
+        (Some(_), Some(evidence))
+            if evidence.needs_review
+                || evidence
+                    .observed_sha256
+                    .as_ref()
+                    .is_some_and(|hash| !hash.eq_ignore_ascii_case(&item.sha256)) =>
+        {
+            (
+                "failed-verification",
+                "The most recent verification did not match the registered SHA-256.",
+                "failed or requires review",
+            )
+        }
+        (Some(snapshot), Some(evidence))
+            if evidence.observed_size != snapshot.length
+                || evidence.observed_modified_millis.map(u128::from)
+                    != snapshot.modified_millis =>
+        {
+            (
+                "snapshot-changed",
+                "The local size or modification snapshot changed after the last verification.",
+                "previous evidence is stale",
+            )
+        }
+        (Some(_), Some(evidence))
+            if evidence
+                .observed_sha256
+                .as_ref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&item.sha256)) =>
+        {
+            (
+                "verified",
+                "Registered bytes and the current-device snapshot have verified evidence.",
+                "verified on this device",
+            )
+        }
+        (Some(_), _) => (
+            "awaiting-verification",
+            "The registered file is present but has no current verified evidence on this device.",
+            "no current-device hash evidence",
+        ),
+        (None, Some(evidence)) if evidence.needs_review => (
+            "failed-verification",
+            "The last verification requires review and the registered path is not currently available.",
+            "failed or requires review",
+        ),
+        (None, Some(_)) => (
+            "missing-or-relocated",
+            "This device previously verified the file, but its registered path is now missing.",
+            "previously verified on this device",
+        ),
+        (None, None) if !item.integrity_by_device.is_empty() => (
+            "awaiting-syncthing",
+            "Other-device evidence exists, but this device has not received the registered file.",
+            "verified elsewhere; unavailable here",
+        ),
+        (None, None) => (
+            "unavailable",
+            "The registered path is unavailable and no device-specific integrity evidence is present.",
+            "no device evidence",
+        ),
+    }
+}
+
+#[tauri::command]
+fn list_pending_verification(app: AppHandle) -> Result<Vec<PendingVerificationItem>, String> {
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let master = PathBuf::from(&settings.master_bin_path);
+    let discovery_path = settings_path(&app)?
+        .parent()
+        .ok_or("Settings path has no parent")?
+        .join("discovery-observations.json");
+    let observations = discovery::load(&discovery_path).unwrap_or_default();
+    let known_paths = catalogue
+        .media
+        .iter()
+        .map(|item| item.relative_path.as_str())
+        .collect::<HashSet<_>>();
+    let mut items = Vec::with_capacity(catalogue.media.len() + observations.candidates.len());
+    for item in &catalogue.media {
+        let evidence = item.integrity_by_device.get(&settings.device_id);
+        let resolved = fs_safe::resolve_existing(&master, &item.relative_path).ok();
+        let snapshot = resolved
+            .as_ref()
+            .and_then(|path| fs_safe::snapshot(path).ok());
+        let available = snapshot.is_some();
+        let (classification, reason, evidence_status) =
+            classify_pending_media(item, snapshot.as_ref(), evidence);
+        items.push(PendingVerificationItem {
+            id: format!("media:{}", item.id),
+            media_id: Some(item.id.clone()),
+            original_filename: item.original_filename.clone(),
+            relative_path: item.relative_path.clone(),
+            available,
+            classification: classification.into(),
+            reason: reason.into(),
+            evidence_observed_at: evidence.and_then(|value| value.observed_at.clone()),
+            evidence_status: evidence_status.into(),
+            expected_size: Some(item.technical.size_bytes),
+            observed_size: snapshot.as_ref().map(|value| value.length),
+            selectable: available && classification != "verified",
+        });
+    }
+    for (relative_path, observation) in observations
+        .candidates
+        .iter()
+        .filter(|(path, _)| !known_paths.contains(path.as_str()))
+    {
+        let available = fs_safe::resolve_existing(&master, relative_path).is_ok();
+        let original_filename = Path::new(relative_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| relative_path.clone());
+        items.push(PendingVerificationItem {
+            id: format!("path:{relative_path}"),
+            media_id: None,
+            original_filename,
+            relative_path: relative_path.clone(),
+            available,
+            classification: if available {
+                "discovered-awaiting-verification".into()
+            } else {
+                "unavailable".into()
+            },
+            reason: if available {
+                "A stable discovered file awaits explicit content verification before registration."
+                    .into()
+            } else {
+                "A previously observed unregistered file is no longer available locally.".into()
+            },
+            evidence_observed_at: DateTime::from_timestamp(
+                observation.last_observed_unix_seconds,
+                0,
+            )
+            .map(|value| value.to_rfc3339()),
+            evidence_status: "discovery snapshot only; no hash evidence".into(),
+            expected_size: None,
+            observed_size: Some(observation.length),
+            selectable: false,
+        });
+    }
+    items.sort_by(|left, right| {
+        (left.classification == "verified")
+            .cmp(&(right.classification == "verified"))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    Ok(items)
+}
+
 #[tauri::command]
 fn verify_media_integrity(
     app: AppHandle,
     state: State<'_, NativeState>,
     media_id: String,
+    operation_id: Option<String>,
 ) -> Result<bool, String> {
     let _operation = begin_critical_operation(&state.operations, "integrity verification")?;
     let settings = load_settings_file(&app)?;
@@ -7223,10 +7415,16 @@ fn verify_media_integrity(
         || false,
     )?;
     let snapshot = fs_safe::snapshot(&path)?;
-    let observed_sha256 = match sha256(&path) {
+    let observed_sha256 = match sha256_cancellable(&path, || {
+        operation_id
+            .as_ref()
+            .is_some_and(|id| state.integrity_cancelled.lock().unwrap().contains(id))
+    }) {
         Ok(hash) => hash,
         Err(error) => {
+            if !error.contains("cancelled safely") {
             volume_permit.record_error(error.clone());
+            }
             return Err(error);
         }
     };
@@ -9382,7 +9580,14 @@ fn cancel_background_operation(
     state: State<'_, NativeState>,
     operation_id: String,
 ) -> Result<(), String> {
-    if operation_id.starts_with("playback-proxy:") {
+    if operation_id.starts_with("integrity-verification:") {
+        state
+            .integrity_cancelled
+            .lock()
+            .unwrap()
+            .insert(operation_id);
+        Ok(())
+    } else if operation_id.starts_with("playback-proxy:") {
         state
             .playback_proxy_cancelled
             .lock()
@@ -9399,6 +9604,15 @@ fn cancel_background_operation(
     } else {
         cancel_inventory(state, operation_id)
     }
+}
+
+#[tauri::command]
+fn finish_integrity_verification(state: State<'_, NativeState>, operation_id: String) {
+    state
+        .integrity_cancelled
+        .lock()
+        .unwrap()
+        .remove(&operation_id);
 }
 
 fn build_premiere_import_manifest(
@@ -11021,6 +11235,7 @@ pub fn run() {
             inventory_sd_card,
             cancel_inventory,
             cancel_background_operation,
+            finish_integrity_verification,
             list_background_operations,
             reapprove_ingest_destinations,
             replan_ingest_destinations,
@@ -11052,6 +11267,7 @@ pub fn run() {
             get_resource_governor_status,
             log_ui_error,
             log_playback_event,
+            list_pending_verification,
             verify_media_integrity,
             review_media_relocation,
             approve_media_relocation,
@@ -11092,6 +11308,71 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_verification_classifies_evidence_without_reading_content() {
+        let root = temporary("pending-verification-classification");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"registered-content").unwrap();
+        let hash = sha256(&source).unwrap();
+        let mut item = new_media(
+            &source,
+            "20261124/clip.mp4".into(),
+            None,
+            hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        assert_eq!(
+            classify_pending_media(&item, Some(&snapshot), None).0,
+            "awaiting-verification"
+        );
+        let evidence = catalogue::IntegrityEvidence {
+            observed_size: snapshot.length,
+            observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
+            observed_sha256: Some(hash.clone()),
+            needs_review: false,
+            observed_at: Some("2026-11-24T00:00:00Z".into()),
+        };
+        assert_eq!(
+            classify_pending_media(&item, Some(&snapshot), Some(&evidence)).0,
+            "verified"
+        );
+        let changed = fs_safe::FileSnapshot {
+            length: snapshot.length + 1,
+            modified_millis: snapshot.modified_millis,
+        };
+        assert_eq!(
+            classify_pending_media(&item, Some(&changed), Some(&evidence)).0,
+            "snapshot-changed"
+        );
+        let failed = catalogue::IntegrityEvidence {
+            needs_review: true,
+            observed_sha256: Some("different".into()),
+            ..evidence.clone()
+        };
+        assert_eq!(
+            classify_pending_media(&item, Some(&snapshot), Some(&failed)).0,
+            "failed-verification"
+        );
+        assert_eq!(
+            classify_pending_media(&item, None, Some(&evidence)).0,
+            "missing-or-relocated"
+        );
+        item.integrity_by_device
+            .insert("other-device".into(), evidence);
+        assert_eq!(
+            classify_pending_media(&item, None, None).0,
+            "awaiting-syncthing"
+        );
+        assert!(sha256_cancellable(&source, || true)
+            .unwrap_err()
+            .contains("cancelled safely"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn transient_operations_expose_authoritative_worker_lifetime() {
@@ -13257,6 +13538,7 @@ mod tests {
                     .map(|value| value as u64),
                 observed_sha256: Some(changed_hash),
                 needs_review: true,
+                observed_at: None,
             },
         );
         fs::write(&source, b"expected").unwrap();

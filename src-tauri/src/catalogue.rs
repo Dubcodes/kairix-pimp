@@ -33,6 +33,8 @@ pub struct IntegrityEvidence {
     pub observed_modified_millis: Option<u64>,
     pub observed_sha256: Option<String>,
     pub needs_review: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1072,6 +1074,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                             observed_modified_millis: *observed_modified_millis,
                             observed_sha256: observed_sha256.clone(),
                             needs_review: *needs_review,
+                            observed_at: Some(envelope.occurred_at.clone()),
                         },
                     );
                 }

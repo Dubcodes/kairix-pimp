@@ -134,6 +134,7 @@ export interface MediaItem {
       observedModifiedMillis?: number;
       observedSha256?: string;
       needsReview: boolean;
+      observedAt?: string;
     }
   >;
 }
@@ -308,6 +309,28 @@ export interface DiscoveryStatus {
   errors: number;
   startedAt?: string;
   lastCompletedAt?: string;
+}
+export interface PendingVerificationItem {
+  id: string;
+  mediaId?: string;
+  originalFilename: string;
+  relativePath: string;
+  available: boolean;
+  classification:
+    | 'verified'
+    | 'snapshot-changed'
+    | 'awaiting-verification'
+    | 'discovered-awaiting-verification'
+    | 'missing-or-relocated'
+    | 'awaiting-syncthing'
+    | 'unavailable'
+    | 'failed-verification';
+  reason: string;
+  evidenceObservedAt?: string;
+  evidenceStatus: string;
+  expectedSize?: number;
+  observedSize?: number;
+  selectable: boolean;
 }
 export interface MediaToolsStatus {
   ffmpegAvailable: boolean;
@@ -758,8 +781,12 @@ export const desktopBridge = {
       'github' | 'releases' | 'test-builds' | 'website' | 'coffee' | 'degoo',
   ) => invoke<void>('open_support_link', { destination }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),
-  verifyMediaIntegrity: (mediaId: string) =>
-    invoke<boolean>('verify_media_integrity', { mediaId }),
+  listPendingVerification: () =>
+    invoke<PendingVerificationItem[]>('list_pending_verification'),
+  verifyMediaIntegrity: (mediaId: string, operationId?: string) =>
+    invoke<boolean>('verify_media_integrity', { mediaId, operationId }),
+  finishIntegrityVerification: (operationId: string) =>
+    invoke<void>('finish_integrity_verification', { operationId }),
   reviewMediaRelocation: (mediaIds: string[], selectedPath: string) =>
     invoke<RelocationReview>('review_media_relocation', {
       mediaIds,

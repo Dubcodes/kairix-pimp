@@ -1672,6 +1672,41 @@ article footer span {
   font-weight: 700;
 }
 
+.verification-progress {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.verification-progress progress {
+  width: 100%;
+}
+
+.verification-list {
+  display: grid;
+  gap: 0.55rem;
+  max-height: 32rem;
+  overflow: auto;
+}
+
+.verification-item {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--panel) 90%, transparent);
+}
+
+.verification-item label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.verification-item code {
+  overflow-wrap: anywhere;
+}
+
 .scan-actions {
   display: flex;
   flex-wrap: wrap;

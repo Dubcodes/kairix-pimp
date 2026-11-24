@@ -75,6 +75,7 @@ export interface IntegrityEvidence {
   observedModifiedMillis?: number;
   observedSha256?: string;
   needsReview: boolean;
+  observedAt?: string;
 }
 
 export interface FolderRecord {

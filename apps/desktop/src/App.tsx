@@ -57,6 +57,7 @@ import {
   type IngestProgress,
   type IngestResult,
   type MediaToolsStatus,
+  type PendingVerificationItem,
   type RelocationReview,
   type HoverPreview,
   type ProjectInventory,
@@ -345,6 +346,21 @@ export function App() {
     },
     errors: 0,
   });
+  const [pendingVerificationItems, setPendingVerificationItems] = useState<
+    PendingVerificationItem[]
+  >([]);
+  const [selectedVerificationIds, setSelectedVerificationIds] = useState<
+    Set<string>
+  >(() => new Set());
+  const [showVerifiedEvidence, setShowVerifiedEvidence] = useState(false);
+  const [verificationProgress, setVerificationProgress] = useState<{
+    operationId: string;
+    completed: number;
+    total: number;
+    current: string;
+    cancelling: boolean;
+  }>();
+  const verificationCancelRequested = useRef(false);
   const [batchTags, setBatchTags] = useState<string[]>([]);
   const [removeBatchTags, setRemoveBatchTags] = useState<string[]>([]);
   const [batchProjects, setBatchProjects] = useState<string[]>([]);
@@ -540,6 +556,18 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [settingsSection, view]);
   useEffect(() => {
+    if (
+      !native ||
+      view !== 'Settings' ||
+      settingsSection !== 'Ingest & Discovery'
+    )
+      return;
+    void desktopBridge
+      .listPendingVerification()
+      .then(setPendingVerificationItems)
+      .catch((reason) => setError(errorText(reason)));
+  }, [native, settingsSection, view]);
+  useEffect(() => {
     const preservePendingSettings = (event: BeforeUnloadEvent) => {
       if (!savingSettings.hasUnsavedChanges()) return;
       event.preventDefault();
@@ -586,6 +614,89 @@ export function App() {
     },
     [refresh],
   );
+  const refreshPendingVerification = useCallback(async () => {
+    setPendingVerificationItems(await desktopBridge.listPendingVerification());
+  }, []);
+  const verifyPendingSelection = useCallback(async () => {
+    const targets = pendingVerificationItems.filter(
+      (item) =>
+        selectedVerificationIds.has(item.id) && item.selectable && item.mediaId,
+    );
+    if (!targets.length || verificationProgress) return;
+    const operationId = `integrity-verification:${Date.now()}`;
+    verificationCancelRequested.current = false;
+    setError('');
+    setVerificationProgress({
+      operationId,
+      completed: 0,
+      total: targets.length,
+      current: targets[0].originalFilename,
+      cancelling: false,
+    });
+    let verified = 0;
+    let mismatched = 0;
+    let failed = 0;
+    try {
+      for (let index = 0; index < targets.length; index += 1) {
+        if (verificationCancelRequested.current) break;
+        const target = targets[index];
+        setVerificationProgress((current) =>
+          current
+            ? {
+                ...current,
+                completed: index,
+                current: target.originalFilename,
+              }
+            : current,
+        );
+        try {
+          const matches = await desktopBridge.verifyMediaIntegrity(
+            target.mediaId!,
+            operationId,
+          );
+          if (matches) verified += 1;
+          else mismatched += 1;
+        } catch (reason) {
+          if (verificationCancelRequested.current) break;
+          failed += 1;
+          setError(errorText(reason));
+        }
+        setVerificationProgress((current) =>
+          current ? { ...current, completed: index + 1 } : current,
+        );
+      }
+      await refresh();
+      await refreshPendingVerification();
+      setSelectedVerificationIds(new Set());
+      setMessage(
+        verificationCancelRequested.current
+          ? `Verification cancelled safely: ${verified} matched, ${mismatched} mismatched, ${failed} failed before cancellation.`
+          : `Selective verification complete: ${verified} matched, ${mismatched} mismatched, ${failed} failed.`,
+      );
+    } finally {
+      await desktopBridge
+        .finishIntegrityVerification(operationId)
+        .catch(() => undefined);
+      verificationCancelRequested.current = false;
+      setVerificationProgress(undefined);
+    }
+  }, [
+    pendingVerificationItems,
+    refresh,
+    refreshPendingVerification,
+    selectedVerificationIds,
+    verificationProgress,
+  ]);
+  const cancelPendingVerification = useCallback(() => {
+    if (!verificationProgress || verificationProgress.cancelling) return;
+    verificationCancelRequested.current = true;
+    setVerificationProgress((current) =>
+      current ? { ...current, cancelling: true } : current,
+    );
+    void desktopBridge.cancelBackgroundOperation(
+      verificationProgress.operationId,
+    );
+  }, [verificationProgress]);
   const receiveJobs = (incoming: IngestJob[]) =>
     setJobs(
       incoming.map((job) => ({
@@ -3670,6 +3781,141 @@ export function App() {
                     SHA-256 verification. PIMP never replaces a destination on
                     collision and never modifies source media.
                   </div>
+                  <fieldset className="settings-subsection pending-verification">
+                    <legend>Pending Verification</legend>
+                    <p>
+                      Opening this view reads catalogue and filesystem metadata
+                      only. SHA-256 reads start only for the registered files
+                      you select below. Pending does not mean corrupt.
+                    </p>
+                    <div className="scan-actions">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={showVerifiedEvidence}
+                          onChange={(event) =>
+                            setShowVerifiedEvidence(event.target.checked)
+                          }
+                        />{' '}
+                        Include verified files
+                      </label>
+                      <button
+                        type="button"
+                        disabled={verificationProgress != null}
+                        onClick={() => {
+                          const selectable = pendingVerificationItems.filter(
+                            (item) =>
+                              item.selectable &&
+                              item.classification !== 'verified',
+                          );
+                          setSelectedVerificationIds(
+                            new Set(selectable.map((item) => item.id)),
+                          );
+                        }}
+                      >
+                        Select all verifiable pending
+                      </button>
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={
+                          verificationProgress != null ||
+                          !pendingVerificationItems.some(
+                            (item) =>
+                              item.selectable &&
+                              selectedVerificationIds.has(item.id),
+                          )
+                        }
+                        onClick={() => void verifyPendingSelection()}
+                      >
+                        Verify selected
+                      </button>
+                      {verificationProgress && (
+                        <button
+                          type="button"
+                          onClick={cancelPendingVerification}
+                          disabled={verificationProgress.cancelling}
+                        >
+                          {verificationProgress.cancelling
+                            ? 'Cancelling safely…'
+                            : 'Cancel verification'}
+                        </button>
+                      )}
+                    </div>
+                    {verificationProgress && (
+                      <div role="status" className="verification-progress">
+                        <progress
+                          value={verificationProgress.completed}
+                          max={verificationProgress.total}
+                        />
+                        <span>
+                          {verificationProgress.completed}/
+                          {verificationProgress.total} ·{' '}
+                          {verificationProgress.current}
+                        </span>
+                      </div>
+                    )}
+                    <p role="status">
+                      {
+                        pendingVerificationItems.filter(
+                          (item) => item.classification !== 'verified',
+                        ).length
+                      }{' '}
+                      require attention ·{' '}
+                      {
+                        pendingVerificationItems.filter(
+                          (item) => item.classification === 'verified',
+                        ).length
+                      }{' '}
+                      verified on this device
+                    </p>
+                    <div className="verification-list">
+                      {pendingVerificationItems
+                        .filter(
+                          (item) =>
+                            showVerifiedEvidence ||
+                            item.classification !== 'verified',
+                        )
+                        .map((item) => (
+                          <article key={item.id} className="verification-item">
+                            <label>
+                              <input
+                                type="checkbox"
+                                aria-label={`Verify ${item.originalFilename}`}
+                                checked={selectedVerificationIds.has(item.id)}
+                                disabled={
+                                  !item.selectable ||
+                                  verificationProgress != null
+                                }
+                                onChange={(event) =>
+                                  setSelectedVerificationIds((current) => {
+                                    const next = new Set(current);
+                                    if (event.target.checked) next.add(item.id);
+                                    else next.delete(item.id);
+                                    return next;
+                                  })
+                                }
+                              />
+                              <strong>{item.originalFilename}</strong>
+                            </label>
+                            <code>{item.relativePath}</code>
+                            <span>
+                              {verificationClassificationLabel(
+                                item.classification,
+                              )}{' '}
+                              · {item.available ? 'available' : 'unavailable'}
+                            </span>
+                            <span>{item.reason}</span>
+                            <small>
+                              Evidence: {item.evidenceStatus}
+                              {item.evidenceObservedAt
+                                ? ` · ${new Date(item.evidenceObservedAt).toLocaleString()}`
+                                : ' · age unavailable'}
+                            </small>
+                          </article>
+                        ))}
+                    </div>
+                  </fieldset>
                   <button
                     className="primary"
                     disabled={busy}
@@ -7465,6 +7711,23 @@ const previewableVideoTypes = new Set([
   'm2ts',
   'avi',
 ]);
+
+function verificationClassificationLabel(
+  classification: PendingVerificationItem['classification'],
+) {
+  const labels: Record<PendingVerificationItem['classification'], string> = {
+    verified: 'Registered and verified on this device',
+    'snapshot-changed': 'Registered snapshot changed',
+    'awaiting-verification': 'Registered, awaiting device verification',
+    'discovered-awaiting-verification':
+      'Discovered, awaiting registration verification',
+    'missing-or-relocated': 'Missing or relocated after local verification',
+    'awaiting-syncthing': 'Unavailable; Syncthing copy has not arrived',
+    unavailable: 'Unavailable with no device evidence',
+    'failed-verification': 'Failed verification or requires review',
+  };
+  return labels[classification];
+}
 
 function MediaThumbnail({
   mediaId,

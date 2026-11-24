@@ -23,6 +23,8 @@ Device settings, absolute project-path mappings, pending project-manifest reconc
 
 Resource profile, gentle-scanning policy, idle delay/boost intent and background-pause state are device-local settings. Volume GUIDs, active permits, queue wait times, byte/throughput counters, CPU/memory samples and recent I/O errors are transient local scheduling evidence; they are never portable catalogue events or synchronized project metadata.
 
+Projected per-device integrity evidence includes the observation event's `occurredAt` as optional `observedAt`. This is derived during replay rather than added to or rewritten in historic events, so old portable records remain schema-compatible. Pending-verification classification compares current metadata snapshots with that device evidence without reading file content; only an explicit selected verification computes SHA-256.
+
 Playback-proxy operations are high-frequency device-local state, not synchronized records. Their stable operation key is derived from media ID, authoritative content hash, source snapshot and transform version. Progress, cancellation flags, child-process IDs, active-view pins and partial paths live only in native memory; completed derivatives live only beneath the PIMP cache and are rebuildable. `playbackProxyCacheLimitBytes` is a backward-compatible device preference with a 2 GB default.
 
 The remembered ingest date mode is a device preference, not shared production metadata. Legacy `shared-settings.json` is retained but no longer overwritten; this removes its former last-writer-wins role without discarding it.

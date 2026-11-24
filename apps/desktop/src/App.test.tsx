@@ -95,7 +95,9 @@ const mocks = vi.hoisted(() => ({
   getResourceGovernorStatus: vi.fn(),
   logUiError: vi.fn(),
   logPlaybackEvent: vi.fn(),
+  listPendingVerification: vi.fn(),
   verifyMediaIntegrity: vi.fn(),
+  finishIntegrityVerification: vi.fn(),
   reapproveIngestDestinations: vi.fn(),
   replanIngestDestinations: vi.fn(),
   listRemovableVolumes: vi.fn(),
@@ -217,7 +219,9 @@ vi.mock('./bridge', () => ({
     revealProjectAsset: mocks.revealProjectAsset,
     rescan: mocks.rescan,
     enrichMedia: vi.fn(async () => 0),
+    listPendingVerification: mocks.listPendingVerification,
     verifyMediaIntegrity: mocks.verifyMediaIntegrity,
+    finishIntegrityVerification: mocks.finishIntegrityVerification,
     reviewMediaRelocation: mocks.reviewMediaRelocation,
     approveMediaRelocation: mocks.approveMediaRelocation,
     mediaToolsStatus: mocks.mediaToolsStatus,
@@ -508,6 +512,10 @@ describe('native application integration', () => {
     });
     mocks.verifyMediaIntegrity.mockReset();
     mocks.verifyMediaIntegrity.mockResolvedValue(true);
+    mocks.listPendingVerification.mockReset();
+    mocks.listPendingVerification.mockResolvedValue([]);
+    mocks.finishIntegrityVerification.mockReset();
+    mocks.finishIntegrityVerification.mockResolvedValue(undefined);
     mocks.listBackgroundOperations.mockResolvedValue([]);
     mocks.reapproveIngestDestinations.mockReset();
     mocks.replanIngestDestinations.mockReset();
@@ -2299,6 +2307,59 @@ describe('native application integration', () => {
     await user.click(screen.getByRole('button', { name: 'Library & Storage' }));
     expect(screen.getByDisplayValue('C:\\Master')).toBeVisible();
     expect(screen.getByText(/Catalogue location is locked/)).toBeVisible();
+  });
+
+  it('classifies pending verification without hashing until selected', async () => {
+    mocks.listPendingVerification.mockResolvedValue([
+      {
+        id: 'media:m1',
+        mediaId: 'm1',
+        originalFilename: 'changed.mp4',
+        relativePath: '20261124/changed.mp4',
+        available: true,
+        classification: 'snapshot-changed',
+        reason: 'The local snapshot changed.',
+        evidenceObservedAt: '2026-11-23T00:00:00Z',
+        evidenceStatus: 'previous evidence is stale',
+        expectedSize: 100,
+        observedSize: 101,
+        selectable: true,
+      },
+      {
+        id: 'media:m2',
+        mediaId: 'm2',
+        originalFilename: 'remote.mp4',
+        relativePath: '20261124/remote.mp4',
+        available: false,
+        classification: 'awaiting-syncthing',
+        reason: 'The Syncthing copy has not arrived.',
+        evidenceStatus: 'verified elsewhere; unavailable here',
+        selectable: false,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Ingest & Discovery' }),
+    );
+    expect(await screen.findByText('changed.mp4')).toBeVisible();
+    expect(screen.getByText('remote.mp4')).toBeVisible();
+    expect(mocks.verifyMediaIntegrity).not.toHaveBeenCalled();
+
+    await user.click(
+      screen.getByRole('checkbox', { name: 'Verify changed.mp4' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Verify selected' }));
+    await waitFor(() =>
+      expect(mocks.verifyMediaIntegrity).toHaveBeenCalledWith(
+        'm1',
+        expect.stringMatching(/^integrity-verification:/),
+      ),
+    );
+    await waitFor(() =>
+      expect(mocks.finishIntegrityVerification).toHaveBeenCalled(),
+    );
   });
 
   it('finishes saving settings without waiting for catalogue indexing', async () => {
