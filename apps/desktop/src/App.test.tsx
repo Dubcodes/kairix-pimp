@@ -103,8 +103,10 @@ const mocks = vi.hoisted(() => ({
   listRemovableVolumes: vi.fn(),
   updateMedia: vi.fn(),
   openSupportLink: vi.fn(),
+  openPublicReleaseInstaller: vi.fn(),
   updaterConfiguration: vi.fn(),
   checkApprovedBetaUpdate: vi.fn(),
+  checkPublicReleases: vi.fn(),
   installApprovedBetaUpdate: vi.fn(),
   retryProjectSynchronization: vi.fn(),
   inventoryProject: vi.fn(),
@@ -188,6 +190,7 @@ vi.mock('./bridge', () => ({
       releaseDate: '2026-11-07',
     })),
     openSupportLink: mocks.openSupportLink,
+    openPublicReleaseInstaller: mocks.openPublicReleaseInstaller,
     openLogsFolder: vi.fn(),
     updaterConfiguration: mocks.updaterConfiguration,
     onFileDrop: vi.fn(async () => () => undefined),
@@ -254,6 +257,10 @@ vi.mock('./bridge', () => ({
 vi.mock('./updates', () => ({
   checkApprovedBetaUpdate: mocks.checkApprovedBetaUpdate,
   installApprovedBetaUpdate: mocks.installApprovedBetaUpdate,
+}));
+
+vi.mock('./public-releases', () => ({
+  checkPublicReleases: mocks.checkPublicReleases,
 }));
 
 import { App } from './App';
@@ -452,6 +459,9 @@ describe('native application integration', () => {
         'Signed updates are not configured in this build. Use the reviewed NSIS installer from GitHub Releases.',
     });
     mocks.checkApprovedBetaUpdate.mockReset();
+    mocks.checkApprovedBetaUpdate.mockResolvedValue(null);
+    mocks.checkPublicReleases.mockReset();
+    mocks.checkPublicReleases.mockResolvedValue(null);
     mocks.installApprovedBetaUpdate.mockReset();
     mocks.mediaToolsStatus.mockReset();
     mocks.mediaToolsStatus.mockResolvedValue({
@@ -525,6 +535,8 @@ describe('native application integration', () => {
     mocks.updateMedia.mockReset();
     mocks.updateMedia.mockImplementation(async () => mocks.catalogue);
     mocks.openSupportLink.mockReset();
+    mocks.openPublicReleaseInstaller.mockReset();
+    mocks.openPublicReleaseInstaller.mockResolvedValue(undefined);
     mocks.retryProjectSynchronization.mockReset();
     mocks.retryProjectSynchronization.mockResolvedValue([]);
     mocks.inventoryProject.mockReset();
@@ -2539,7 +2551,23 @@ describe('native application integration', () => {
     expect(mocks.saveSettings).toHaveBeenCalledTimes(2);
   });
 
-  it('shows manual build links without starting a check when signing is not configured', async () => {
+  it('checks public releases even when signed updates are not configured', async () => {
+    mocks.checkPublicReleases.mockResolvedValue({
+      version: '0.1.1-5',
+      classification: 'Development',
+      publishedAt: '2026-10-28T20:27:30Z',
+      notes: 'Historical beta',
+      releaseUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/tag/v0.1.1-5',
+      installerUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-5/Kairix-PIMP-Light-0.1.1-5-Windows-x64-Setup-Unsigned.exe',
+      installerSizeBytes: 100,
+      checksumUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-5/SHA256SUMS.txt',
+      buildInfoUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-5/BUILD-INFO.txt',
+      newerThanInstalled: false,
+    });
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Settings' }));
@@ -2549,8 +2577,18 @@ describe('native application integration', () => {
     ).toBeVisible();
     expect(
       screen.getByRole('button', { name: 'Check for updates' }),
-    ).toBeDisabled();
+    ).toBeEnabled();
     expect(mocks.checkApprovedBetaUpdate).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
+    await waitFor(() => expect(mocks.checkPublicReleases).toHaveBeenCalled());
+    expect(mocks.checkApprovedBetaUpdate).not.toHaveBeenCalled();
+    expect(await screen.findByText(/0.1.1-5 — Development/)).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Open public NSIS installer' }),
+    );
+    expect(mocks.openPublicReleaseInstaller).toHaveBeenCalledWith(
+      expect.stringContaining('/v0.1.1-5/'),
+    );
     await user.click(screen.getByRole('button', { name: 'GitHub Releases' }));
     await user.click(
       screen.getByRole('button', { name: 'View available test builds' }),
@@ -2574,12 +2612,12 @@ describe('native application integration', () => {
     mocks.checkApprovedBetaUpdate.mockReturnValueOnce(pending.promise);
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      screen.getByText('Checking the signed Development channel…'),
+      screen.getByText('Checking signed update and public release channels…'),
     ).toBeVisible();
     await act(async () => pending.resolve(null));
     expect(
       await screen.findByText(
-        /No newer signed Development release was available/,
+        /No newer signed Development release is available/,
       ),
     ).toBeVisible();
 
@@ -2590,7 +2628,7 @@ describe('native application integration', () => {
     });
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      await screen.findByText('Development 0.1.1-4 is available.'),
+      await screen.findByText(/Signed Development 0.1.1-4 is available/),
     ).toBeVisible();
 
     mocks.checkApprovedBetaUpdate.mockRejectedValueOnce(
@@ -2598,7 +2636,9 @@ describe('native application integration', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Check for updates' }));
     expect(
-      await screen.findByText('Update check failed: manifest unavailable'),
+      await screen.findByText(
+        /Signed update check failed: manifest unavailable/,
+      ),
     ).toBeVisible();
   });
 

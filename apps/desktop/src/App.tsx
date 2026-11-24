@@ -74,6 +74,7 @@ import {
   installApprovedBetaUpdate,
   type AvailableUpdate,
 } from './updates';
+import { checkPublicReleases, type PublicRelease } from './public-releases';
 import { SettingsWriteQueue } from './settings-write-queue';
 import { hoverPreviewRequestCache } from './hover-preview-cache';
 import { idlePreviewScheduler } from './idle-preview-scheduler';
@@ -323,6 +324,7 @@ export function App() {
   const [updaterConfiguration, setUpdaterConfiguration] =
     useState<UpdaterConfiguration>();
   const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate>();
+  const [publicRelease, setPublicRelease] = useState<PublicRelease>();
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateStatus, setUpdateStatus] = useState(
     'Loading update configuration…',
@@ -2475,32 +2477,47 @@ export function App() {
     }
   };
   const checkForUpdates = useCallback(async () => {
-    if (!updaterConfiguration?.configured) {
-      setUpdateStatus('Automatic updates not configured');
-      return;
-    }
+    if (!applicationInfo || !updaterConfiguration) return;
     setCheckingUpdate(true);
-    setUpdateStatus(
-      `Checking the signed ${updaterConfiguration.channel} channel…`,
-    );
+    setUpdateStatus('Checking signed update and public release channels…');
     setError('');
     try {
-      const update = await checkApprovedBetaUpdate();
+      const [signedResult, publicResult] = await Promise.allSettled([
+        updaterConfiguration.configured
+          ? checkApprovedBetaUpdate()
+          : Promise.resolve(null),
+        checkPublicReleases(
+          applicationInfo.version,
+          updaterConfiguration.channel,
+        ),
+      ]);
       const checkedAt = new Date().toLocaleString();
       localStorage.setItem('pimp-last-update-check', checkedAt);
-      setAvailableUpdate(update ?? undefined);
-      setUpdateStatus(
-        update
-          ? `${update.classification} ${update.version} is available.`
-          : `No newer signed ${updaterConfiguration.channel} release was available at ${checkedAt}.`,
-      );
-    } catch (reason) {
-      setUpdateStatus(`Update check failed: ${errorText(reason)}`);
+      const signedUpdate =
+        signedResult.status === 'fulfilled' ? signedResult.value : null;
+      const latestPublic =
+        publicResult.status === 'fulfilled' ? publicResult.value : null;
+      setAvailableUpdate(signedUpdate ?? undefined);
+      setPublicRelease(latestPublic ?? undefined);
+      const automatic = updaterConfiguration.configured
+        ? signedResult.status === 'rejected'
+          ? `Signed update check failed: ${errorText(signedResult.reason)}`
+          : signedUpdate
+            ? `Signed ${signedUpdate.classification} ${signedUpdate.version} is available.`
+            : `No newer signed ${updaterConfiguration.channel} release is available.`
+        : 'Automatic signed updates are not configured in this build.';
+      const manual =
+        publicResult.status === 'rejected'
+          ? `Public release check failed: ${errorText(publicResult.reason)}`
+          : latestPublic
+            ? ` Latest public ${latestPublic.classification} release: ${latestPublic.version}${latestPublic.newerThanInstalled ? ' (newer than installed)' : ' (not newer than installed)'}.`
+            : ` No complete public ${updaterConfiguration.channel} installer release was found.`;
+      setUpdateStatus(`${automatic}${manual}`);
     } finally {
       setCheckingUpdate(false);
       setUpdateProgress(undefined);
     }
-  }, [updaterConfiguration]);
+  }, [applicationInfo, updaterConfiguration]);
   useEffect(() => {
     if (
       !native ||
@@ -4473,27 +4490,40 @@ export function App() {
                   </div>
                   <div className="info-card">
                     <strong>Latest approved public release</strong>
-                    <span>
-                      Check the permanent public GitHub Releases page.
-                    </span>
+                    {publicRelease ? (
+                      <>
+                        <span>
+                          {publicRelease.version} —{' '}
+                          {publicRelease.classification} · published{' '}
+                          {new Date(
+                            publicRelease.publishedAt,
+                          ).toLocaleDateString()}
+                        </span>
+                        <span>
+                          {publicRelease.newerThanInstalled
+                            ? 'Newer than the installed version.'
+                            : 'The installed version is the same or newer.'}
+                        </span>
+                        {publicRelease.notes && <p>{publicRelease.notes}</p>}
+                        <span>
+                          NSIS installer ·{' '}
+                          {size(publicRelease.installerSizeBytes)}
+                        </span>
+                      </>
+                    ) : (
+                      <span>
+                        Use Check for updates to query the permanent public
+                        GitHub Releases API.
+                      </span>
+                    )}
                     <small>
-                      Public installers are separate from signed
-                      automatic-update payloads and may show a Windows
-                      SmartScreen warning.
+                      Public installers are unsigned and separate from signed
+                      automatic-update payloads. PIMP opens the official asset
+                      in your browser; verify SHA256SUMS.txt before running it.
                     </small>
                   </div>
                   <div className="scan-actions">
-                    <button
-                      disabled={
-                        checkingUpdate || !updaterConfiguration?.configured
-                      }
-                      title={
-                        updaterConfiguration?.configured === false
-                          ? 'This build has no configured update-signing key'
-                          : undefined
-                      }
-                      onClick={checkForUpdates}
-                    >
+                    <button disabled={checkingUpdate} onClick={checkForUpdates}>
                       {updateProgress
                         ? 'Update in progress…'
                         : checkingUpdate
@@ -4525,6 +4555,17 @@ export function App() {
                     </button>
                     <button onClick={() => void openSupport('releases')}>
                       GitHub Releases
+                    </button>
+                    <button
+                      disabled={!publicRelease}
+                      onClick={() => {
+                        if (publicRelease)
+                          void desktopBridge.openPublicReleaseInstaller(
+                            publicRelease.installerUrl,
+                          );
+                      }}
+                    >
+                      Open public NSIS installer
                     </button>
                     <button onClick={() => void openSupport('test-builds')}>
                       View available test builds

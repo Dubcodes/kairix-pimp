@@ -780,6 +780,8 @@ export const desktopBridge = {
     destination:
       'github' | 'releases' | 'test-builds' | 'website' | 'coffee' | 'degoo',
   ) => invoke<void>('open_support_link', { destination }),
+  openPublicReleaseInstaller: (url: string) =>
+    invoke<void>('open_public_release_installer', { url }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),
   listPendingVerification: () =>
     invoke<PendingVerificationItem[]>('list_pending_verification'),

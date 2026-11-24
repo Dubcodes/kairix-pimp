@@ -9908,6 +9908,42 @@ fn open_support_link(app: AppHandle, destination: String) -> Result<(), String> 
         .map_err(|error| format!("Could not open the link: {error}"))
 }
 
+fn approved_public_installer_url(url: &str) -> bool {
+    const PREFIX: &str =
+        "https://github.com/Dubcodes/kairix-pimp/releases/download/";
+    let Some(relative) = url.strip_prefix(PREFIX) else {
+        return false;
+    };
+    if relative.contains(['?', '#', '\\']) {
+        return false;
+    }
+    let mut components = relative.split('/');
+    let (Some(tag), Some(filename), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    tag.starts_with('v')
+        && tag.len() > 1
+        && tag
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-'))
+        && filename == format!("Kairix-PIMP-Light-{}-Windows-x64-Setup-Unsigned.exe", &tag[1..])
+        && filename
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-'))
+}
+
+#[tauri::command]
+fn open_public_release_installer(app: AppHandle, url: String) -> Result<(), String> {
+    if !approved_public_installer_url(&url) {
+        return Err("The public installer link was not an approved Kairix PIMP GitHub Release asset".into());
+    }
+    app.opener()
+        .open_url(url, None::<String>)
+        .map_err(|error| format!("Could not open the public installer: {error}"))
+}
+
 #[tauri::command]
 fn open_logs_folder(app: AppHandle) -> Result<(), String> {
     let path = diagnostic_log_path(&app)?;
@@ -11278,6 +11314,7 @@ pub fn run() {
             begin_update_installation,
             end_update_installation,
             open_support_link,
+            open_public_release_installer,
             open_logs_folder,
             resolve_media_path,
             resolve_media_playback_source,
@@ -13272,6 +13309,18 @@ mod tests {
             Some("https://www.dubcodesmedia.com/kairix/kairix-pimp")
         );
         assert_eq!(support_url("https://example.invalid"), None);
+        assert!(approved_public_installer_url(
+            "https://github.com/Dubcodes/kairix-pimp/releases/download/v0.2.0/Kairix-PIMP-Light-0.2.0-Windows-x64-Setup-Unsigned.exe"
+        ));
+        assert!(!approved_public_installer_url(
+            "https://example.invalid/Kairix-PIMP-Light-0.2.0-Windows-x64-Setup-Unsigned.exe"
+        ));
+        assert!(!approved_public_installer_url(
+            "https://github.com/Dubcodes/kairix-pimp/releases/download/v0.2.0/../../installer.exe"
+        ));
+        assert!(!approved_public_installer_url(
+            "https://github.com/Dubcodes/kairix-pimp/releases/download/v0.2.0/Kairix-PIMP-Light-0.2.0-Windows-x64-Setup-Unsigned.exe?redirect=bad"
+        ));
     }
 
     #[test]
