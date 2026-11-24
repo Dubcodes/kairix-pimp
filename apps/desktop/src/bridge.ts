@@ -819,11 +819,19 @@ export const desktopBridge = {
   },
   loadHoverPreviewStatuses: (mediaIds: string[]) =>
     invoke<string[]>('load_hover_preview_statuses', { mediaIds }),
-  loadHoverPreview: (mediaId: string) =>
-    invoke<HoverPreview>('load_hover_preview', { mediaId }),
+  loadHoverPreview: async (mediaId: string) => {
+    const preview = await invoke<HoverPreview>('load_hover_preview', {
+      mediaId,
+    });
+    return {
+      ...preview,
+      frames: preview.frames.map((path) => convertFileSrc(path)),
+    };
+  },
   prepareHoverPreview: (mediaId: string) =>
     invoke<void>('prepare_hover_preview', { mediaId }),
   hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
+  sharedHoverPreviewUsage: () => invoke<number>('shared_hover_preview_usage'),
   clearHoverPreviewCache: () => invoke<number>('clear_hover_preview_cache'),
   choosePremiereManifestDestination: () =>
     save({

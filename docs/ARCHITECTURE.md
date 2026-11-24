@@ -154,7 +154,7 @@ The UI's Background Operations view combines typed inventory, discovery/integrit
 
 The shared Resource Management scheduler now coordinates identified-volume access and background-worker admission across these typed operations without replacing durable ingest/backup state with transient UI status. It preserves foreground static thumbnails and explicit playback above automatic hover preparation, and verified ingest/integrity safety above optional derivatives. CPU-thread, RAM allocation, GPU, battery, temporary-space reservation, explicit byte-rate caps and reliable grouping of multiple logical volumes on one physical device remain future measured extensions; the UI does not claim those controls exist.
 
-Newly registered media requests one coalesced background enrichment pass. FFmpeg/FFprobe failure never blocks ingest and produces no no-op enrichment event. Ordinary thumbnail JPEGs are evicted oldest-first under the configured device-local byte limit; hover-preview storage remains separately governed.
+Newly registered media requests one coalesced background enrichment pass. FFmpeg/FFprobe failure never blocks ingest and produces no no-op enrichment event. Legacy device-local thumbnail/hover data remains byte-bounded; shared static and scrub-preview derivatives are retained by default and require a separate reviewed cleanup operation.
 
 ## Security boundaries
 

@@ -113,6 +113,7 @@ const mocks = vi.hoisted(() => ({
   loadHoverPreviewStatuses: vi.fn(),
   prepareHoverPreview: vi.fn(),
   hoverPreviewCacheUsage: vi.fn(),
+  sharedHoverPreviewUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
   prepareMediaThumbnail: vi.fn(),
@@ -240,6 +241,7 @@ vi.mock('./bridge', () => ({
     loadHoverPreviewStatuses: mocks.loadHoverPreviewStatuses,
     prepareHoverPreview: mocks.prepareHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
+    sharedHoverPreviewUsage: mocks.sharedHoverPreviewUsage,
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
     thumbnailUrl: (path: string) => path,
   },
@@ -531,6 +533,8 @@ describe('native application integration', () => {
     mocks.prepareHoverPreview.mockResolvedValue(undefined);
     mocks.hoverPreviewCacheUsage.mockReset();
     mocks.hoverPreviewCacheUsage.mockResolvedValue(0);
+    mocks.sharedHoverPreviewUsage.mockReset();
+    mocks.sharedHoverPreviewUsage.mockResolvedValue(0);
     mocks.clearHoverPreviewCache.mockReset();
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.loadThumbnailSources.mockReset();
@@ -1252,7 +1256,7 @@ describe('native application integration', () => {
     const thumbnail = container.querySelector(
       '.media-thumbnail',
     ) as HTMLElement;
-    await screen.findByText('Scrubbable preview stored on this device');
+    await screen.findByText('Shared scrubbable preview stored in Master Bin');
     expect(
       screen.queryByLabelText('Scrubbable preview ready'),
     ).not.toBeInTheDocument();
@@ -1306,7 +1310,7 @@ describe('native application integration', () => {
     await user.click(screen.getByRole('button', { name: 'Settings' }));
     await user.click(screen.getByRole('button', { name: 'Appearance' }));
     await user.click(
-      screen.getByRole('button', { name: 'Clear preview cache' }),
+      screen.getByRole('button', { name: 'Clear legacy local preview cache' }),
     );
     await waitFor(() =>
       expect(mocks.clearHoverPreviewCache).toHaveBeenCalledTimes(1),
@@ -1340,7 +1344,7 @@ describe('native application integration', () => {
           notes: '',
           technical: { sizeBytes: 100, durationSeconds: 10 },
           thumbnailPath: 'cached.jpg',
-          available: true,
+          available: false,
           needsReview: false,
           observedSize: 100,
           observedModifiedMillis: 123,
@@ -1366,8 +1370,12 @@ describe('native application integration', () => {
           releaseGeneration = resolve;
         }),
     );
+    const user = userEvent.setup();
     const { container } = render(<App />);
-    await screen.findByText('Scrubbable preview stored on this device');
+    await user.click(
+      await screen.findByRole('switch', { name: 'Include unavailable' }),
+    );
+    await screen.findByText('Shared scrubbable preview stored in Master Bin');
     fireEvent.pointerEnter(
       container.querySelector('.media-thumbnail') as HTMLElement,
     );

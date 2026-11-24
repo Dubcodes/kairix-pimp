@@ -306,6 +306,7 @@ export function App() {
   const [thumbnailSourceRequestCount, setThumbnailSourceRequestCount] =
     useState(0);
   const [previewCacheUsage, setPreviewCacheUsage] = useState(0);
+  const [sharedPreviewUsage, setSharedPreviewUsage] = useState(0);
   const [previewStoredIds, setPreviewStoredIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -527,6 +528,10 @@ export function App() {
     void desktopBridge
       .hoverPreviewCacheUsage()
       .then(setPreviewCacheUsage)
+      .catch(() => undefined);
+    void desktopBridge
+      .sharedHoverPreviewUsage()
+      .then(setSharedPreviewUsage)
       .catch(() => undefined);
   }, [native, settingsSection, view]);
   useEffect(() => {
@@ -2336,13 +2341,18 @@ export function App() {
     setError('');
     previewWorkQueue.clearQueued();
     hoverPreviewRequestCache.invalidate();
-    setPreviewStoredIds(new Set());
     setPreviewMemoryUsage(0);
     setPreviewMemoryCount(0);
     setPreviewCacheEpoch((value) => value + 1);
     try {
       setPreviewCacheUsage(await desktopBridge.clearHoverPreviewCache());
-      setMessage('Device-local hover preview cache cleared.');
+      const ready = await desktopBridge.loadHoverPreviewStatuses(
+        catalogue.media.map((item) => item.id),
+      );
+      setPreviewStoredIds(new Set(ready));
+      setMessage(
+        'Device-local legacy preview cache cleared. Shared scrub previews were preserved.',
+      );
     } catch (reason) {
       setError(errorText(reason));
     } finally {
@@ -4057,7 +4067,7 @@ export function App() {
                     </select>
                   </label>
                   <label>
-                    Hover preview cache limit (GB)
+                    Legacy local preview cache limit (GB)
                     <input
                       type="number"
                       min="0.1"
@@ -4108,14 +4118,18 @@ export function App() {
                     />
                   </label>
                   <div className="info-card">
-                    <strong>Hover preview cache</strong>
+                    <strong>Preview storage</strong>
                     <span>
                       {previewMemoryCount} loaded · {size(previewMemoryUsage)}
                       {' in memory'}
                     </span>
                     <span>
-                      {previewStoredIds.size} stored · {size(previewCacheUsage)}
-                      {' on disk'}
+                      {previewStoredIds.size} shared scrub previews ·{' '}
+                      {size(sharedPreviewUsage)} inside Master Bin
+                    </span>
+                    <span>
+                      {size(previewCacheUsage)} legacy local preview data on
+                      this computer
                     </span>
                     <span role="status">
                       {staticThumbnailQueueStatus.active
@@ -4132,8 +4146,9 @@ export function App() {
                           : 'Generation queue idle'}
                     </span>
                     <small>
-                      Regenerable frames stay in the device-local cache and are
-                      never synchronized.
+                      Shared static thumbnails and scrub previews are portable
+                      derivatives inside Master Bin. Playback proxies, temporary
+                      files and legacy preview data stay on this computer.
                     </small>
                     <button
                       type="button"
@@ -4142,7 +4157,7 @@ export function App() {
                     >
                       {clearingPreviewCache
                         ? 'Waiting for preview generation…'
-                        : 'Clear preview cache'}
+                        : 'Clear legacy local preview cache'}
                     </button>
                     <button
                       type="button"
@@ -4507,8 +4522,8 @@ export function App() {
                             128 * 1024 * 1024,
                         )}{' '}
                         budget · {previewStoredIds.size} stored ·{' '}
-                        {size(previewCacheUsage)} disk /{' '}
-                        {size(settings.previewCacheLimitBytes)} budget
+                        {size(sharedPreviewUsage)} shared scrub previews ·{' '}
+                        {size(previewCacheUsage)} legacy local disk
                       </dd>
                     </div>
                     <div>
@@ -7531,7 +7546,7 @@ function MediaThumbnail({
       : undefined;
   const previewEligible =
     Boolean(previewKey) &&
-    sourceAvailable &&
+    (sourceAvailable || previewStored) &&
     enableHoverPreview &&
     previewableVideoTypes.has(fileType.toLowerCase()) &&
     !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -7857,7 +7872,7 @@ function MediaThumbnail({
       )}
       {!preview && previewStored && (
         <span className="sr-only">
-          Scrubbable preview stored on this device
+          Shared scrubbable preview stored in Master Bin
         </span>
       )}
       {isHovering &&

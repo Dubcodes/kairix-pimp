@@ -521,7 +521,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 ## ADR-071 — Share deterministic static thumbnails, keep heavy derivatives local
 
 - **Date:** 2026-11-07
-- **Status:** Accepted
+- **Status:** Superseded for scrub previews by ADR-082; retained for playback proxies and decoded memory
 - **Decision:** Store static JPEG derivatives beneath the selected shared catalogue at `thumbnails/v1`, named by source SHA-256 plus seek/format/transform version. Validate and flush unique temporary files, atomically promote without replacement, reuse a concurrent valid winner, and migrate validated legacy local JPEGs incrementally. Retain frontend asset references across ordinary refreshes. Keep hover previews, playback proxies and decoded presentation memory device-local and bounded.
 - **Consequences:** Syncthing-connected devices can display the same static thumbnail without repeated FFmpeg decoding, including before media arrives. Shared derivatives are not authoritative, are not silently evicted, and require a future explicit cleanup design. Custom frames now synchronize as distinct immutable derivatives. Real two-device conflict, arrival-order, free-space and installed 1,000-record scrolling acceptance remain outstanding.
 
@@ -594,3 +594,10 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted, pending installed production-catalogue acceptance
 - **Decision:** Represent an approved move as `media.relocated`. Native review is restricted to a user-selected Master Bin file/folder, narrows candidates by original filename and size, and hashes only those candidates. Approval repeats containment, size, SHA-256 and stable-snapshot checks before append.
 - **Consequences:** Stable IDs and metadata survive and offline devices can replay the path change before media arrives, while original media remains immutable. Ambiguous, mismatched and occupied destinations remain unresolved. Project manifests are reconciled as metadata projections; Premiere project files are never edited.
+
+## ADR-082 — Synchronize validated scrub-preview derivatives
+
+- **Date:** 2026-11-24
+- **Status:** Accepted, pending installed two-device Syncthing and production-codec acceptance
+- **Decision:** Store version-4 scrub previews beneath `.pimp/hover-previews/v1`, keyed by authoritative source SHA-256, duration and a versioned sampling/transform policy rather than device-local paths or filesystem timestamps. Validate bounded manifests, timestamps, filenames, containment and JPEG bytes before use. Publish through a unique staging directory and atomic no-overwrite rename, accept only a concurrently published valid winner, and never silently replace an incomplete shared identity. Permit reuse before source media arrives. Before generation, require matching current-device integrity evidence or independently hash the source. Incrementally copy valid version-3 local entries into the shared format while retaining the local original.
+- **Consequences:** Devices can reuse synchronized scrub frames without decoding the same recording and without requiring media to have arrived first. Shared derivative storage is intentionally outside the legacy local byte budget and is not removed by ordinary cache clearing; explicit reviewed repair/cleanup remains future work. Playback proxies and decoded frontend memory remain local. ADR-039's device-local storage decision is superseded for scrub previews, while its lazy-generation and bounded-frame principles remain.

@@ -35,7 +35,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Byte-range ingest resume and throughput history
 - Native notification watcher, folder notes and field-level conflict resolution workflow
 - SQLite/FTS disposable projection, saved compound filters, pagination and measured large-library virtualization
-- Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a fingerprinted device-local cache; richer preview player, contact-sheet optimization and custom thumbnails remain planned
+- Implemented: lazy silent hover-to-scrub frames with bounded FFmpeg generation and a validated portable shared derivative store; richer preview player and contact-sheet optimization remain planned
 - Implemented: eight-entry preview request LRU/in-flight bound, concurrent deduplication, clear epochs and generation-mutex-coordinated disk-cache clearing
 - Implemented: mounted cards release large preview frames after hover/out-of-viewport, and timecodes use actual FFmpeg `showinfo` sample timestamps rather than planned positions
 - Implemented: device-local thumbnail hold-frame selection using the nearest actual preview sample, including bounded per-media last-hover persistence
