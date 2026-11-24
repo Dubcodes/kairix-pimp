@@ -294,6 +294,9 @@ export function App() {
   const [showSdGrabber, setShowSdGrabber] = useState(false);
   const [allowDuplicateCopies, setAllowDuplicateCopies] = useState(false);
   const [allowUnverifiedReimport, setAllowUnverifiedReimport] = useState(false);
+  const [ingestVerificationMode, setIngestVerificationMode] = useState<
+    'fast' | 'deep'
+  >('deep');
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -1898,6 +1901,7 @@ export function App() {
         approvedPlanId: inventory.planId,
         allowDuplicateCopies,
         allowUnverifiedReimport,
+        verificationMode: ingestVerificationMode,
       });
       setJobs((current) => [...current, job]);
       setSources([]);
@@ -3171,7 +3175,10 @@ export function App() {
                     <small>
                       {job.state} · {job.filesCompleted}/{job.files.length}{' '}
                       complete · {size(job.bytesTransferred)} /{' '}
-                      {size(job.bytesTotal)}
+                      {size(job.bytesTotal)} ·{' '}
+                      {(job.verificationMode ?? 'deep') === 'deep'
+                        ? 'Deep verification'
+                        : 'Fast verification'}
                     </small>
                   </div>
                   <div className="job-actions">
@@ -3237,6 +3244,18 @@ export function App() {
                         <small className="job-error">
                           Metadata not yet saved to the catalogue:{' '}
                           {file.metadataError}
+                        </small>
+                      )}
+                      {file.verificationMethod && (
+                        <small>
+                          {file.verificationMethod === 'deep'
+                            ? 'Deep verified'
+                            : 'Fast checked'}{' '}
+                          · source read {size(file.sourceBytesRead ?? 0)} ·
+                          destination written{' '}
+                          {size(file.destinationBytesWritten ?? 0)} ·
+                          destination reread{' '}
+                          {size(file.destinationBytesRead ?? 0)}
                         </small>
                       )}
                       <label>
@@ -6424,9 +6443,10 @@ export function App() {
               <UploadCloud size={42} />
               <h2>Drop camera media here</h2>
               <p>
-                Files and recursive folders are copied to Master Bin,
-                independently SHA-256 verified, and atomically promoted.
-                Originals are never modified.
+                Files and recursive folders are copied through private staging,
+                checked using the selected verification strength, and atomically
+                promoted without overwrite. Sources remain unchanged during
+                ingest.
               </p>
               <div className="button-row">
                 <button onClick={addFiles}>Choose files</button>
@@ -6579,7 +6599,7 @@ export function App() {
                   />
                   <small>
                     {progress.phase === 'verifying'
-                      ? 'Verifying staged copy'
+                      ? 'Finalizing staged copy'
                       : 'Copying and hashing source'}{' '}
                     · {size(progress.bytesComplete)} /{' '}
                     {size(progress.bytesTotal)}
@@ -6648,6 +6668,38 @@ export function App() {
                 recordings. You can still add file-specific tags while the job
                 is running.
               </small>
+              <fieldset className="ingest-verification-choices">
+                <legend>Verification strength</legend>
+                <label>
+                  <input
+                    type="radio"
+                    name="ingest-verification-mode"
+                    value="fast"
+                    checked={ingestVerificationMode === 'fast'}
+                    onChange={() => setIngestVerificationMode('fast')}
+                  />{' '}
+                  Fast
+                </label>
+                <small>
+                  Retains the source SHA-256 while copying and validates the
+                  completed staged file without rereading all destination bytes.
+                </small>
+                <label>
+                  <input
+                    type="radio"
+                    name="ingest-verification-mode"
+                    value="deep"
+                    checked={ingestVerificationMode === 'deep'}
+                    onChange={() => setIngestVerificationMode('deep')}
+                  />{' '}
+                  Deep
+                </label>
+                <small>
+                  Independently rereads and SHA-256 verifies every staged
+                  destination before promotion. This remains the compatibility
+                  default.
+                </small>
+              </fieldset>
               {conflicts.length > 0 && (
                 <div className="conflict-list">
                   <strong>Resolve filename conflicts</strong>

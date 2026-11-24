@@ -135,6 +135,7 @@ export interface MediaItem {
       observedSha256?: string;
       needsReview: boolean;
       observedAt?: string;
+      verificationMethod?: 'fast' | 'deep' | 'selective-deep' | string;
     }
   >;
 }
@@ -497,6 +498,12 @@ export interface IngestJobFile {
   metadata: ProvisionalMetadata;
   pendingMetadata?: ProvisionalMetadata;
   metadataError?: string;
+  verificationMethod?: 'fast' | 'deep';
+  sourceBytesRead?: number;
+  destinationBytesWritten?: number;
+  destinationBytesRead?: number;
+  copyDurationMillis?: number;
+  verificationDurationMillis?: number;
 }
 export interface IngestJob {
   schemaVersion: number;
@@ -507,6 +514,7 @@ export interface IngestJob {
   updatedAt: string;
   batchTimestamp: string;
   dateOverride?: string;
+  verificationMode?: 'fast' | 'deep';
   files: IngestJobFile[];
   unsupported: string[];
   failures: string[];
@@ -670,6 +678,7 @@ export const desktopBridge = {
     approvedPlanId: string;
     allowDuplicateCopies?: boolean;
     allowUnverifiedReimport?: boolean;
+    verificationMode?: 'fast' | 'deep';
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),

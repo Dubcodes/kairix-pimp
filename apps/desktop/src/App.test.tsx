@@ -2308,8 +2308,28 @@ describe('native application integration', () => {
       screen.getByRole('button', { name: 'Start verified ingest' }),
     );
     expect(mocks.startIngest).toHaveBeenCalledWith(
-      expect.objectContaining({ batchTags: ['Race Day'] }),
+      expect.objectContaining({
+        batchTags: ['Race Day'],
+        verificationMode: 'deep',
+      }),
     );
+  });
+
+  it('offers keyboard-accessible Fast and Deep ingest verification choices', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    const deep = screen.getByRole('radio', { name: 'Deep' });
+    const fast = screen.getByRole('radio', { name: 'Fast' });
+    expect(deep).toBeChecked();
+    expect(fast).not.toBeChecked();
+    fast.focus();
+    await user.keyboard(' ');
+    expect(fast).toBeChecked();
+    expect(deep).not.toBeChecked();
+    expect(
+      screen.getByText(/without rereading all destination bytes/i),
+    ).toBeVisible();
   });
 
   it('exposes persisted configuration rather than hard-coded paths', async () => {

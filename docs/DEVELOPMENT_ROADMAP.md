@@ -29,7 +29,7 @@ UI implemented and component-test covered: application shell, primary navigation
 - Implemented reliability correction: updater checks/installations are single-flight, failed checks and interrupted downloads cannot leave reusable stale state, critical filesystem operations share a native exclusion gate with installation, and publication verifies version/build/checksum/signature evidence before promoting a channel manifest
 - Implemented discovery correction: filesystem traversal/hashing runs on a blocking worker with streamed entries, repeated unchanged full verification emits no synchronized evidence event, and append failure retains stable retry evidence
 - Implemented approved ingest plans and global content deduplication: exact reviewed sources/destinations survive into the durable job; SHA-256 candidates are skipped only after a fresh stable local Master Bin verification; concurrent jobs reserve hashes
-- Implemented initial SD Card Grabber: Windows removable-volume enumeration with volume identity, manual folder fallback, recursive configurable MP4/WAV filtering, new/imported/attention summary, and copy-only verified ingest
+- Implemented initial SD Card Grabber: Windows removable-volume enumeration with volume identity, manual folder fallback, recursive configurable MP4/WAV filtering, new/imported/attention summary, and copy-only ingest with durable Fast/Deep verification evidence; Deep remains the compatibility default
 - Implemented ingest-triggered coalesced enrichment and ordinary-thumbnail byte-limit eviction; physical-card and installed Windows acceptance remain
 - Future: add density presets beyond the current Compact and Comfortable choices after installed-window profiling
 - Byte-range ingest resume and throughput history

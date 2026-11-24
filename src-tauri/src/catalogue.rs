@@ -35,6 +35,8 @@ pub struct IntegrityEvidence {
     pub needs_review: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_method: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -215,6 +217,8 @@ pub enum CatalogueEvent {
         observed_sha256: Option<String>,
         #[serde(rename = "needsReview")]
         needs_review: bool,
+        #[serde(default, rename = "verificationMethod", skip_serializing_if = "Option::is_none")]
+        verification_method: Option<String>,
     },
     #[serde(rename = "media.relocated")]
     MediaRelocated {
@@ -1061,6 +1065,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                 observed_modified_millis,
                 observed_sha256,
                 needs_review,
+                verification_method,
             } => {
                 let media_id = canonical_media_id(&media_aliases, media_id);
                 if let Some(item) = media.get_mut(media_id) {
@@ -1075,6 +1080,7 @@ pub fn rebuild(mut read: EventRead) -> Catalogue {
                             observed_sha256: observed_sha256.clone(),
                             needs_review: *needs_review,
                             observed_at: Some(envelope.occurred_at.clone()),
+                            verification_method: verification_method.clone(),
                         },
                     );
                 }
@@ -2524,6 +2530,7 @@ mod tests {
                 observed_modified_millis: Some(20),
                 observed_sha256: Some("changed".into()),
                 needs_review: true,
+                verification_method: None,
             },
         );
         let verified = envelope(
@@ -2535,6 +2542,7 @@ mod tests {
                 observed_modified_millis: Some(10),
                 observed_sha256: Some("hash-m".into()),
                 needs_review: false,
+                verification_method: None,
             },
         );
         let catalogue = rebuild(EventRead {

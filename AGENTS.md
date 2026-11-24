@@ -36,12 +36,12 @@ Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 
 ## File and media safety
 
-- Treat original media as immutable. Never delete, truncate, rewrite, or rename a source file.
+- Treat original media as immutable during discovery, planning, copying, verification, and ordinary catalogue work. Never truncate, rewrite, or rename a source file. Source removal is permitted only in the separately reviewed, explicitly authorized post-batch cleanup state machine; production cleanup remains disabled until its disposable-removable-media acceptance passes.
 - Never silently overwrite an existing destination. Detect collisions and report ambiguity.
-- Destination writes stage in an application-owned same-filesystem directory outside the synchronized Master Bin, recheck source consistency, independently verify staged bytes, and use atomic no-overwrite promotion.
+- Destination writes stage in an application-owned same-filesystem directory outside the synchronized Master Bin, recheck source consistency, flush and close staged bytes, and use atomic no-overwrite promotion. Deep verification independently rereads and hashes staged bytes. Fast verification may omit that destination reread only when it retains the copy-stream source SHA-256 and records its lower assurance explicitly.
 - Reject paths outside configured roots after canonical resolution; string-prefix checks are insufficient.
 - Make operations idempotent and interruption-safe where practical. Tests use synthetic media and repository-local or OS-provided disposable fixture directories only.
-- Do not add source deletion or destructive cleanup without a separately reviewed design, explicit authorization, archive-independence verification, and recoverable quarantine.
+- Do not add source deletion or destructive cleanup outside its separately reviewed state machine. SD-card cleanup requires job-specific opt-in, exact batch reconciliation, canonical containment and volume-identity revalidation, durable per-file intent/outcomes, and disposable-media acceptance; it never removes excluded support files or directories. Master Bin cleanup additionally requires archive independence, cross-project protection, and recoverable quarantine.
 
 ## Syncthing and metadata
 

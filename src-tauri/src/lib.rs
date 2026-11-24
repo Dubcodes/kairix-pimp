@@ -471,6 +471,9 @@ fn default_update_channel() -> String {
 fn default_resource_idle_delay_minutes() -> u16 {
     10
 }
+fn default_ingest_verification_mode() -> String {
+    "deep".into()
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -541,6 +544,8 @@ struct IngestRequest {
     allow_duplicate_copies: bool,
     #[serde(default)]
     allow_unverified_reimport: bool,
+    #[serde(default = "default_ingest_verification_mode")]
+    verification_mode: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -708,6 +713,18 @@ struct IngestJobFile {
     duplicate_existing_relative_path: Option<String>,
     #[serde(default)]
     intentional_duplicate: bool,
+    #[serde(default)]
+    verification_method: Option<String>,
+    #[serde(default)]
+    source_bytes_read: u64,
+    #[serde(default)]
+    destination_bytes_written: u64,
+    #[serde(default)]
+    destination_bytes_read: u64,
+    #[serde(default)]
+    copy_duration_millis: u64,
+    #[serde(default)]
+    verification_duration_millis: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -724,6 +741,8 @@ struct IngestJob {
     updated_at: String,
     batch_timestamp: String,
     date_override: Option<String>,
+    #[serde(default = "default_ingest_verification_mode")]
+    verification_mode: String,
     files: Vec<IngestJobFile>,
     #[serde(default)]
     unsupported: Vec<String>,
@@ -3930,6 +3949,12 @@ struct VerifiedCopy {
     hash: String,
     journal_path: PathBuf,
     staged_path: PathBuf,
+    verification_method: String,
+    source_bytes_read: u64,
+    destination_bytes_written: u64,
+    destination_bytes_read: u64,
+    copy_duration_millis: u64,
+    verification_duration_millis: u64,
 }
 
 #[derive(Default)]
@@ -3947,6 +3972,33 @@ fn verify_approved_source_hash(actual: &str, approved: &str) -> Result<(), Strin
                 .into(),
         )
     }
+}
+
+fn validated_ingest_verification_mode(value: &str) -> Result<&str, String> {
+    match value {
+        "fast" | "deep" => Ok(value),
+        _ => Err("Ingest verification mode must be Fast or Deep".into()),
+    }
+}
+
+fn verify_staged_copy(
+    staged: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    verification_mode: &str,
+) -> Result<u64, String> {
+    let verification_mode = validated_ingest_verification_mode(verification_mode)?;
+    let staged_size = staged.metadata().map_err(|error| error.to_string())?.len();
+    if staged_size != expected_size {
+        return Err("Staged destination size does not match the completed source read".into());
+    }
+    if verification_mode == "fast" {
+        return Ok(0);
+    }
+    if sha256(staged)? != expected_sha256 {
+        return Err("Independent SHA-256 verification failed".into());
+    }
+    Ok(staged_size)
 }
 
 fn update_job_progress(
@@ -4137,7 +4189,9 @@ fn copy_verified(
     file_total: usize,
     approved_hash: Option<&str>,
     source_volume_identity: Option<&str>,
+    verification_mode: &str,
 ) -> Result<VerifiedCopy, String> {
+    let verification_mode = validated_ingest_verification_mode(verification_mode)?;
     configure_volume_governor(state, settings);
     let source_volume = volume_resource_id(source)?;
     let destination_volume = volume_resource_id(Path::new(&settings.master_bin_path))?;
@@ -4176,7 +4230,7 @@ fn copy_verified(
         media: None,
     };
     write_json(&journal_path, &journal)?;
-    let operation: Result<String, String> = (|| {
+    let operation: Result<(String, u64, u64, u64), String> = (|| {
         let mut input =
             File::open(source).map_err(|error| format!("Cannot read source: {error}"))?;
         let mut output = OpenOptions::new()
@@ -4240,6 +4294,8 @@ fn copy_verified(
         }
         output.sync_all().map_err(|error| error.to_string())?;
         drop(output);
+        let copy_duration_millis = started.elapsed().as_millis() as u64;
+        let verification_started = Instant::now();
         update_job_progress(app, state, job_id, file_id, "verifying", copied, None)?;
         let _ = app.emit(
             "ingest-progress",
@@ -4270,21 +4326,40 @@ fn copy_verified(
                 );
             }
         }
-        if sha256(&temp)? != copied_source_hash {
-            return Err("Independent SHA-256 verification failed".into());
-        }
+        let destination_bytes_read =
+            verify_staged_copy(&temp, copied, &copied_source_hash, verification_mode)?;
         journal.status = "verified".into();
         write_json(&journal_path, &journal)?;
-        Ok(copied_source_hash)
+        Ok((
+            copied_source_hash,
+            copy_duration_millis,
+            verification_started.elapsed().as_millis() as u64,
+            destination_bytes_read,
+        ))
     })();
     match operation {
-        Ok(hash) => {
+        Ok((
+            hash,
+            copy_duration_millis,
+            verification_duration_millis,
+            destination_bytes_read,
+        )) => {
             volume_permit.add_bytes_for(&source_volume, before.length, 0);
-            volume_permit.add_bytes_for(&destination_volume, before.length, before.length);
+            volume_permit.add_bytes_for(
+                &destination_volume,
+                destination_bytes_read,
+                before.length,
+            );
             Ok(VerifiedCopy {
                 hash,
                 journal_path,
                 staged_path: temp,
+                verification_method: verification_mode.into(),
+                source_bytes_read: before.length,
+                destination_bytes_written: before.length,
+                destination_bytes_read,
+                copy_duration_millis,
+                verification_duration_millis,
             })
         }
         Err(error) => {
@@ -4455,6 +4530,10 @@ fn commit_job_file(
         .iter_mut()
         .find(|file| file.id == file_id)
         .ok_or("Ingest job file no longer exists")?;
+    let verification_method = file
+        .verification_method
+        .clone()
+        .unwrap_or_else(default_ingest_verification_mode);
     let destination = PathBuf::from(&file.destination_path);
     let (_, capture, provenance) = destination_date(
         settings,
@@ -4506,11 +4585,12 @@ fn commit_job_file(
         .iter()
         .find(|existing| existing.id == item.id || existing.relative_path == item.relative_path)
         .unwrap_or(&item);
-    if let Some(event) = evidence_observation_event(
+    if let Some(event) = evidence_observation_event_with_method(
         evidence_item,
         &settings.device_id,
         &committed_snapshot,
         hash,
+        &verification_method,
     ) {
         events.push(event);
     }
@@ -4568,6 +4648,35 @@ fn complete_duplicate_job_file(
             .count();
         job.bytes_transferred = job.files.iter().map(|file| file.bytes_transferred).sum();
         job.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_ingest_file_verification(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+    file_id: &str,
+    method: &str,
+    source_bytes_read: u64,
+    destination_bytes_written: u64,
+    destination_bytes_read: u64,
+    copy_duration_millis: u64,
+    verification_duration_millis: u64,
+) -> Result<(), String> {
+    mutate_jobs(app, state, |jobs| {
+        let file = jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .and_then(|job| job.files.iter_mut().find(|file| file.id == file_id))
+            .ok_or("Ingest job file no longer exists")?;
+        file.verification_method = Some(method.into());
+        file.source_bytes_read = source_bytes_read;
+        file.destination_bytes_written = destination_bytes_written;
+        file.destination_bytes_read = destination_bytes_read;
+        file.copy_duration_millis = copy_duration_millis;
+        file.verification_duration_millis = verification_duration_millis;
         Ok(())
     })
 }
@@ -4737,6 +4846,18 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                         && item.sha256 == expected_hash
                 });
             if trustworthy && existing.is_some() {
+                record_ingest_file_verification(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    "deep",
+                    planned.size_bytes,
+                    0,
+                    planned.size_bytes,
+                    0,
+                    0,
+                )?;
                 complete_duplicate_job_file(
                     app,
                     &state,
@@ -4761,6 +4882,18 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
         if destination.exists() {
             match (sha256(&source), sha256(&destination)) {
                 (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
+                    record_ingest_file_verification(
+                        app,
+                        &state,
+                        job_id,
+                        &planned.id,
+                        "deep",
+                        planned.size_bytes,
+                        0,
+                        planned.size_bytes,
+                        0,
+                        0,
+                    )?;
                     let catalogue = load_catalogue_file(&settings)?;
                     if let Some(existing) = catalogue.media.iter().find(|item| {
                         item.relative_path == planned.relative_path
@@ -4817,8 +4950,21 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             job.files.len(),
             planned.approved_sha256.as_deref(),
             planned.source_volume_identity.as_deref(),
+            &job.verification_mode,
         ) {
             Ok(copy) => {
+                record_ingest_file_verification(
+                    app,
+                    &state,
+                    job_id,
+                    &planned.id,
+                    &copy.verification_method,
+                    copy.source_bytes_read,
+                    copy.destination_bytes_written,
+                    copy.destination_bytes_read,
+                    copy.copy_duration_millis,
+                    copy.verification_duration_millis,
+                )?;
                 let catalogue = load_catalogue_file(&settings)?;
                 let candidates = catalogue
                     .media
@@ -5011,6 +5157,7 @@ fn start_ingest(
     let _operation = begin_critical_operation(&state.operations, "ingest start")?;
     let _plan_guard = state.approved_plan_store.lock().unwrap();
     let settings = load_settings_file(&app)?;
+    let verification_mode = validated_ingest_verification_mode(&request.verification_mode)?;
     let master = PathBuf::from(&settings.master_bin_path);
     let plan_id = request
         .approved_plan_id
@@ -5128,6 +5275,12 @@ fn start_ingest(
             source_volume_identity: approved.source_volume_identity.clone(),
             duplicate_existing_relative_path: is_duplicate.then_some(relative_path.clone()),
             intentional_duplicate,
+            verification_method: None,
+            source_bytes_read: 0,
+            destination_bytes_written: 0,
+            destination_bytes_read: 0,
+            copy_duration_millis: 0,
+            verification_duration_millis: 0,
         });
     }
     let now = Utc::now().to_rfc3339();
@@ -5151,6 +5304,7 @@ fn start_ingest(
         updated_at: now,
         batch_timestamp: batch_timestamp.to_rfc3339(),
         date_override: request.date_override,
+        verification_mode: verification_mode.into(),
         bytes_total,
         bytes_transferred: 0,
         files_completed: 0,
@@ -6828,6 +6982,7 @@ fn evidence_matches(
     observed_modified_millis: Option<u64>,
     observed_sha256: Option<&str>,
     needs_review: bool,
+    verification_method: &str,
 ) -> bool {
     item.integrity_by_device
         .get(device_id)
@@ -6836,6 +6991,8 @@ fn evidence_matches(
                 && evidence.observed_modified_millis == observed_modified_millis
                 && evidence.observed_sha256.as_deref() == observed_sha256
                 && evidence.needs_review == needs_review
+                && evidence.verification_method.as_deref().unwrap_or("deep")
+                    == verification_method
         })
 }
 
@@ -6852,6 +7009,10 @@ fn has_verified_snapshot(
                     == snapshot.modified_millis.map(|value| value as u64)
                 && evidence.observed_sha256.as_deref() == Some(item.sha256.as_str())
                 && !evidence.needs_review
+                && matches!(
+                    evidence.verification_method.as_deref(),
+                    None | Some("deep") | Some("selective-deep")
+                )
         })
 }
 
@@ -6860,6 +7021,22 @@ fn evidence_observation_event(
     device_id: &str,
     snapshot: &fs_safe::FileSnapshot,
     observed_sha256: String,
+) -> Option<CatalogueEvent> {
+    evidence_observation_event_with_method(
+        item,
+        device_id,
+        snapshot,
+        observed_sha256,
+        "deep",
+    )
+}
+
+fn evidence_observation_event_with_method(
+    item: &MediaItem,
+    device_id: &str,
+    snapshot: &fs_safe::FileSnapshot,
+    observed_sha256: String,
+    verification_method: &str,
 ) -> Option<CatalogueEvent> {
     let observed_modified_millis = snapshot.modified_millis.map(|value| value as u64);
     let needs_review = observed_sha256 != item.sha256;
@@ -6870,6 +7047,7 @@ fn evidence_observation_event(
         observed_modified_millis,
         Some(&observed_sha256),
         needs_review,
+        verification_method,
     ))
     .then(|| CatalogueEvent::MediaEvidenceObserved {
         media_id: item.id.clone(),
@@ -6877,6 +7055,7 @@ fn evidence_observation_event(
         observed_modified_millis,
         observed_sha256: Some(observed_sha256),
         needs_review,
+        verification_method: Some(verification_method.into()),
     })
 }
 
@@ -7165,6 +7344,7 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
             observed_modified_millis,
             observed_sha256,
             needs_review,
+            verification_method,
         } => current
             .media
             .iter()
@@ -7177,6 +7357,7 @@ fn run_rescan(app: &AppHandle, state: &NativeState, full: bool) -> Result<Rescan
                     *observed_modified_millis,
                     observed_sha256.as_deref(),
                     *needs_review,
+                    verification_method.as_deref().unwrap_or("deep"),
                 )
             }),
         _ => true,
@@ -7257,6 +7438,15 @@ fn classify_pending_media(
                 "snapshot-changed",
                 "The local size or modification snapshot changed after the last verification.",
                 "previous evidence is stale",
+            )
+        }
+        (Some(_), Some(evidence))
+            if evidence.verification_method.as_deref() == Some("fast") =>
+        {
+            (
+                "awaiting-verification",
+                "Fast ingest confirmed the source hash and destination size, but the destination has not been independently reread on this device.",
+                "Fast evidence is awaiting Deep verification",
             )
         }
         (Some(_), Some(evidence))
@@ -7440,11 +7630,12 @@ fn verify_media_integrity(
         .iter()
         .find(|candidate| candidate.id == media_id)
         .ok_or("Media changed while its integrity was being verified")?;
-    if let Some(event) = evidence_observation_event(
+    if let Some(event) = evidence_observation_event_with_method(
         current_item,
         &settings.device_id,
         &snapshot,
         observed_sha256,
+        "selective-deep",
     ) {
         append_events(&settings, vec![event])?;
         let _ = app.emit("catalogue-changed", ());
@@ -11373,10 +11564,18 @@ mod tests {
             observed_sha256: Some(hash.clone()),
             needs_review: false,
             observed_at: Some("2026-11-24T00:00:00Z".into()),
+            verification_method: None,
         };
         assert_eq!(
             classify_pending_media(&item, Some(&snapshot), Some(&evidence)).0,
             "verified"
+        );
+
+        let mut fast = evidence.clone();
+        fast.verification_method = Some("fast".into());
+        assert_eq!(
+            classify_pending_media(&item, Some(&snapshot), Some(&fast)).0,
+            "awaiting-verification"
         );
         let changed = fs_safe::FileSnapshot {
             length: snapshot.length + 1,
@@ -11900,6 +12099,7 @@ mod tests {
             updated_at: "2026-10-24T00:00:00Z".into(),
             batch_timestamp: "2026-10-24T00:00:00+00:00".into(),
             date_override: None,
+            verification_mode: "deep".into(),
             files: vec![IngestJobFile {
                 id: "file-1".into(),
                 media_id: "media-1".into(),
@@ -11931,6 +12131,12 @@ mod tests {
                 source_volume_identity: None,
                 duplicate_existing_relative_path: None,
                 intentional_duplicate: false,
+                verification_method: None,
+                source_bytes_read: 0,
+                destination_bytes_written: 0,
+                destination_bytes_read: 0,
+                copy_duration_millis: 0,
+                verification_duration_millis: 0,
             }],
             unsupported: Vec::new(),
             failures: vec!["previous failure".into()],
@@ -11981,6 +12187,12 @@ mod tests {
             source_volume_identity: None,
             duplicate_existing_relative_path: None,
             intentional_duplicate: false,
+            verification_method: None,
+            source_bytes_read: 0,
+            destination_bytes_written: 0,
+            destination_bytes_read: 0,
+            copy_duration_millis: 0,
+            verification_duration_millis: 0,
         };
         let catalogue = Catalogue {
             media: vec![media],
@@ -12685,6 +12897,228 @@ mod tests {
             approved.source_sha256.as_deref().unwrap()
         )
         .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fast_verification_avoids_destination_reread_while_deep_detects_mismatch() {
+        let root = temporary("verification-modes");
+        let staged = root.join("clip.part");
+        fs::write(&staged, b"different").unwrap();
+        let expected_hash = format!("{:x}", Sha256::digest(b"expected!"));
+        let expected_size = fs::metadata(&staged).unwrap().len();
+
+        assert_eq!(
+            verify_staged_copy(&staged, expected_size, &expected_hash, "fast").unwrap(),
+            0
+        );
+        assert!(verify_staged_copy(&staged, expected_size, &expected_hash, "deep").is_err());
+        assert!(verify_staged_copy(&staged, expected_size + 1, &expected_hash, "fast").is_err());
+        assert!(verify_staged_copy(&staged, expected_size, &expected_hash, "unknown").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fast_evidence_remains_pending_until_selective_deep_verification() {
+        let root = temporary("fast-evidence");
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"verified bytes").unwrap();
+        let hash = sha256(&source).unwrap();
+        let mut item = new_media(
+            &source,
+            "20261125/clip.mp4".into(),
+            None,
+            hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        let snapshot = fs_safe::snapshot(&source).unwrap();
+        let fast = evidence_observation_event_with_method(
+            &item,
+            "desktop",
+            &snapshot,
+            hash.clone(),
+            "fast",
+        )
+        .unwrap();
+        let CatalogueEvent::MediaEvidenceObserved {
+            verification_method,
+            ..
+        } = fast
+        else {
+            panic!("expected evidence event")
+        };
+        item.integrity_by_device.insert(
+            "desktop".into(),
+            catalogue::IntegrityEvidence {
+                observed_size: snapshot.length,
+                observed_modified_millis: snapshot.modified_millis.map(|value| value as u64),
+                observed_sha256: Some(hash.clone()),
+                needs_review: false,
+                observed_at: None,
+                verification_method,
+            },
+        );
+        assert!(!has_verified_snapshot(&item, "desktop", &snapshot));
+        let deep = evidence_observation_event(&item, "desktop", &snapshot, hash).unwrap();
+        assert!(matches!(
+            deep,
+            CatalogueEvent::MediaEvidenceObserved {
+                verification_method: Some(method),
+                ..
+            } if method == "deep"
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_ingest_jobs_default_to_deep_without_fabricated_metrics() {
+        let mut value = serde_json::to_value(ingest_job("completed", "completed")).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("verificationMode");
+        let file = object["files"].as_array_mut().unwrap()[0]
+            .as_object_mut()
+            .unwrap();
+        for key in [
+            "verificationMethod",
+            "sourceBytesRead",
+            "destinationBytesWritten",
+            "destinationBytesRead",
+            "copyDurationMillis",
+            "verificationDurationMillis",
+        ] {
+            file.remove(key);
+        }
+        let restored: IngestJob = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.verification_mode, "deep");
+        assert_eq!(restored.files[0].verification_method, None);
+        assert_eq!(restored.files[0].destination_bytes_read, 0);
+    }
+
+    #[test]
+    #[ignore = "large repository-local performance fixture; run explicitly"]
+    fn benchmark_fast_and_deep_ingest_costs() {
+        let root = temporary("ingest-benchmark");
+        let card = root.join("card");
+        let master = root.join("master");
+        fs::create_dir_all(&card).unwrap();
+        fs::create_dir_all(&master).unwrap();
+        let source = card.join("representative.mp4");
+        let size_mib = std::env::var("PIMP_BENCHMARK_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(256);
+        let block = vec![0x5a_u8; 1024 * 1024];
+        let mut fixture = File::create(&source).unwrap();
+        for _ in 0..size_mib {
+            fixture.write_all(&block).unwrap();
+        }
+        fixture.sync_all().unwrap();
+        drop(fixture);
+        let size_bytes = fs::metadata(&source).unwrap().len();
+
+        let inventory_started = Instant::now();
+        let inventory = build_source_inventory(&[card.to_string_lossy().into_owned()]);
+        let inventory_millis = inventory_started.elapsed().as_millis() as u64;
+        assert_eq!(inventory.total_file_count, 1);
+        assert_eq!(inventory.total_bytes, size_bytes);
+
+        let raw = master.join("raw-copy.mp4");
+        let raw_started = Instant::now();
+        let mut raw_input = File::open(&source).unwrap();
+        let mut raw_output = File::create(&raw).unwrap();
+        std::io::copy(&mut raw_input, &mut raw_output).unwrap();
+        raw_output.sync_all().unwrap();
+        let raw_copy_millis = raw_started.elapsed().as_millis() as u64;
+
+        let staged = master.join("hashed-copy.mp4");
+        let copy_started = Instant::now();
+        let mut input = File::open(&source).unwrap();
+        let mut output = File::create(&staged).unwrap();
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = input.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            output.write_all(&buffer[..read]).unwrap();
+        }
+        output.sync_all().unwrap();
+        drop(output);
+        let copy_hash_millis = copy_started.elapsed().as_millis() as u64;
+        let source_hash = format!("{:x}", hasher.finalize());
+
+        let deep_started = Instant::now();
+        assert_eq!(verify_staged_copy(&staged, size_bytes, &source_hash, "deep").unwrap(), size_bytes);
+        let deep_reread_millis = deep_started.elapsed().as_millis() as u64;
+        assert_eq!(verify_staged_copy(&staged, size_bytes, &source_hash, "fast").unwrap(), 0);
+
+        let journal = root.join("benchmark-journal.json");
+        let journal_started = Instant::now();
+        write_json(
+            &journal,
+            &IngestJournal {
+                job_id: "benchmark".into(),
+                source_path: source.to_string_lossy().into(),
+                destination_path: staged.to_string_lossy().into(),
+                staged_name: "hashed-copy.mp4".into(),
+                status: "verified".into(),
+                detail: None,
+                media: None,
+            },
+        )
+        .unwrap();
+        let journal_millis = journal_started.elapsed().as_millis() as u64;
+
+        let catalogue_root = master.join(".pimp");
+        let registration_started = Instant::now();
+        let media = new_media(
+            &staged,
+            "benchmark/representative.mp4".into(),
+            Some("representative.mp4".into()),
+            source_hash.clone(),
+            None,
+            "filesystem-modified".into(),
+            false,
+        )
+        .unwrap();
+        catalogue::append(
+            &catalogue_root,
+            "benchmark-device",
+            vec![CatalogueEvent::MediaRegistered { media }],
+        )
+        .unwrap();
+        let registration_millis = registration_started.elapsed().as_millis() as u64;
+
+        let duplicate_started = Instant::now();
+        assert_eq!(sha256(&source).unwrap(), sha256(&staged).unwrap());
+        let duplicate_verification_millis = duplicate_started.elapsed().as_millis() as u64;
+        let throughput = |millis: u64| {
+            if millis == 0 {
+                0
+            } else {
+                size_bytes.saturating_mul(1000) / millis
+            }
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "fixtureBytes": size_bytes,
+                "inventory": {"millis": inventory_millis, "sourceBytesRead": 0},
+                "rawCopy": {"millis": raw_copy_millis, "bytesPerSecond": throughput(raw_copy_millis)},
+                "copyWithSourceSha256": {"millis": copy_hash_millis, "bytesPerSecond": throughput(copy_hash_millis), "sourceBytesRead": size_bytes, "destinationBytesWritten": size_bytes},
+                "observedHashingDeltaMillis": copy_hash_millis as i128 - raw_copy_millis as i128,
+                "fast": {"totalMillis": copy_hash_millis, "destinationBytesRead": 0},
+                "deep": {"totalMillis": copy_hash_millis + deep_reread_millis, "destinationRereadMillis": deep_reread_millis, "destinationBytesRead": size_bytes},
+                "journalPersistenceMillis": journal_millis,
+                "catalogueRegistrationMillis": registration_millis,
+                "duplicateVerification": {"millis": duplicate_verification_millis, "sourceAndDestinationBytesRead": size_bytes * 2}
+            })
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -13588,6 +14022,7 @@ mod tests {
                 observed_sha256: Some(changed_hash),
                 needs_review: true,
                 observed_at: None,
+                verification_method: None,
             },
         );
         fs::write(&source, b"expected").unwrap();

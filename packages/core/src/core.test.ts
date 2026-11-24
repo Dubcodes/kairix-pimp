@@ -749,6 +749,7 @@ describe('catalogue reducer', () => {
           observedSize: 2,
           observedSha256: 'abc',
           needsReview: false,
+          verificationMethod: 'fast',
         },
         'laptop-evidence',
         'laptop',
@@ -758,6 +759,7 @@ describe('catalogue reducer', () => {
     expect(state.media.m1.integrityByDevice?.laptop).toMatchObject({
       observedSha256: 'abc',
       needsReview: false,
+      verificationMethod: 'fast',
     });
   });
   it('surfaces concurrent project record changes', () => {

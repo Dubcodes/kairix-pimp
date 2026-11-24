@@ -326,6 +326,7 @@ export function rebuildCatalogue(events: EventEnvelope[]): CatalogueState {
         observedSha256: event.observedSha256,
         needsReview: event.needsReview,
         observedAt: envelope.occurredAt,
+        verificationMethod: event.verificationMethod,
       };
     } else if (event.type === 'media.relocated') {
       const mediaId = canonicalMediaId(event.mediaId);

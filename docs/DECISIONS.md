@@ -55,7 +55,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 ## ADR-006 — Verified ingest and immutable originals
 
 - **Recorded:** 2026-10-22 (original decision date not recorded)
-- **Status:** Accepted
+- **Status:** Superseded by ADR-086 for selectable Fast/Deep verification; staging, no-overwrite promotion, source consistency, and Deep verification requirements retained
 - **Context:** Production footage loss is unacceptable.
 - **Options:** Fast unchecked copy; post-copy spot checking; temporary copy with independent checksums and atomic promotion.
 - **Decision:** Preserve sources; copy to a sibling temporary file, independently hash source/destination, then atomically promote without overwrite.
@@ -175,7 +175,7 @@ Known early decisions predate this log; their original dates were not recorded. 
 ## ADR-022 — Verification-gated, recoverable cleanup
 
 - **Date:** 2026-10-23
-- **Status:** Accepted
+- **Status:** Partially superseded by ADR-086 for explicitly authorized SD-card cleanup; Master Bin/archive cleanup requirements retained
 - **Decision:** Cleanup automation is future, opt-in and disabled by default. Eligibility requires successful finalization verification, per-file protection and cross-project reference checks. Removal first uses recoverable quarantine; Syncthing replicas do not count as backups.
 - **Consequences:** No deletion behavior is added in the reliability milestone. Later purge requires separate authorization and retention policy.
 
@@ -622,3 +622,17 @@ Known early decisions predate this log; their original dates were not recorded. 
 - **Status:** Accepted, pending first owner-approved public promotion
 - **Decision:** After a reviewed release is made public, download the exact recommended NSIS asset through its permanent unauthenticated GitHub Release URL and compare both byte length and SHA-256 with the reviewed staged installer. Keep this independent of automatic-update signing so absent updater secrets cannot block a reviewed unsigned public installer.
 - **Consequences:** A successful public-release workflow now proves that its primary installer is actually retrievable outside Actions artifacts and that the retrieved bytes match the reviewed package. It does not provide Authenticode trust, Tauri updater signing, installed upgrade acceptance or owner review; repository branch/environment protections remain mandatory configuration.
+
+## ADR-086 — Selectable ingest assurance and separately authorized card cleanup
+
+- **Date:** 2026-11-25
+- **Status:** Accepted for staged implementation; cleanup remains production-disabled pending disposable removable-media acceptance
+- **Decision:** Preserve the existing Deep ingest as the compatibility default and add an explicit Fast mode. Both modes retain metadata-only inventory, the copy-stream source SHA-256, approved source snapshot and volume identity, flushed same-filesystem staging, source rechecks, atomic no-overwrite promotion and catalogue registration. Deep independently rereads and hashes staged destination bytes. Fast omits that unconditional reread and records `fast` evidence that is never treated as independent byte-for-byte destination verification. A later selective Deep verification upgrades evidence without changing media identity or metadata. SD-card cleanup is an optional durable phase after the entire batch reconciles; authorization is job-specific, editable until cleanup begins, and never inferred from settings, restart or successful copy. It removes only exact approved eligible recording files, never excluded support files or directories. Master Bin/project cleanup remains a separate archive-independence workflow.
+- **Consequences:** Fast can reduce destination read traffic while retaining content identity and duplicate-candidate hashes, but it provides lower assurance and cannot serve as a trusted existing duplicate destination until Deep verification exists. Historical jobs deserialize as Deep and never silently weaken. Automatic cleanup may eventually operate after either mode, but discrepancies trigger targeted Deep checks and block cleanup if unresolved. No production destructive command is enabled until native failure-injection coverage and real disposable-card acceptance pass.
+
+## ADR-087 — Portable lifecycle restoration and selective invalidation
+
+- **Date:** 2026-11-25
+- **Status:** Accepted as product direction; implementation staged
+- **Decision:** Treat temporary Master Bin absence and completed-project return as normal lifecycle states. Stable media/project IDs, portable relative paths, content hashes, manual metadata, project-use evidence and compatible derivative/analysis provenance survive path or device changes. Folder return alone never creates new identity or invalidates unchanged analysis; only affected changed or ambiguous content receives new work. Completed-project restoration reads compatible portable manifests idempotently and remains read-only until future finalization and collection transitions are separately verified.
+- **Consequences:** Explorer-based temporary offload can be reconciled without deleting catalogue records or blanket reprocessing. Whether offload should propagate deletions through Syncthing remains explicitly unresolved. Project finalization, redundant Master Bin removal, backup retention and future AI packaging remain planned rather than implied by restoration evidence.
