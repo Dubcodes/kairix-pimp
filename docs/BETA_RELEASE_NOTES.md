@@ -1,6 +1,6 @@
-# Kairix PIMP Light 0.2 — Development candidate
+# Kairix PIMP Light 0.3 — Development candidate
 
-This file supplies release notes to the protected promotion workflows. Source version `0.2.0` is displayed as `0.2 — Development`; it is not publicly available until a permanent GitHub Development Release has completed verification. The historical `v0.1.1-5` beta remains unchanged.
+This file supplies release notes to the reviewed promotion workflows. Source version `0.3.0` is displayed as `0.3 — Development`; it is strictly newer than internal `0.2.0` builds and is not publicly available until a permanent GitHub Development Release has completed verification. The historical `v0.1.1-5` beta remains unchanged.
 
 ## Highlights
 
@@ -8,6 +8,7 @@ This file supplies release notes to the protected promotion workflows. Source ve
 - Release and updater publication are serialized; immutable signed assets are verified on retry and channel manifests reject rollback or same-version replacement.
 - Settings can select Development or Stable signed update channels and can check after startup, every six hours, or manually. Update installation still fails closed without the protected public key and signature.
 - Keyless builds can still inspect complete permanent releases through GitHub's public API, compare the installed version and open only the official unsigned NSIS asset for manual checksum verification and installation.
+- Equal public and installed SemVer is reported as inconclusive until the displayed build identity is compared with `BUILD-INFO.txt`; version equality is never presented as proof of equal executable bytes.
 - Static thumbnails and scrub previews use deterministic portable identities beneath the shared catalogue at `.pimp/thumbnails/v1` and `.pimp/hover-previews/v1`. Valid legacy local derivatives migrate incrementally; playback proxies remain local.
 - Pending Verification explains verified, stale, awaiting, unavailable, moved and failed evidence without hashing on open, then hashes only explicitly selected registered files with progress and cancellation.
 - Static asset references survive card unmount and ordinary catalogue refresh so returning to earlier recordings does not deliberately restore placeholders or rerun FFmpeg.

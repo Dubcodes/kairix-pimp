@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_version:
-        description: Exact internal SemVer to publish (for example 0.2.0)
+        description: Exact internal SemVer to publish (for example 0.3.0)
         required: true
         type: string
       classification:
@@ -217,3 +217,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run signed-beta-update.yml --ref main -f release_tag='${{ steps.identity.outputs.tag }}'
+
+      - name: Verify anonymous permanent installer download
+        shell: pwsh
+        run: |
+          $version = '${{ steps.identity.outputs.version }}'
+          $tag = '${{ steps.identity.outputs.tag }}'
+          $name = "Kairix-PIMP-Light-$version-Windows-x64-Setup-Unsigned.exe"
+          $url = "https://github.com/Dubcodes/kairix-pimp/releases/download/$tag/$name"
+          $destination = Join-Path $env:RUNNER_TEMP $name
+          Invoke-WebRequest -Uri $url -Headers @{ 'User-Agent' = 'Kairix-PIMP-release-verifier' } -OutFile $destination
+          $local = Join-Path 'release-assets' $name
+          if (-not (Test-Path -LiteralPath $destination) -or (Get-Item -LiteralPath $destination).Length -le 0) {
+            throw 'The public installer could not be downloaded anonymously.'
+          }
+          if ((Get-Item -LiteralPath $destination).Length -ne (Get-Item -LiteralPath $local).Length) {
+            throw 'The anonymously downloaded installer size differs from the reviewed asset.'
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $local).Hash) {
+            throw 'The anonymously downloaded installer hash differs from the reviewed asset.'
+          }

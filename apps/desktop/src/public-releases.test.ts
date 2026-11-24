@@ -43,6 +43,41 @@ it('accepts only complete permanent public installer releases', async () => {
     version: '0.2.0',
     classification: 'Development',
     newerThanInstalled: true,
+    versionComparison: 'newer',
+  });
+});
+
+it('distinguishes equal SemVer because it does not prove equal executable bytes', async () => {
+  const request = vi.fn(
+    async () =>
+      new Response(
+        JSON.stringify([
+          {
+            tag_name: 'v0.3.0',
+            html_url:
+              'https://github.com/Dubcodes/kairix-pimp/releases/tag/v0.3.0',
+            published_at: '2026-11-24T00:00:00Z',
+            body: 'Release notes',
+            draft: false,
+            prerelease: true,
+            assets: [
+              asset(
+                'Kairix-PIMP-Light-0.3.0-Windows-x64-Setup-Unsigned.exe',
+                'v0.3.0',
+              ),
+              asset('SHA256SUMS.txt', 'v0.3.0'),
+              asset('BUILD-INFO.txt', 'v0.3.0'),
+            ],
+          },
+        ]),
+        { status: 200 },
+      ),
+  );
+  await expect(
+    checkPublicReleases('0.3.0', 'Development', request),
+  ).resolves.toMatchObject({
+    newerThanInstalled: false,
+    versionComparison: 'same',
   });
 });
 

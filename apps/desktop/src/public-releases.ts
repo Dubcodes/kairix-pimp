@@ -9,6 +9,7 @@ export interface PublicRelease {
   checksumUrl: string;
   buildInfoUrl: string;
   newerThanInstalled: boolean;
+  versionComparison: 'newer' | 'same' | 'older';
 }
 
 interface GitHubAsset {
@@ -123,6 +124,7 @@ export async function checkPublicReleases(
     const checksum = assets.find((asset) => asset.name === 'SHA256SUMS.txt');
     const buildInfo = assets.find((asset) => asset.name === 'BUILD-INFO.txt');
     if (!installer || !checksum || !buildInfo) return [];
+    const comparison = comparePublicVersions(version, installedVersion);
     return [
       {
         version,
@@ -134,8 +136,9 @@ export async function checkPublicReleases(
         installerSizeBytes: installer.size,
         checksumUrl: checksum.url,
         buildInfoUrl: buildInfo.url,
-        newerThanInstalled:
-          comparePublicVersions(version, installedVersion) > 0,
+        newerThanInstalled: comparison > 0,
+        versionComparison:
+          comparison > 0 ? 'newer' : comparison < 0 ? 'older' : 'same',
       },
     ];
   });

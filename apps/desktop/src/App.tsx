@@ -2510,7 +2510,7 @@ export function App() {
         publicResult.status === 'rejected'
           ? `Public release check failed: ${errorText(publicResult.reason)}`
           : latestPublic
-            ? ` Latest public ${latestPublic.classification} release: ${latestPublic.version}${latestPublic.newerThanInstalled ? ' (newer than installed)' : ' (not newer than installed)'}.`
+            ? ` Latest public ${latestPublic.classification} release: ${latestPublic.version} (${latestPublic.versionComparison} SemVer).`
             : ` No complete public ${updaterConfiguration.channel} installer release was found.`;
       setUpdateStatus(`${automatic}${manual}`);
     } finally {
@@ -4500,9 +4500,11 @@ export function App() {
                           ).toLocaleDateString()}
                         </span>
                         <span>
-                          {publicRelease.newerThanInstalled
+                          {publicRelease.versionComparison === 'newer'
                             ? 'Newer than the installed version.'
-                            : 'The installed version is the same or newer.'}
+                            : publicRelease.versionComparison === 'same'
+                              ? 'Same SemVer as installed. Compare the installed build identity above with BUILD-INFO.txt; version equality alone does not prove identical executable contents.'
+                              : 'Older than the installed version.'}
                         </span>
                         {publicRelease.notes && <p>{publicRelease.notes}</p>}
                         <span>
@@ -4565,7 +4567,7 @@ export function App() {
                           );
                       }}
                     >
-                      Open public NSIS installer
+                      Download update
                     </button>
                     <button onClick={() => void openSupport('test-builds')}>
                       View available test builds

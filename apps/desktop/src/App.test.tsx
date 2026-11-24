@@ -2567,6 +2567,7 @@ describe('native application integration', () => {
       buildInfoUrl:
         'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-5/BUILD-INFO.txt',
       newerThanInstalled: false,
+      versionComparison: 'older',
     });
     const user = userEvent.setup();
     render(<App />);
@@ -2583,9 +2584,7 @@ describe('native application integration', () => {
     await waitFor(() => expect(mocks.checkPublicReleases).toHaveBeenCalled());
     expect(mocks.checkApprovedBetaUpdate).not.toHaveBeenCalled();
     expect(await screen.findByText(/0.1.1-5 — Development/)).toBeVisible();
-    await user.click(
-      screen.getByRole('button', { name: 'Open public NSIS installer' }),
-    );
+    await user.click(screen.getByRole('button', { name: 'Download update' }));
     expect(mocks.openPublicReleaseInstaller).toHaveBeenCalledWith(
       expect.stringContaining('/v0.1.1-5/'),
     );
@@ -2595,6 +2594,37 @@ describe('native application integration', () => {
     );
     expect(mocks.openSupportLink).toHaveBeenNthCalledWith(1, 'releases');
     expect(mocks.openSupportLink).toHaveBeenNthCalledWith(2, 'test-builds');
+  });
+
+  it('does not treat equal public SemVer as proof of equal executable bytes', async () => {
+    mocks.checkPublicReleases.mockResolvedValue({
+      version: '0.1.1-1',
+      classification: 'Development',
+      publishedAt: '2026-11-24T00:00:00Z',
+      notes: 'Equal-version test release',
+      releaseUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/tag/v0.1.1-1',
+      installerUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-1/Kairix-PIMP-Light-0.1.1-1-Windows-x64-Setup-Unsigned.exe',
+      installerSizeBytes: 100,
+      checksumUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-1/SHA256SUMS.txt',
+      buildInfoUrl:
+        'https://github.com/Dubcodes/kairix-pimp/releases/download/v0.1.1-1/BUILD-INFO.txt',
+      newerThanInstalled: false,
+      versionComparison: 'same',
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Updates' }));
+    await user.click(screen.getByRole('button', { name: 'Check for updates' }));
+    expect(
+      await screen.findByText(/version equality alone does not prove/i),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Download update' }),
+    ).toBeEnabled();
   });
 
   it('reports checking, available and up-to-date states for a configured signer', async () => {

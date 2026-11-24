@@ -13325,7 +13325,7 @@ mod tests {
 
     #[test]
     fn updater_is_a_higher_development_release_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
         let configuration = updater_configuration_for_key(
             option_env!("PIMP_UPDATER_PUBLIC_KEY"),
             "development",
