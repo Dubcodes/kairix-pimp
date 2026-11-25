@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "kairix-pimp"
-version = "0.1.1-5"
+version = "0.1.1-6"
 dependencies = [
  "base64 0.22.1",
  "chrono",

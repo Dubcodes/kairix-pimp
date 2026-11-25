@@ -9,6 +9,7 @@ import {
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Catalogue, DeviceSettings, IngestJob } from './bridge';
+import { resetLastHoveredRatioMemoryCache } from './thumbnail-hold';
 
 const mocks = vi.hoisted(() => ({
   native: true,
@@ -22,6 +23,9 @@ const mocks = vi.hoisted(() => ({
     thumbnailCacheLimitBytes: 2147483648,
     hoverPreviewsEnabled: true,
     previewCacheLimitBytes: 536870912,
+    thumbnailHoldFrame: 'first',
+    previewPreloading: 'visible-nearby',
+    previewRamCacheLimitBytes: 0,
     ingestDateOrganization: 'original-file-dates' as const,
     dateFolderPattern: 'yyyymmdd',
     initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -68,9 +72,12 @@ const mocks = vi.hoisted(() => ({
   openProjectFolder: vi.fn(),
   revealProjectAsset: vi.fn(),
   loadHoverPreview: vi.fn(),
+  prepareHoverPreview: vi.fn(),
   hoverPreviewCacheUsage: vi.fn(),
   clearHoverPreviewCache: vi.fn(),
   loadThumbnailSources: vi.fn(),
+  choosePremiereManifestDestination: vi.fn(),
+  exportPremiereManifest: vi.fn(),
   startIngest: vi.fn(),
 }));
 
@@ -142,7 +149,10 @@ vi.mock('./bridge', () => ({
     openMediaFolder: mocks.openMediaFolder,
     loadThumbnail: vi.fn(async () => null),
     loadThumbnailSources: mocks.loadThumbnailSources,
+    choosePremiereManifestDestination: mocks.choosePremiereManifestDestination,
+    exportPremiereManifest: mocks.exportPremiereManifest,
     loadHoverPreview: mocks.loadHoverPreview,
+    prepareHoverPreview: mocks.prepareHoverPreview,
     hoverPreviewCacheUsage: mocks.hoverPreviewCacheUsage,
     clearHoverPreviewCache: mocks.clearHoverPreviewCache,
     thumbnailUrl: (path: string) => path,
@@ -207,6 +217,8 @@ describe('native application integration', () => {
     );
   });
   beforeEach(() => {
+    localStorage.clear();
+    resetLastHoveredRatioMemoryCache();
     mocks.native = true;
     mocks.settings = {
       deviceId: 'device-1',
@@ -218,6 +230,9 @@ describe('native application integration', () => {
       thumbnailCacheLimitBytes: 2147483648,
       hoverPreviewsEnabled: true,
       previewCacheLimitBytes: 536870912,
+      thumbnailHoldFrame: 'first',
+      previewPreloading: 'visible-nearby',
+      previewRamCacheLimitBytes: 0,
       ingestDateOrganization: 'original-file-dates',
       dateFolderPattern: 'yyyymmdd',
       initializedCataloguePath: 'C:\\Master\\.pimp',
@@ -311,12 +326,17 @@ describe('native application integration', () => {
     mocks.revealProjectAsset.mockReset();
     mocks.revealProjectAsset.mockResolvedValue(undefined);
     mocks.loadHoverPreview.mockReset();
+    mocks.prepareHoverPreview.mockReset();
+    mocks.prepareHoverPreview.mockResolvedValue(undefined);
     mocks.hoverPreviewCacheUsage.mockReset();
     mocks.hoverPreviewCacheUsage.mockResolvedValue(0);
     mocks.clearHoverPreviewCache.mockReset();
     mocks.clearHoverPreviewCache.mockResolvedValue(0);
     mocks.loadThumbnailSources.mockReset();
     mocks.loadThumbnailSources.mockResolvedValue({});
+    mocks.choosePremiereManifestDestination.mockReset();
+    mocks.choosePremiereManifestDestination.mockResolvedValue(undefined);
+    mocks.exportPremiereManifest.mockReset();
     mocks.startIngest.mockReset();
     mocks.startIngest.mockResolvedValue({
       schemaVersion: 3,
@@ -674,7 +694,8 @@ describe('native application integration', () => {
     expect(screen.queryByText('PIMP_MASTER_001.MP4')).not.toBeInTheDocument();
   });
 
-  it('scrubs cached hover frames locally and restores the normal thumbnail', async () => {
+  it('scrubs immediately, persists once on exit and restores the last hovered frame', async () => {
+    mocks.settings.thumbnailHoldFrame = 'last-hovered';
     mocks.catalogue = {
       media: [
         {
@@ -731,7 +752,11 @@ describe('native application integration', () => {
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1),
     );
     await screen.findByLabelText('Move horizontally to preview video frames');
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    fireEvent.pointerMove(thumbnail, { clientX: 10 });
+    fireEvent.pointerMove(thumbnail, { clientX: 55 });
     fireEvent.pointerMove(thumbnail, { clientX: 99 });
+    expect(setItem).not.toHaveBeenCalled();
     expect(container.querySelector('.media-thumbnail img')).toHaveAttribute(
       'src',
       'data:image/jpeg;base64,last',
@@ -740,12 +765,17 @@ describe('native application integration', () => {
       '1:40',
     );
     fireEvent.pointerLeave(thumbnail);
+    expect(setItem).toHaveBeenCalledTimes(1);
     expect(
       container.querySelector('.preview-timecode'),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText('Move horizontally to preview video frames'),
     ).not.toBeInTheDocument();
+    expect(container.querySelector('.media-thumbnail img')).toHaveAttribute(
+      'src',
+      'data:image/jpeg;base64,last',
+    );
     fireEvent.pointerEnter(thumbnail);
     await screen.findByLabelText('Move horizontally to preview video frames');
     expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(1);
@@ -766,6 +796,31 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(mocks.loadHoverPreview).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it('persists device-local preview preparation and RAM allowance controls', async () => {
+    mocks.saveSettings.mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.selectOptions(
+      screen.getByLabelText('Preview preloading'),
+      'idle',
+    );
+    await user.selectOptions(
+      screen.getByLabelText('RAM preview-cache allowance'),
+      String(64 * 1024 * 1024),
+    );
+    await waitFor(() =>
+      expect(mocks.saveSettings.mock.calls.at(-1)?.[0]).toEqual(
+        expect.objectContaining({
+          previewPreloading: 'idle',
+          previewRamCacheLimitBytes: 64 * 1024 * 1024,
+        }),
+      ),
+    );
+    expect(screen.getByText('Generation queue idle')).toBeVisible();
   });
 
   it.each([100, 700, 3000])(
@@ -1338,6 +1393,10 @@ describe('native application integration', () => {
   });
 
   it('presents paired video and WAV as one searchable logical recording', async () => {
+    mocks.choosePremiereManifestDestination.mockResolvedValue(
+      'C:\\Exports\\selection.pimp-premiere.json',
+    );
+    mocks.exportPremiereManifest.mockResolvedValue(2);
     mocks.catalogue = {
       media: [
         {
@@ -1425,6 +1484,15 @@ describe('native application integration', () => {
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
         'C:\\Master\\video\r\nC:\\Master\\audio',
+      ),
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Export Premiere manifest' }),
+    );
+    await waitFor(() =>
+      expect(mocks.exportPremiereManifest).toHaveBeenCalledWith(
+        ['video', 'audio'],
+        'C:\\Exports\\selection.pimp-premiere.json',
       ),
     );
     await user.click(

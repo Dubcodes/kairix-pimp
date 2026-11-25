@@ -17,6 +17,12 @@ Full-edition AI processing is planned and is not implemented in this milestone.
 
 ## Milestone status
 
+Appearance settings now select the nearest real sampled first, 10%, 20%, middle, 80% or last thumbnail hold frame, or retain a bounded device-local per-media last-hover position. The source media and synchronized catalogue are not modified.
+
+Preview preparation now uses a bounded priority queue: an active hover runs before queued visible, nearby and optional idle work, while an already-running FFmpeg operation finishes safely. Disk preparation is distinct from byte-budgeted RAM preloading, pauses during active ingest, and exposes queue, memory and disk usage in Appearance settings.
+
+The repository now contains a separately packaged Premiere UXP proof of concept and a native **Export Premiere manifest** handoff for selected Master Bin media, including attached WAV files. Its interchange validation is automated-test covered, but the panel has not yet been loaded or packaged with UXP Developer Tool and no real Premiere compatibility is claimed. See [Premiere Companion integration](docs/PREMIERE_INTEGRATION.md).
+
 Thumbnail cache paths are resolved in one validated native batch per catalogue revision. Near-viewport observation and lazy decoding avoid per-card catalogue replays and Base64 image transfers during Library startup.
 
 Ingest can seed normalized tags across all eligible video, audio and image recordings while retaining later per-file edits in the existing durable job metadata. Copy remains the default and only enabled source workflow; SD-card cleanup is not implemented.
@@ -36,6 +42,8 @@ New installations use `yyyymmdd` date folders. Settings provide a live preview b
 Settings are organized into General, Library & Storage, Ingest & Discovery, Appearance, Updates, About & Support and Diagnostics. Graphite is the default token-based theme, with Adobe-style Dark, Light, Midnight, System and High Contrast alternatives. Immediate preference writes are serialized and retryable so rapid edits cannot be lost or rolled back by an older response. Release Windows builds use the GUI subsystem and suppress consoles for FFmpeg/FFprobe, while debug builds retain console diagnostics. Normal launch, a second shortcut launch, a tray click and **Show PIMP** share one logged show/unminimize/focus path; minimized autostart hides only after tray creation. Explorer reveal uses the Windows Shell selection API after media-ID lookup and canonical Master Bin validation. Safe support links are selected from a native allowlist. The recommended Windows beta package is the per-user NSIS installer; see [Windows installation and upgrades](docs/WINDOWS_INSTALLATION.md).
 
 Version `0.1.1-5` is the first public Windows beta candidate. It retains safe finalized-history clearing, bounds preview data in both the shared cache and mounted cards, and labels hover frames with FFmpeg's actual sampled timestamps. Public manual installers are permanent GitHub Release assets; automatic updates remain fail-closed until the protected signing key/password and matching repository public key are provisioned and a real installed upgrade passes. See [Windows beta distribution and signed updates](docs/UPDATES.md).
+
+Version `0.1.1-6` is a short-lived pull-request acceptance build for the optimized preview and Premiere Companion milestone. It does not replace the `0.1.1-5` public prerelease, is unsigned, and is available only through the PR's expiring Actions artifacts.
 
 Configure DCM Master Bin itself as the Syncthing folder. If a broader parent directory is synchronized, explicitly exclude the sibling `.DCM Master Bin.pimp-staging-*` path so incomplete device-local staging is never replicated.
 

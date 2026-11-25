@@ -73,6 +73,12 @@ struct DeviceSettings {
     hover_previews_enabled: bool,
     #[serde(default = "default_preview_cache_limit_bytes")]
     preview_cache_limit_bytes: u64,
+    #[serde(default = "default_thumbnail_hold_frame")]
+    thumbnail_hold_frame: String,
+    #[serde(default = "default_preview_preloading")]
+    preview_preloading: String,
+    #[serde(default)]
+    preview_ram_cache_limit_bytes: u64,
     #[serde(default = "legacy_date_mode")]
     ingest_date_organization: String,
     #[serde(default = "legacy_date_folder_pattern")]
@@ -164,6 +170,30 @@ struct HoverPreviewManifest {
     generated_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PremiereImportManifest {
+    schema_version: u32,
+    kind: String,
+    created_at: String,
+    device_id: String,
+    items: Vec<PremiereImportItem>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PremiereImportItem {
+    media_id: String,
+    absolute_path: String,
+    relative_path: String,
+    original_filename: String,
+    sha256: String,
+    file_type: String,
+    bin_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attached_to_media_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectUpdate {
@@ -189,6 +219,12 @@ fn default_library_folder_sort() -> String {
 fn default_preview_cache_limit_bytes() -> u64 {
     512 * 1024 * 1024
 }
+fn default_thumbnail_hold_frame() -> String {
+    "first".into()
+}
+fn default_preview_preloading() -> String {
+    "visible-nearby".into()
+}
 fn legacy_date_mode() -> String {
     "original-file-dates".into()
 }
@@ -207,6 +243,9 @@ impl Default for DeviceSettings {
             thumbnail_cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             hover_previews_enabled: true,
             preview_cache_limit_bytes: default_preview_cache_limit_bytes(),
+            thumbnail_hold_frame: default_thumbnail_hold_frame(),
+            preview_preloading: default_preview_preloading(),
+            preview_ram_cache_limit_bytes: 0,
             ingest_date_organization: "today".into(),
             date_folder_pattern: "yyyymmdd".into(),
             initialized_catalogue_path: String::new(),
@@ -603,6 +642,11 @@ fn snapshot_jobs(app: &AppHandle, state: &NativeState) -> Result<Vec<IngestJob>,
     load_jobs_unlocked(app)
 }
 
+fn has_active_ingest(jobs: &[IngestJob]) -> bool {
+    jobs.iter()
+        .any(|job| matches!(job.state.as_str(), "queued" | "copying" | "verifying"))
+}
+
 const UPDATE_OPERATION_BLOCKED: &str =
     "A verified update is being installed. Wait for the application to restart before starting or resuming ingest.";
 
@@ -803,6 +847,32 @@ fn save_settings(
     }
     if !matches!(settings.density.as_str(), "comfortable" | "compact") {
         return Err("Choose a supported layout density".into());
+    }
+    if !matches!(
+        settings.thumbnail_hold_frame.as_str(),
+        "first"
+            | "10-percent"
+            | "20-percent"
+            | "middle"
+            | "80-percent"
+            | "last"
+            | "last-hovered"
+    ) {
+        return Err("Choose a supported thumbnail hold frame".into());
+    }
+    if !matches!(
+        settings.preview_preloading.as_str(),
+        "hovered" | "visible-nearby" | "idle"
+    ) {
+        return Err("Choose a supported preview preloading mode".into());
+    }
+    if settings.preview_ram_cache_limit_bytes != 0
+        && !matches!(
+            settings.preview_ram_cache_limit_bytes,
+            67_108_864 | 134_217_728 | 268_435_456 | 536_870_912
+        )
+    {
+        return Err("Choose a supported preview RAM cache allowance".into());
     }
     if !matches!(
         settings.library_folder_sort.as_str(),
@@ -4270,6 +4340,109 @@ fn resolve_media_path(app: AppHandle, media_id: String) -> Result<String, String
         .to_string())
 }
 
+fn build_premiere_import_manifest(
+    settings: &DeviceSettings,
+    catalogue: &Catalogue,
+    media_ids: &[String],
+) -> Result<PremiereImportManifest, String> {
+    if media_ids.is_empty() || media_ids.len() > 5_000 {
+        return Err("Select between 1 and 5,000 media files for Premiere".into());
+    }
+    let master = Path::new(&settings.master_bin_path)
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve authorized Master Bin: {error}"))?;
+    let mut seen = HashSet::new();
+    let mut items = Vec::with_capacity(media_ids.len());
+    for media_id in media_ids {
+        if !seen.insert(media_id) {
+            continue;
+        }
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == *media_id)
+            .ok_or_else(|| format!("Unknown media item {media_id}"))?;
+        let relative = fs_safe::validate_relative(&item.relative_path)?;
+        let absolute = fs_safe::resolve_existing(&master, &item.relative_path)?;
+        if !absolute.is_file() {
+            return Err(format!("{} is not available locally", item.original_filename));
+        }
+        let bin_path = relative
+            .parent()
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let attached_to_media_id = catalogue
+            .media
+            .iter()
+            .find(|candidate| candidate.attached_audio_id.as_deref() == Some(item.id.as_str()))
+            .map(|candidate| candidate.id.clone());
+        items.push(PremiereImportItem {
+            media_id: item.id.clone(),
+            absolute_path: absolute.to_string_lossy().into_owned(),
+            relative_path: item.relative_path.replace('\\', "/"),
+            original_filename: item.original_filename.clone(),
+            sha256: item.sha256.clone(),
+            file_type: item.file_type.clone(),
+            bin_path,
+            attached_to_media_id,
+        });
+    }
+    Ok(PremiereImportManifest {
+        schema_version: 1,
+        kind: "kairix-pimp-premiere-import".into(),
+        created_at: Utc::now().to_rfc3339(),
+        device_id: settings.device_id.clone(),
+        items,
+    })
+}
+
+fn write_new_premiere_manifest(
+    destination: &Path,
+    manifest: &PremiereImportManifest,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "The selected manifest already exists; choose a new filename so it is not silently replaced".to_string()
+            } else {
+                format!("Cannot create Premiere manifest: {error}")
+            }
+        })?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Cannot finish Premiere manifest: {error}"))
+}
+
+#[tauri::command]
+fn export_premiere_manifest(
+    app: AppHandle,
+    media_ids: Vec<String>,
+    destination_path: String,
+) -> Result<usize, String> {
+    let destination = PathBuf::from(destination_path);
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return Err("Premiere interchange manifests must use the .json extension".into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or("Choose a valid manifest destination")?;
+    if !parent.is_dir() {
+        return Err("The selected manifest destination folder is unavailable".into());
+    }
+    let settings = load_settings_file(&app)?;
+    let catalogue = load_catalogue_file(&settings)?;
+    let manifest = build_premiere_import_manifest(&settings, &catalogue, &media_ids)?;
+    write_new_premiere_manifest(&destination, &manifest)?;
+    Ok(manifest.items.len())
+}
+
 #[cfg(target_os = "windows")]
 fn reveal_path_in_explorer(path: &Path) -> Result<(), String> {
     use std::{ffi::c_void, iter::once, os::windows::ffi::OsStrExt, ptr};
@@ -4606,7 +4779,10 @@ fn hover_preview_frame_times(duration_seconds: f64) -> Result<Vec<f64>, String> 
         .collect())
 }
 
-fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<HoverPreview, String> {
+fn validate_hover_preview(
+    directory: &Path,
+    expected_fingerprint: &str,
+) -> Result<HoverPreviewManifest, String> {
     let manifest_path = directory.join("manifest.json");
     let manifest: HoverPreviewManifest = serde_json::from_slice(
         &fs::read(&manifest_path)
@@ -4622,7 +4798,6 @@ fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<Ho
     let canonical_directory = directory
         .canonicalize()
         .map_err(|error| format!("Cannot resolve hover preview directory: {error}"))?;
-    let mut frames = Vec::with_capacity(manifest.frame_files.len());
     let mut total_bytes = 0_u64;
     for reference in &manifest.frame_files {
         if reference.contains('/') || reference.contains('\\') || !reference.ends_with(".jpg") {
@@ -4635,11 +4810,24 @@ fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<Ho
         if !path.starts_with(&canonical_directory) || !path.is_file() {
             return Err("Hover preview frame resolved outside its cache entry".into());
         }
-        let bytes = fs::read(path).map_err(|error| format!("Cannot read hover preview frame: {error}"))?;
-        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        total_bytes = total_bytes.saturating_add(
+            path.metadata()
+                .map_err(|error| format!("Cannot inspect hover preview frame: {error}"))?
+                .len(),
+        );
         if total_bytes > 32 * 1024 * 1024 {
             return Err("Hover preview exceeds the 32 MB safety limit".into());
         }
+    }
+    Ok(manifest)
+}
+
+fn read_hover_preview(directory: &Path, expected_fingerprint: &str) -> Result<HoverPreview, String> {
+    let manifest = validate_hover_preview(directory, expected_fingerprint)?;
+    let mut frames = Vec::with_capacity(manifest.frame_files.len());
+    for reference in &manifest.frame_files {
+        let bytes = fs::read(directory.join(reference))
+            .map_err(|error| format!("Cannot read hover preview frame: {error}"))?;
         frames.push(format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)));
     }
     Ok(HoverPreview {
@@ -4689,11 +4877,11 @@ fn evict_hover_preview_cache(root: &Path, budget: u64, keep: &Path) -> Result<()
     Ok(())
 }
 
-fn generate_hover_preview(
+fn ensure_hover_preview(
     settings: &DeviceSettings,
     item: &MediaItem,
     source: &Path,
-) -> Result<HoverPreview, String> {
+) -> Result<(PathBuf, String), String> {
     let duration_seconds = item
         .technical
         .duration_seconds
@@ -4704,8 +4892,8 @@ fn generate_hover_preview(
     let root = hover_preview_root(settings)?;
     let final_directory = root.join(&fingerprint);
     if final_directory.is_dir() {
-        if let Ok(preview) = read_hover_preview(&final_directory, &fingerprint) {
-            return Ok(preview);
+        if validate_hover_preview(&final_directory, &fingerprint).is_ok() {
+            return Ok((final_directory, fingerprint));
         }
         fs::remove_dir_all(&final_directory)
             .map_err(|error| format!("Cannot replace invalid hover preview cache: {error}"))?;
@@ -4780,7 +4968,16 @@ fn generate_hover_preview(
     fs::rename(&temporary, &final_directory)
         .map_err(|error| format!("Cannot commit hover preview cache entry: {error}"))?;
     evict_hover_preview_cache(&root, settings.preview_cache_limit_bytes, &final_directory)?;
-    read_hover_preview(&final_directory, &fingerprint)
+    Ok((final_directory, fingerprint))
+}
+
+fn generate_hover_preview(
+    settings: &DeviceSettings,
+    item: &MediaItem,
+    source: &Path,
+) -> Result<HoverPreview, String> {
+    let (directory, fingerprint) = ensure_hover_preview(settings, item, source)?;
+    read_hover_preview(&directory, &fingerprint)
 }
 
 #[tauri::command]
@@ -4809,6 +5006,37 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
     })
     .await
     .map_err(|error| format!("Hover preview task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeState>();
+        if has_active_ingest(&snapshot_jobs(&app, &state)?) {
+            return Err("Background preview preparation is deferred while ingest is active".into());
+        }
+        let _guard = state.preview_generation.lock().unwrap();
+        let settings = load_settings_file(&app)?;
+        if !settings.hover_previews_enabled {
+            return Err("Hover previews are disabled in Settings".into());
+        }
+        let catalogue = load_catalogue_file(&settings)?;
+        let item = catalogue
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .ok_or("Unknown media item")?;
+        if !matches!(
+            item.file_type.to_ascii_lowercase().as_str(),
+            "mp4" | "mov" | "m4v" | "mxf" | "mts" | "m2ts" | "avi"
+        ) {
+            return Err("Hover previews are available only for supported video files".into());
+        }
+        let source = resolve_catalogue_media_path(&settings, &media_id)?;
+        ensure_hover_preview(&settings, item, &source).map(|_| ())
+    })
+    .await
+    .map_err(|error| format!("Hover preview preparation task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -5029,11 +5257,13 @@ pub fn run() {
             open_support_link,
             open_logs_folder,
             resolve_media_path,
+            export_premiere_manifest,
             reveal_media_in_explorer,
             open_media_folder,
             load_thumbnail,
             load_thumbnail_sources,
             load_hover_preview,
+            prepare_hover_preview,
             hover_preview_cache_usage,
             clear_hover_preview_cache
         ])
@@ -5227,6 +5457,67 @@ mod tests {
         assert!(validate_job_action("queued", "resume").is_err());
         assert!(validate_job_action("completed", "cancel").is_err());
         assert!(validate_job_action("queued", "cancel").is_ok());
+    }
+
+    #[test]
+    fn background_preview_preparation_defers_for_active_ingest_only() {
+        assert!(has_active_ingest(&[ingest_job("queued", "queued")]));
+        assert!(has_active_ingest(&[ingest_job("copying", "copying")]));
+        assert!(has_active_ingest(&[ingest_job("verifying", "verifying")]));
+        assert!(!has_active_ingest(&[ingest_job("paused", "queued")]));
+        assert!(!has_active_ingest(&[ingest_job("completed", "completed")]));
+    }
+
+    #[test]
+    fn premiere_manifest_uses_validated_master_paths_and_attached_audio() {
+        let (root, master, _, mut catalogue) = completion_fixture("premiere-manifest");
+        let audio_path = master.join("20261024").join("clip.wav");
+        fs::write(&audio_path, b"verified-audio").unwrap();
+        let mut audio = new_media(
+            &audio_path,
+            "20261024/clip.wav".into(),
+            None,
+            sha256(&audio_path).unwrap(),
+            None,
+            "unknown".into(),
+            false,
+        )
+        .unwrap();
+        audio.id = "audio-a".into();
+        catalogue.media[0].id = "video-a".into();
+        catalogue.media[0].attached_audio_id = Some(audio.id.clone());
+        catalogue.media.push(audio);
+        let mut settings = DeviceSettings::default();
+        settings.master_bin_path = master.to_string_lossy().into_owned();
+
+        let manifest = build_premiere_import_manifest(
+            &settings,
+            &catalogue,
+            &["video-a".into(), "audio-a".into()],
+        )
+        .unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.items.len(), 2);
+        assert_eq!(manifest.items[0].bin_path, "20261024");
+        assert_eq!(
+            manifest.items[1].attached_to_media_id.as_deref(),
+            Some("video-a")
+        );
+        assert!(Path::new(&manifest.items[0].absolute_path).is_absolute());
+        let output = root.join("selection.pimp-premiere.json");
+        write_new_premiere_manifest(&output, &manifest).unwrap();
+        let first_bytes = fs::read(&output).unwrap();
+        assert!(write_new_premiere_manifest(&output, &manifest).is_err());
+        assert_eq!(fs::read(&output).unwrap(), first_bytes);
+
+        fs::remove_file(&audio_path).unwrap();
+        assert!(build_premiere_import_manifest(
+            &settings,
+            &catalogue,
+            &["audio-a".into()]
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5947,7 +6238,7 @@ mod tests {
 
     #[test]
     fn updater_is_a_higher_beta_and_fails_closed_without_a_public_key() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-5");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.1-6");
         let configuration = updater_configuration();
         assert_eq!(configuration.channel, "Beta");
         assert!(configuration.endpoint.starts_with("https://"));
