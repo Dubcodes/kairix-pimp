@@ -1,4 +1,4 @@
-name: Windows beta installer
+name: Windows development installer
 
 on:
   pull_request:
@@ -74,9 +74,8 @@ jobs:
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $expectedTag = "v$version"
-          if ($version -notmatch '^\d+\.\d+\.\d+-\d+$') {
-            throw 'Windows Beta versions require a numeric prerelease identifier (for example 0.1.1-1).'
-          }
+          node tools/release-policy.mjs validate $version development
+          if ($LASTEXITCODE -ne 0) { throw 'Development version policy validation failed.' }
           if ('${{ github.ref_name }}' -ne $expectedTag) {
             throw "Release tag must exactly match package version: expected $expectedTag"
           }
@@ -142,3 +141,46 @@ jobs:
             apps/premiere-companion/manifest.json
             apps/premiere-companion/styles.css
             docs/PREMIERE_INTEGRATION.md
+
+      - name: Build separately identified disposable cleanup acceptance installer
+        env:
+          PIMP_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target/cleanup-acceptance
+        run: npm run tauri -- build --bundles nsis --features cleanup-acceptance --config src-tauri/tauri.cleanup-acceptance.conf.json
+
+      - name: Verify cleanup acceptance package identity
+        shell: pwsh
+        run: |
+          $sourceSha = '${{ github.event.pull_request.head.sha || github.sha }}'
+          $shortSha = $sourceSha.Substring(0, 12)
+          $bundleRoot = (Resolve-Path src-tauri/target/cleanup-acceptance/release/bundle).Path
+          $installer = Get-Item src-tauri/target/cleanup-acceptance/release/bundle/nsis/*-setup.exe
+          if ($installer.Length -eq 0) { throw 'Cleanup acceptance installer is empty.' }
+          if ($installer.Name -notmatch 'Cleanup Acceptance') {
+            throw "Acceptance installer name is not visibly distinct: $($installer.Name)"
+          }
+          $config = Get-Content src-tauri/tauri.cleanup-acceptance.conf.json -Raw | ConvertFrom-Json
+          if ($config.identifier -ne 'com.kairix.pimp.cleanup-acceptance') {
+            throw 'Cleanup acceptance application identifier is not isolated.'
+          }
+          "CLEANUP_ACCEPTANCE_SHORT_SHA=$shortSha" | Out-File -FilePath $env:GITHUB_ENV -Append
+          @(
+            'Kairix PIMP disposable cleanup acceptance build'
+            "Source commit: $sourceSha"
+            'Synthetic fixtures on an empty removable volume only'
+            'Isolated application identifier and settings directory'
+            'Never install or use with production camera media'
+          ) | Set-Content "$bundleRoot/CLEANUP-ACCEPTANCE-BUILD-INFO.txt"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
+          "$hash  nsis/$($installer.Name)" | Set-Content "$bundleRoot/CLEANUP-ACCEPTANCE-SHA256SUMS.txt"
+
+      - name: Upload disposable cleanup acceptance installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kairix-PIMP-${{ env.APP_VERSION }}-${{ env.CLEANUP_ACCEPTANCE_SHORT_SHA }}-cleanup-acceptance-windows
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/cleanup-acceptance/release/bundle/nsis/*-setup.exe
+            src-tauri/target/cleanup-acceptance/release/bundle/CLEANUP-ACCEPTANCE-BUILD-INFO.txt
+            src-tauri/target/cleanup-acceptance/release/bundle/CLEANUP-ACCEPTANCE-SHA256SUMS.txt

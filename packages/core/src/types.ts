@@ -75,6 +75,8 @@ export interface IntegrityEvidence {
   observedModifiedMillis?: number;
   observedSha256?: string;
   needsReview: boolean;
+  observedAt?: string;
+  verificationMethod?: 'fast' | 'deep' | 'selective-deep' | string;
 }
 
 export interface FolderRecord {
@@ -119,6 +121,14 @@ export type CatalogueEvent =
       observedModifiedMillis?: number;
       observedSha256?: string;
       needsReview: boolean;
+      verificationMethod?: 'fast' | 'deep' | 'selective-deep' | string;
+    }
+  | {
+      type: 'media.relocated';
+      mediaId: string;
+      previousRelativePath: string;
+      relativePath: string;
+      sha256: string;
     }
   | { type: 'folder.upserted'; folder: FolderRecord }
   | { type: 'folder.moved'; folderId: string; relativePath: string }

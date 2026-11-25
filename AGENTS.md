@@ -12,6 +12,7 @@ Read this file, `README.md`, and the documents relevant to the task. At minimum 
 - `docs/DECISIONS.md` before changing an established technical direction.
 - `docs/TESTING.md` for the verification matrix and exact commands.
 - `docs/SYNCTHING_DESIGN.md` for synchronization-sensitive changes.
+- `docs/RESOURCE_MANAGEMENT.md` for external-drive scanning and worker-budget changes.
 
 Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 
@@ -35,12 +36,12 @@ Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 
 ## File and media safety
 
-- Treat original media as immutable. Never delete, truncate, rewrite, or rename a source file.
+- Treat original media as immutable during discovery, planning, copying, verification, and ordinary catalogue work. Never truncate, rewrite, or rename a source file. Source removal is permitted only in the separately reviewed, explicitly authorized post-batch cleanup state machine. Ordinary packages keep it disabled; the compile-time cleanup-acceptance package may target only its exact generated manifest in isolated application state on detected removable media.
 - Never silently overwrite an existing destination. Detect collisions and report ambiguity.
-- Destination writes stage in an application-owned same-filesystem directory outside the synchronized Master Bin, recheck source consistency, independently verify staged bytes, and use atomic no-overwrite promotion.
+- Destination writes stage in an application-owned same-filesystem directory outside the synchronized Master Bin, recheck source consistency, flush and close staged bytes, and use atomic no-overwrite promotion. Deep verification independently rereads and hashes staged bytes. Fast verification may omit that destination reread only when it retains the copy-stream source SHA-256 and records its lower assurance explicitly.
 - Reject paths outside configured roots after canonical resolution; string-prefix checks are insufficient.
 - Make operations idempotent and interruption-safe where practical. Tests use synthetic media and repository-local or OS-provided disposable fixture directories only.
-- Do not add source deletion or destructive cleanup without a separately reviewed design, explicit authorization, archive-independence verification, and recoverable quarantine.
+- Do not add source deletion or destructive cleanup outside its separately reviewed state machine. SD-card cleanup requires job-specific opt-in, exact batch reconciliation, canonical containment, source/destination file and volume identity revalidation, durable per-file intent/outcomes, and disposable-media acceptance; it never removes excluded support files or directories. Never add a general runtime bypass for the acceptance gate. Master Bin cleanup additionally requires archive independence, cross-project protection, and recoverable quarantine.
 
 ## Syncthing and metadata
 
@@ -55,6 +56,9 @@ Use `docs/AI_TASK_TEMPLATE.md` to frame substantial future work.
 - Light contains the complete non-AI application and may read compatible AI results, but must not import or ship AI runtimes, models, or processing dependencies.
 - Full uses the same catalogue and schemas and adds optional, isolated local AI workers. AI must not block ingest or browsing.
 - Do not claim Premiere functionality without testing against a supported Premiere installation and documented UXP APIs. Never manipulate undocumented `.prproj` internals.
+- Integrate remote storage only through documented provider interfaces or explicit written authorization. Do not ship reverse-engineered private endpoints, browser impersonation, persisted browser sessions, or browser automation as an unattended backup mechanism.
+- Treat upload acknowledgement and remote listing as verification-pending. A cloud backup is verified only after PIMP independently reads every stored object through a supported interface and matches its expected size and SHA-256.
+- Keep provider credentials and refresh tokens in the operating-system credential store, redact them from diagnostics, and never place them in portable manifests, synchronized metadata, command-line arguments, repository files, or ordinary logs.
 - Preserve the exact ingest labels **Use today's date** and **Use original file dates** as visible radio choices.
 
 ## Tests, documentation, and Git

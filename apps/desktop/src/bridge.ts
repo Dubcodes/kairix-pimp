@@ -12,7 +12,8 @@ export type ThumbnailHoldFrame =
   | '80-percent'
   | 'last'
   | 'last-hovered';
-export type PreviewPreloading = 'hovered' | 'visible-nearby' | 'idle';
+export type PreviewPreloading =
+  'off' | 'hovered' | 'visible' | 'visible-nearby' | 'idle';
 export interface DeviceSettings {
   deviceId: string;
   masterBinPath: string;
@@ -23,6 +24,7 @@ export interface DeviceSettings {
   thumbnailCacheLimitBytes: number;
   hoverPreviewsEnabled: boolean;
   previewCacheLimitBytes: number;
+  playbackProxyCacheLimitBytes: number;
   thumbnailHoldFrame: ThumbnailHoldFrame;
   previewPreloading: PreviewPreloading;
   previewRamCacheLimitBytes: number;
@@ -34,6 +36,7 @@ export interface DeviceSettings {
   closeToTray: boolean;
   startupPage: 'Ingest' | 'Library' | 'Projects' | 'Archive';
   checkForUpdates: boolean;
+  updateChannel: 'development' | 'stable';
   theme:
     | 'graphite'
     | 'adobe-dark'
@@ -42,6 +45,7 @@ export interface DeviceSettings {
     | 'system'
     | 'high-contrast';
   density: 'comfortable' | 'compact';
+  libraryThumbnailWidth: number;
   showAttachedAudioSeparately: boolean;
   sidebarCollapsed?: boolean;
   libraryFolderSort?:
@@ -53,19 +57,47 @@ export interface DeviceSettings {
     | 'fewest-recordings'
     | 'custom';
   libraryFolderOrder?: string[];
+  libraryMediaSort?:
+    | 'ingested-newest'
+    | 'ingested-oldest'
+    | 'recorded-newest'
+    | 'recorded-oldest'
+    | 'filename-asc'
+    | 'filename-desc';
+  sdGrabberEnabled: boolean;
+  sdGrabberAutoDetect: boolean;
+  sdGrabberExtensions: string[];
+  sdGrabberSearchSubfolders: boolean;
+  sdGrabberRememberDevices: boolean;
+  sdGrabberRecognizedDeviceIds: string[];
+  resourceProfile: 'quiet' | 'balanced' | 'performance';
+  gentleScanning: boolean;
+  increaseProcessingWhileIdle: boolean;
+  resourceIdleDelayMinutes: number;
+  backgroundProcessingPaused: boolean;
 }
 export interface AppInfo {
   version: string;
+  displayVersion: string;
   buildCommit: string;
   edition: string;
-  releaseChannel: string;
+  releaseClassification: 'Development' | 'Stable';
+  releaseDate: string;
 }
 export interface UpdaterConfiguration {
   configured: boolean;
-  channel: 'Beta';
+  channel: 'Development' | 'Stable';
   endpoint: string;
+  target: 'development-channel' | 'stable-channel';
   reason?: string;
 }
+
+export interface NativeDragThreshold {
+  horizontal: number;
+  vertical: number;
+}
+
+export type NativeDragOutcome = 'dropped' | 'cancelled' | 'rejected';
 export interface MediaItem {
   id: string;
   relativePath: string;
@@ -95,6 +127,32 @@ export interface MediaItem {
   needsReview: boolean;
   observedSize?: number;
   observedModifiedMillis?: number;
+  integrityByDevice?: Record<
+    string,
+    {
+      observedSize: number;
+      observedModifiedMillis?: number;
+      observedSha256?: string;
+      needsReview: boolean;
+      observedAt?: string;
+      verificationMethod?: 'fast' | 'deep' | 'selective-deep' | string;
+    }
+  >;
+}
+export interface RelocationMatch {
+  mediaId: string;
+  previousRelativePath: string;
+  candidateRelativePath?: string;
+  originalFilename: string;
+  status: 'exact' | 'unresolved' | 'ambiguous' | 'mismatched';
+  detail: string;
+}
+export interface RelocationReview {
+  matches: RelocationMatch[];
+  exact: number;
+  unresolved: number;
+  ambiguous: number;
+  mismatched: number;
 }
 export interface ProjectRecord {
   id: string;
@@ -128,6 +186,84 @@ export interface ProjectInventory {
   mainPremiereProject?: string;
   scannedAt: string;
   items: ProjectAsset[];
+  premiereIndex?: {
+    parserVersion: string;
+    sourceRelativePath: string;
+    sourceFingerprint: string;
+    sourceModifiedMillis: number;
+    indexedAt: string;
+    status: 'supported' | 'partial' | 'unsupported';
+    formatVersion?: string;
+    mediaReferences: Array<{
+      path: string;
+      evidence:
+        | 'imported-into-saved-project'
+        | 'used-in-saved-timeline'
+        | 'historical-reference-supported'
+        | 'unclassified-project-reference'
+        | 'previously-referenced-in-saved-project';
+      mediaId?: string;
+      sequenceIds: string[];
+      timelinePlacements: number;
+    }>;
+    sequences: Array<{
+      id: string;
+      name: string;
+      nested: boolean;
+      mediaPaths: string[];
+      timelinePlacements: number;
+    }>;
+    bins: string[];
+    issues: string[];
+  };
+}
+export interface BackupAsset {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+export interface BackupManifest {
+  schemaVersion: number;
+  backupId: string;
+  projectId: string;
+  createdAt: string;
+  sourceFileCount: number;
+  sourceBytes: number;
+  collectionComplete: boolean;
+  assets: BackupAsset[];
+}
+export type BackupJobState =
+  | 'prepared'
+  | 'copying'
+  | 'verifying'
+  | 'verified'
+  | 'interrupted'
+  | 'failed'
+  | 'needs-attention';
+export interface BackupJob {
+  schemaVersion: number;
+  id: string;
+  projectId: string;
+  projectName: string;
+  sourceRoot: string;
+  destinationRoot: string;
+  generationPath: string;
+  generationRelativePath: string;
+  destinationVolumeId: string;
+  state: BackupJobState;
+  createdAt: string;
+  updatedAt: string;
+  filesCompleted: number;
+  bytesCompleted: number;
+  currentFile?: string;
+  error?: string;
+  manifest: BackupManifest;
+}
+export interface RestoreTestResult {
+  restorePath: string;
+  filesVerified: number;
+  bytesVerified: number;
+  verifiedAt: string;
 }
 export interface HoverPreview {
   mediaId: string;
@@ -152,9 +288,15 @@ export interface RescanResult {
   registered: number;
   changed: number;
   pending: number;
+  pendingDetails: PendingDiscoveryCounts;
   errors: number;
   full: boolean;
   completedAt: string;
+}
+export interface PendingDiscoveryCounts {
+  stabilizing: number;
+  needsFullVerification: number;
+  changedDuringScan: number;
 }
 export interface DiscoveryStatus {
   running: boolean;
@@ -164,9 +306,32 @@ export interface DiscoveryStatus {
   registered: number;
   changed: number;
   pending: number;
+  pendingDetails: PendingDiscoveryCounts;
   errors: number;
   startedAt?: string;
   lastCompletedAt?: string;
+}
+export interface PendingVerificationItem {
+  id: string;
+  mediaId?: string;
+  originalFilename: string;
+  relativePath: string;
+  available: boolean;
+  classification:
+    | 'verified'
+    | 'snapshot-changed'
+    | 'awaiting-verification'
+    | 'discovered-awaiting-verification'
+    | 'missing-or-relocated'
+    | 'awaiting-syncthing'
+    | 'unavailable'
+    | 'failed-verification';
+  reason: string;
+  evidenceObservedAt?: string;
+  evidenceStatus: string;
+  expectedSize?: number;
+  observedSize?: number;
+  selectable: boolean;
 }
 export interface MediaToolsStatus {
   ffmpegAvailable: boolean;
@@ -182,6 +347,8 @@ export interface IngestProgress {
   filesTotal: number;
   bytesComplete: number;
   bytesTotal: number;
+  bytesPerSecond?: number;
+  etaSeconds?: number;
 }
 export interface IngestResult {
   imported: MediaItem[];
@@ -199,6 +366,9 @@ export interface InventoryFile {
   kind: 'video' | 'audio' | 'image' | 'camera-support' | 'unknown';
   analysisSupported: boolean;
   preserveHierarchy: boolean;
+  disposition: 'new' | 'already-imported' | 'attention';
+  existingRelativePath?: string;
+  detail?: string;
 }
 export interface InventoryExclusion {
   path: string;
@@ -206,13 +376,93 @@ export interface InventoryExclusion {
   sizeBytes?: number;
 }
 export interface SourceInventory {
+  planId: string;
   files: InventoryFile[];
   excluded: InventoryExclusion[];
   issues: string[];
+  conflicts?: Array<{
+    sourcePath: string;
+    destinationPath: string;
+    reason: string;
+  }>;
   totalFileCount: number;
   totalBytes: number;
   copyFileCount: number;
   copyBytes: number;
+  alreadyImportedFileCount: number;
+  alreadyImportedBytes: number;
+  attentionFileCount: number;
+  attentionBytes: number;
+}
+export interface RemovableVolume {
+  rootPath: string;
+  label: string;
+  identity: string;
+  capacityBytes: number;
+  availableBytes: number;
+}
+export interface BackgroundOperation {
+  id: string;
+  kind: string;
+  title: string;
+  state:
+    'queued' | 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed';
+  stage: string;
+  currentItem?: string;
+  completedItems: number;
+  totalItems?: number;
+  bytesCompleted: number;
+  bytesTotal?: number;
+  counts: {
+    newFiles: number;
+    duplicateFiles: number;
+    attentionFiles: number;
+    failedFiles: number;
+    attemptedFiles: number;
+    existingFiles: number;
+    pendingFiles: number;
+  };
+  cancellable: boolean;
+  pausable: boolean;
+  retryable: boolean;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+export interface ResourceGovernorStatus {
+  profile: 'quiet' | 'balanced' | 'performance';
+  idleBoostActive: boolean;
+  backgroundPaused: boolean;
+  shutdown: boolean;
+  activeBackgroundWorkers: number;
+  queuedWorkers: number;
+  averageWaitMillis: number;
+  volumes: Array<{
+    volumeId: string;
+    activeReaders: number;
+    activeWriters: number;
+    bytesRead: number;
+    bytesWritten: number;
+    observedBytesPerSecond?: number;
+    completedOperations: number;
+    ioErrors: number;
+    backingOff: boolean;
+  }>;
+  waiting: Array<{
+    operation: string;
+    priority: number;
+    waitMillis: number;
+    reason: string;
+    volumeIds: string[];
+  }>;
+  recentErrors: string[];
+  systemActivity: {
+    inputIdleSeconds?: number;
+    cpuLoadPercent?: number;
+    availableMemoryBytes?: number;
+    idleBoostEligible: boolean;
+    reason: string;
+  };
 }
 export type IngestJobState =
   | 'queued'
@@ -222,7 +472,11 @@ export type IngestJobState =
   | 'failed'
   | 'cancelled'
   | 'interrupted'
-  | 'paused';
+  | 'paused'
+  | 'reconciling'
+  | 'cleanup-revalidating'
+  | 'removing'
+  | 'needs-attention';
 export interface ProvisionalMetadata {
   tags: string[];
   projectIds: string[];
@@ -248,15 +502,45 @@ export interface IngestJobFile {
   metadata: ProvisionalMetadata;
   pendingMetadata?: ProvisionalMetadata;
   metadataError?: string;
+  verificationMethod?: 'fast' | 'deep';
+  sourceBytesRead?: number;
+  destinationBytesWritten?: number;
+  destinationBytesRead?: number;
+  copyDurationMillis?: number;
+  verificationDurationMillis?: number;
+  sourceRootPath?: string;
+  mediaKind?: string;
+  verifiedSha256?: string;
+  sourceFileIdentity?: string;
+  destinationFileIdentity?: string;
+  destinationModifiedMillis?: number;
+  destinationVolumeIdentity?: string;
+  destinationContentVerified?: boolean;
+  cleanupSourceBytesRead?: number;
+  cleanupDestinationBytesRead?: number;
+  cleanupState?: string;
+  cleanupIntentId?: string;
+  cleanupDetail?: string;
+}
+export interface CleanupIssue {
+  fileId?: string;
+  sourcePath: string;
+  destinationPath?: string;
+  expected: string;
+  observed: string;
+  reason: string;
+  action: string;
 }
 export interface IngestJob {
   schemaVersion: number;
   id: string;
+  approvedPlanId?: string;
   state: IngestJobState;
   createdAt: string;
   updatedAt: string;
   batchTimestamp: string;
   dateOverride?: string;
+  verificationMode?: 'fast' | 'deep';
   files: IngestJobFile[];
   unsupported: string[];
   failures: string[];
@@ -268,6 +552,19 @@ export interface IngestJob {
   bytesTotal: number;
   bytesTransferred: number;
   filesCompleted: number;
+  cleanupRequested?: boolean;
+  cleanupAuthorizationRevision?: number;
+  cleanupAuthorizationLockedRevision?: number;
+  cleanupState?: string;
+  cleanupIssues?: CleanupIssue[];
+  cleanupScopeComplete?: boolean;
+  cleanupReportPath?: string;
+}
+export interface CleanupAcceptancePreparation {
+  sourcePath: string;
+  fixtureId: string;
+  manifestPath: string;
+  settings: DeviceSettings;
 }
 
 export const nativeAvailable = () => isTauri();
@@ -281,6 +578,7 @@ export const emptySettings = (): DeviceSettings => ({
   thumbnailCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   hoverPreviewsEnabled: true,
   previewCacheLimitBytes: 512 * 1024 * 1024,
+  playbackProxyCacheLimitBytes: 2 * 1024 * 1024 * 1024,
   thumbnailHoldFrame: 'first',
   previewPreloading: 'visible-nearby',
   previewRamCacheLimitBytes: 0,
@@ -292,12 +590,25 @@ export const emptySettings = (): DeviceSettings => ({
   closeToTray: true,
   startupPage: 'Library',
   checkForUpdates: true,
+  updateChannel: 'development',
   theme: 'graphite',
   density: 'comfortable',
+  libraryThumbnailWidth: 240,
   showAttachedAudioSeparately: false,
   sidebarCollapsed: false,
   libraryFolderSort: 'newest',
   libraryFolderOrder: [],
+  sdGrabberEnabled: true,
+  sdGrabberAutoDetect: true,
+  sdGrabberExtensions: ['mp4', 'wav'],
+  sdGrabberSearchSubfolders: true,
+  sdGrabberRememberDevices: true,
+  sdGrabberRecognizedDeviceIds: [],
+  resourceProfile: 'balanced',
+  gentleScanning: true,
+  increaseProcessingWhileIdle: true,
+  resourceIdleDelayMinutes: 10,
+  backgroundProcessingPaused: false,
 });
 export const emptyCatalogue = (): Catalogue => ({
   media: [],
@@ -356,17 +667,88 @@ export const desktopBridge = {
     const value = await open({ multiple: false, directory: true });
     return typeof value === 'string' ? value : undefined;
   },
-  inventorySources: (sources: string[], dateOverride?: string) =>
-    invoke<SourceInventory>('inventory_sources', { sources, dateOverride }),
+  cleanupAcceptanceMode: () => invoke<boolean>('cleanup_acceptance_mode'),
+  prepareCleanupAcceptanceFixture: (selectedPath: string) =>
+    invoke<CleanupAcceptancePreparation>('prepare_cleanup_acceptance_fixture', {
+      selectedPath,
+    }),
+  chooseCleanupAcceptanceReportDestination: () =>
+    save({
+      defaultPath: 'kairix-pimp-cleanup-acceptance-report.json',
+      filters: [
+        { name: 'Kairix PIMP cleanup acceptance report', extensions: ['json'] },
+      ],
+    }),
+  exportCleanupAcceptanceReport: (jobId: string, destinationPath: string) =>
+    invoke<void>('export_cleanup_acceptance_report', {
+      jobId,
+      destinationPath,
+    }),
+  inventorySources: (
+    operationId: string,
+    sources: string[],
+    dateOverride?: string,
+  ) =>
+    invoke<SourceInventory>('inventory_sources', {
+      operationId,
+      sources,
+      dateOverride,
+    }),
+  inventorySdCard: (
+    operationId: string,
+    sources: string[],
+    dateOverride?: string,
+  ) =>
+    invoke<SourceInventory>('inventory_sd_card', {
+      operationId,
+      sources,
+      dateOverride,
+    }),
+  cancelInventory: (operationId: string) =>
+    invoke<void>('cancel_inventory', { operationId }),
+  cancelBackgroundOperation: (operationId: string) =>
+    invoke<void>('cancel_background_operation', { operationId }),
+  listBackgroundOperations: () =>
+    invoke<BackgroundOperation[]>('list_background_operations'),
+  reapproveIngestDestinations: (
+    planId: string,
+    renamedDestinations: Record<string, string>,
+  ) =>
+    invoke<SourceInventory>('reapprove_ingest_destinations', {
+      planId,
+      renamedDestinations,
+    }),
+  replanIngestDestinations: (planId: string, dateOverride: string) =>
+    invoke<SourceInventory>('replan_ingest_destinations', {
+      planId,
+      dateOverride,
+    }),
+  listRemovableVolumes: () =>
+    invoke<RemovableVolume[]>('list_removable_volumes'),
   startIngest: (request: {
     jobId: string;
     sources: string[];
     dateOverride?: string;
     renamedDestinations?: Record<string, string>;
     batchTags?: string[];
+    approvedPlanId: string;
+    allowDuplicateCopies?: boolean;
+    allowUnverifiedReimport?: boolean;
+    verificationMode?: 'fast' | 'deep';
+    cleanupRequested?: boolean;
   }) => invoke<IngestJob>('start_ingest', { request }),
   initializeIngestJobs: () => invoke<IngestJob[]>('initialize_ingest_jobs'),
   listIngestJobs: () => invoke<IngestJob[]>('list_ingest_jobs'),
+  setIngestCleanupAuthorization: (
+    jobId: string,
+    expectedRevision: number,
+    requested: boolean,
+  ) =>
+    invoke<IngestJob>('set_ingest_cleanup_authorization', {
+      jobId,
+      expectedRevision,
+      requested,
+    }),
   clearCompletedIngestJobs: (jobId?: string) =>
     invoke<IngestJob[]>('clear_completed_ingest_jobs', { jobId }),
   updateIngestFileMetadata: (
@@ -394,6 +776,12 @@ export const desktopBridge = {
     handler: (jobs: IngestJob[]) => void,
   ): Promise<UnlistenFn> =>
     listen<IngestJob[]>('ingest-jobs-changed', (event) =>
+      handler(event.payload),
+    ),
+  onBackupJobsChanged: (
+    handler: (jobs: BackupJob[]) => void,
+  ): Promise<UnlistenFn> =>
+    listen<BackupJob[]>('backup-jobs-changed', (event) =>
       handler(event.payload),
     ),
   onDiscoveryProgress: (
@@ -432,32 +820,98 @@ export const desktopBridge = {
     }),
   inventoryProject: (projectId: string) =>
     invoke<ProjectInventory>('inventory_project', { projectId }),
+  initializeBackupJobs: () => invoke<BackupJob[]>('initialize_backup_jobs'),
+  listBackupJobs: () => invoke<BackupJob[]>('list_backup_jobs'),
+  startProjectBackup: (projectId: string, destinationRoot: string) =>
+    invoke<BackupJob>('start_project_backup', {
+      projectId,
+      destinationRoot,
+    }),
+  retryProjectBackup: (jobId: string, destinationRoot?: string) =>
+    invoke<BackupJob>('retry_project_backup', { jobId, destinationRoot }),
+  verifyProjectBackup: (jobId: string) =>
+    invoke<BackupJob>('verify_project_backup', { jobId }),
+  testProjectBackupRestore: (jobId: string, restoreRoot: string) =>
+    invoke<RestoreTestResult>('test_project_backup_restore', {
+      jobId,
+      restoreRoot,
+    }),
   openProjectFolder: (projectId: string) =>
     invoke<void>('open_project_folder', { projectId }),
   revealProjectAsset: (projectId: string, relativePath: string) =>
     invoke<void>('reveal_project_asset', { projectId, relativePath }),
   rescan: (full = false) => invoke<RescanResult>('rescan', { full }),
   getDiscoveryStatus: () => invoke<DiscoveryStatus>('get_discovery_status'),
+  getResourceGovernorStatus: () =>
+    invoke<ResourceGovernorStatus>('get_resource_governor_status'),
   logUiError: (message: string) => invoke<void>('log_ui_error', { message }),
+  logPlaybackEvent: (event: string, detail: string) =>
+    invoke<void>('log_playback_event', { event, detail }),
   appInfo: () => invoke<AppInfo>('app_info'),
   updaterConfiguration: () =>
     invoke<UpdaterConfiguration>('updater_configuration'),
   beginUpdateInstallation: () => invoke<void>('begin_update_installation'),
   endUpdateInstallation: () => invoke<void>('end_update_installation'),
   openSupportLink: (
-    destination: 'github' | 'releases' | 'test-builds' | 'website' | 'coffee',
+    destination:
+      'github' | 'releases' | 'test-builds' | 'website' | 'coffee' | 'degoo',
   ) => invoke<void>('open_support_link', { destination }),
+  openPublicReleaseInstaller: (url: string) =>
+    invoke<void>('open_public_release_installer', { url }),
   openLogsFolder: () => invoke<void>('open_logs_folder'),
-  verifyMediaIntegrity: (mediaId: string) =>
-    invoke<boolean>('verify_media_integrity', { mediaId }),
-  enrichMedia: () => invoke<number>('enrich_media'),
+  listPendingVerification: () =>
+    invoke<PendingVerificationItem[]>('list_pending_verification'),
+  verifyMediaIntegrity: (mediaId: string, operationId?: string) =>
+    invoke<boolean>('verify_media_integrity', { mediaId, operationId }),
+  finishIntegrityVerification: (operationId: string) =>
+    invoke<void>('finish_integrity_verification', { operationId }),
+  reviewMediaRelocation: (mediaIds: string[], selectedPath: string) =>
+    invoke<RelocationReview>('review_media_relocation', {
+      mediaIds,
+      selectedPath,
+    }),
+  approveMediaRelocation: (
+    approvals: Array<{ mediaId: string; relativePath: string }>,
+  ) => invoke<number>('approve_media_relocation', { approvals }),
+  enrichMedia: (explicitRequest = true) =>
+    invoke<number>('enrich_media', { explicitRequest }),
   mediaToolsStatus: () => invoke<MediaToolsStatus>('media_tools_status'),
   resolveMediaPath: (mediaId: string) =>
     invoke<string>('resolve_media_path', { mediaId }),
+  nativeDragThreshold: () =>
+    invoke<NativeDragThreshold>('native_drag_threshold'),
+  startNativeMediaDrag: (mediaIds: string[]) =>
+    invoke<NativeDragOutcome>('start_native_media_drag', { mediaIds }),
+  startNativeFolderDrag: (relativePath: string) =>
+    invoke<NativeDragOutcome>('start_native_folder_drag', { relativePath }),
+  resolveMediaPlaybackSource: async (mediaId: string) =>
+    convertFileSrc(
+      await invoke<string>('resolve_media_playback_source', { mediaId }),
+    ),
+  preparePlaybackProxy: async (mediaId: string) =>
+    convertFileSrc(await invoke<string>('prepare_playback_proxy', { mediaId })),
+  releasePlaybackProxy: (mediaId: string) =>
+    invoke<void>('release_playback_proxy', { mediaId }),
+  setMediaThumbnailFrame: async (mediaId: string, seconds: number) =>
+    convertFileSrc(
+      await invoke<string>('set_media_thumbnail_frame', { mediaId, seconds }),
+    ),
   revealMediaInExplorer: (mediaId: string) =>
     invoke<void>('reveal_media_in_explorer', { mediaId }),
+  revealIngestCleanupIssue: (
+    jobId: string,
+    fileId: string,
+    target: 'source' | 'destination',
+  ) =>
+    invoke<void>('reveal_ingest_cleanup_issue', {
+      jobId,
+      fileId,
+      target,
+    }),
   openMediaFolder: (mediaId: string) =>
     invoke<void>('open_media_folder', { mediaId }),
+  revealLibraryFolder: (relativePath: string) =>
+    invoke<void>('reveal_library_folder', { relativePath }),
   loadThumbnail: (mediaId: string) =>
     invoke<string | null>('load_thumbnail', { mediaId }),
   loadThumbnailSources: async (mediaIds: string[]) => {
@@ -472,11 +926,27 @@ export const desktopBridge = {
       ]),
     );
   },
-  loadHoverPreview: (mediaId: string) =>
-    invoke<HoverPreview>('load_hover_preview', { mediaId }),
+  prepareMediaThumbnail: async (mediaId: string) => {
+    const path = await invoke<string | null>('prepare_media_thumbnail', {
+      mediaId,
+    });
+    return path ? convertFileSrc(path) : undefined;
+  },
+  loadHoverPreviewStatuses: (mediaIds: string[]) =>
+    invoke<string[]>('load_hover_preview_statuses', { mediaIds }),
+  loadHoverPreview: async (mediaId: string) => {
+    const preview = await invoke<HoverPreview>('load_hover_preview', {
+      mediaId,
+    });
+    return {
+      ...preview,
+      frames: preview.frames.map((path) => convertFileSrc(path)),
+    };
+  },
   prepareHoverPreview: (mediaId: string) =>
     invoke<void>('prepare_hover_preview', { mediaId }),
   hoverPreviewCacheUsage: () => invoke<number>('hover_preview_cache_usage'),
+  sharedHoverPreviewUsage: () => invoke<number>('shared_hover_preview_usage'),
   clearHoverPreviewCache: () => invoke<number>('clear_hover_preview_cache'),
   choosePremiereManifestDestination: () =>
     save({

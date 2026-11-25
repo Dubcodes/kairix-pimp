@@ -57,6 +57,91 @@ describe('dates', () => {
 });
 
 describe('catalogue reducer', () => {
+  it('relinks a recording without replacing its identity or metadata', () => {
+    const registered = {
+      ...media,
+      relativePath: '20261120/DCIM/DJI_001/clip.mp4',
+      tags: ['DJI'],
+      projectIds: ['project-1'],
+      notes: 'keep me',
+      favourite: true,
+      thumbnailPath: 'shared.jpg',
+    };
+    const relocated: EventEnvelope = {
+      ...envelope(
+        {
+          type: 'media.relocated',
+          mediaId: 'm1',
+          previousRelativePath: registered.relativePath,
+          relativePath: '20261120/clip.mp4',
+          sha256: registered.sha256,
+        },
+        'e2',
+      ),
+      sequence: 2,
+      observed: { a: 1 },
+    };
+    const state = rebuildCatalogue([
+      envelope({ type: 'media.registered', media: registered }),
+      relocated,
+    ]);
+    expect(state.media.m1).toMatchObject({
+      id: 'm1',
+      relativePath: '20261120/clip.mp4',
+      tags: ['DJI'],
+      projectIds: ['project-1'],
+      notes: 'keep me',
+      favourite: true,
+      thumbnailPath: 'shared.jpg',
+    });
+  });
+
+  it('rejects relocation hashes and destinations belonging to other media', () => {
+    const other = {
+      ...media,
+      id: 'm2',
+      relativePath: '20261120/occupied.mp4',
+      sha256: 'other-hash',
+    };
+    const events = [
+      envelope({ type: 'media.registered', media }),
+      envelope({ type: 'media.registered', media: other }, 'e2'),
+      {
+        ...envelope(
+          {
+            type: 'media.relocated' as const,
+            mediaId: 'm1',
+            previousRelativePath: media.relativePath,
+            relativePath: other.relativePath,
+            sha256: media.sha256,
+          },
+          'e3',
+        ),
+        sequence: 2,
+        observed: { a: 1 },
+      },
+      {
+        ...envelope(
+          {
+            type: 'media.relocated' as const,
+            mediaId: 'm1',
+            previousRelativePath: media.relativePath,
+            relativePath: '20261120/new.mp4',
+            sha256: 'wrong-hash',
+          },
+          'e4',
+        ),
+        sequence: 3,
+        observed: { a: 2 },
+      },
+    ];
+    const state = rebuildCatalogue(events);
+    expect(state.media.m1.relativePath).toBe(media.relativePath);
+    expect(state.conflicts.map(({ field }) => field)).toEqual(
+      expect.arrayContaining(['relocation-destination', 'relocation-hash']),
+    );
+  });
+
   it('is idempotent for duplicate events', () => {
     const event = envelope({ type: 'media.registered', media });
     expect(Object.keys(rebuildCatalogue([event, event]).media)).toEqual(['m1']);
@@ -664,6 +749,7 @@ describe('catalogue reducer', () => {
           observedSize: 2,
           observedSha256: 'abc',
           needsReview: false,
+          verificationMethod: 'fast',
         },
         'laptop-evidence',
         'laptop',
@@ -673,6 +759,7 @@ describe('catalogue reducer', () => {
     expect(state.media.m1.integrityByDevice?.laptop).toMatchObject({
       observedSha256: 'abc',
       needsReview: false,
+      verificationMethod: 'fast',
     });
   });
   it('surfaces concurrent project record changes', () => {

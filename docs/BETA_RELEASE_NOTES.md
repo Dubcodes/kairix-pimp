@@ -1,48 +1,37 @@
-# Kairix PIMP Light 0.1.1-5 — Windows Beta
+# Kairix PIMP Light 0.3 — Development
 
-This is a public prerelease for Windows x64. Download the plainly named per-user
-NSIS Setup executable from the GitHub Release; the MSI is an alternative. Both
-installers are unsigned, so Windows may display a SmartScreen warning. Confirm
-the source commit in `BUILD-INFO.txt` and verify `SHA256SUMS.txt` before running it.
+Kairix PIMP Light 0.3 is a public Development prerelease for Windows. It is a copy-only media workflow application: original source removal remains unavailable in ordinary builds.
 
-This build adds conservative completed-ingest history management and bounds the in-memory hover-preview lifecycle. Active, completed and attention-needed jobs are counted separately; only native-revalidated finalized history can be cleared, without touching media, metadata events or recovery evidence. Preview requests use an eight-entry LRU/in-flight bound, mounted cards release frame collections after hover or when leaving the viewport, and displayed timecodes come from FFmpeg's actual sampled timestamps. Native cache clearing waits for FFmpeg generation to release the cache mutex.
+## What is working
 
-## Verified by automated tests and Windows CI
+- Responsive metadata-first SD-card and folder inventory with reviewable destination paths, preserved camera-package hierarchy and separate-root collision handling.
+- Fast and Deep ingest modes. Both hash the exact protected source handle while writing same-filesystem staging, flush staged bytes and promote without overwrite; Deep additionally rereads and hashes the staged handle.
+- Persistent background ingest jobs, interruption recovery, immediate provisional metadata editing and safe completed-history clearing.
+- Library browsing, search, sorting, tags, notes, favourites, project assignment and selective integrity verification.
+- Logical video/audio recording association while retaining both immutable physical files.
+- Shared static thumbnails and hover-scrub derivatives, bounded background preparation, configurable hold frames and responsive thumbnail sizing.
+- Clip Viewer playback with validated local proxy generation for unsupported media.
+- COPY-only native Windows drag-and-drop to Explorer and compatible hosts, plus manual Premiere manifest export.
+- Read-only Premiere project indexing with explicit unknown/historical evidence; no undocumented project-file modification.
+- Portable append-only catalogue events and synchronized regenerable derivatives designed for eventual Syncthing delivery.
+- Project backup jobs with staged no-overwrite copying, SHA-256 manifests, re-verification and restore testing to an independent empty folder.
+- Manual public update discovery through permanent GitHub Releases, including version comparison, release notes, build identity and checksum guidance when signed updating is unavailable.
 
-- Recursive source inventory retains common production media, MXF, camera
-  sidecars and unknown package files while reporting exclusions and failures.
-- Durable background ingest stages outside Master Bin, independently verifies
-  SHA-256, prevents overwrite and retains metadata through retry and restart.
-- Completed history can be cleared individually or together only after native
-  checks reject pending metadata, inventory errors, file failures and recovery journals.
-- Batch tags seed eligible video, audio and image metadata without replacing
-  later file-specific edits or creating records for camera sidecars.
-- The 100-, 700- and 3,000-record thumbnail harness performs one native source
-  request per catalogue revision; installed 684-record timing remains to be repeated.
-- Preview request tests cover concurrent deduplication, bounded pending and
-  completed entries, source-key invalidation, and cache clearing during generation.
-- The Library supports search, desktop-style multiple selection, batch metadata
-  changes, Explorer actions and multi-path clipboard handoff to Premiere Pro.
-- Portable append-only event replay covers offline delivery, duplicate delivery,
-  concurrent additive edits and reported scalar conflicts.
-- Windows CI builds nonempty unsigned MSI and NSIS installers from the recorded
-  commit after the required TypeScript, Rust, build and audit checks pass, and
-  inspects the packaged executable for the Windows GUI subsystem.
+## Safety and recovery changes
 
-## Manual or external acceptance still required
+Ingest hashes and file identity now come from the actual open source and staging handles. The staging identity is carried through atomic promotion and checked again before catalogue registration. Duplicate verification uses the same handle-bound reasoning. The isolated cleanup-acceptance build now requires an independently stored app-local fixture trust record, and deletion observation distinguishes confirmed absence from permission, device and other indeterminate failures.
 
-- Complete the installed-app checklist in `docs/BETA_TESTING.md`, including a
-  same-build reinstall, console/focus/tray/Explorer checks and removable-source interruption.
-- Perform a real two-machine Syncthing pass before using production footage.
-- Authenticode signing, upgrade across versions and SmartScreen reputation are
-  not verified. Automatic updates require a one-time manual bootstrap containing
-  the approved updater public key and remain non-operational until a real signed
-  higher-version upgrade passes. FFmpeg and FFprobe are optional PATH-based tools and are not bundled.
-- Production-media and real two-device Syncthing acceptance remain incomplete.
-- Windows x64 is the only published platform for this beta.
-- Premiere handoff is manual; automated Premiere integration is not included.
-- AI processing, archive consolidation, cloud upload and source cleanup are not
-  implemented. PIMP never authorizes deletion of original media; the required
-  cleanup safety state machine is design-only in `docs/SOURCE_CLEANUP_DESIGN.md`.
+These cleanup corrections do not enable production deletion. The ordinary application contains no executable source-removal path.
 
-Official website: https://www.dubcodesmedia.com/kairix/kairix-pimp
+## Important limitations
+
+- Production SD-card/source deletion remains disabled pending physical removable-media acceptance and a separate activation review.
+- Full automatic project finalization is not implemented.
+- Returned-project support does not automatically discover projects or restore archived project metadata; complete archived-project restoration is not implemented.
+- AI analysis and Storyteller functionality are not implemented.
+- The Premiere companion proof has automated interchange coverage but has not completed broad installed Premiere acceptance.
+- Real two-device Syncthing, production-camera/card, large-library installed performance and complete production-codec acceptance remain open.
+- Installers are not Authenticode signed and may trigger Windows SmartScreen.
+- Signed automatic updating is unavailable unless the protected updater public key and signing secrets are genuinely provisioned and an installed A-to-B update is accepted. Manual release discovery remains available.
+
+Install only from the [official GitHub Releases page](https://github.com/Dubcodes/kairix-pimp/releases). Compare the installer against `SHA256SUMS.txt` and confirm `BUILD-INFO.txt` names the expected source commit before running it.

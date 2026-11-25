@@ -1,4 +1,4 @@
-export type PreviewPriority = 0 | 1 | 2 | 3;
+export type PreviewPriority = 0 | 1 | 2 | 3 | 4 | 5;
 
 export interface PreviewQueueStatus {
   active: boolean;
@@ -108,6 +108,15 @@ export class PreviewWorkQueue {
     this.emit();
   }
 
+  cancel(key: string) {
+    const work = this.queued.get(key);
+    if (!work) return false;
+    this.queued.delete(key);
+    work.reject(new Error('Preview work left the active viewport.'));
+    this.emit();
+    return true;
+  }
+
   get status(): PreviewQueueStatus {
     return {
       active: Boolean(this.active),
@@ -148,4 +157,8 @@ export class PreviewWorkQueue {
   }
 }
 
+// Static images and multi-frame hover previews intentionally have independent
+// single-active lanes. A slow hover encode must never occupy the only slot that
+// can make the Library usable.
+export const staticThumbnailWorkQueue = new PreviewWorkQueue(128);
 export const previewWorkQueue = new PreviewWorkQueue();
