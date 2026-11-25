@@ -2,7 +2,7 @@
 
 ## Current Development candidate 0.2
 
-Current source is internal version `0.3.0`, displayed as `0.3 — Development`. It is strictly newer than the distributed internal `0.2.0` builds. Pull-request artifacts remain unsigned internal verification output; an approved tester build should instead be promoted to a permanent GitHub Development Release. Until that promotion succeeds, `v0.1.1-5` remains the latest public beta. For upgrade acceptance, verify the NSIS Setup against `SHA256SUMS.txt` and `BUILD-INFO.txt`, then confirm device ID, configured roots, catalogue, shared thumbnails, recoverable jobs and device-local settings remain present.
+Current source is public version `0.3.0`, displayed as `0.3 — Development`. It is strictly newer than the distributed internal `0.2.0` builds. Pull-request artifacts remain unsigned internal verification output; testers should use the permanent `v0.3.0` GitHub Development Release. For upgrade acceptance, verify the NSIS Setup against `SHA256SUMS.txt` and `BUILD-INFO.txt`, then confirm device ID, configured roots, catalogue, shared thumbnails, recoverable jobs and device-local settings remain present.
 
 The same run publishes a separately named **Premiere Companion developer source** artifact. It is unpackaged source for UXP Developer Tool, not a `.ccx`. Follow `PREMIERE_INTEGRATION.md` and use only a disposable Premiere project with synthetic MP4/WAV media.
 
