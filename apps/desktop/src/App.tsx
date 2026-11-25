@@ -298,6 +298,7 @@ export function App() {
     'fast' | 'deep'
   >('deep');
   const [cleanupRequested, setCleanupRequested] = useState(false);
+  const [cleanupAcceptanceMode, setCleanupAcceptanceMode] = useState(false);
   const [conflicts, setConflicts] = useState<IngestResult['conflicts']>([]);
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -500,6 +501,14 @@ export function App() {
   const automaticUpdateCheckStarted = useRef(false);
 
   const configured = Boolean(settings.initializedCataloguePath);
+  useEffect(() => {
+    if (!native) return;
+    void desktopBridge
+      .cleanupAcceptanceMode()
+      .then(setCleanupAcceptanceMode)
+      .catch(() => setCleanupAcceptanceMode(false));
+  }, [native]);
+
   useEffect(() => {
     if (!native) return;
     let current = true;
@@ -1874,6 +1883,27 @@ export function App() {
   const chooseSdSource = async () => {
     const path = await desktopBridge.chooseFolder();
     if (path) scanSdSource(path);
+  };
+  const prepareCleanupAcceptance = async () => {
+    const path = await desktopBridge.chooseFolder();
+    if (!path) return;
+    setError('');
+    try {
+      const prepared =
+        await desktopBridge.prepareCleanupAcceptanceFixture(path);
+      setSettings(prepared.settings);
+      setCleanupRequested(true);
+      setSdGrabberMode(false);
+      setInventory(undefined);
+      setInventoryError('');
+      setInventoryLoading(true);
+      setSources([prepared.sourcePath]);
+      setMessage(
+        `Disposable cleanup fixture ${prepared.fixtureId} created in the isolated acceptance workspace.`,
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    }
   };
   const refreshRemovableVolumes = async () => {
     try {
@@ -3282,9 +3312,34 @@ export function App() {
                   {job.cleanupAuthorizationLockedRevision !== undefined
                     ? `Locked at authorization revision ${job.cleanupAuthorizationLockedRevision} because cleanup revalidation began.`
                     : 'Job-specific and editable until native cleanup revalidation begins.'}{' '}
-                  This Development build records and reviews cleanup but keeps
-                  removal acceptance-gated.
+                  {cleanupAcceptanceMode
+                    ? 'This acceptance build removes only a generated fixture after manifest and removable-volume validation.'
+                    : 'This ordinary build records and reviews cleanup but keeps removal disabled.'}
                 </small>
+                {cleanupAcceptanceMode && job.cleanupReportPath && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void desktopBridge
+                        .chooseCleanupAcceptanceReportDestination()
+                        .then(async (destinationPath) => {
+                          if (!destinationPath) return false;
+                          await desktopBridge.exportCleanupAcceptanceReport(
+                            job.id,
+                            destinationPath,
+                          );
+                          return true;
+                        })
+                        .then((exported) => {
+                          if (exported)
+                            setMessage('Cleanup acceptance report exported.');
+                        })
+                        .catch((reason) => setError(errorText(reason)))
+                    }
+                  >
+                    Export cleanup acceptance report
+                  </button>
+                )}
                 <progress
                   value={job.bytesTransferred}
                   max={job.bytesTotal || 1}
@@ -3324,6 +3379,44 @@ export function App() {
                           .
                         </small>
                         <small>{issue.action}</small>
+                        {issue.fileId && (
+                          <div className="job-actions">
+                            {issue.sourcePath && (
+                              <button
+                                onClick={() =>
+                                  void desktopBridge
+                                    .revealIngestCleanupIssue(
+                                      job.id,
+                                      issue.fileId!,
+                                      'source',
+                                    )
+                                    .catch((reason) =>
+                                      setError(errorText(reason)),
+                                    )
+                                }
+                              >
+                                Reveal source
+                              </button>
+                            )}
+                            {issue.destinationPath && (
+                              <button
+                                onClick={() =>
+                                  void desktopBridge
+                                    .revealIngestCleanupIssue(
+                                      job.id,
+                                      issue.fileId!,
+                                      'destination',
+                                    )
+                                    .catch((reason) =>
+                                      setError(errorText(reason)),
+                                    )
+                                }
+                              >
+                                Reveal destination
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </section>
@@ -3354,6 +3447,13 @@ export function App() {
                           {size(file.destinationBytesWritten ?? 0)} ·
                           destination reread{' '}
                           {size(file.destinationBytesRead ?? 0)}
+                          {(file.cleanupSourceBytesRead ?? 0) > 0 ||
+                          (file.cleanupDestinationBytesRead ?? 0) > 0
+                            ? ` · cleanup investigation read ${size(
+                                (file.cleanupSourceBytesRead ?? 0) +
+                                  (file.cleanupDestinationBytesRead ?? 0),
+                              )}`
+                            : ''}
                         </small>
                       )}
                       <label>
@@ -6493,6 +6593,25 @@ export function App() {
               >
                 <HardDrive size={18} /> Grab files from SD card
               </button>
+              {cleanupAcceptanceMode && (
+                <section
+                  className="conflict-list"
+                  aria-label="Cleanup acceptance mode"
+                >
+                  <strong>Disposable cleanup acceptance build</strong>
+                  <small>
+                    Creates synthetic media only on an empty removable volume
+                    and uses an isolated Master Bin. Never select production
+                    media or a card that contains files.
+                  </small>
+                  <button
+                    type="button"
+                    onClick={() => void prepareCleanupAcceptance()}
+                  >
+                    Prepare disposable cleanup fixture
+                  </button>
+                </section>
+              )}
               {showSdGrabber && (
                 <div className="source-list" aria-label="SD Card Grabber">
                   <strong>SD Card Grabber</strong>
@@ -6860,10 +6979,10 @@ export function App() {
               </label>
               <small>
                 Irreversible cleanup is a separate whole-batch phase. Fast mode
-                does not independently reread destination content. This
-                Development build records your job-specific authorization and
-                reconciliation result but will retain source files until
-                disposable-removable-media acceptance enables execution.
+                does not independently reread destination content.{' '}
+                {cleanupAcceptanceMode
+                  ? 'This separately identified acceptance build can remove only the generated, manifest-verified fixture from its original removable volume.'
+                  : 'This ordinary build records your job-specific authorization and reconciliation result but never removes source files.'}
               </small>
               <button
                 className="primary"

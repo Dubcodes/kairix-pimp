@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kairix PIMP Cleanup Acceptance",
+  "identifier": "com.kairix.pimp.cleanup-acceptance",
+  "app": {
+    "windows": [
+      {
+        "title": "Kairix PIMP Cleanup Acceptance — Disposable Media Only"
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "Isolated disposable-media cleanup acceptance build"
+  }
+}

@@ -511,11 +511,19 @@ export interface IngestJobFile {
   sourceRootPath?: string;
   mediaKind?: string;
   verifiedSha256?: string;
+  sourceFileIdentity?: string;
+  destinationFileIdentity?: string;
+  destinationModifiedMillis?: number;
+  destinationVolumeIdentity?: string;
+  destinationContentVerified?: boolean;
+  cleanupSourceBytesRead?: number;
+  cleanupDestinationBytesRead?: number;
   cleanupState?: string;
   cleanupIntentId?: string;
   cleanupDetail?: string;
 }
 export interface CleanupIssue {
+  fileId?: string;
   sourcePath: string;
   destinationPath?: string;
   expected: string;
@@ -550,6 +558,13 @@ export interface IngestJob {
   cleanupState?: string;
   cleanupIssues?: CleanupIssue[];
   cleanupScopeComplete?: boolean;
+  cleanupReportPath?: string;
+}
+export interface CleanupAcceptancePreparation {
+  sourcePath: string;
+  fixtureId: string;
+  manifestPath: string;
+  settings: DeviceSettings;
 }
 
 export const nativeAvailable = () => isTauri();
@@ -652,6 +667,23 @@ export const desktopBridge = {
     const value = await open({ multiple: false, directory: true });
     return typeof value === 'string' ? value : undefined;
   },
+  cleanupAcceptanceMode: () => invoke<boolean>('cleanup_acceptance_mode'),
+  prepareCleanupAcceptanceFixture: (selectedPath: string) =>
+    invoke<CleanupAcceptancePreparation>('prepare_cleanup_acceptance_fixture', {
+      selectedPath,
+    }),
+  chooseCleanupAcceptanceReportDestination: () =>
+    save({
+      defaultPath: 'kairix-pimp-cleanup-acceptance-report.json',
+      filters: [
+        { name: 'Kairix PIMP cleanup acceptance report', extensions: ['json'] },
+      ],
+    }),
+  exportCleanupAcceptanceReport: (jobId: string, destinationPath: string) =>
+    invoke<void>('export_cleanup_acceptance_report', {
+      jobId,
+      destinationPath,
+    }),
   inventorySources: (
     operationId: string,
     sources: string[],
@@ -866,6 +898,16 @@ export const desktopBridge = {
     ),
   revealMediaInExplorer: (mediaId: string) =>
     invoke<void>('reveal_media_in_explorer', { mediaId }),
+  revealIngestCleanupIssue: (
+    jobId: string,
+    fileId: string,
+    target: 'source' | 'destination',
+  ) =>
+    invoke<void>('reveal_ingest_cleanup_issue', {
+      jobId,
+      fileId,
+      target,
+    }),
   openMediaFolder: (mediaId: string) =>
     invoke<void>('open_media_folder', { mediaId }),
   revealLibraryFolder: (relativePath: string) =>

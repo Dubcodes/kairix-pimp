@@ -736,6 +736,20 @@ struct IngestJobFile {
     media_kind: String,
     #[serde(default)]
     verified_sha256: Option<String>,
+    #[serde(default)]
+    source_file_identity: Option<String>,
+    #[serde(default)]
+    destination_file_identity: Option<String>,
+    #[serde(default)]
+    destination_modified_millis: Option<u128>,
+    #[serde(default)]
+    destination_volume_identity: Option<String>,
+    #[serde(default)]
+    destination_content_verified: bool,
+    #[serde(default)]
+    cleanup_source_bytes_read: u64,
+    #[serde(default)]
+    cleanup_destination_bytes_read: u64,
     #[serde(default = "default_cleanup_state")]
     cleanup_state: String,
     #[serde(default)]
@@ -747,12 +761,43 @@ struct IngestJobFile {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct CleanupIssue {
+    file_id: Option<String>,
     source_path: String,
     destination_path: Option<String>,
     expected: String,
     observed: String,
     reason: String,
     action: String,
+}
+
+const CLEANUP_ACCEPTANCE_MANIFEST: &str = ".kairix-pimp-cleanup-acceptance.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CleanupAcceptanceFile {
+    relative_path: String,
+    size_bytes: u64,
+    sha256: String,
+    removable: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CleanupAcceptanceManifest {
+    schema_version: u32,
+    fixture_id: String,
+    source_volume_identity: String,
+    acceptance_master_bin: String,
+    files: Vec<CleanupAcceptanceFile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupAcceptancePreparation {
+    source_path: String,
+    fixture_id: String,
+    manifest_path: String,
+    settings: DeviceSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -800,6 +845,8 @@ struct IngestJob {
     cleanup_issues: Vec<CleanupIssue>,
     #[serde(default)]
     cleanup_scope_complete: bool,
+    #[serde(default)]
+    cleanup_report_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2346,6 +2393,13 @@ fn refresh_media_availability(
     let settings = load_settings_file(&app)?;
     let master = PathBuf::from(&settings.master_bin_path);
     let mut availability = state.availability.lock().unwrap();
+    Ok(refresh_availability_map(&master, &mut availability))
+}
+
+fn refresh_availability_map(
+    master: &Path,
+    availability: &mut HashMap<String, (String, bool)>,
+) -> bool {
     let mut changed = false;
     for (_, (relative_path, available)) in availability.iter_mut() {
         let next = fs_safe::resolve_existing(&master, relative_path)
@@ -2356,7 +2410,7 @@ fn refresh_media_availability(
             changed = true;
         }
     }
-    Ok(changed)
+    changed
 }
 
 #[tauri::command]
@@ -4626,6 +4680,9 @@ fn commit_job_file(
     // this device at commit time so a successful ingest is not presented as an
     // unverified discovery candidate on every quick inventory.
     let committed_snapshot = fs_safe::snapshot(&destination)?;
+    file.destination_file_identity = Some(file_identity(&destination)?);
+    file.destination_modified_millis = committed_snapshot.modified_millis;
+    file.destination_volume_identity = volume_identity_for_path(&destination)?;
     let evidence_item = catalogue
         .media
         .iter()
@@ -4668,11 +4725,25 @@ fn commit_job_file(
 fn complete_duplicate_job_file(
     app: &AppHandle,
     state: &NativeState,
+    settings: &DeviceSettings,
     job_id: &str,
     file_id: &str,
     media_id: &str,
     bytes_processed: u64,
 ) -> Result<(), String> {
+    let catalogue = load_catalogue_file(settings)?;
+    let media = catalogue
+        .media
+        .iter()
+        .find(|media| media.id == media_id)
+        .ok_or("Verified duplicate no longer exists in the catalogue")?;
+    let destination = fs_safe::resolve_existing(
+        Path::new(&settings.master_bin_path),
+        &media.relative_path,
+    )?;
+    let snapshot = fs_safe::snapshot(&destination)?;
+    let destination_identity = file_identity(&destination)?;
+    let destination_volume_identity = volume_identity_for_path(&destination)?;
     mutate_jobs(app, state, |jobs| {
         let job = jobs
             .iter_mut()
@@ -4684,6 +4755,11 @@ fn complete_duplicate_job_file(
             .find(|file| file.id == file_id)
             .ok_or("Ingest job file no longer exists")?;
         file.media_id = media_id.into();
+        file.relative_path = media.relative_path.clone();
+        file.destination_path = destination.to_string_lossy().into_owned();
+        file.destination_file_identity = Some(destination_identity);
+        file.destination_modified_millis = snapshot.modified_millis;
+        file.destination_volume_identity = destination_volume_identity;
         file.state = "completed".into();
         file.bytes_transferred = bytes_processed;
         file.error = None;
@@ -4711,6 +4787,8 @@ fn record_ingest_file_verification(
     copy_duration_millis: u64,
     verification_duration_millis: u64,
     verified_sha256: &str,
+    source_file_identity: &str,
+    destination_content_verified: bool,
 ) -> Result<(), String> {
     mutate_jobs(app, state, |jobs| {
         let file = jobs
@@ -4725,6 +4803,8 @@ fn record_ingest_file_verification(
         file.copy_duration_millis = copy_duration_millis;
         file.verification_duration_millis = verification_duration_millis;
         file.verified_sha256 = Some(verified_sha256.into());
+        file.source_file_identity = Some(source_file_identity.into());
+        file.destination_content_verified = destination_content_verified;
         Ok(())
     })
 }
@@ -4739,10 +4819,13 @@ fn all_job_files_completed(job: &IngestJob) -> bool {
 struct CleanupReconciliation {
     eligible_file_ids: Vec<String>,
     issues: Vec<CleanupIssue>,
+    destination_bytes_read: HashMap<String, u64>,
+    refreshed_destination_modified_millis: HashMap<String, Option<u128>>,
 }
 
 fn cleanup_issue(file: Option<&IngestJobFile>, reason: impl Into<String>) -> CleanupIssue {
     CleanupIssue {
+        file_id: file.map(|file| file.id.clone()),
         source_path: file.map(|file| file.source_path.clone()).unwrap_or_default(),
         destination_path: file.map(|file| file.destination_path.clone()),
         expected: file
@@ -4826,12 +4909,33 @@ fn reconcile_cleanup_batch(
             ));
             continue;
         }
-        if file.source_volume_identity.as_deref().is_some_and(|expected| {
-            volume_identity_for_path(&source).ok().flatten().as_deref() != Some(expected)
-        }) {
+        let Some(expected_source_volume) = file.source_volume_identity.as_deref() else {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "No durable source-volume identity is available",
+            ));
+            continue;
+        };
+        if volume_identity_for_path(&source).ok().flatten().as_deref()
+            != Some(expected_source_volume)
+        {
             result.issues.push(cleanup_issue(
                 Some(file),
                 "The source volume identity changed or could not be re-established",
+            ));
+            continue;
+        }
+        let Some(expected_source_identity) = file.source_file_identity.as_deref() else {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "No durable source-file identity is available",
+            ));
+            continue;
+        };
+        if file_identity(&source).as_deref() != Ok(expected_source_identity) {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "The approved source file was replaced or could not be re-identified",
             ));
             continue;
         }
@@ -4865,21 +4969,67 @@ fn reconcile_cleanup_batch(
             ));
             continue;
         }
-        match sha256(&destination) {
-            Ok(observed) if observed.eq_ignore_ascii_case(expected_hash) => {}
-            Ok(_) => {
-                result.issues.push(cleanup_issue(
-                    Some(file),
-                    "Independent destination SHA-256 does not match the verified source",
-                ));
+        let Some(expected_destination_volume) = file.destination_volume_identity.as_deref() else {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "No durable destination-volume identity is available",
+            ));
+            continue;
+        };
+        if volume_identity_for_path(&destination).ok().flatten().as_deref()
+            != Some(expected_destination_volume)
+        {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "The destination volume changed or could not be re-established",
+            ));
+            continue;
+        }
+        let Some(expected_destination_identity) = file.destination_file_identity.as_deref() else {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "No durable destination-file identity is available",
+            ));
+            continue;
+        };
+        if file_identity(&destination).as_deref() != Ok(expected_destination_identity) {
+            result.issues.push(cleanup_issue(
+                Some(file),
+                "The verified destination file was replaced or could not be re-identified",
+            ));
+            continue;
+        }
+        let destination_snapshot = match fs_safe::snapshot(&destination) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                result.issues.push(cleanup_issue(Some(file), error));
                 continue;
             }
-            Err(error) => {
-                result.issues.push(cleanup_issue(
-                    Some(file),
-                    format!("Cannot independently read the destination: {error}"),
-                ));
-                continue;
+        };
+        if destination_snapshot.modified_millis != file.destination_modified_millis {
+            match sha256(&destination) {
+                Ok(observed) if observed.eq_ignore_ascii_case(expected_hash) => {
+                    result
+                        .destination_bytes_read
+                        .insert(file.id.clone(), file.size_bytes);
+                    result
+                        .refreshed_destination_modified_millis
+                        .insert(file.id.clone(), destination_snapshot.modified_millis);
+                }
+                Ok(_) => {
+                    result.issues.push(cleanup_issue(
+                        Some(file),
+                        "Targeted destination SHA-256 does not match the verified source",
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    result.issues.push(cleanup_issue(
+                        Some(file),
+                        format!("Cannot perform targeted destination verification: {error}"),
+                    ));
+                    continue;
+                }
             }
         }
         result.eligible_file_ids.push(file.id.clone());
@@ -4890,6 +5040,7 @@ fn reconcile_cleanup_batch(
                 known_sources.insert(path);
             }
             Err(error) => result.issues.push(CleanupIssue {
+                file_id: None,
                 source_path: excluded.path.clone(),
                 destination_path: None,
                 expected: format!("Excluded source retained: {}", excluded.reason),
@@ -4920,6 +5071,7 @@ fn reconcile_cleanup_batch(
                 match entry.path().canonicalize() {
                     Ok(path) if !known_sources.contains(&path) => {
                         result.issues.push(CleanupIssue {
+                            file_id: None,
                             source_path: path.to_string_lossy().into_owned(),
                             destination_path: None,
                             expected: "Only files present in the approved inventory".into(),
@@ -4941,21 +5093,301 @@ fn reconcile_cleanup_batch(
 }
 
 fn source_cleanup_execution_enabled() -> bool {
-    cfg!(test)
+    cfg!(any(test, feature = "cleanup-acceptance"))
 }
 
-fn hash_open_file(file: &mut File) -> Result<String, String> {
-    file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
+#[tauri::command]
+fn cleanup_acceptance_mode() -> bool {
+    cfg!(feature = "cleanup-acceptance")
+}
+
+fn write_acceptance_fixture_file(path: &Path, size_bytes: u64, seed: u8) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("Cannot create acceptance fixture: {error}"))?;
+    let block = vec![seed; 1024 * 1024];
+    let mut remaining = size_bytes;
+    while remaining > 0 {
+        let count = remaining.min(block.len() as u64) as usize;
+        file.write_all(&block[..count])
+            .map_err(|error| error.to_string())?;
+        remaining -= count as u64;
     }
-    Ok(format!("{:x}", digest.finalize()))
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn prepare_cleanup_acceptance_fixture(
+    app: AppHandle,
+    selected_path: String,
+) -> Result<CleanupAcceptancePreparation, String> {
+    if !cfg!(feature = "cleanup-acceptance") {
+        return Err("Cleanup acceptance tooling is absent from ordinary builds".into());
+    }
+    let selected = PathBuf::from(selected_path)
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve the disposable test folder: {error}"))?;
+    if !selected.is_dir() {
+        return Err("Choose an empty folder on disposable removable media".into());
+    }
+    if fs::read_dir(&selected)
+        .map_err(|error| error.to_string())?
+        .next()
+        .is_some()
+    {
+        return Err("The cleanup acceptance fixture folder must be empty".into());
+    }
+    let volume = removable_volumes()
+        .into_iter()
+        .find(|volume| {
+            let root = PathBuf::from(&volume.root_path);
+            fs_safe::within(&root, &selected) && volume.identity == volume_identity_for_path(&selected).ok().flatten().unwrap_or_default()
+        })
+        .ok_or("The selected folder is not on a currently identified Windows removable volume")?;
+
+    let app_data = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let workspace = app_data.join("cleanup-acceptance-workspace");
+    let master = workspace.join("Master Bin");
+    let projects = workspace.join("Working Projects");
+    let thumbnails = workspace.join("thumbnails");
+    fs::create_dir_all(&master).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&projects).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&thumbnails).map_err(|error| error.to_string())?;
+    if fs_safe::within(&selected, &workspace) || fs_safe::within(&workspace, &selected) {
+        return Err("Acceptance source and isolated workspace may not overlap".into());
+    }
+
+    let fixture_id = Uuid::new_v4().to_string();
+    let fixture_specs = [
+        ("acceptance-video.mp4", 8 * 1024 * 1024, 0x41, true),
+        ("acceptance-audio.wav", 4 * 1024 * 1024, 0x57, true),
+        ("acceptance-metadata.xml", 32 * 1024, 0x58, false),
+        ("acceptance-thumbnail.thm", 16 * 1024, 0x54, false),
+    ];
+    let mut files = Vec::new();
+    for (name, size_bytes, seed, removable) in fixture_specs {
+        let path = selected.join(name);
+        write_acceptance_fixture_file(&path, size_bytes, seed)?;
+        files.push(CleanupAcceptanceFile {
+            relative_path: name.into(),
+            size_bytes,
+            sha256: sha256(&path)?,
+            removable,
+        });
+    }
+    let manifest = CleanupAcceptanceManifest {
+        schema_version: 1,
+        fixture_id: fixture_id.clone(),
+        source_volume_identity: volume.identity,
+        acceptance_master_bin: master.to_string_lossy().into_owned(),
+        files,
+    };
+    let manifest_path = selected.join(CLEANUP_ACCEPTANCE_MANIFEST);
+    write_json(&manifest_path, &manifest)?;
+
+    let mut settings = load_settings_file(&app)?;
+    settings.master_bin_path = master.to_string_lossy().into_owned();
+    settings.working_projects_path = projects.to_string_lossy().into_owned();
+    settings.catalogue_in_master_bin = true;
+    settings.shared_catalogue_path.clear();
+    settings.thumbnail_cache_path = thumbnails.to_string_lossy().into_owned();
+    let catalogue = master.join(".pimp");
+    fs::create_dir_all(&catalogue).map_err(|error| error.to_string())?;
+    settings.initialized_catalogue_path = catalogue.to_string_lossy().into_owned();
+    settings.check_for_updates = false;
+    write_json(&settings_path(&app)?, &settings)?;
+    Ok(CleanupAcceptancePreparation {
+        source_path: selected.to_string_lossy().into_owned(),
+        fixture_id,
+        manifest_path: manifest_path.to_string_lossy().into_owned(),
+        settings,
+    })
+}
+
+fn validate_cleanup_acceptance_job(
+    job: &IngestJob,
+    settings: &DeviceSettings,
+) -> Result<CleanupAcceptanceManifest, String> {
+    if !cfg!(feature = "cleanup-acceptance") {
+        return Err("Cleanup execution is not enabled in this ordinary build".into());
+    }
+    let roots = job
+        .files
+        .iter()
+        .filter_map(|file| cleanup_source_root(file).ok())
+        .collect::<HashSet<_>>();
+    if roots.len() != 1 {
+        return Err("Acceptance cleanup requires exactly one fixture root".into());
+    }
+    let root = roots.into_iter().next().unwrap().canonicalize().map_err(|error| error.to_string())?;
+    let manifest: CleanupAcceptanceManifest = read_json(&root.join(CLEANUP_ACCEPTANCE_MANIFEST))?;
+    if manifest.schema_version != 1 || Uuid::parse_str(&manifest.fixture_id).is_err() {
+        return Err("The cleanup acceptance manifest is invalid or unsupported".into());
+    }
+    let master = PathBuf::from(&settings.master_bin_path)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let expected_master = PathBuf::from(&manifest.acceptance_master_bin)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if master != expected_master || fs_safe::within(&root, &master) || fs_safe::within(&master, &root) {
+        return Err("The acceptance destination is not the isolated manifest workspace".into());
+    }
+    if volume_identity_for_path(&root)?.as_deref() != Some(&manifest.source_volume_identity) {
+        return Err("The disposable acceptance volume identity changed".into());
+    }
+    let currently_removable = removable_volumes().into_iter().any(|volume| {
+        volume.identity == manifest.source_volume_identity
+            && fs_safe::within(Path::new(&volume.root_path), &root)
+    });
+    if !currently_removable {
+        return Err("The acceptance fixture is not on a currently removable volume".into());
+    }
+
+    let expected = manifest
+        .files
+        .iter()
+        .map(|file| (file.relative_path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    for entry in WalkDir::new(&root).min_depth(1).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            format!("Cannot inspect the complete acceptance fixture: {error}")
+        })?;
+        let relative = portable_relative(
+            entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|_| "Acceptance fixture entry escaped its root")?,
+        );
+        if entry.file_type().is_dir() || entry.file_type().is_symlink() {
+            return Err(format!(
+                "The acceptance fixture contains an unexpected directory or link: {relative}"
+            ));
+        }
+        if entry.file_type().is_file()
+            && relative != CLEANUP_ACCEPTANCE_MANIFEST
+            && !expected.contains_key(&relative)
+        {
+            return Err(format!(
+                "The acceptance fixture contains a file outside its exact manifest: {relative}"
+            ));
+        }
+    }
+    let observed = job
+        .files
+        .iter()
+        .filter(|file| file.source_relative_path != CLEANUP_ACCEPTANCE_MANIFEST)
+        .map(|file| (file.source_relative_path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    if observed.len() != expected.len() || observed.keys().any(|path| !expected.contains_key(path)) {
+        return Err("The reviewed fixture inventory differs from the dedicated acceptance manifest".into());
+    }
+    for (relative, expected_file) in expected {
+        let file = observed.get(&relative).unwrap();
+        let eligible = matches!(file.media_kind.as_str(), "video" | "audio" | "image");
+        if eligible != expected_file.removable
+            || file.size_bytes != expected_file.size_bytes
+            || file.verified_sha256.as_deref() != Some(expected_file.sha256.as_str())
+            || file.source_volume_identity.as_deref() != Some(manifest.source_volume_identity.as_str())
+        {
+            return Err(format!("Acceptance fixture evidence changed: {relative}"));
+        }
+    }
+    Ok(manifest)
+}
+
+fn write_cleanup_acceptance_report(
+    app: &AppHandle,
+    state: &NativeState,
+    job_id: &str,
+) -> Result<(), String> {
+    if !cfg!(feature = "cleanup-acceptance") {
+        return Ok(());
+    }
+    let settings = load_settings_file(app)?;
+    let job = snapshot_jobs(app, state)?
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .ok_or("Acceptance cleanup job no longer exists")?;
+    let manifest = validate_cleanup_acceptance_job(&job, &settings)?;
+    let report = serde_json::json!({
+        "schemaVersion": 1,
+        "fixtureId": manifest.fixture_id,
+        "generatedAt": Utc::now().to_rfc3339(),
+        "applicationVersion": env!("CARGO_PKG_VERSION"),
+        "buildKind": "cleanup-acceptance",
+        "jobId": job.id,
+        "verificationMode": job.verification_mode,
+        "cleanupAuthorizationRevision": job.cleanup_authorization_revision,
+        "cleanupAuthorizationLockedRevision": job.cleanup_authorization_locked_revision,
+        "cleanupState": job.cleanup_state,
+        "sourceVolumeIdentity": manifest.source_volume_identity,
+        "acceptanceMasterBin": manifest.acceptance_master_bin,
+        "files": job.files.iter().map(|file| serde_json::json!({
+            "sourceRelativePath": file.source_relative_path,
+            "destinationRelativePath": file.relative_path,
+            "sizeBytes": file.size_bytes,
+            "sha256": file.verified_sha256,
+            "verificationMethod": file.verification_method,
+            "cleanupState": file.cleanup_state,
+            "cleanupDetail": file.cleanup_detail,
+            "sourceBytesRead": file.source_bytes_read,
+            "destinationBytesWritten": file.destination_bytes_written,
+            "destinationBytesRead": file.destination_bytes_read,
+            "cleanupSourceBytesRead": file.cleanup_source_bytes_read,
+            "cleanupDestinationBytesRead": file.cleanup_destination_bytes_read,
+        })).collect::<Vec<_>>(),
+    });
+    let reports = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("cleanup-acceptance-reports");
+    fs::create_dir_all(&reports).map_err(|error| error.to_string())?;
+    let path = reports.join(format!("cleanup-acceptance-{}.json", manifest.fixture_id));
+    write_json(&path, &report)?;
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
+        job.cleanup_report_path = Some(path.to_string_lossy().into_owned());
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn export_cleanup_acceptance_report(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+    destination_path: String,
+) -> Result<(), String> {
+    if !cfg!(feature = "cleanup-acceptance") {
+        return Err("Cleanup acceptance reporting is absent from ordinary builds".into());
+    }
+    let job = snapshot_jobs(&app, &state)?
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .ok_or("Acceptance cleanup job no longer exists")?;
+    let source = PathBuf::from(
+        job.cleanup_report_path
+            .ok_or("This job has no completed acceptance report")?,
+    );
+    let destination = PathBuf::from(destination_path);
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return Err("Acceptance reports must use the .json extension".into());
+    }
+    let bytes = fs::read(&source).map_err(|error| error.to_string())?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|error| format!("Cannot create acceptance report: {error}"))?;
+    output.write_all(&bytes).map_err(|error| error.to_string())?;
+    output.sync_all().map_err(|error| error.to_string())
 }
 
 fn metadata_modified_millis(metadata: &fs::Metadata) -> Option<u128> {
@@ -4967,11 +5399,107 @@ fn metadata_modified_millis(metadata: &fs::Metadata) -> Option<u128> {
 }
 
 #[cfg(target_os = "windows")]
+fn file_identity_for_handle(file: &File) -> Result<String, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            &mut information,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Cannot read Windows file identity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(format!(
+        "win:{:08x}:{:08x}{:08x}",
+        information.dwVolumeSerialNumber, information.nFileIndexHigh, information.nFileIndexLow
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn file_identity(path: &Path) -> Result<String, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .map_err(|error| format!("Cannot open {} for identity: {error}", path.display()))?;
+    file_identity_for_handle(&file)
+}
+
+#[cfg(target_os = "windows")]
+fn open_validated_destination(
+    path: &Path,
+    expected_size: u64,
+    expected_modified_millis: Option<u128>,
+    expected_identity: &str,
+) -> Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|error| format!("Cannot protect the verified destination: {error}"))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if metadata.len() != expected_size
+        || metadata_modified_millis(&metadata) != expected_modified_millis
+        || file_identity_for_handle(&file).as_deref() != Ok(expected_identity)
+    {
+        return Err("Destination identity or snapshot changed before cleanup".into());
+    }
+    Ok(file)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_validated_destination(
+    path: &Path,
+    expected_size: u64,
+    expected_modified_millis: Option<u128>,
+    expected_identity: &str,
+) -> Result<File, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if metadata.len() != expected_size
+        || metadata_modified_millis(&metadata) != expected_modified_millis
+        || file_identity(path).as_deref() != Ok(expected_identity)
+    {
+        return Err("Destination identity or snapshot changed before cleanup".into());
+    }
+    Ok(file)
+}
+
+#[cfg(all(not(target_os = "windows"), unix))]
+fn file_identity(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = path.metadata().map_err(|error| error.to_string())?;
+    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(all(not(target_os = "windows"), not(unix)))]
+fn file_identity(path: &Path) -> Result<String, String> {
+    Ok(format!(
+        "path:{}",
+        path.canonicalize().map_err(|error| error.to_string())?.display()
+    ))
+}
+
+#[cfg(target_os = "windows")]
 fn remove_exact_source(
     path: &Path,
     expected_size: u64,
     expected_modified_millis: Option<u128>,
-    expected_hash: &str,
+    expected_identity: &str,
 ) -> Result<(), String> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -4979,7 +5507,7 @@ fn remove_exact_source(
         FILE_SHARE_READ, FileDispositionInfo,
     };
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .access_mode(DELETE | windows_sys::Win32::Foundation::GENERIC_READ)
         .share_mode(FILE_SHARE_READ)
@@ -4992,11 +5520,9 @@ fn remove_exact_source(
     if !metadata.is_file()
         || metadata.len() != expected_size
         || metadata_modified_millis(&metadata) != expected_modified_millis
+        || file_identity_for_handle(&file).as_deref() != Ok(expected_identity)
     {
         return Err("Approved source handle no longer identifies the expected regular file".into());
-    }
-    if hash_open_file(&mut file)? != expected_hash {
-        return Err("Approved source content changed before removal".into());
     }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     let removed = unsafe {
@@ -5025,13 +5551,14 @@ fn remove_exact_source(
     path: &Path,
     expected_size: u64,
     expected_modified_millis: Option<u128>,
-    expected_hash: &str,
+    expected_identity: &str,
 ) -> Result<(), String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let file = File::open(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if metadata.len() != expected_size
         || metadata_modified_millis(&metadata) != expected_modified_millis
-        || hash_open_file(&mut file)? != expected_hash {
+        || file_identity(path).as_deref() != Ok(expected_identity)
+    {
         return Err("Approved source content changed before removal".into());
     }
     fs::remove_file(path).map_err(|error| error.to_string())
@@ -5069,11 +5596,19 @@ fn execute_cleanup_removals(
             .verified_sha256
             .clone()
             .ok_or("Cleanup source has no durable SHA-256")?;
-        if file.source_volume_identity.as_deref().is_some_and(|expected| {
-            volume_identity_for_path(&source).ok().flatten().as_deref() != Some(expected)
-        }) {
+        let expected_source_volume = file
+            .source_volume_identity
+            .as_deref()
+            .ok_or("Cleanup source has no durable volume identity")?;
+        if volume_identity_for_path(&source).ok().flatten().as_deref()
+            != Some(expected_source_volume)
+        {
             return Err("Cleanup source volume was replaced or could not be identified".into());
         }
+        let expected_source_identity = file
+            .source_file_identity
+            .as_deref()
+            .ok_or("Cleanup source has no durable file identity")?;
         let catalogue = load_catalogue_file(&settings)?;
         let destination = fs_safe::resolve_existing(
             Path::new(&settings.master_bin_path),
@@ -5091,6 +5626,19 @@ fn execute_cleanup_removals(
         if !destination_valid {
             return Err("Cleanup destination evidence changed during final revalidation".into());
         }
+        let expected_destination_volume = file
+            .destination_volume_identity
+            .as_deref()
+            .ok_or("Cleanup destination has no durable volume identity")?;
+        if volume_identity_for_path(&destination).ok().flatten().as_deref()
+            != Some(expected_destination_volume)
+        {
+            return Err("Cleanup destination volume was replaced or could not be identified".into());
+        }
+        let expected_destination_identity = file
+            .destination_file_identity
+            .as_deref()
+            .ok_or("Cleanup destination has no durable file identity")?;
         let source_volume = volume_resource_id(&source)?;
         let destination_volume = volume_resource_id(&destination)?;
         let _permit = state.volume_governor.acquire(
@@ -5105,15 +5653,12 @@ fn execute_cleanup_removals(
             ),
             || false,
         )?;
-        let destination_before = fs_safe::snapshot(&destination)?;
-        if destination_before.length != file.size_bytes
-            || !sha256(&destination)?.eq_ignore_ascii_case(&expected_hash)
-            || fs_safe::snapshot(&destination)? != destination_before
-        {
-            return Err(
-                "Cleanup destination changed or failed independent SHA-256 revalidation".into(),
-            );
-        }
+        let _protected_destination = open_validated_destination(
+            &destination,
+            file.size_bytes,
+            file.destination_modified_millis,
+            expected_destination_identity,
+        )?;
         let intent_id = Uuid::new_v4().to_string();
         mutate_jobs(app, state, |jobs| {
             let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
@@ -5135,7 +5680,7 @@ fn execute_cleanup_removals(
             &source,
             file.size_bytes,
             file.source_modified_millis,
-            &expected_hash,
+            expected_source_identity,
         ) {
             mutate_jobs(app, state, |jobs| {
                 let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
@@ -5164,7 +5709,8 @@ fn execute_cleanup_removals(
         job.cleanup_state = "completed".into();
         job.updated_at = Utc::now().to_rfc3339();
         Ok(())
-    })
+    })?;
+    write_cleanup_acceptance_report(app, state, job_id)
 }
 
 fn run_cleanup_phase(app: &AppHandle, state: &NativeState, job_id: &str) -> Result<(), String> {
@@ -5188,17 +5734,44 @@ fn run_cleanup_phase(app: &AppHandle, state: &NativeState, job_id: &str) -> Resu
     configure_volume_governor(state, &settings);
     let reconciliation = {
         let destination_volume = volume_resource_id(Path::new(&settings.master_bin_path))?;
-        let _permit = state.volume_governor.acquire(
+        let mut permit = state.volume_governor.acquire(
             resource_governor::Request::new(
                 "Source cleanup destination reconciliation",
                 resource_governor::PRIORITY_RECOVERY,
                 false,
-                vec![resource_governor::VolumeNeed::read(destination_volume)],
+                vec![resource_governor::VolumeNeed::read(destination_volume.clone())],
             ),
             || false,
         )?;
-        reconcile_cleanup_batch(&snapshot, &settings, &catalogue)
+        let reconciliation = reconcile_cleanup_batch(&snapshot, &settings, &catalogue);
+        permit.add_bytes_for(
+            &destination_volume,
+            reconciliation.destination_bytes_read.values().sum(),
+            0,
+        );
+        reconciliation
     };
+    mutate_jobs(app, state, |jobs| {
+        let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
+        for file in &mut job.files {
+            file.cleanup_destination_bytes_read = file
+                .cleanup_destination_bytes_read
+                .saturating_add(
+                    reconciliation
+                        .destination_bytes_read
+                        .get(&file.id)
+                        .copied()
+                        .unwrap_or(0),
+                );
+            if let Some(modified) = reconciliation
+                .refreshed_destination_modified_millis
+                .get(&file.id)
+            {
+                file.destination_modified_millis = *modified;
+            }
+        }
+        Ok(())
+    })?;
     if !reconciliation.issues.is_empty() {
         return mutate_jobs(app, state, |jobs| {
             let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
@@ -5234,6 +5807,9 @@ fn run_cleanup_phase(app: &AppHandle, state: &NativeState, job_id: &str) -> Resu
             job.updated_at = Utc::now().to_rfc3339();
             Ok(())
         });
+    }
+    if cfg!(feature = "cleanup-acceptance") {
+        validate_cleanup_acceptance_job(&snapshot, &settings)?;
     }
     let locked_revision = mutate_jobs(app, state, |jobs| {
         let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
@@ -5456,10 +6032,13 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     0,
                     0,
                     expected_hash,
+                    &file_identity(&source)?,
+                    true,
                 )?;
                 complete_duplicate_job_file(
                     app,
                     &state,
+                    &settings,
                     job_id,
                     &planned.id,
                     &planned.media_id,
@@ -5493,6 +6072,8 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                         0,
                         0,
                         &source_hash,
+                        &file_identity(&source)?,
+                        true,
                     )?;
                     let catalogue = load_catalogue_file(&settings)?;
                     if let Some(existing) = catalogue.media.iter().find(|item| {
@@ -5502,6 +6083,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                         complete_duplicate_job_file(
                             app,
                             &state,
+                            &settings,
                             job_id,
                             &planned.id,
                             &existing.id,
@@ -5565,6 +6147,8 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     copy.copy_duration_millis,
                     copy.verification_duration_millis,
                     &copy.hash,
+                    &file_identity(&source)?,
+                    copy.destination_bytes_read == planned.size_bytes,
                 )?;
                 let catalogue = load_catalogue_file(&settings)?;
                 let candidates = catalogue
@@ -5585,6 +6169,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     complete_duplicate_job_file(
                         app,
                         &state,
+                        &settings,
                         job_id,
                         &planned.id,
                         existing_media_id
@@ -5909,6 +6494,13 @@ fn start_ingest(
             .into_owned(),
             media_kind: inventory_file.kind.clone(),
             verified_sha256: None,
+            source_file_identity: file_identity(&source).ok(),
+            destination_file_identity: None,
+            destination_modified_millis: None,
+            destination_volume_identity: None,
+            destination_content_verified: false,
+            cleanup_source_bytes_read: 0,
+            cleanup_destination_bytes_read: 0,
             cleanup_state: default_cleanup_state(),
             cleanup_intent_id: None,
             cleanup_detail: None,
@@ -5961,6 +6553,7 @@ fn start_ingest(
             .sources
             .iter()
             .all(|source| Path::new(source).is_dir()),
+        cleanup_report_path: None,
     };
     mutate_jobs(&app, &state, |jobs| {
         if jobs.iter().any(|existing| existing.id == job.id) {
@@ -6102,6 +6695,13 @@ fn mark_active_jobs_interrupted(jobs: &mut [IngestJob]) {
 }
 
 fn reconcile_interrupted_cleanup_intents(jobs: &mut [IngestJob]) {
+    reconcile_interrupted_cleanup_intents_with(jobs, &|path: &Path| fs::symlink_metadata(path))
+}
+
+fn reconcile_interrupted_cleanup_intents_with<F>(jobs: &mut [IngestJob], observe: &F)
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+{
     for job in jobs {
         let mut blocked = false;
         let mut observed_removal = false;
@@ -6113,11 +6713,15 @@ fn reconcile_interrupted_cleanup_intents(jobs: &mut [IngestJob]) {
                 .ok()
                 .and_then(|root| root.canonicalize().ok());
             let same_volume = root.as_ref().is_some_and(|root| {
-                file.source_volume_identity.as_deref().is_none_or(|expected| {
+                file.source_volume_identity.as_deref().is_some_and(|expected| {
                     volume_identity_for_path(root).ok().flatten().as_deref() == Some(expected)
                 })
             });
-            if same_volume && !Path::new(&file.source_path).exists() {
+            let source_observation = observe(Path::new(&file.source_path));
+            let confirmed_absent = source_observation
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if same_volume && confirmed_absent {
                 file.cleanup_state = "removed".into();
                 file.cleanup_detail = Some(
                     "Restart reconciliation observed the intended source absent on the original volume"
@@ -6126,10 +6730,11 @@ fn reconcile_interrupted_cleanup_intents(jobs: &mut [IngestJob]) {
                 observed_removal = true;
             } else {
                 file.cleanup_state = "blocked".into();
-                file.cleanup_detail = Some(
-                    "Removal intent was interrupted; the source was retained or its original volume could not be proven. PIMP did not repeat removal."
-                        .into(),
-                );
+                file.cleanup_detail = Some(match source_observation {
+                    Ok(_) => "Removal intent was interrupted and the source is still present. PIMP did not repeat removal.".into(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => "Removal intent was interrupted, but absence could not be attributed to the original volume. PIMP did not repeat removal.".into(),
+                    Err(error) => format!("Removal intent outcome is indeterminate because the source could not be inspected: {error}. PIMP did not repeat removal."),
+                });
                 job.cleanup_issues.push(cleanup_issue(
                     Some(file),
                     "Interrupted removal intent requires review and was not repeated",
@@ -7002,6 +7607,37 @@ fn project_identity_for_directory(
     Ok(identities.into_iter().next())
 }
 
+fn validate_project_reassociation(
+    settings: &DeviceSettings,
+    project_id: &str,
+    returned_directory: &Path,
+    manifest_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(configured) = settings.project_paths.get(project_id) else {
+        return Ok(());
+    };
+    match fs_safe::resolve_project_directory(
+        Path::new(&settings.working_projects_path),
+        Path::new(configured),
+        false,
+    ) {
+        Ok(existing) if existing == returned_directory => Ok(()),
+        Ok(_) => Err(format!(
+            "Project {project_id} is already associated with a different authorized folder"
+        )),
+        Err(error)
+            if error == "The authorized project folder is not available locally"
+                && manifest_id == Some(project_id) =>
+        {
+            Ok(())
+        }
+        Err(error) if error == "The authorized project folder is not available locally" => Err(
+            "The previous project folder is unavailable, but the returned folder does not carry the same portable project identity".into(),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
 fn project_from_manifest(
     value: &serde_json::Value,
     fallback_name: &str,
@@ -7277,19 +7913,12 @@ fn create_project(
             tags: vec![],
             created_at: Utc::now().to_rfc3339(),
         });
-    if let Some(existing) = settings.project_paths.get(&project.id) {
-        let existing = fs_safe::resolve_project_directory(
-            Path::new(&settings.working_projects_path),
-            Path::new(existing),
-            false,
-        )?;
-        if existing != directory {
-            return Err(format!(
-                "Project {} is already associated with a different authorized folder",
-                project.id
-            ));
-        }
-    }
+    validate_project_reassociation(
+        &settings,
+        &project.id,
+        &directory,
+        manifest_id.as_deref(),
+    )?;
     let already_registered = catalogue
         .projects
         .iter()
@@ -10785,6 +11414,56 @@ fn reveal_media_in_explorer(app: AppHandle, media_id: String) -> Result<(), Stri
     result
 }
 
+fn validated_cleanup_reveal_path(
+    file: &IngestJobFile,
+    settings: &DeviceSettings,
+    target: &str,
+) -> Result<PathBuf, String> {
+    let (root, relative) = match target {
+        "source" => (cleanup_source_root(file)?, file.source_relative_path.as_str()),
+        "destination" => (
+            PathBuf::from(&settings.master_bin_path),
+            file.relative_path.as_str(),
+        ),
+        _ => return Err("Cleanup reveal target must be source or destination".into()),
+    };
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve cleanup root: {error}"))?;
+    if let Ok(path) = fs_safe::resolve_existing(&root, relative) {
+        return Ok(path);
+    }
+    let parent = Path::new(relative).parent().unwrap_or_else(|| Path::new(""));
+    if parent.as_os_str().is_empty() {
+        Ok(root)
+    } else {
+        fs_safe::resolve_existing(&root, &portable_relative(parent))
+    }
+}
+
+#[tauri::command]
+fn reveal_ingest_cleanup_issue(
+    app: AppHandle,
+    state: State<'_, NativeState>,
+    job_id: String,
+    file_id: String,
+    target: String,
+) -> Result<(), String> {
+    let settings = load_settings_file(&app)?;
+    let jobs = snapshot_jobs(&app, &state)?;
+    let file = jobs
+        .iter()
+        .find(|job| job.id == job_id)
+        .and_then(|job| job.files.iter().find(|file| file.id == file_id))
+        .ok_or("Cleanup review file no longer exists")?;
+    let path = validated_cleanup_reveal_path(file, &settings, &target)?;
+    #[cfg(target_os = "windows")]
+    reveal_path_in_explorer(&path)?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Reveal in Explorer is available only in the Windows build".into());
+    Ok(())
+}
+
 #[tauri::command]
 fn open_media_folder(app: AppHandle, media_id: String) -> Result<(), String> {
     let settings = load_settings_file(&app)?;
@@ -12238,6 +12917,9 @@ pub fn run() {
             reapprove_ingest_destinations,
             replan_ingest_destinations,
             list_removable_volumes,
+            cleanup_acceptance_mode,
+            prepare_cleanup_acceptance_fixture,
+            export_cleanup_acceptance_report,
             start_ingest,
             initialize_ingest_jobs,
             list_ingest_jobs,
@@ -12288,6 +12970,7 @@ pub fn run() {
             release_playback_proxy,
             export_premiere_manifest,
             reveal_media_in_explorer,
+            reveal_ingest_cleanup_issue,
             open_media_folder,
             reveal_library_folder,
             set_media_thumbnail_frame,
@@ -12912,6 +13595,13 @@ mod tests {
                 source_root_path: String::new(),
                 media_kind: "video".into(),
                 verified_sha256: None,
+                source_file_identity: None,
+                destination_file_identity: None,
+                destination_modified_millis: None,
+                destination_volume_identity: None,
+                destination_content_verified: false,
+                cleanup_source_bytes_read: 0,
+                cleanup_destination_bytes_read: 0,
                 cleanup_state: default_cleanup_state(),
                 cleanup_intent_id: None,
                 cleanup_detail: None,
@@ -12932,6 +13622,7 @@ mod tests {
             cleanup_state: default_cleanup_state(),
             cleanup_issues: Vec::new(),
             cleanup_scope_complete: false,
+            cleanup_report_path: None,
         }
     }
 
@@ -12980,6 +13671,13 @@ mod tests {
             source_root_path: String::new(),
             media_kind: "video".into(),
             verified_sha256: None,
+            source_file_identity: None,
+            destination_file_identity: None,
+            destination_modified_millis: None,
+            destination_volume_identity: None,
+            destination_content_verified: false,
+            cleanup_source_bytes_read: 0,
+            cleanup_destination_bytes_read: 0,
             cleanup_state: default_cleanup_state(),
             cleanup_intent_id: None,
             cleanup_detail: None,
@@ -13775,6 +14473,7 @@ mod tests {
             "cleanupState",
             "cleanupIssues",
             "cleanupScopeComplete",
+            "cleanupReportPath",
         ] {
             object.remove(key);
         }
@@ -13791,6 +14490,13 @@ mod tests {
             "sourceRootPath",
             "mediaKind",
             "verifiedSha256",
+            "sourceFileIdentity",
+            "destinationFileIdentity",
+            "destinationModifiedMillis",
+            "destinationVolumeIdentity",
+            "destinationContentVerified",
+            "cleanupSourceBytesRead",
+            "cleanupDestinationBytesRead",
             "cleanupState",
             "cleanupIntentId",
             "cleanupDetail",
@@ -13850,9 +14556,14 @@ mod tests {
         file.size_bytes = snapshot.length;
         file.bytes_transferred = snapshot.length;
         file.source_modified_millis = snapshot.modified_millis;
+        file.source_volume_identity = volume_identity_for_path(&source).unwrap();
+        file.source_file_identity = Some(file_identity(&source).unwrap());
         file.media_kind = "video".into();
         file.media_id = media.id.clone();
         file.verified_sha256 = Some(hash);
+        file.destination_file_identity = Some(file_identity(&destination).unwrap());
+        file.destination_modified_millis = fs_safe::snapshot(&destination).unwrap().modified_millis;
+        file.destination_volume_identity = volume_identity_for_path(&destination).unwrap();
         file.verification_method = Some("fast".into());
         let mut retained = file.clone();
         retained.id = "support".into();
@@ -13878,13 +14589,41 @@ mod tests {
             media: vec![media],
             ..Default::default()
         };
+        let source_identity = job.files[0].source_file_identity.take();
+        assert!(reconcile_cleanup_batch(&job, &settings, &catalogue)
+            .issues
+            .iter()
+            .any(|issue| issue.reason.contains("source-file identity")));
+        job.files[0].source_file_identity = source_identity;
+        let source_volume = job.files[0].source_volume_identity.take();
+        assert!(reconcile_cleanup_batch(&job, &settings, &catalogue)
+            .issues
+            .iter()
+            .any(|issue| issue.reason.contains("source-volume identity")));
+        job.files[0].source_volume_identity = source_volume;
         let fast = reconcile_cleanup_batch(&job, &settings, &catalogue);
         assert!(fast.issues.is_empty(), "{:?}", fast.issues);
         assert_eq!(fast.eligible_file_ids, vec!["file-1"]);
+        assert!(fast.destination_bytes_read.is_empty());
         job.files[0].verification_method = Some("deep".into());
-        assert!(reconcile_cleanup_batch(&job, &settings, &catalogue).issues.is_empty());
+        let deep = reconcile_cleanup_batch(&job, &settings, &catalogue);
+        assert!(deep.issues.is_empty());
+        assert!(deep.destination_bytes_read.is_empty());
         job.files[0].duplicate_existing_relative_path = Some("20261125/clip.mp4".into());
         assert!(reconcile_cleanup_batch(&job, &settings, &catalogue).issues.is_empty());
+        std::thread::sleep(StdDuration::from_millis(5));
+        fs::write(&destination, b"recording").unwrap();
+        let targeted = reconcile_cleanup_batch(&job, &settings, &catalogue);
+        assert!(targeted.issues.is_empty(), "{:?}", targeted.issues);
+        assert_eq!(
+            targeted.destination_bytes_read.get("file-1"),
+            Some(&snapshot.length)
+        );
+        job.files[0].destination_modified_millis = targeted
+            .refreshed_destination_modified_millis
+            .get("file-1")
+            .copied()
+            .flatten();
         let arrived = card.join("arrived-after-review.mp4");
         fs::write(&arrived, b"new").unwrap();
         assert!(reconcile_cleanup_batch(&job, &settings, &catalogue)
@@ -13898,17 +14637,27 @@ mod tests {
             .iter()
             .any(|issue| issue.reason.contains("Destination")));
         fs::write(&destination, b"recording").unwrap();
+        assert!(reconcile_cleanup_batch(&job, &settings, &catalogue)
+            .issues
+            .iter()
+            .any(|issue| issue.reason.contains("destination file was replaced")));
+        job.files[0].destination_file_identity = Some(file_identity(&destination).unwrap());
+        job.files[0].destination_modified_millis =
+            fs_safe::snapshot(&destination).unwrap().modified_millis;
+        std::thread::sleep(StdDuration::from_millis(5));
         fs::write(&destination, b"tampered!").unwrap();
         assert!(reconcile_cleanup_batch(&job, &settings, &catalogue)
             .issues
             .iter()
             .any(|issue| issue.reason.contains("destination SHA-256")));
         fs::write(&destination, b"recording").unwrap();
-        fs::write(&source, b"different").unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"recording").unwrap();
         assert!(reconcile_cleanup_batch(&job, &settings, &catalogue)
             .issues
             .iter()
-            .any(|issue| issue.reason.contains("Source size or modification")));
+            .any(|issue| issue.reason.contains("source file was replaced")
+                || issue.reason.contains("Source size or modification")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -13917,18 +14666,57 @@ mod tests {
         let root = temporary("cleanup-remove");
         let source = root.join("clip.mp4");
         fs::write(&source, b"expected").unwrap();
-        let hash = sha256(&source).unwrap();
         let modified = fs_safe::snapshot(&source).unwrap().modified_millis;
+        let identity = file_identity(&source).unwrap();
         assert!(remove_exact_source(
             &source,
             8,
             modified,
-            &format!("{:x}", Sha256::digest(b"changed!"))
+            "wrong-file-identity"
         )
         .is_err());
         assert!(source.exists());
-        remove_exact_source(&source, 8, modified, &hash).unwrap();
+        remove_exact_source(&source, 8, modified, &identity).unwrap();
         assert!(!source.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_issue_reveal_is_confined_to_recorded_roots() {
+        let root = temporary("cleanup-reveal");
+        let card = root.join("card");
+        let master = root.join("master");
+        fs::create_dir_all(card.join("DCIM")) .unwrap();
+        fs::create_dir_all(master.join("20261125")).unwrap();
+        let source = card.join("DCIM/clip.mp4");
+        let destination = master.join("20261125/clip.mp4");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destination").unwrap();
+        let mut file = ingest_job("completed", "completed").files.remove(0);
+        file.source_root_path = card.to_string_lossy().into_owned();
+        file.source_relative_path = "DCIM/clip.mp4".into();
+        file.relative_path = "20261125/clip.mp4".into();
+        let settings = DeviceSettings {
+            master_bin_path: master.to_string_lossy().into_owned(),
+            ..DeviceSettings::default()
+        };
+
+        assert_eq!(
+            validated_cleanup_reveal_path(&file, &settings, "source").unwrap(),
+            source.canonicalize().unwrap()
+        );
+        assert_eq!(
+            validated_cleanup_reveal_path(&file, &settings, "destination").unwrap(),
+            destination.canonicalize().unwrap()
+        );
+        fs::remove_file(&destination).unwrap();
+        assert_eq!(
+            validated_cleanup_reveal_path(&file, &settings, "destination").unwrap(),
+            master.join("20261125").canonicalize().unwrap()
+        );
+        file.source_relative_path = "../outside.mp4".into();
+        assert!(validated_cleanup_reveal_path(&file, &settings, "source").is_err());
+        assert!(validated_cleanup_reveal_path(&file, &settings, "other").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -13945,6 +14733,7 @@ mod tests {
         present.files[0].source_path = source.to_string_lossy().into_owned();
         present.files[0].source_relative_path = "clip.mp4".into();
         present.files[0].source_root_path = card.to_string_lossy().into_owned();
+        present.files[0].source_volume_identity = volume_identity_for_path(&card).unwrap();
         present.files[0].media_kind = "video".into();
         present.files[0].cleanup_state = "intent-persisted".into();
         let mut absent = present.clone();
@@ -13959,6 +14748,30 @@ mod tests {
         assert_eq!(jobs[1].files[0].cleanup_state, "removed");
         assert!(source.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_cleanup_permission_error_is_indeterminate_not_removed() {
+        let mut job = ingest_job("interrupted", "completed");
+        job.cleanup_requested = true;
+        job.cleanup_state = "removing".into();
+        job.files[0].media_kind = "video".into();
+        job.files[0].cleanup_state = "intent-persisted".into();
+        let mut jobs = vec![job];
+        reconcile_interrupted_cleanup_intents_with(&mut jobs, &|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected sharing violation",
+            ))
+        });
+        assert_eq!(jobs[0].state, "needs-attention");
+        assert_eq!(jobs[0].cleanup_state, "blocked");
+        assert_eq!(jobs[0].files[0].cleanup_state, "blocked");
+        assert!(jobs[0].files[0]
+            .cleanup_detail
+            .as_deref()
+            .unwrap()
+            .contains("indeterminate"));
     }
 
     #[test]
@@ -14127,6 +14940,145 @@ mod tests {
                 "journalPersistenceMillis": journal_millis,
                 "catalogueRegistrationMillis": registration_millis,
                 "duplicateVerification": {"millis": duplicate_verification_millis, "sourceAndDestinationBytesRead": size_bytes * 2}
+            })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "multi-file full-lifecycle benchmark; run explicitly"]
+    fn benchmark_complete_cleanup_lifecycle() {
+        fn copy_and_hash(source: &Path, destination: &Path) -> String {
+            let mut input = File::open(source).unwrap();
+            let mut output = File::create(destination).unwrap();
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let read = input.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                output.write_all(&buffer[..read]).unwrap();
+            }
+            output.sync_all().unwrap();
+            format!("{:x}", hasher.finalize())
+        }
+
+        let root = temporary("complete-cleanup-benchmark");
+        let card = root.join("card");
+        fs::create_dir_all(&card).unwrap();
+        let file_mib = std::env::var("PIMP_BENCHMARK_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(32);
+        let file_count = std::env::var("PIMP_BENCHMARK_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3);
+        let runs = std::env::var("PIMP_BENCHMARK_RUNS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3);
+        let block = vec![0x6d_u8; 1024 * 1024];
+        let mut sources = Vec::new();
+        for index in 0..file_count {
+            let source = card.join(format!("recording-{index}.mp4"));
+            let mut file = File::create(&source).unwrap();
+            for _ in 0..file_mib {
+                file.write_all(&block).unwrap();
+            }
+            file.sync_all().unwrap();
+            sources.push(source);
+        }
+        let batch_bytes = sources
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum::<u64>();
+        let expected_hashes = sources
+            .iter()
+            .map(|source| sha256(source).unwrap())
+            .collect::<Vec<_>>();
+        let mut measurements = Vec::new();
+        for run in 0..runs {
+            let mut measure = |name: &str, deep: bool, cleanup: bool| {
+                let destination = root.join(format!("{name}-{run}"));
+                fs::create_dir_all(&destination).unwrap();
+                let started = Instant::now();
+                let mut destinations = Vec::new();
+                for (index, source) in sources.iter().enumerate() {
+                    let target = destination.join(format!("recording-{index}.mp4"));
+                    let expected = copy_and_hash(source, &target);
+                    if deep {
+                        assert_eq!(sha256(&target).unwrap(), expected);
+                    }
+                    if cleanup {
+                        let snapshot = fs_safe::snapshot(&target).unwrap();
+                        let identity = file_identity(&target).unwrap();
+                        let protected = open_validated_destination(
+                            &target,
+                            snapshot.length,
+                            snapshot.modified_millis,
+                            &identity,
+                        )
+                        .unwrap();
+                        drop(protected);
+                    }
+                    destinations.push(target);
+                }
+                measurements.push(serde_json::json!({
+                    "run": run + 1,
+                    "scenario": name,
+                    "millis": started.elapsed().as_millis(),
+                    "sourceBytesRead": batch_bytes,
+                    "destinationBytesWritten": batch_bytes,
+                    "destinationBytesRead": if deep { batch_bytes } else { 0 },
+                    "cleanupAdditionalContentBytesRead": 0
+                }));
+                destinations
+            };
+
+            let _ = measure("fast-without-cleanup", false, false);
+            let _ = measure("deep-without-cleanup", true, false);
+            let fast_cleanup = measure("fast-with-cleanup", false, true);
+            let _ = measure("deep-with-cleanup", true, true);
+
+            let duplicate_started = Instant::now();
+            for (source, destination) in sources.iter().zip(&fast_cleanup) {
+                assert_eq!(sha256(source).unwrap(), sha256(destination).unwrap());
+            }
+            measurements.push(serde_json::json!({
+                "run": run + 1,
+                "scenario": "existing-duplicate-with-cleanup",
+                "millis": duplicate_started.elapsed().as_millis(),
+                "sourceBytesRead": batch_bytes,
+                "destinationBytesRead": batch_bytes,
+                "destinationBytesWritten": 0,
+                "cleanupAdditionalContentBytesRead": 0
+            }));
+
+            let investigation_started = Instant::now();
+            for (destination, expected) in fast_cleanup.iter().zip(&expected_hashes) {
+                assert_eq!(&sha256(destination).unwrap(), expected);
+            }
+            measurements.push(serde_json::json!({
+                "run": run + 1,
+                "scenario": "inconsistent-targeted-investigation",
+                "millis": investigation_started.elapsed().as_millis(),
+                "sourceBytesRead": 0,
+                "destinationBytesRead": batch_bytes,
+                "destinationBytesWritten": 0,
+                "cleanupAdditionalContentBytesRead": batch_bytes
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "fileCount": file_count,
+                "fileMiB": file_mib,
+                "runs": runs,
+                "batchBytes": batch_bytes,
+                "measurements": measurements
             })
         );
         fs::remove_dir_all(root).unwrap();
@@ -15880,6 +16832,141 @@ mod tests {
             project_identity_for_directory(&state_path, &settings, &directory, Some("project-c"))
                 .unwrap_err();
         assert!(conflict.contains("conflicting project identities"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn returned_project_rebinds_only_with_matching_manifest_identity() {
+        let root = temporary("returned-project-rebind");
+        let projects_root = root.join("projects");
+        let returned = projects_root.join("Returned");
+        fs::create_dir_all(&returned).unwrap();
+        let returned = returned.canonicalize().unwrap();
+        let mut settings = DeviceSettings::default();
+        settings.working_projects_path = projects_root.to_string_lossy().into_owned();
+        settings.project_paths.insert(
+            "project-a".into(),
+            projects_root
+                .join("Unavailable Original")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        validate_project_reassociation(
+            &settings,
+            "project-a",
+            &returned,
+            Some("project-a"),
+        )
+        .unwrap();
+        let mismatch = validate_project_reassociation(
+            &settings,
+            "project-a",
+            &returned,
+            Some("project-b"),
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("does not carry the same portable project identity"));
+
+        let original = projects_root.join("Unavailable Original");
+        fs::create_dir_all(&original).unwrap();
+        let conflict = validate_project_reassociation(
+            &settings,
+            "project-a",
+            &returned,
+            Some("project-a"),
+        )
+        .unwrap_err();
+        assert!(conflict.contains("already associated"));
+
+        let second_projects_root = root.join("second-device-projects");
+        let second_return = second_projects_root.join("Renamed on laptop");
+        fs::create_dir_all(&second_return).unwrap();
+        let second_return = second_return.canonicalize().unwrap();
+        let mut second_settings = DeviceSettings::default();
+        second_settings.working_projects_path =
+            second_projects_root.to_string_lossy().into_owned();
+        let second_state = root.join("second-device-manifest-sync.json");
+        assert_eq!(
+            project_identity_for_directory(
+                &second_state,
+                &second_settings,
+                &second_return,
+                Some("project-a"),
+            )
+            .unwrap(),
+            Some("project-a".into())
+        );
+        validate_project_reassociation(
+            &second_settings,
+            "project-a",
+            &second_return,
+            Some("project-a"),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporary_master_absence_and_return_preserves_media_identity() {
+        let root = temporary("temporary-master-absence");
+        let master = root.join("master");
+        let away = root.join("temporarily-away");
+        fs::create_dir_all(master.join("20261125")).unwrap();
+        fs::create_dir_all(master.join("20261124")).unwrap();
+        fs::write(master.join("20261125/clip.mp4"), b"synthetic media").unwrap();
+        fs::write(master.join("20261125/clip.wav"), b"synthetic audio").unwrap();
+        fs::write(master.join("20261124/older.mp4"), b"older media").unwrap();
+        let portable_metadata = HashMap::from([
+            (
+                "stable-video-id",
+                (vec!["interview"], "keep description", true, vec!["project-a"]),
+            ),
+            (
+                "stable-audio-id",
+                (vec!["sound"], "paired audio", false, vec!["project-a"]),
+            ),
+        ]);
+        let mut availability = HashMap::from([
+            (
+                "stable-video-id".into(),
+                ("20261125/clip.mp4".into(), true),
+            ),
+            (
+                "stable-audio-id".into(),
+                ("20261125/clip.wav".into(), true),
+            ),
+            (
+                "stable-older-id".into(),
+                ("20261124/older.mp4".into(), true),
+            ),
+        ]);
+
+        fs::rename(master.join("20261125"), &away).unwrap();
+        assert!(refresh_availability_map(&master, &mut availability));
+        assert_eq!(
+            availability.get("stable-video-id"),
+            Some(&("20261125/clip.mp4".into(), false))
+        );
+        assert_eq!(
+            availability.get("stable-audio-id"),
+            Some(&("20261125/clip.wav".into(), false))
+        );
+        assert_eq!(
+            availability.get("stable-older-id"),
+            Some(&("20261124/older.mp4".into(), true))
+        );
+        assert!(!refresh_availability_map(&master, &mut availability));
+
+        fs::rename(&away, master.join("20261125")).unwrap();
+        assert!(refresh_availability_map(&master, &mut availability));
+        assert_eq!(
+            availability.get("stable-video-id"),
+            Some(&("20261125/clip.mp4".into(), true))
+        );
+        assert_eq!(availability.len(), 3);
+        assert_eq!(portable_metadata["stable-video-id"].1, "keep description");
+        assert_eq!(portable_metadata["stable-video-id"].3, vec!["project-a"]);
         fs::remove_dir_all(root).unwrap();
     }
 

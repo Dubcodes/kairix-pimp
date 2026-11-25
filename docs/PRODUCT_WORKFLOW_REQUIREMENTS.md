@@ -30,9 +30,9 @@ These are implementation claims backed by automated tests; installed production-
 
 - Requirements/ADR reconciliation: implemented in documentation.
 - Fast/Deep verification and method evidence: implemented and automated-test covered; Deep remains the compatibility default. Fast evidence stays pending until selective Deep verification.
-- Cleanup authorization/state machine: job-specific revisioned authorization, complete-batch reconciliation, consolidated review, durable intent/outcome evidence and restart observation are implemented and automated-test covered. Production removal is hard-disabled pending disposable removable-media acceptance.
-- Temporary absence/return regression coverage: planned focused checkpoint; no destructive offload operation.
-- Completed-project restoration foundation: planned read-only checkpoint.
+- Cleanup authorization/state machine: job-specific revisioned authorization, complete-batch reconciliation, consolidated review with validated Explorer actions, identity-bound evidence reuse, durable intent/outcome evidence and restart observation are implemented and automated-test covered. Ordinary-package removal is hard-disabled. A separately identified isolated acceptance build is packaged for exact generated fixtures only; owner-operated physical acceptance is pending.
+- Temporary absence/return regression coverage: ordinary availability refresh proves disappearance and same-path return without deleting or duplicating the stable catalogue record. Different-path return continues through explicit relocation review; there is no destructive offload operation.
+- Completed-project restoration foundation: a compatible `.pimp-project.json` may rebind an existing stable project only when its prior authorized local folder is unavailable. A live conflicting folder or mismatched identity blocks. Incremental saved-project/media reindexing beyond existing fingerprinted projections remains staged.
 
 ## Future planned functionality
 

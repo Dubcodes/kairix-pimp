@@ -5,6 +5,9 @@ description = "Production Ingest & Media Processor"
 authors = ["Kairix"]
 edition = "2021"
 
+[features]
+cleanup-acceptance = []
+
 [lib]
 name = "kairix_pimp_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

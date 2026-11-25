@@ -6,7 +6,18 @@ Master Bin/project cleanup is a different lifecycle operation. It still requires
 
 ## Implementation checkpoint
 
-The durable ingest-job schema, job-specific revisioned authorization, whole-batch reconciliation, consolidated review, locked authorization revision, per-file intent/outcome journal and restart observation are implemented with synthetic native tests. The UI exposes the off-by-default authorization and current review state. Test builds exercise exact handle-bound deletion only inside disposable fixture roots. Production builds stop at `acceptance-required`; they cannot remove source files until the real installed disposable-removable-media matrix below passes and that gate is changed in a separately reviewed commit.
+The durable ingest-job schema, job-specific revisioned authorization, whole-batch reconciliation, consolidated review, validated Explorer actions, locked authorization revision, per-file intent/outcome journal and restart observation are implemented with synthetic native tests. Persisted source/destination file identities, snapshots and volume identities let unchanged Fast or Deep evidence survive cleanup reconciliation without another content read. A changed destination timestamp triggers one targeted SHA-256 read; replacement or missing identity blocks. Final source removal uses an identity-bound exclusive handle and does not reread source content.
+
+Ordinary Development and Stable builds stop at `acceptance-required`. The `cleanup-acceptance` Cargo feature is separately packaged under `com.kairix.pimp.cleanup-acceptance`. It creates an exact synthetic fixture on a selected empty detected removable volume, redirects settings/catalogue/cache roots to isolated application data, revalidates the fixture manifest before the same native removal path, rejects additions/substitutions/non-removable media and exports JSON evidence. It is not a production enablement switch.
+
+## Content-pass policy
+
+- Fast new copy: one source read while hashing/writing staging, one destination write and no destination reread. Cleanup adds metadata/identity checks only while evidence is unchanged.
+- Deep new copy: the Fast work plus one independent staged-destination read. Cleanup adds no unchanged-content pass.
+- Existing duplicate: one source hash and one independent current destination hash establish the duplicate; cleanup reuses that identity-bound evidence.
+- A changed timestamp or discrepancy triggers a targeted affected-destination hash. Missing or replaced identities fail closed instead of falling back to path/size trust.
+
+Targeted cleanup reads acquire destination-volume admission and are added to per-file cleanup diagnostics. Metadata and handle validation are not misreported as content bytes.
 
 ## Durable state model
 

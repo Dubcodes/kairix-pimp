@@ -64,6 +64,11 @@ const mocks = vi.hoisted(() => ({
   initializeIngestJobs: vi.fn(),
   clearCompletedIngestJobs: vi.fn(),
   setIngestCleanupAuthorization: vi.fn(),
+  revealIngestCleanupIssue: vi.fn(),
+  cleanupAcceptanceMode: vi.fn(),
+  prepareCleanupAcceptanceFixture: vi.fn(),
+  chooseCleanupAcceptanceReportDestination: vi.fn(),
+  exportCleanupAcceptanceReport: vi.fn(),
   updateIngestFileMetadata: vi.fn(),
   jobListener: undefined as
     ((jobs: import('./bridge').IngestJob[]) => void) | undefined,
@@ -148,6 +153,12 @@ vi.mock('./bridge', () => ({
     listIngestJobs: vi.fn(async () => []),
     clearCompletedIngestJobs: mocks.clearCompletedIngestJobs,
     setIngestCleanupAuthorization: mocks.setIngestCleanupAuthorization,
+    revealIngestCleanupIssue: mocks.revealIngestCleanupIssue,
+    cleanupAcceptanceMode: mocks.cleanupAcceptanceMode,
+    prepareCleanupAcceptanceFixture: mocks.prepareCleanupAcceptanceFixture,
+    chooseCleanupAcceptanceReportDestination:
+      mocks.chooseCleanupAcceptanceReportDestination,
+    exportCleanupAcceptanceReport: mocks.exportCleanupAcceptanceReport,
     updateIngestFileMetadata: mocks.updateIngestFileMetadata,
     pauseIngest: vi.fn(),
     resumeIngest: vi.fn(),
@@ -406,6 +417,13 @@ describe('native application integration', () => {
     );
     mocks.updateIngestFileMetadata.mockReset();
     mocks.setIngestCleanupAuthorization.mockReset();
+    mocks.revealIngestCleanupIssue.mockReset();
+    mocks.revealIngestCleanupIssue.mockResolvedValue(undefined);
+    mocks.cleanupAcceptanceMode.mockReset();
+    mocks.cleanupAcceptanceMode.mockResolvedValue(false);
+    mocks.prepareCleanupAcceptanceFixture.mockReset();
+    mocks.chooseCleanupAcceptanceReportDestination.mockReset();
+    mocks.exportCleanupAcceptanceReport.mockReset();
     mocks.jobListener = undefined;
     mocks.catalogueListener = undefined;
     mocks.refreshMediaAvailability.mockReset();
@@ -2331,6 +2349,17 @@ describe('native application integration', () => {
       cleanupRequested: false,
       cleanupAuthorizationRevision: 4,
       cleanupState: 'authorized',
+      cleanupIssues: [
+        {
+          fileId: 'cleanup-file',
+          sourcePath: 'E:\\card\\clip.mp4',
+          destinationPath: 'D:\\master\\clip.mp4',
+          expected: 'verified evidence',
+          observed: 'changed evidence',
+          reason: 'Cleanup evidence changed',
+          action: 'Review both files.',
+        },
+      ],
     };
     const updated = {
       ...job,
@@ -2353,6 +2382,41 @@ describe('native application integration', () => {
       true,
     );
     expect(await screen.findByText(/changed from off to on/i)).toBeVisible();
+    const revealSource = screen.getByRole('button', { name: 'Reveal source' });
+    revealSource.focus();
+    await user.keyboard('{Enter}');
+    expect(mocks.revealIngestCleanupIssue).toHaveBeenCalledWith(
+      'cleanup',
+      'cleanup-file',
+      'source',
+    );
+  });
+
+  it('exposes fixture preparation only in the isolated cleanup acceptance build', async () => {
+    mocks.cleanupAcceptanceMode.mockResolvedValue(true);
+    mocks.chooseFolder.mockResolvedValue('E:\\Disposable');
+    mocks.prepareCleanupAcceptanceFixture.mockResolvedValue({
+      sourcePath: 'E:\\Disposable',
+      fixtureId: 'fixture-1',
+      manifestPath: 'E:\\Disposable\\.kairix-pimp-cleanup-acceptance.json',
+      settings: mocks.settings,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Ingest' }));
+    await user.click(
+      await screen.findByRole('button', {
+        name: 'Prepare disposable cleanup fixture',
+      }),
+    );
+    expect(mocks.prepareCleanupAcceptanceFixture).toHaveBeenCalledWith(
+      'E:\\Disposable',
+    );
+    expect(
+      await screen.findByText(
+        'Disposable cleanup fixture fixture-1 created in the isolated acceptance workspace.',
+      ),
+    ).toBeVisible();
   });
 
   it('offers keyboard-accessible Fast and Deep ingest verification choices', async () => {
