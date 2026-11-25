@@ -1,6 +1,7 @@
 mod backup;
 mod catalogue;
 mod discovery;
+mod file_continuity;
 mod fs_safe;
 mod premiere_index;
 mod resource_governor;
@@ -13,6 +14,13 @@ use catalogue::{
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
+use file_continuity::{
+    evidence_for_handle, file_identity, hash_with_evidence, open_protected_read,
+    open_validated_destination, remove_exact_source, validated_ingest_verification_mode,
+    verify_approved_source_hash, verify_staged_handle, ContinuityEvidence,
+};
+#[cfg(test)]
+use file_continuity::verify_staged_copy;
 use premiere_index::PremiereProjectIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,11 +43,9 @@ use walkdir::WalkDir;
 use windows::{
     core::{implement, PCWSTR},
     Win32::{
-        Foundation::{
-            DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK,
-        },
+        Foundation::{DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK},
         System::{
-            Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL},
+            Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL},
             Ole::{
                 DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
                 CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
@@ -771,6 +777,7 @@ struct CleanupIssue {
 }
 
 const CLEANUP_ACCEPTANCE_MANIFEST: &str = ".kairix-pimp-cleanup-acceptance.json";
+const CLEANUP_ACCEPTANCE_TRUST_RECORD: &str = "cleanup-acceptance-trusted-fixture.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -798,6 +805,14 @@ struct CleanupAcceptancePreparation {
     fixture_id: String,
     manifest_path: String,
     settings: DeviceSettings,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CleanupAcceptanceTrustRecord {
+    schema_version: u32,
+    source_root: String,
+    manifest: CleanupAcceptanceManifest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2841,7 +2856,17 @@ fn classify_global_duplicate(
                 continue;
             }
         };
-        let before = match fs_safe::snapshot(&candidate) {
+        let mut candidate_file = match open_protected_read(&candidate) {
+            Ok(file) => file,
+            Err(error) => {
+                failures.push(format!(
+                    "{} cannot be protected: {error}",
+                    item.relative_path
+                ));
+                continue;
+            }
+        };
+        let before = match evidence_for_handle(&candidate_file) {
             Ok(value) if value.length == expected_size => value,
             Ok(_) => {
                 failures.push(format!("{} has a different size", item.relative_path));
@@ -2857,32 +2882,35 @@ fn classify_global_duplicate(
             let volume_id = match volume_resource_id(&candidate) {
                 Ok(value) => value,
                 Err(error) => {
-                    failures.push(format!("{} volume is unavailable: {error}", item.relative_path));
+                    failures.push(format!(
+                        "{} volume is unavailable: {error}",
+                        item.relative_path
+                    ));
                     continue;
                 }
             };
             match state.volume_governor.acquire(
-                    resource_governor::Request::new(
-                        format!("Duplicate verification: {}", item.original_filename),
-                        resource_governor::PRIORITY_RECOVERY,
-                        false,
-                        vec![resource_governor::VolumeNeed::read(volume_id.clone())],
-                    ),
-                    || {
-                        cancellable_operation_id
-                            .is_some_and(|id| inventory_was_cancelled(state, id))
-                    },
-                ) {
+                resource_governor::Request::new(
+                    format!("Duplicate verification: {}", item.original_filename),
+                    resource_governor::PRIORITY_RECOVERY,
+                    false,
+                    vec![resource_governor::VolumeNeed::read(volume_id.clone())],
+                ),
+                || cancellable_operation_id.is_some_and(|id| inventory_was_cancelled(state, id)),
+            ) {
                 Ok(permit) => Some((permit, volume_id)),
                 Err(error) => {
-                    failures.push(format!("{} verification was not admitted: {error}", item.relative_path));
+                    failures.push(format!(
+                        "{} verification was not admitted: {error}",
+                        item.relative_path
+                    ));
                     continue;
                 }
             }
         } else {
             None
         };
-        let hash = sha256(&candidate);
+        let hash = file_continuity::sha256_for_handle(&mut candidate_file);
         if let Some((permit, volume_id)) = volume_permit.as_mut() {
             if hash.is_ok() {
                 permit.add_bytes_for(volume_id, expected_size, 0);
@@ -2890,7 +2918,7 @@ fn classify_global_duplicate(
                 permit.record_error(error.clone());
             }
         }
-        let after = fs_safe::snapshot(&candidate);
+        let after = evidence_for_handle(&candidate_file);
         if hash.as_deref() == Ok(source_hash) && after.as_ref() == Ok(&before) {
             return (
                 "already-imported".into(),
@@ -4049,6 +4077,9 @@ struct VerifiedCopy {
     hash: String,
     journal_path: PathBuf,
     staged_path: PathBuf,
+    staging_handle: Option<File>,
+    source_evidence: ContinuityEvidence,
+    staged_evidence: ContinuityEvidence,
     verification_method: String,
     source_bytes_read: u64,
     destination_bytes_written: u64,
@@ -4061,44 +4092,6 @@ struct VerifiedCopy {
 struct RecoverySummary {
     recovered: usize,
     needs_review: usize,
-}
-
-fn verify_approved_source_hash(actual: &str, approved: &str) -> Result<(), String> {
-    if actual == approved {
-        Ok(())
-    } else {
-        Err(
-            "Source bytes no longer match the approved inventory SHA-256; staged copy was rejected"
-                .into(),
-        )
-    }
-}
-
-fn validated_ingest_verification_mode(value: &str) -> Result<&str, String> {
-    match value {
-        "fast" | "deep" => Ok(value),
-        _ => Err("Ingest verification mode must be Fast or Deep".into()),
-    }
-}
-
-fn verify_staged_copy(
-    staged: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-    verification_mode: &str,
-) -> Result<u64, String> {
-    let verification_mode = validated_ingest_verification_mode(verification_mode)?;
-    let staged_size = staged.metadata().map_err(|error| error.to_string())?.len();
-    if staged_size != expected_size {
-        return Err("Staged destination size does not match the completed source read".into());
-    }
-    if verification_mode == "fast" {
-        return Ok(0);
-    }
-    if sha256(staged)? != expected_sha256 {
-        return Err("Independent SHA-256 verification failed".into());
-    }
-    Ok(staged_size)
 }
 
 fn update_job_progress(
@@ -4312,7 +4305,6 @@ fn copy_verified(
             return Err("The source volume changed after approval; rescan the card".into());
         }
     }
-    let before = fs_safe::snapshot(source)?;
     let staging = fs_safe::staging_root(Path::new(&settings.master_bin_path), &settings.device_id)?;
     let staged_name = format!("{}.part", Uuid::new_v4());
     let temp = staging.join("files").join(&staged_name);
@@ -4330,14 +4322,21 @@ fn copy_verified(
         media: None,
     };
     write_json(&journal_path, &journal)?;
-    let operation: Result<(String, u64, u64, u64), String> = (|| {
-        let mut input =
-            File::open(source).map_err(|error| format!("Cannot read source: {error}"))?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|error| format!("Cannot create staging file: {error}"))?;
+    let operation: Result<
+        (
+            String,
+            u64,
+            u64,
+            u64,
+            File,
+            ContinuityEvidence,
+            ContinuityEvidence,
+        ),
+        String,
+    > = (|| {
+        let mut input = open_protected_read(source)?;
+        let source_evidence = evidence_for_handle(&input)?;
+        let mut output = file_continuity::create_staging_file(&temp)?;
         let mut copied = 0u64;
         let mut source_hash = Sha256::new();
         let mut buffer = vec![0u8; 1024 * 1024];
@@ -4393,7 +4392,7 @@ fn copy_verified(
             }
         }
         output.sync_all().map_err(|error| error.to_string())?;
-        drop(output);
+        let staged_evidence = evidence_for_handle(&output)?;
         let copy_duration_millis = started.elapsed().as_millis() as u64;
         let verification_started = Instant::now();
         update_job_progress(app, state, job_id, file_id, "verifying", copied, None)?;
@@ -4415,8 +4414,8 @@ fn copy_verified(
         if let Some(approved_hash) = approved_hash {
             verify_approved_source_hash(&copied_source_hash, approved_hash)?;
         }
-        let after = fs_safe::snapshot(source)?;
-        if before != after || copied != before.length {
+        let source_after = evidence_for_handle(&input)?;
+        if source_evidence != source_after || copied != source_evidence.length {
             return Err("Source changed during transfer; staged copy was rejected".into());
         }
         if let Some(expected_volume) = source_volume_identity {
@@ -4426,8 +4425,13 @@ fn copy_verified(
                 );
             }
         }
-        let destination_bytes_read =
-            verify_staged_copy(&temp, copied, &copied_source_hash, verification_mode)?;
+        let destination_bytes_read = verify_staged_handle(
+            &mut output,
+            &staged_evidence,
+            copied,
+            &copied_source_hash,
+            verification_mode,
+        )?;
         journal.status = "verified".into();
         write_json(&journal_path, &journal)?;
         Ok((
@@ -4435,6 +4439,9 @@ fn copy_verified(
             copy_duration_millis,
             verification_started.elapsed().as_millis() as u64,
             destination_bytes_read,
+            output,
+            source_evidence,
+            staged_evidence,
         ))
     })();
     match operation {
@@ -4443,20 +4450,26 @@ fn copy_verified(
             copy_duration_millis,
             verification_duration_millis,
             destination_bytes_read,
+            staging_handle,
+            source_evidence,
+            staged_evidence,
         )) => {
-            volume_permit.add_bytes_for(&source_volume, before.length, 0);
+            volume_permit.add_bytes_for(&source_volume, source_evidence.length, 0);
             volume_permit.add_bytes_for(
                 &destination_volume,
                 destination_bytes_read,
-                before.length,
+                source_evidence.length,
             );
             Ok(VerifiedCopy {
                 hash,
                 journal_path,
                 staged_path: temp,
+                staging_handle: Some(staging_handle),
+                source_evidence: source_evidence.clone(),
+                staged_evidence,
                 verification_method: verification_mode.into(),
-                source_bytes_read: before.length,
-                destination_bytes_written: before.length,
+                source_bytes_read: source_evidence.length,
+                destination_bytes_written: source_evidence.length,
                 destination_bytes_read,
                 copy_duration_millis,
                 verification_duration_millis,
@@ -4483,8 +4496,16 @@ fn copy_verified(
     }
 }
 
-fn promote_verified_copy(copy: &VerifiedCopy, destination: &Path) -> Result<(), String> {
+fn promote_verified_copy(copy: &mut VerifiedCopy, destination: &Path) -> Result<(), String> {
     fs_safe::promote_no_overwrite(&copy.staged_path, destination)?;
+    let staging_handle = copy
+        .staging_handle
+        .take()
+        .ok_or("Verified staging handle is unavailable")?;
+    if evidence_for_handle(&staging_handle)? != copy.staged_evidence {
+        return Err("Promoted destination no longer matches the verified staging handle".into());
+    }
+    drop(staging_handle);
     let mut journal: IngestJournal = read_json(&copy.journal_path)?;
     journal.status = "committed".into();
     write_json(&copy.journal_path, &journal)
@@ -4616,6 +4637,7 @@ fn commit_job_file(
     job_id: &str,
     file_id: &str,
     hash: String,
+    expected_destination: Option<&ContinuityEvidence>,
     journal_path: Option<&Path>,
 ) -> Result<(), String> {
     let _catalogue_guard = state.catalogue_write.lock().unwrap();
@@ -4635,6 +4657,16 @@ fn commit_job_file(
         .clone()
         .unwrap_or_else(default_ingest_verification_mode);
     let destination = PathBuf::from(&file.destination_path);
+    let _destination_guard = expected_destination
+        .map(|evidence| {
+            open_validated_destination(
+                &destination,
+                evidence.length,
+                evidence.modified_millis,
+                &evidence.identity,
+            )
+        })
+        .transpose()?;
     let (_, capture, provenance) = destination_date(
         settings,
         &PathBuf::from(&file.source_path),
@@ -4680,7 +4712,10 @@ fn commit_job_file(
     // this device at commit time so a successful ingest is not presented as an
     // unverified discovery candidate on every quick inventory.
     let committed_snapshot = fs_safe::snapshot(&destination)?;
-    file.destination_file_identity = Some(file_identity(&destination)?);
+    file.destination_file_identity = Some(match expected_destination {
+        Some(evidence) => evidence.identity.clone(),
+        None => file_identity(&destination)?,
+    });
     file.destination_modified_millis = committed_snapshot.modified_millis;
     file.destination_volume_identity = volume_identity_for_path(&destination)?;
     let evidence_item = catalogue
@@ -4737,12 +4772,13 @@ fn complete_duplicate_job_file(
         .iter()
         .find(|media| media.id == media_id)
         .ok_or("Verified duplicate no longer exists in the catalogue")?;
-    let destination = fs_safe::resolve_existing(
-        Path::new(&settings.master_bin_path),
-        &media.relative_path,
-    )?;
-    let snapshot = fs_safe::snapshot(&destination)?;
-    let destination_identity = file_identity(&destination)?;
+    let destination =
+        fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &media.relative_path)?;
+    let (destination_hash, destination_evidence) = hash_with_evidence(&destination)?;
+    if destination_hash != media.sha256 || destination_evidence.length != media.technical.size_bytes
+    {
+        return Err("Verified duplicate changed before job completion".into());
+    }
     let destination_volume_identity = volume_identity_for_path(&destination)?;
     mutate_jobs(app, state, |jobs| {
         let job = jobs
@@ -4757,8 +4793,8 @@ fn complete_duplicate_job_file(
         file.media_id = media_id.into();
         file.relative_path = media.relative_path.clone();
         file.destination_path = destination.to_string_lossy().into_owned();
-        file.destination_file_identity = Some(destination_identity);
-        file.destination_modified_millis = snapshot.modified_millis;
+        file.destination_file_identity = Some(destination_evidence.identity);
+        file.destination_modified_millis = destination_evidence.modified_millis;
         file.destination_volume_identity = destination_volume_identity;
         file.state = "completed".into();
         file.bytes_transferred = bytes_processed;
@@ -5185,6 +5221,15 @@ fn prepare_cleanup_acceptance_fixture(
         files,
     };
     let manifest_path = selected.join(CLEANUP_ACCEPTANCE_MANIFEST);
+    let trust_record = CleanupAcceptanceTrustRecord {
+        schema_version: 1,
+        source_root: selected.to_string_lossy().into_owned(),
+        manifest: manifest.clone(),
+    };
+    write_json(
+        &app_data.join(CLEANUP_ACCEPTANCE_TRUST_RECORD),
+        &trust_record,
+    )?;
     write_json(&manifest_path, &manifest)?;
 
     let mut settings = load_settings_file(&app)?;
@@ -5206,7 +5251,31 @@ fn prepare_cleanup_acceptance_fixture(
     })
 }
 
+fn validate_acceptance_trust_boundary(
+    root: &Path,
+    master: &Path,
+    isolated_master: &Path,
+    manifest: &CleanupAcceptanceManifest,
+    trusted: &CleanupAcceptanceTrustRecord,
+    trusted_root: &Path,
+) -> Result<(), String> {
+    if trusted.schema_version != 1
+        || trusted.manifest != *manifest
+        || trusted_root != root
+        || master != isolated_master
+        || fs_safe::within(root, master)
+        || fs_safe::within(master, root)
+    {
+        return Err(
+            "The removable manifest does not match the trusted app-local acceptance boundary"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_cleanup_acceptance_job(
+    app: &AppHandle,
     job: &IngestJob,
     settings: &DeviceSettings,
 ) -> Result<CleanupAcceptanceManifest, String> {
@@ -5229,12 +5298,34 @@ fn validate_cleanup_acceptance_job(
     let master = PathBuf::from(&settings.master_bin_path)
         .canonicalize()
         .map_err(|error| error.to_string())?;
-    let expected_master = PathBuf::from(&manifest.acceptance_master_bin)
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let trusted: CleanupAcceptanceTrustRecord =
+        read_json(&app_data.join(CLEANUP_ACCEPTANCE_TRUST_RECORD))?;
+    let trusted_root = PathBuf::from(&trusted.source_root)
+        .canonicalize()
+        .map_err(|error| format!("Trusted acceptance source is unavailable: {error}"))?;
+    let isolated_master = app_data
+        .join("cleanup-acceptance-workspace")
+        .join("Master Bin")
         .canonicalize()
         .map_err(|error| error.to_string())?;
-    if master != expected_master || fs_safe::within(&root, &master) || fs_safe::within(&master, &root) {
-        return Err("The acceptance destination is not the isolated manifest workspace".into());
+    let manifest_master = PathBuf::from(&manifest.acceptance_master_bin)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if manifest_master != isolated_master {
+        return Err("The removable manifest names a different acceptance destination".into());
     }
+    validate_acceptance_trust_boundary(
+        &root,
+        &master,
+        &isolated_master,
+        &manifest,
+        &trusted,
+        &trusted_root,
+    )?;
     if volume_identity_for_path(&root)?.as_deref() != Some(&manifest.source_volume_identity) {
         return Err("The disposable acceptance volume identity changed".into());
     }
@@ -5252,9 +5343,8 @@ fn validate_cleanup_acceptance_job(
         .map(|file| (file.relative_path.clone(), file))
         .collect::<HashMap<_, _>>();
     for entry in WalkDir::new(&root).min_depth(1).follow_links(false) {
-        let entry = entry.map_err(|error| {
-            format!("Cannot inspect the complete acceptance fixture: {error}")
-        })?;
+        let entry = entry
+            .map_err(|error| format!("Cannot inspect the complete acceptance fixture: {error}"))?;
         let relative = portable_relative(
             entry
                 .path()
@@ -5281,8 +5371,11 @@ fn validate_cleanup_acceptance_job(
         .filter(|file| file.source_relative_path != CLEANUP_ACCEPTANCE_MANIFEST)
         .map(|file| (file.source_relative_path.clone(), file))
         .collect::<HashMap<_, _>>();
-    if observed.len() != expected.len() || observed.keys().any(|path| !expected.contains_key(path)) {
-        return Err("The reviewed fixture inventory differs from the dedicated acceptance manifest".into());
+    if observed.len() != expected.len() || observed.keys().any(|path| !expected.contains_key(path))
+    {
+        return Err(
+            "The reviewed fixture inventory differs from the dedicated acceptance manifest".into(),
+        );
     }
     for (relative, expected_file) in expected {
         let file = observed.get(&relative).unwrap();
@@ -5311,7 +5404,7 @@ fn write_cleanup_acceptance_report(
         .into_iter()
         .find(|job| job.id == job_id)
         .ok_or("Acceptance cleanup job no longer exists")?;
-    let manifest = validate_cleanup_acceptance_job(&job, &settings)?;
+    let manifest = validate_cleanup_acceptance_job(app, &job, &settings)?;
     let report = serde_json::json!({
         "schemaVersion": 1,
         "fixtureId": manifest.fixture_id,
@@ -5386,182 +5479,10 @@ fn export_cleanup_acceptance_report(
         .create_new(true)
         .open(&destination)
         .map_err(|error| format!("Cannot create acceptance report: {error}"))?;
-    output.write_all(&bytes).map_err(|error| error.to_string())?;
+    output
+        .write_all(&bytes)
+        .map_err(|error| error.to_string())?;
     output.sync_all().map_err(|error| error.to_string())
-}
-
-fn metadata_modified_millis(metadata: &fs::Metadata) -> Option<u128> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_millis())
-}
-
-#[cfg(target_os = "windows")]
-fn file_identity_for_handle(file: &File) -> Result<String, String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    };
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe {
-        GetFileInformationByHandle(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            &mut information,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "Cannot read Windows file identity: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(format!(
-        "win:{:08x}:{:08x}{:08x}",
-        information.dwVolumeSerialNumber, information.nFileIndexHigh, information.nFileIndexLow
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn file_identity(path: &Path) -> Result<String, String> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .open(path)
-        .map_err(|error| format!("Cannot open {} for identity: {error}", path.display()))?;
-    file_identity_for_handle(&file)
-}
-
-#[cfg(target_os = "windows")]
-fn open_validated_destination(
-    path: &Path,
-    expected_size: u64,
-    expected_modified_millis: Option<u128>,
-    expected_identity: &str,
-) -> Result<File, String> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .open(path)
-        .map_err(|error| format!("Cannot protect the verified destination: {error}"))?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if metadata.len() != expected_size
-        || metadata_modified_millis(&metadata) != expected_modified_millis
-        || file_identity_for_handle(&file).as_deref() != Ok(expected_identity)
-    {
-        return Err("Destination identity or snapshot changed before cleanup".into());
-    }
-    Ok(file)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn open_validated_destination(
-    path: &Path,
-    expected_size: u64,
-    expected_modified_millis: Option<u128>,
-    expected_identity: &str,
-) -> Result<File, String> {
-    let file = File::open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if metadata.len() != expected_size
-        || metadata_modified_millis(&metadata) != expected_modified_millis
-        || file_identity(path).as_deref() != Ok(expected_identity)
-    {
-        return Err("Destination identity or snapshot changed before cleanup".into());
-    }
-    Ok(file)
-}
-
-#[cfg(all(not(target_os = "windows"), unix))]
-fn file_identity(path: &Path) -> Result<String, String> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = path.metadata().map_err(|error| error.to_string())?;
-    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
-}
-
-#[cfg(all(not(target_os = "windows"), not(unix)))]
-fn file_identity(path: &Path) -> Result<String, String> {
-    Ok(format!(
-        "path:{}",
-        path.canonicalize().map_err(|error| error.to_string())?.display()
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn remove_exact_source(
-    path: &Path,
-    expected_size: u64,
-    expected_modified_millis: Option<u128>,
-    expected_identity: &str,
-) -> Result<(), String> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FileDispositionInfo,
-    };
-
-    let file = OpenOptions::new()
-        .read(true)
-        .access_mode(DELETE | windows_sys::Win32::Foundation::GENERIC_READ)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| format!("Cannot exclusively open approved source: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("Cannot inspect approved source handle: {error}"))?;
-    if !metadata.is_file()
-        || metadata.len() != expected_size
-        || metadata_modified_millis(&metadata) != expected_modified_millis
-        || file_identity_for_handle(&file).as_deref() != Ok(expected_identity)
-    {
-        return Err("Approved source handle no longer identifies the expected regular file".into());
-    }
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    let removed = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            FileDispositionInfo,
-            &disposition as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-        )
-    };
-    if removed == 0 {
-        return Err(format!(
-            "Windows refused handle-bound source removal: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    drop(file);
-    if path.exists() {
-        return Err("Source removal outcome is uncertain because the path remains present".into());
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn remove_exact_source(
-    path: &Path,
-    expected_size: u64,
-    expected_modified_millis: Option<u128>,
-    expected_identity: &str,
-) -> Result<(), String> {
-    let file = File::open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if metadata.len() != expected_size
-        || metadata_modified_millis(&metadata) != expected_modified_millis
-        || file_identity(path).as_deref() != Ok(expected_identity)
-    {
-        return Err("Approved source content changed before removal".into());
-    }
-    fs::remove_file(path).map_err(|error| error.to_string())
 }
 
 fn execute_cleanup_removals(
@@ -5580,7 +5501,10 @@ fn execute_cleanup_removals(
             .cleanup_authorization_locked_revision
             .ok_or("Cleanup authorization is not locked")?;
         if !job.cleanup_requested || job.cleanup_authorization_revision != locked_revision {
-            return Err("Cleanup authorization changed after locking; all remaining sources were retained".into());
+            return Err(
+                "Cleanup authorization changed after locking; all remaining sources were retained"
+                    .into(),
+            );
         }
         let file = job
             .files
@@ -5610,10 +5534,8 @@ fn execute_cleanup_removals(
             .as_deref()
             .ok_or("Cleanup source has no durable file identity")?;
         let catalogue = load_catalogue_file(&settings)?;
-        let destination = fs_safe::resolve_existing(
-            Path::new(&settings.master_bin_path),
-            &file.relative_path,
-        )?;
+        let destination =
+            fs_safe::resolve_existing(Path::new(&settings.master_bin_path), &file.relative_path)?;
         let destination_valid = destination
             .metadata()
             .map(|metadata| metadata.len() == file.size_bytes)
@@ -5630,10 +5552,15 @@ fn execute_cleanup_removals(
             .destination_volume_identity
             .as_deref()
             .ok_or("Cleanup destination has no durable volume identity")?;
-        if volume_identity_for_path(&destination).ok().flatten().as_deref()
+        if volume_identity_for_path(&destination)
+            .ok()
+            .flatten()
+            .as_deref()
             != Some(expected_destination_volume)
         {
-            return Err("Cleanup destination volume was replaced or could not be identified".into());
+            return Err(
+                "Cleanup destination volume was replaced or could not be identified".into(),
+            );
         }
         let expected_destination_identity = file
             .destination_file_identity
@@ -5739,7 +5666,9 @@ fn run_cleanup_phase(app: &AppHandle, state: &NativeState, job_id: &str) -> Resu
                 "Source cleanup destination reconciliation",
                 resource_governor::PRIORITY_RECOVERY,
                 false,
-                vec![resource_governor::VolumeNeed::read(destination_volume.clone())],
+                vec![resource_governor::VolumeNeed::read(
+                    destination_volume.clone(),
+                )],
             ),
             || false,
         )?;
@@ -5809,7 +5738,7 @@ fn run_cleanup_phase(app: &AppHandle, state: &NativeState, job_id: &str) -> Resu
         });
     }
     if cfg!(feature = "cleanup-acceptance") {
-        validate_cleanup_acceptance_job(&snapshot, &settings)?;
+        validate_cleanup_acceptance_job(app, &snapshot, &settings)?;
     }
     let locked_revision = mutate_jobs(app, state, |jobs| {
         let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
@@ -5835,12 +5764,7 @@ fn run_cleanup_phase(app: &AppHandle, state: &NativeState, job_id: &str) -> Resu
     if locked_revision.is_none() {
         return Ok(());
     }
-    match execute_cleanup_removals(
-        app,
-        state,
-        job_id,
-        &reconciliation.eligible_file_ids,
-    ) {
+    match execute_cleanup_removals(app, state, job_id, &reconciliation.eligible_file_ids) {
         Ok(()) => Ok(()),
         Err(error) => mutate_jobs(app, state, |jobs| {
             let job = jobs.iter_mut().find(|job| job.id == job_id).unwrap();
@@ -5983,22 +5907,21 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                 .approved_sha256
                 .as_deref()
                 .ok_or("Approved duplicate is missing its source hash")?;
-            let source_before = fs_safe::snapshot(&source);
-            let destination_before = fs_safe::snapshot(&destination);
             let source_volume_before = volume_identity_for_path(&source).ok().flatten();
-            let source_hash = sha256(&source);
-            let destination_hash = sha256(&destination);
+            let source_result = hash_with_evidence(&source);
+            let destination_result = hash_with_evidence(&destination);
             let volume_matches = planned
                 .source_volume_identity
                 .as_deref()
                 .is_none_or(|expected| source_volume_before.as_deref() == Some(expected));
             let trustworthy = volume_matches
-                && source_before.as_ref().is_ok_and(|snapshot| {
-                    snapshot.length == planned.size_bytes
-                        && snapshot.modified_millis == planned.source_modified_millis
+                && source_result.as_ref().is_ok_and(|(_, evidence)| {
+                    evidence.length == planned.size_bytes
+                        && evidence.modified_millis == planned.source_modified_millis
                 })
-                && source_hash.as_deref() == Ok(expected_hash)
-                && fs_safe::snapshot(&source).as_ref() == source_before.as_ref()
+                && source_result
+                    .as_ref()
+                    .is_ok_and(|(hash, _)| hash == expected_hash)
                 && planned
                     .source_volume_identity
                     .as_deref()
@@ -6006,11 +5929,9 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                         volume_identity_for_path(&source).ok().flatten().as_deref()
                             == Some(expected)
                     })
-                && destination_before
-                    .as_ref()
-                    .is_ok_and(|snapshot| snapshot.length == planned.size_bytes)
-                && destination_hash.as_deref() == Ok(expected_hash)
-                && fs_safe::snapshot(&destination).as_ref() == destination_before.as_ref();
+                && destination_result.as_ref().is_ok_and(|(hash, evidence)| {
+                    hash == expected_hash && evidence.length == planned.size_bytes
+                });
             let existing = load_catalogue_file(&settings)?
                 .media
                 .into_iter()
@@ -6032,7 +5953,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     0,
                     0,
                     expected_hash,
-                    &file_identity(&source)?,
+                    &source_result.as_ref().unwrap().1.identity,
                     true,
                 )?;
                 complete_duplicate_job_file(
@@ -6058,8 +5979,17 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             continue;
         }
         if destination.exists() {
-            match (sha256(&source), sha256(&destination)) {
-                (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
+            match (
+                hash_with_evidence(&source),
+                hash_with_evidence(&destination),
+            ) {
+                (
+                    Ok((source_hash, source_evidence)),
+                    Ok((destination_hash, destination_evidence)),
+                ) if source_hash == destination_hash
+                    && source_evidence.length == planned.size_bytes
+                    && destination_evidence.length == planned.size_bytes =>
+                {
                     record_ingest_file_verification(
                         app,
                         &state,
@@ -6072,7 +6002,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                         0,
                         0,
                         &source_hash,
-                        &file_identity(&source)?,
+                        &source_evidence.identity,
                         true,
                     )?;
                     let catalogue = load_catalogue_file(&settings)?;
@@ -6097,6 +6027,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                             job_id,
                             &planned.id,
                             destination_hash,
+                            None,
                             None,
                         )?;
                         kick_enrichment_worker(app.clone());
@@ -6134,7 +6065,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
             planned.source_volume_identity.as_deref(),
             &job.verification_mode,
         ) {
-            Ok(copy) => {
+            Ok(mut copy) => {
                 record_ingest_file_verification(
                     app,
                     &state,
@@ -6147,7 +6078,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     copy.copy_duration_millis,
                     copy.verification_duration_millis,
                     &copy.hash,
-                    &file_identity(&source)?,
+                    &copy.source_evidence.identity,
                     copy.destination_bytes_read == planned.size_bytes,
                 )?;
                 let catalogue = load_catalogue_file(&settings)?;
@@ -6180,7 +6111,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     completed_bytes = completed_bytes.saturating_add(planned.size_bytes);
                     continue;
                 }
-                if let Err(error) = promote_verified_copy(&copy, &destination) {
+                if let Err(error) = promote_verified_copy(&mut copy, &destination) {
                     let actionable = if error == "__destination_exists__" {
                         actionable_ingest_error("__race__")
                     } else {
@@ -6204,6 +6135,7 @@ fn process_ingest_job(app: &AppHandle, job_id: &str) -> Result<(), String> {
                     job_id,
                     &planned.id,
                     copy.hash,
+                    Some(&copy.staged_evidence),
                     Some(&copy.journal_path),
                 ) {
                     update_job_progress(
@@ -6486,12 +6418,9 @@ fn start_ingest(
             destination_bytes_read: 0,
             copy_duration_millis: 0,
             verification_duration_millis: 0,
-            source_root_path: source_root_for_file(
-                &source,
-                &inventory_file.source_relative_path,
-            )?
-            .to_string_lossy()
-            .into_owned(),
+            source_root_path: source_root_for_file(&source, &inventory_file.source_relative_path)?
+                .to_string_lossy()
+                .into_owned(),
             media_kind: inventory_file.kind.clone(),
             verified_sha256: None,
             source_file_identity: file_identity(&source).ok(),
@@ -7913,12 +7842,7 @@ fn create_project(
             tags: vec![],
             created_at: Utc::now().to_rfc3339(),
         });
-    validate_project_reassociation(
-        &settings,
-        &project.id,
-        &directory,
-        manifest_id.as_deref(),
-    )?;
+    validate_project_reassociation(&settings, &project.id, &directory, manifest_id.as_deref())?;
     let already_registered = catalogue
         .projects
         .iter()
@@ -8422,13 +8346,7 @@ fn evidence_observation_event(
     snapshot: &fs_safe::FileSnapshot,
     observed_sha256: String,
 ) -> Option<CatalogueEvent> {
-    evidence_observation_event_with_method(
-        item,
-        device_id,
-        snapshot,
-        observed_sha256,
-        "deep",
-    )
+    evidence_observation_event_with_method(item, device_id, snapshot, observed_sha256, "deep")
 }
 
 fn evidence_observation_event_with_method(
@@ -9058,7 +8976,9 @@ fn relocation_candidates(
         return Err("Choose a file or folder inside the configured Master Bin".into());
     }
     if selected == master {
-        return Err("Choose the moved file or its destination folder, not the entire Master Bin".into());
+        return Err(
+            "Choose the moved file or its destination folder, not the entire Master Bin".into(),
+        );
     }
     let files = if selected.is_file() {
         vec![selected]
@@ -9207,11 +9127,8 @@ fn review_media_relocation(
     if media.len() != requested.len() {
         return Err("One or more selected recordings no longer exist in the catalogue".into());
     }
-    let matches = relocation_candidates(
-        Path::new(&settings.master_bin_path),
-        &selected_path,
-        &media,
-    )?;
+    let matches =
+        relocation_candidates(Path::new(&settings.master_bin_path), &selected_path, &media)?;
     Ok(RelocationReview {
         exact: matches.iter().filter(|item| item.status == "exact").count(),
         unresolved: matches
@@ -9297,12 +9214,9 @@ fn approve_media_relocation(
             relative_path: relative,
             sha256: item.sha256.clone(),
         });
-        if let Some(evidence) = evidence_observation_event(
-            item,
-            &settings.device_id,
-            &snapshot,
-            observed_sha256,
-        ) {
+        if let Some(evidence) =
+            evidence_observation_event(item, &settings.device_id, &snapshot, observed_sha256)
+        {
             events.push(evidence);
         }
         projects.extend(item.project_ids.iter().cloned());
@@ -9518,13 +9432,21 @@ fn migrate_legacy_static_thumbnail(
         return Ok(true);
     }
     if destination.exists() {
-        return Err("Shared thumbnail identity is occupied by invalid or incompatible bytes".into());
+        return Err(
+            "Shared thumbnail identity is occupied by invalid or incompatible bytes".into(),
+        );
     }
     let Some(legacy) = validated_legacy_static_thumbnail(settings, item) else {
         return Ok(false);
     };
-    let parent = destination.parent().ok_or("Invalid shared thumbnail path")?;
-    let temporary = parent.join(format!(".migrate-{}-{}.jpg", settings.device_id, Uuid::new_v4()));
+    let parent = destination
+        .parent()
+        .ok_or("Invalid shared thumbnail path")?;
+    let temporary = parent.join(format!(
+        ".migrate-{}-{}.jpg",
+        settings.device_id,
+        Uuid::new_v4()
+    ));
     fs::copy(&legacy, &temporary)
         .map_err(|error| format!("Cannot stage legacy thumbnail migration: {error}"))?;
     OpenOptions::new()
@@ -10125,7 +10047,12 @@ fn create_native_drag_data_object(
             .collect::<Vec<_>>();
         let mut item = std::ptr::null_mut();
         unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut item, 0, None) }.map_err(
-            |error| format!("Windows Shell could not represent selected item {}: {error}", index + 1),
+            |error| {
+                format!(
+                    "Windows Shell could not represent selected item {}: {error}",
+                    index + 1
+                )
+            },
         )?;
         if item.is_null() {
             return Err(format!(
@@ -10151,9 +10078,7 @@ fn create_native_drag_data_object(
     };
     unsafe { data_object.QueryGetData(&file_drop_format) }
         .ok()
-        .map_err(|error| {
-            format!("Windows file drag payload does not expose CF_HDROP: {error}")
-        })?;
+        .map_err(|error| format!("Windows file drag payload does not expose CF_HDROP: {error}"))?;
     Ok((data_object, item_ids))
 }
 
@@ -10889,10 +10814,7 @@ fn run_playback_proxy_generation(
 }
 
 #[tauri::command]
-async fn resolve_media_playback_source(
-    app: AppHandle,
-    media_id: String,
-) -> Result<String, String> {
+async fn resolve_media_playback_source(app: AppHandle, media_id: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
         let state = app.state::<NativeState>();
@@ -11420,7 +11342,10 @@ fn validated_cleanup_reveal_path(
     target: &str,
 ) -> Result<PathBuf, String> {
     let (root, relative) = match target {
-        "source" => (cleanup_source_root(file)?, file.source_relative_path.as_str()),
+        "source" => (
+            cleanup_source_root(file)?,
+            file.source_relative_path.as_str(),
+        ),
         "destination" => (
             PathBuf::from(&settings.master_bin_path),
             file.relative_path.as_str(),
@@ -11578,7 +11503,9 @@ fn approved_public_installer_url(url: &str) -> bool {
 #[tauri::command]
 fn open_public_release_installer(app: AppHandle, url: String) -> Result<(), String> {
     if !approved_public_installer_url(&url) {
-        return Err("The public installer link was not an approved Kairix PIMP GitHub Release asset".into());
+        return Err(
+            "The public installer link was not an approved Kairix PIMP GitHub Release asset".into(),
+        );
     }
     app.opener()
         .open_url(url, None::<String>)
@@ -11816,9 +11743,7 @@ fn load_thumbnail_sources(
     let settings = load_settings_file(&app)?;
     let catalogue = load_catalogue_file(&settings)?;
     let shared = shared_thumbnail_root(&settings)?;
-    let sources = thumbnail_sources_for_items(
-        &settings, &catalogue, &shared, &requested,
-    );
+    let sources = thumbnail_sources_for_items(&settings, &catalogue, &shared, &requested);
     // The static config deliberately grants no filesystem glob. Only native-
     // validated JPEGs are exposed to the WebView, one exact file at a time.
     // This supports a user-selected shared catalogue without granting the
@@ -12002,10 +11927,7 @@ fn hover_preview_fingerprint(item: &MediaItem) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn legacy_hover_preview_fingerprint(
-    item: &MediaItem,
-    snapshot: &fs_safe::FileSnapshot,
-) -> String {
+fn legacy_hover_preview_fingerprint(item: &MediaItem, snapshot: &fs_safe::FileSnapshot) -> String {
     let mut digest = Sha256::new();
     digest.update(b"pimp-hover-preview-v3-sparse-seek\0");
     digest.update(item.id.as_bytes());
@@ -12143,9 +12065,10 @@ fn validate_hover_preview_version(
         || manifest.frame_files.len() != manifest.frame_times.len()
         || manifest.frame_files.is_empty()
         || manifest.frame_files.len() > 8
-        || manifest.frame_times.iter().any(|time| {
-            !time.is_finite() || *time < 0.0 || *time > manifest.duration_seconds + 0.5
-        })
+        || manifest
+            .frame_times
+            .iter()
+            .any(|time| !time.is_finite() || *time < 0.0 || *time > manifest.duration_seconds + 0.5)
     {
         return Err("Hover preview manifest has an invalid frame list".into());
     }
@@ -12405,7 +12328,10 @@ fn ensure_hover_preview(
                     .is_some_and(|hash| hash.eq_ignore_ascii_case(&item.sha256))
         });
     if !evidence_matches && !sha256(source)?.eq_ignore_ascii_case(&item.sha256) {
-        return Err("Source bytes do not match the catalogue SHA-256; shared preview was not generated".into());
+        return Err(
+            "Source bytes do not match the catalogue SHA-256; shared preview was not generated"
+                .into(),
+        );
     }
 
     let temporary = root.join(format!(".generating-{}", Uuid::new_v4()));
@@ -12553,11 +12479,7 @@ async fn load_hover_preview(app: AppHandle, media_id: String) -> Result<HoverPre
             read_authorized_hover_preview(&app, &cached_directory, &fingerprint, &media_id)
         });
         if result.is_ok() {
-            volume_permit.add_bytes_for(
-                &cache_volume,
-                0,
-                preview_cache_usage(&cached_directory),
-            );
+            volume_permit.add_bytes_for(&cache_volume, 0, preview_cache_usage(&cached_directory));
         }
         result
     })
@@ -12626,11 +12548,7 @@ async fn prepare_hover_preview(app: AppHandle, media_id: String) -> Result<(), S
         let result = ensure_hover_preview(&settings, item, &source);
         match result {
             Ok((directory, _)) => {
-                volume_permit.add_bytes_for(
-                    &cache_volume,
-                    0,
-                    preview_cache_usage(&directory),
-                );
+                volume_permit.add_bytes_for(&cache_volume, 0, preview_cache_usage(&directory));
                 Ok(())
             }
             Err(error) => Err(error),
@@ -12991,6 +12909,54 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_acceptance_requires_an_independent_matching_trust_record() {
+        let root = PathBuf::from("R:/fixture");
+        let master = PathBuf::from("C:/acceptance/Master Bin");
+        let manifest = CleanupAcceptanceManifest {
+            schema_version: 1,
+            fixture_id: Uuid::new_v4().to_string(),
+            source_volume_identity: "volume-a".into(),
+            acceptance_master_bin: master.to_string_lossy().into_owned(),
+            files: vec![CleanupAcceptanceFile {
+                relative_path: "clip.mp4".into(),
+                size_bytes: 4,
+                sha256: "abcd".into(),
+                removable: true,
+            }],
+        };
+        let trusted = CleanupAcceptanceTrustRecord {
+            schema_version: 1,
+            source_root: root.to_string_lossy().into_owned(),
+            manifest: manifest.clone(),
+        };
+        assert!(validate_acceptance_trust_boundary(
+            &root, &master, &master, &manifest, &trusted, &root
+        )
+        .is_ok());
+
+        let mut device_controlled = manifest.clone();
+        device_controlled.files[0].sha256 = "tampered".into();
+        assert!(validate_acceptance_trust_boundary(
+            &root,
+            &master,
+            &master,
+            &device_controlled,
+            &trusted,
+            &root
+        )
+        .is_err());
+        assert!(validate_acceptance_trust_boundary(
+            &root,
+            &PathBuf::from("D:/other"),
+            &master,
+            &manifest,
+            &trusted,
+            &root
+        )
+        .is_err());
+    }
 
     #[test]
     fn pending_verification_classifies_evidence_without_reading_content() {
@@ -15722,10 +15688,8 @@ mod tests {
     #[test]
     fn updater_is_a_higher_development_release_and_fails_closed_without_a_public_key() {
         assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
-        let configuration = updater_configuration_for_key(
-            option_env!("PIMP_UPDATER_PUBLIC_KEY"),
-            "development",
-        );
+        let configuration =
+            updater_configuration_for_key(option_env!("PIMP_UPDATER_PUBLIC_KEY"), "development");
         assert_eq!(configuration.channel, "Development");
         assert_eq!(configuration.target, "development-channel");
         assert!(configuration.endpoint.starts_with("https://"));
@@ -16214,7 +16178,10 @@ mod tests {
         let _ole = OleInitialization::initialize().unwrap();
 
         for paths in [
-            vec![first.canonicalize().unwrap(), second.canonicalize().unwrap()],
+            vec![
+                first.canonicalize().unwrap(),
+                second.canonicalize().unwrap(),
+            ],
             vec![folder.canonicalize().unwrap()],
             vec![long_file.canonicalize().unwrap()],
         ] {
@@ -16852,31 +16819,18 @@ mod tests {
                 .into_owned(),
         );
 
-        validate_project_reassociation(
-            &settings,
-            "project-a",
-            &returned,
-            Some("project-a"),
-        )
-        .unwrap();
-        let mismatch = validate_project_reassociation(
-            &settings,
-            "project-a",
-            &returned,
-            Some("project-b"),
-        )
-        .unwrap_err();
+        validate_project_reassociation(&settings, "project-a", &returned, Some("project-a"))
+            .unwrap();
+        let mismatch =
+            validate_project_reassociation(&settings, "project-a", &returned, Some("project-b"))
+                .unwrap_err();
         assert!(mismatch.contains("does not carry the same portable project identity"));
 
         let original = projects_root.join("Unavailable Original");
         fs::create_dir_all(&original).unwrap();
-        let conflict = validate_project_reassociation(
-            &settings,
-            "project-a",
-            &returned,
-            Some("project-a"),
-        )
-        .unwrap_err();
+        let conflict =
+            validate_project_reassociation(&settings, "project-a", &returned, Some("project-a"))
+                .unwrap_err();
         assert!(conflict.contains("already associated"));
 
         let second_projects_root = root.join("second-device-projects");
@@ -16920,7 +16874,12 @@ mod tests {
         let portable_metadata = HashMap::from([
             (
                 "stable-video-id",
-                (vec!["interview"], "keep description", true, vec!["project-a"]),
+                (
+                    vec!["interview"],
+                    "keep description",
+                    true,
+                    vec!["project-a"],
+                ),
             ),
             (
                 "stable-audio-id",
@@ -16928,14 +16887,8 @@ mod tests {
             ),
         ]);
         let mut availability = HashMap::from([
-            (
-                "stable-video-id".into(),
-                ("20261125/clip.mp4".into(), true),
-            ),
-            (
-                "stable-audio-id".into(),
-                ("20261125/clip.wav".into(), true),
-            ),
+            ("stable-video-id".into(), ("20261125/clip.mp4".into(), true)),
+            ("stable-audio-id".into(), ("20261125/clip.wav".into(), true)),
             (
                 "stable-older-id".into(),
                 ("20261124/older.mp4".into(), true),

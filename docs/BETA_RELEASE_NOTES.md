@@ -1,31 +1,37 @@
-# Kairix PIMP Light 0.3 — Development candidate
+# Kairix PIMP Light 0.3 — Development
 
-This file supplies release notes to the reviewed promotion workflows. Source version `0.3.0` is displayed as `0.3 — Development`; it is strictly newer than internal `0.2.0` builds and is not publicly available until a permanent GitHub Development Release has completed verification. The historical `v0.1.1-5` beta remains unchanged.
+Kairix PIMP Light 0.3 is a public Development prerelease for Windows. It is a copy-only media workflow application: original source removal remains unavailable in ordinary builds.
 
-## Highlights
+## What is working
 
-- Approved user builds are promoted as permanent GitHub Releases with NSIS/MSI installers, SHA-256 evidence, source identity and an explicit Development or Stable classification.
-- Release and updater publication are serialized; immutable signed assets are verified on retry and channel manifests reject rollback or same-version replacement.
-- Settings can select Development or Stable signed update channels and can check after startup, every six hours, or manually. Update installation still fails closed without the protected public key and signature.
-- Keyless builds can still inspect complete permanent releases through GitHub's public API, compare the installed version and open only the official unsigned NSIS asset for manual checksum verification and installation.
-- Equal public and installed SemVer is reported as inconclusive until the displayed build identity is compared with `BUILD-INFO.txt`; version equality is never presented as proof of equal executable bytes.
-- Static thumbnails and scrub previews use deterministic portable identities beneath the shared catalogue at `.pimp/thumbnails/v1` and `.pimp/hover-previews/v1`. Valid legacy local derivatives migrate incrementally; playback proxies remain local.
-- Pending Verification explains verified, stale, awaiting, unavailable, moved and failed evidence without hashing on open, then hashes only explicitly selected registered files with progress and cancellation.
-- Static asset references survive card unmount and ordinary catalogue refresh so returning to earlier recordings does not deliberately restore placeholders or rerun FFmpeg.
-- Library overflow belongs only to the folder and media panels. Other workspaces retain conditional natural scrolling.
+- Responsive metadata-first SD-card and folder inventory with reviewable destination paths, preserved camera-package hierarchy and separate-root collision handling.
+- Fast and Deep ingest modes. Both hash the exact protected source handle while writing same-filesystem staging, flush staged bytes and promote without overwrite; Deep additionally rereads and hashes the staged handle.
+- Persistent background ingest jobs, interruption recovery, immediate provisional metadata editing and safe completed-history clearing.
+- Library browsing, search, sorting, tags, notes, favourites, project assignment and selective integrity verification.
+- Logical video/audio recording association while retaining both immutable physical files.
+- Shared static thumbnails and hover-scrub derivatives, bounded background preparation, configurable hold frames and responsive thumbnail sizing.
+- Clip Viewer playback with validated local proxy generation for unsupported media.
+- COPY-only native Windows drag-and-drop to Explorer and compatible hosts, plus manual Premiere manifest export.
+- Read-only Premiere project indexing with explicit unknown/historical evidence; no undocumented project-file modification.
+- Portable append-only catalogue events and synchronized regenerable derivatives designed for eventual Syncthing delivery.
+- Project backup jobs with staged no-overwrite copying, SHA-256 manifests, re-verification and restore testing to an independent empty folder.
+- Manual public update discovery through permanent GitHub Releases, including version comparison, release notes, build identity and checksum guidance when signed updating is unavailable.
 
-## Safety retained
+## Safety and recovery changes
 
-- Original media is immutable and ingest retains independent SHA-256 verification, same-filesystem staging and atomic no-overwrite promotion.
-- Shared thumbnails and scrub previews are regenerable derivatives, not authoritative catalogue identity, and ordinary local cache clearing does not delete them.
-- Automatic updates cannot start while critical ingest, backup, verification or derivative filesystem work is active.
-- No source cleanup or automatic deletion is enabled.
+Ingest hashes and file identity now come from the actual open source and staging handles. The staging identity is carried through atomic promotion and checked again before catalogue registration. Duplicate verification uses the same handle-bound reasoning. The isolated cleanup-acceptance build now requires an independently stored app-local fixture trust record, and deletion observation distinguishes confirmed absence from permission, device and other indeterminate failures.
 
-## Acceptance still required
+These cleanup corrections do not enable production deletion. The ordinary application contains no executable source-removal path.
 
-- Provision protected signing credentials/public key and complete a real installed A-to-B update, tamper rejection and interrupted-download retry.
-- Repeat installed Windows scrolling with at least 1,000 logical recordings and test narrow, 1080p, ultrawide and 125–200% scaling.
-- Complete real two-device Syncthing thumbnail arrival, concurrent-generation/conflict and different-root testing.
-- Complete physical-card, production-codec, Premiere host and Authenticode acceptance.
+## Important limitations
 
-Install only from the [official GitHub Releases page](https://github.com/Dubcodes/kairix-pimp/releases), compare `SHA256SUMS.txt` and `BUILD-INFO.txt`, and expect a SmartScreen warning while installers remain unsigned by Authenticode.
+- Production SD-card/source deletion remains disabled pending physical removable-media acceptance and a separate activation review.
+- Full automatic project finalization is not implemented.
+- Returned-project support does not automatically discover projects or restore archived project metadata; complete archived-project restoration is not implemented.
+- AI analysis and Storyteller functionality are not implemented.
+- The Premiere companion proof has automated interchange coverage but has not completed broad installed Premiere acceptance.
+- Real two-device Syncthing, production-camera/card, large-library installed performance and complete production-codec acceptance remain open.
+- Installers are not Authenticode signed and may trigger Windows SmartScreen.
+- Signed automatic updating is unavailable unless the protected updater public key and signing secrets are genuinely provisioned and an installed A-to-B update is accepted. Manual release discovery remains available.
+
+Install only from the [official GitHub Releases page](https://github.com/Dubcodes/kairix-pimp/releases). Compare the installer against `SHA256SUMS.txt` and confirm `BUILD-INFO.txt` names the expected source commit before running it.

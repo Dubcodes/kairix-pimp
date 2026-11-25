@@ -77,6 +77,8 @@ Implemented foundation: persistent project backup jobs create a complete, no-ove
 
 Retain lightweight completed-project records in catalogue search and a portable project-local archive carrying stable project identity and its media manifest. Public sharing links and YouTube metadata remain deferred.
 
+Returned-project support currently performs only manifest-proven reassociation of an existing stable project ID when the previous local folder is unavailable. It does not automatically discover returned projects, restore archived project metadata, or reconstruct a complete archived project. Those remain part of the later archive/finalization work and must not be presented as complete restore behavior.
+
 ## Milestone 6 — safe cleanup
 
 Unused-footage review, cross-project protection, synchronization preflight, recoverable quarantine, multi-step explicit authorization, and delayed purge. No direct deletion from source cards.
